@@ -36,6 +36,7 @@ const PRESERVE_BYTES = `${PRESERVE_ANCHOR}        with (output / "konteks-source
             preserved.write((receipts / "inspection/binaries.json").read_bytes())
 `;
 const TARGETS = new Set(['aarch64-apple-darwin', 'x86_64-apple-darwin']);
+const PLATFORMS = Object.freeze({ 'aarch64-apple-darwin': 'darwin_arm64', 'x86_64-apple-darwin': 'darwin_x86_64' });
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const check = (condition, message) => { if (!condition) throw new Error(message); };
 
@@ -166,15 +167,31 @@ function option(values, key, expected) {
   check(found.length === 1 && found[0] === expected, 'CPAL Rustc crate or target binding changed');
 }
 
+function productionConfiguration(configuration, target) {
+  check([undefined, false, true].includes(configuration.isTool), 'CPAL compiler configuration tool flag refused');
+  if (configuration.isTool === true) return false;
+  const platform = PLATFORMS[target];
+  check(configuration.platformName === platform && configuration.mnemonic === `${platform}-opt`, 'CPAL production compiler configuration changed');
+  check(typeof configuration.checksum === 'string' && /^[a-f0-9]{64}$/.test(configuration.checksum), 'CPAL compiler configuration checksum refused');
+  return true;
+}
+
 function compilerAction(graph, target) {
-  const actions = rows(graph.actions);
+  const configurations = indexed(graph.configuration);
+  const actions = rows(graph.actions).filter(action => {
+    check(action.mnemonic === 'Rustc', 'CPAL effective compiler action type changed');
+    return productionConfiguration(required(configurations, action.configurationId), target);
+  });
   check(actions.length === 1 && actions[0].mnemonic === 'Rustc', 'CPAL effective Rustc action is ambiguous');
   const action = actions[0];
   check(typeof action.actionKey === 'string' && /^[a-f0-9]{16,128}$/.test(action.actionKey), 'CPAL action key refused');
   const args = actionArguments(action);
   option(args, '--crate-name', 'cpal');
+  option(args, '--crate-type', 'rlib');
   option(args, '--target', target);
-  return { action, argumentsSha256: digest(JSON.stringify(args)) };
+  const configuration = required(configurations, action.configurationId);
+  return { action, argumentsSha256: digest(JSON.stringify(args)), configuration: {
+    mnemonic: configuration.mnemonic, platformName: configuration.platformName, checksum: configuration.checksum, isTool: false } };
 }
 
 function compilerMember(graph, action) {
@@ -194,6 +211,16 @@ function compilerMember(graph, action) {
   return matches[0];
 }
 
+function compilerOutput(graph, selected, member) {
+  const artifacts = indexed(graph.artifacts), fragments = indexed(graph.pathFragments);
+  const outputs = ids(selected.action.outputIds).map(id => fragmentPath(fragments, required(artifacts, id).pathFragmentId));
+  check(outputs.length === 1, 'CPAL production library output is missing or ambiguous');
+  const directory = `bazel-out/${selected.configuration.mnemonic}/bin/${member.slice(0, -MEMBER.length)}`;
+  check(outputs[0].startsWith(directory), 'CPAL production library output owner changed');
+  check(/^libcpal-[A-Za-z0-9_-]+[.]rlib$/.test(outputs[0].slice(directory.length)), 'CPAL production library output type changed');
+  return outputs[0];
+}
+
 export async function verifyCpalCompilerInput({ text, outputBase, work, target }) {
   check(TARGETS.has(target), 'CPAL candidate target refused');
   check(typeof text === 'string' && Buffer.byteLength(text) <= 4 * 1024 ** 2, 'CPAL action graph text exceeds bound');
@@ -202,11 +229,12 @@ export async function verifyCpalCompilerInput({ text, outputBase, work, target }
   const graph = JSON.parse(text);
   const selected = compilerAction(graph, target);
   const member = compilerMember(graph, selected.action);
+  const libraryOutputPath = compilerOutput(graph, selected, member);
   const repository = member.slice(0, -MEMBER.length);
   await pinned(outputBase, join(outputBase, repository, 'Cargo.toml'), HASH.crateManifest, 16 * 1024);
   const bytes = await boundedBytes(outputBase, join(outputBase, ...member.split('/')), 64 * 1024);
   check(digest(bytes) === HASH.candidate, 'CPAL effective compiler source differs from the reviewed candidate');
-  return { actionKey: selected.action.actionKey, argumentsSha256: selected.argumentsSha256,
+  return { actionKey: selected.action.actionKey, argumentsSha256: selected.argumentsSha256, configuration: selected.configuration, libraryOutputPath,
     loopbackSha256: digest(bytes), materializedRelativePath: member, crateVersion: '0.18.2', crateManifestSha256: HASH.crateManifest,
     target, candidateOnly: true, shippingReplacementApproved: false };
 }

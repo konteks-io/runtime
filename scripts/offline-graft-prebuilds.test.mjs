@@ -2,13 +2,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import * as nodePath from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { runInNewContext } from "node:vm";
+import { gunzipSync } from "node:zlib";
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const helper = join(scriptDirectory, "offline-graft-prebuilds.mjs");
@@ -66,11 +67,12 @@ function execBoundary(state, command, args) {
   if (command === "npm" || command === "npm.cmd") {
     state.root = args[args.indexOf("--prefix") + 1];
     seedGraft(state.root);
+    if (state.developmentCli) seedDevelopmentCli(state.root);
     state.before = inventory(state.root);
     return;
   }
   state.calls.push({ command, args: [...args] });
-  if (command === "tar") state.archived = inventory(state.root);
+  if (command === "tar") { state.archived = inventory(state.root); state.cliArchived = existsSync(join(state.root, "node_modules/tree-sitter-cli/tree-sitter")); }
 }
 
 function builderContext(directory, coordinate, state) {
@@ -80,18 +82,20 @@ function builderContext(directory, coordinate, state) {
   writeFileSync(config, JSON.stringify({ nodeVersion: process.versions.node, tools: { graft: { package: "@nanonets/graft", version: "0.18.0", entrypoint: "dist/cli.js" } } }));
   return {
     ...helperExports, existsSync, mkdirSync, readFileSync, rmSync, tmpdir, join,
+    // Existing prebuild-only fixtures do not model the separate reviewed CLI graph.
+    pruneGraftDevelopmentCli: state.developmentCli ? helperExports.pruneGraftDevelopmentCli : () => [],
     mkdtempSync: () => work,
     execFileSync: (command, args) => execBoundary(state, command, args),
     process: { platform: coordinate.platform, arch: coordinate.nodeArch, version: process.version, execPath: process.execPath, env: {}, argv: [process.execPath, "builder", "--tool", "graft", "--architecture", coordinate.architecture, "--config", config, "--out", join(directory, "fixture.tgz")] },
     macOsArtifactOptions: architecture => ({ architecture, minimumOS: "13" }),
-    assertMacOsArtifactTree: root => { state.guard = inventory(root); state.calls.push({ command: "compatibility", args: [] }); },
+    assertMacOsArtifactTree: root => { state.guard = inventory(root); state.cliAtGuard = existsSync(join(root, "node_modules/tree-sitter-cli/tree-sitter")); state.calls.push({ command: "compatibility", args: [] }); },
     console: { log: () => {} },
   };
 }
 
-function buildFixture(coordinate) {
+function buildFixture(coordinate, developmentCli = false) {
   const directory = mkdtempSync(join(tmpdir(), "graft-builder-characterization-"));
-  const state = { calls: [] };
+  const state = { calls: [], developmentCli };
   try {
     const source = readFileSync(join(scriptDirectory, "build-offline-tool.mjs"), "utf8").replace(/^import .+;\r?$/gm, "");
     runInNewContext(source, builderContext(directory, coordinate, state), { timeout: 5_000 });
@@ -310,16 +314,16 @@ test("Graft refuses a grammar whose root expression is not the reviewed literal 
   assert.deepEqual(inventory(root), before);
 }));
 
-test("Graft parser smoke resolves both languages through its own package and refuses parse errors", () => {
+test("Graft parser smoke resolves all languages through its own package and refuses parse errors", () => {
   const parsed = [];
-  const languages = new Map([["typescript", {}], ["javascript", {}]]);
+  const languages = new Map([["typescript", {}], ["javascript", {}], ["swift", {}]]);
   const parser = smokeParser(parsed, languages);
-  const exports = new Map([["tree-sitter", parser], ["tree-sitter-typescript", { typescript: languages.get("typescript") }], ["tree-sitter-javascript", languages.get("javascript")]]);
+  const exports = new Map([["tree-sitter", parser], ["tree-sitter-typescript", { typescript: languages.get("typescript") }], ["tree-sitter-javascript", languages.get("javascript")], ["tree-sitter-swift", languages.get("swift")]]);
   const root = join(tmpdir(), "owned-graft-smoke");
   const expected = join(root, "node_modules", "@nanonets", "graft", "package.json");
   const context = { process: { argv: [process.execPath, root] }, console: { log: () => {} }, require: name => smokeDependency(name, exports, expected) };
   runInNewContext(helperExports.graftParserSmokeSource(), context, { timeout: 1_000 });
-  assert.deepEqual(parsed.map(value => value.language), ["typescript", "javascript"]);
+  assert.deepEqual(parsed.map(value => value.language), ["typescript", "javascript", "swift"]);
   exports.set("tree-sitter", class { setLanguage() {} parse() { return { rootNode: { hasError: true, type: "program" } }; } });
   assert.throws(() => runInNewContext(helperExports.graftParserSmokeSource(), { ...context }, { timeout: 1_000 }), /smoke refused/);
 });
@@ -327,7 +331,7 @@ test("Graft parser smoke resolves both languages through its own package and ref
 function smokeParser(parsed, languages) {
   return class {
     setLanguage(language) { this.language = [...languages].find(([, value]) => value === language)[0]; }
-    parse(text) { parsed.push({ language: this.language, text }); return { rootNode: { hasError: false, type: "program" } }; }
+    parse(text) { parsed.push({ language: this.language, text }); return { rootNode: { hasError: false, type: this.language === "swift" ? "source_file" : "program" } }; }
   };
 }
 
@@ -338,6 +342,86 @@ function smokeDependency(name, exports, expected) {
     assert.equal(entry, expected);
     return name => { assert.ok(exports.has(name)); return exports.get(name); };
   } };
+}
+
+const cliFixtureDirectory = join(scriptDirectory, "fixtures", "graft-0.18.0-cli-consumers");
+const cliFixtureBytes = readFileSync(join(cliFixtureDirectory, "sources.json.gz"));
+assert.equal(createHash("sha256").update(cliFixtureBytes).digest("hex"), "1c9a972090437b75ac065d3e568e736c588dcec5ed8484216bebba2e8c7c62d7");
+const cliSources = JSON.parse(gunzipSync(cliFixtureBytes, { maxOutputLength: 2 * 1024 * 1024 }).toString("utf8")).sources;
+
+function seedDevelopmentCli(root) {
+  for (const row of cliSources) write(root, `node_modules/${row.package}/${row.path}`, Buffer.from(row.base64, "base64"));
+  write(root, "node_modules/tree-sitter-cli/tree-sitter", "controlled unused native CLI fixture\n");
+  write(root, "node_modules/.bin/tree-sitter", "controlled untouched launcher fixture\n");
+}
+
+for (const coordinate of coordinates) {
+  test(`Graft developmental CLI builder only prunes on ${coordinate.platform}/${coordinate.nodeArch}`, () => {
+    const state = buildFixture(coordinate, true);
+    assert.equal(state.cliArchived, coordinate.platform !== "darwin");
+    if (coordinate.platform === "darwin") assert.equal(state.cliAtGuard, false, "development-only downloaded CLI must be removed before complete Mach-O inspection");
+  });
+}
+
+test("Graft developmental CLI parser smoke actually exercises Swift without a CLI process", () => {
+  const parsed = [];
+  const languages = new Map([["typescript", {}], ["javascript", {}], ["swift", {}]]);
+  const exports = new Map([["tree-sitter", smokeParser(parsed, languages)], ["tree-sitter-typescript", { typescript: languages.get("typescript") }], ["tree-sitter-javascript", languages.get("javascript")], ["tree-sitter-swift", languages.get("swift")]]);
+  const root = join(tmpdir(), "graft-cli-parser-smoke");
+  const expected = join(root, "node_modules", "@nanonets", "graft", "package.json");
+  runInNewContext(helperExports.graftParserSmokeSource(), { require: name => smokeDependency(name, exports, expected), process: { argv: ["node", root] }, console: { log() {} } }, { timeout: 1_000 });
+  assert.deepEqual(parsed.map(value => value.language), ["typescript", "javascript", "swift"]);
+});
+
+for (const coordinate of coordinates) {
+  test(`Graft developmental CLI exact source preserves runtime and launcher bytes on ${coordinate.platform}/${coordinate.nodeArch}`, () => parserFixture(root => {
+    seedDevelopmentCli(root);
+    const rows = helperExports.pruneGraftDevelopmentCli(root, coordinate);
+    assert.equal(existsSync(join(root, "node_modules/tree-sitter-cli/tree-sitter")), coordinate.platform !== "darwin");
+    assert.equal(rows.length, coordinate.platform === "darwin" ? 1 : 0);
+    for (const row of cliSources) assert.deepEqual(readFileSync(join(root, `node_modules/${row.package}/${row.path}`)), Buffer.from(row.base64, "base64"));
+    assert.equal(readFileSync(join(root, "node_modules/.bin/tree-sitter"), "utf8"), "controlled untouched launcher fixture\n");
+    assert.deepEqual(inventory(root).tuples, tuples.slice().sort(), "CLI removal cannot change native grammar selection");
+  }));
+}
+
+const developmentCliRefusals = [
+  ["unreviewed Graft identity", root => appendCliSource(root, "@nanonets/graft/package.json"), /source review/],
+  ["changed runtime process consumer", root => appendCliSource(root, "@nanonets/graft/dist/cli.js"), /closure.*source review/],
+  ["new runtime source", root => write(root, "node_modules/@nanonets/graft/dist/extra.js", "import 'tree-sitter-cli';\n"), /closure.*source review/],
+  ["unreviewed Swift version", root => appendCliSource(root, "tree-sitter-swift/package.json"), /source review/],
+  ["changed Swift binding", root => appendCliSource(root, "tree-sitter-swift/bindings/node/index.js"), /source review/],
+  ["different installed CLI version", root => write(root, "node_modules/tree-sitter-cli/package.json", JSON.stringify({ name: "tree-sitter-cli", version: "0.23.1" })), /source review/],
+  ["changed CLI entry", root => appendCliSource(root, "tree-sitter-cli/cli.js"), /source review/],
+  ["changed CLI installer", root => appendCliSource(root, "tree-sitter-cli/install.js"), /source review/],
+  ["hardlinked CLI native file", root => linkSync(join(root, "node_modules/tree-sitter-cli/tree-sitter"), join(root, "shared-native")), /bounded regular/],
+  ["directory instead of native file", root => { rmSync(join(root, "node_modules/tree-sitter-cli/tree-sitter")); mkdirSync(join(root, "node_modules/tree-sitter-cli/tree-sitter")); }, /regular file/],
+  ["linked CLI package", root => linkedDevelopmentPackage(root), /link/],
+];
+
+function appendCliSource(root, name) {
+  const path = `node_modules/${name}`;
+  write(root, path, Buffer.concat([readFileSync(join(root, path)), Buffer.from("\n ")]));
+}
+
+function linkedDevelopmentPackage(root) {
+  const original = join(root, "node_modules/tree-sitter-cli");
+  const moved = join(root, "held-cli");
+  mkdirSync(moved);
+  for (const name of readdirSync(original)) writeFileSync(join(moved, name), readFileSync(join(original, name)));
+  rmSync(original, { recursive: true });
+  symlinkSync(moved, original, process.platform === "win32" ? "junction" : "dir");
+}
+
+for (const [name, mutate, expected] of developmentCliRefusals) {
+  test(`Graft developmental CLI refuses ${name} before native-file removal`, () => parserFixture(root => {
+    seedDevelopmentCli(root);
+    mutate(root);
+    const before = inventory(root);
+    assert.throws(() => helperExports.pruneGraftDevelopmentCli(root, coordinates[0]), expected);
+    assert.ok(existsSync(join(root, "node_modules/tree-sitter-cli/tree-sitter")));
+    assert.deepEqual(inventory(root), before);
+  }));
 }
 
 const reviewedRootDirectory = join(scriptDirectory, "fixtures", "tree-sitter-0.22.4");

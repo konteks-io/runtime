@@ -234,7 +234,7 @@ function voiceBuildOptions(context) {
 
 async function cpalCompilerInput(context, codex, startup) {
   const outputBase = (await run(context, 'cpal-output-base', 'bazel', [...startup, 'info', 'output_base'], 120, { cwd: codex.directory })).trim();
-  const query = 'mnemonic("Rustc", inputs(".*src/host/coreaudio/macos/loopback[.]rs", deps(//codex-rs/voice-host:codex-voice-host)))';
+  const query = 'outputs("(^|/)libcpal-[A-Za-z0-9_-]+[.]rlib$", mnemonic("Rustc", inputs(".*src/host/coreaudio/macos/loopback[.]rs", deps(//codex-rs/voice-host:codex-voice-host))))';
   const text = await run(context, 'cpal-effective-action', 'bazel', [...startup, 'aquery', ...voiceBuildOptions(context),
     '--output=jsonproto', '--include_artifacts', '--include_param_files', query], 300, { cwd: codex.directory });
   return verifyCpalCompilerInput({ text, outputBase, work: context.work, target: context.coordinate.target });

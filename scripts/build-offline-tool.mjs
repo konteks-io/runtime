@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import process from "node:process";
 import { assertMacOsArtifactTree, macOsArtifactOptions } from "./macos-artifact-compatibility.mjs";
-import { graftParserSmokeSource, pruneGraftPrebuilds } from "./offline-graft-prebuilds.mjs";
+import { graftParserSmokeSource, pruneGraftDevelopmentCli, pruneGraftPrebuilds } from "./offline-graft-prebuilds.mjs";
 
 const shell = process.platform === "win32";
 const npm = shell ? "npm.cmd" : "npm";
@@ -44,6 +44,8 @@ try {
     if (process.arch !== nodeArch) throw new Error("Graft target does not match the native build host");
     const selection = pruneGraftPrebuilds(root, { platform: process.platform, architecture: args.architecture });
     console.log(`Graft native prebuild selection: ${JSON.stringify(selection)}`);
+    const developmentCli = pruneGraftDevelopmentCli(root, { platform: process.platform, architecture: args.architecture });
+    console.log(`Graft development-only generator selection: ${JSON.stringify(developmentCli)}`);
   }
   // The package must run with nothing but this Node: no network, no home.
   execFileSync(process.execPath, [cli, "--version"], { stdio: "inherit", env: { PATH: "/usr/bin:/bin", HOME: work, DO_NOT_TRACK: "1" } });

@@ -9,6 +9,7 @@ import { runInNewContext } from 'node:vm';
 import test from 'node:test';
 import { assertStableCpalCompilerInput, prepareCpalAvailabilityCandidate, verifyCpalCompilerInput } from './cpal-patch.mjs';
 import { sha256 } from './inspect-candidate.mjs';
+import { actionIndex, actionPath } from './bazel-actions.mjs';
 
 const probe = readFileSync(new URL('./probe.mjs', import.meta.url), 'utf8');
 const commit = '687a119f0fcaace47e1f1abcc77cec6c813fd6da';
@@ -223,12 +224,24 @@ test('wrong Codex commit and preexisting patch refuse without changing the pinne
 
 function syntheticGraph(target = 'aarch64-apple-darwin') {
   const segments = 'external/crates+cpal-0.18.2/src/host/coreaudio/macos/loopback.rs'.split('/');
-  return { actions: [{ actionKey: 'a'.repeat(64), mnemonic: 'Rustc', targetId: '1', inputDepSetIds: ['1'],
-    arguments: ['rustc', '--crate-name', 'cpal', '--target', target] }],
+  const platform = target === 'aarch64-apple-darwin' ? 'darwin_arm64' : 'darwin_x86_64';
+  const output = `bazel-out/${platform}-opt/bin/external/crates+cpal-0.18.2/libcpal-6231125.rlib`;
+  const graph = { actions: [{ actionKey: 'a'.repeat(64), mnemonic: 'Rustc', targetId: '1', configurationId: '1', inputDepSetIds: ['1'], outputIds: ['2'],
+    arguments: ['rustc', '--crate-name', 'cpal', '--target', target, '--crate-type', 'rlib', '--out-dir', output.slice(0, output.lastIndexOf('/'))] }],
+  configuration: [{ id: '1', mnemonic: `${platform}-opt`, platformName: platform, checksum: 'c'.repeat(64) }],
   targets: [{ id: '1', label: '@@crates+cpal-0.18.2//:cpal' }],
   artifacts: [{ id: '1', pathFragmentId: String(segments.length) }],
   pathFragments: segments.map((label, index) => ({ id: String(index + 1), label, parentId: String(index) })),
   depSetOfFiles: [{ id: '1', transitiveDepSetIds: ['2'] }, { id: '2', directArtifactIds: ['1'] }] };
+  graphOutput(graph, '2', output);
+  return graph;
+}
+
+function graphOutput(graph, id, path) {
+  const start = graph.pathFragments.length + 1;
+  const segments = path.split('/');
+  graph.pathFragments.push(...segments.map((label, index) => ({ id: String(start + index), label, parentId: index ? String(start + index - 1) : '0' })));
+  graph.artifacts.push({ id, pathFragmentId: String(start + segments.length - 1) });
 }
 
 async function compilerFixture(root, graph = syntheticGraph()) {
@@ -295,7 +308,10 @@ test('materialized linked repository refuses before compiler-input hash authorit
   await mkdir(moved);
   await symlink(moved, join(input.outputBase, 'external/linked'), process.platform === 'win32' ? 'junction' : 'dir');
   const graph = syntheticGraph();
-  graph.pathFragments[1].label = 'linked';
+  for (const fragment of graph.pathFragments) {
+    if (fragment.label === 'crates+cpal-0.18.2') fragment.label = 'linked';
+  }
+  graph.actions[0].arguments[8] = graph.actions[0].arguments[8].replace('crates+cpal-0.18.2', 'linked');
   graph.targets[0].label = '@@linked//:cpal';
   await mkdir(join(moved, 'src/host/coreaudio/macos'), { recursive: true });
   await copyFile(join(actual, 'src/host/coreaudio/macos/loopback.rs'), join(moved, 'src/host/coreaudio/macos/loopback.rs'));
@@ -320,6 +336,71 @@ test('actual compiler-query seam has finite bounds and shares the build configur
   assert.match(calls[1].args.at(-1), /deps\(\/\/codex-rs\/voice-host:codex-voice-host\)/);
   assert.equal(result.target, context.coordinate.target);
 });
+
+function libraryAndBuildScriptGraph(target) {
+  const graph = syntheticGraph(target);
+  const platform = graph.configuration[0].platformName;
+  graph.configuration.push({ id: '2', mnemonic: `${platform}-opt-exec`, platformName: platform, checksum: 'd'.repeat(64), isTool: true });
+  graph.actions.push({ ...graph.actions[0], actionKey: 'c'.repeat(64), configurationId: '2', outputIds: ['3'],
+    arguments: [...graph.actions[0].arguments.slice(0, -1), `bazel-out/${platform}-opt-exec/bin/external/crates+cpal-0.18.2`] });
+  graph.actions.push({ ...graph.actions[0], actionKey: 'b'.repeat(64), targetId: '2', configurationId: '2', outputIds: ['4'],
+    arguments: ['rustc', '--crate-name', 'build_script_build', '--target', target, '--crate-type', 'bin'] });
+  graph.targets.push({ id: '2', label: '@@crates+cpal-0.18.2//:_bs_' + target + '_' });
+  graphOutput(graph, '3', `bazel-out/${platform}-opt-exec/bin/external/crates+cpal-0.18.2/libcpal-6231125.rlib`);
+  graphOutput(graph, '4', `bazel-out/${platform}-opt-exec/bin/external/crates+cpal-0.18.2/_bs_target_`);
+  return graph;
+}
+
+/** A synthetic Bazel output-filter boundary, not a native query execution. */
+function selectedCompilerGraph(query, graph) {
+  const match = /^outputs\("([^"]+)", /.exec(query);
+  if (!match) return graph;
+  const output = new RegExp(match[1]);
+  assert.ok(output.test('bazel-out/coordinate/bin/external/crates+cpal-0.18.2/libcpal-6231125.rlib'));
+  assert.equal(output.test('bazel-out/coordinate/bin/external/crates+cpal-0.18.2/_bs_target_'), false);
+  const artifacts = actionIndex(graph.artifacts), fragments = actionIndex(graph.pathFragments);
+  return { ...graph, actions: graph.actions.filter(action => action.outputIds.some(id => output.test(actionPath(fragments, artifacts.get(id).pathFragmentId)))) };
+}
+
+for (const target of ['aarch64-apple-darwin', 'x86_64-apple-darwin']) {
+  test(`actual ${target} CPAL query separates the library from its transitive build script`, () => ownedFixture(async root => {
+    const graph = libraryAndBuildScriptGraph(target);
+    const input = await compilerFixture(root, graph);
+    const context = { work: root, coordinate: { target } };
+    const source = productionFunction('async function cpalCompilerInput(', '\nasync function buildVoice(');
+    const query = runInNewContext(`${source}; cpalCompilerInput`, {
+      join, verifyCpalCompilerInput, voiceBuildOptions: () => [],
+      run: async (_, label, executable, args) => {
+        assert.equal(executable, 'bazel');
+        if (label === 'cpal-output-base') return input.outputBase;
+        assert.equal(label, 'cpal-effective-action');
+        return JSON.stringify(selectedCompilerGraph(args.at(-1), graph));
+      },
+    }, { timeout: 1_000 });
+    const result = await query(context, { directory: root }, []);
+    assert.equal(result.actionKey, graph.actions[0].actionKey);
+    assert.equal(result.target, target);
+    assert.equal(result.loopbackSha256, '981f569aeca0a715f4f403fcbd315dd31f50cdd303f4aa789c56ff878e3041ba');
+  }));
+}
+
+const compilerOutputRefusals = [
+  ['only an execution-tool library', graph => { graph.configuration[0].isTool = true; }, /configuration|ambiguous/],
+  ['missing configuration reference', graph => { graph.actions[0].configurationId = '9'; }, /reference|configuration/],
+  ['foreign platform configuration', graph => { graph.configuration[0].platformName = 'darwin_x86_64'; }, /configuration/],
+  ['wrong configuration checksum', graph => { graph.configuration[0].checksum = 'unproved'; }, /configuration/],
+  ['non-library crate type', graph => { graph.actions[0].arguments[6] = 'bin'; }, /crate or target/],
+  ['missing declared library output', graph => { graph.actions[0].outputIds = []; }, /output/],
+  ['another output owner', graph => { graph.pathFragments.find(row => row.label === 'crates+cpal-0.18.2' && row.id !== '2').label = 'another-owner'; }, /output/],
+];
+
+for (const [name, mutate, expected] of compilerOutputRefusals) {
+  test(`production CPAL library proof refuses ${name}`, () => ownedFixture(async root => {
+    const graph = syntheticGraph();
+    mutate(graph);
+    await assert.rejects(verifyCpalCompilerInput(await compilerFixture(root, graph)), expected);
+  }));
+}
 
 test('materialized CPAL manifest must remain the exact authenticated version and dependency metadata', () => ownedFixture(async root => {
   const input = await compilerFixture(root);
