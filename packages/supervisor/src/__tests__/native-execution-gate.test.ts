@@ -362,7 +362,7 @@ it("retains delivery completion for replay without a second consumption", async 
   expect(f.client.consumeDeliveryExecution).toHaveBeenCalledOnce();
 });
 
-it.each(["valid", "lost-during-keys", "lost-during-admission", "wrong-producer", "wrong-incarnation"])("independently verifies native answer delivery: %s", async mode => {
+it.each(["valid", "valid-fractional", "invalid-clock", "unsafe-clock", "expired-clock", "lost-during-keys", "lost-during-admission", "wrong-producer", "wrong-incarnation"])("independently verifies native answer delivery: %s", async mode => {
   const f = await fixture(), control = generateEd25519();
   const verifier = new CoreSignatureVerifier([{ keyId: "release", publicKeyJwk: generateEd25519().publicJwk,
     coreControlKeys: [{ keyId: "control", publicKeyJwk: control.publicJwk }] }]);
@@ -383,10 +383,10 @@ it.each(["valid", "lost-during-keys", "lost-during-admission", "wrong-producer",
   });
   if (mode === "lost-during-keys") f.client.executionSigningKeys.mockImplementationOnce(async () => { current = false; return keys; });
   const receiver = new PermissionAnswerReceiver({ verifier, core: f.client, coreProducer: mode === "wrong-producer" ? "assistant" : "core-answer",
-    now: () => f.clock.coreNow(), deliver,
+    now: () => mode === "valid-fractional" ? f.clock.coreNow() + 0.5 : mode === "invalid-clock" ? Number.NaN : mode === "unsafe-clock" ? Number.MAX_SAFE_INTEGER + 1 : mode === "expired-clock" ? f.clock.coreNow() + 30000 : f.clock.coreNow(), deliver,
     captureConnection: () => ({ instanceId: "instance", workspaceId: "tenant", runnerIncarnation: mode === "wrong-incarnation" ? "other" : "runner",
       connectionEpoch: 1, leaseExpiresAt: expiresAt, assertCurrent: () => { if (!current) throw new Error("delivery ownership lost"); } }) });
-  if (mode === "valid") {
+  if (mode === "valid" || mode === "valid-fractional") {
     await receiver.receive(body); expect(dispatched).toHaveBeenCalledOnce();
     expect(deliver).toHaveBeenCalledWith(operation, expect.objectContaining({ sender: claims.sender }), expect.any(Function));
   } else { await expect(receiver.receive(body)).rejects.toThrow(); expect(dispatched).not.toHaveBeenCalled(); }

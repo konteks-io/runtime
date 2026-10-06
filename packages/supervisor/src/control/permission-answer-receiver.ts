@@ -28,7 +28,8 @@ export class PermissionAnswerReceiver {
     const assertConnection = () => {
       scope.assertCurrent();
       const now = this.deps.now();
-      if (!Number.isSafeInteger(now) || deliveryNotCurrent(request, scope, now, 0)) throw denied();
+      // Core clock estimation may contain fractional milliseconds; time bounds still use the full estimate.
+      if (!Number.isSafeInteger(Math.floor(now)) || deliveryNotCurrent(request, scope, now, 0)) throw denied();
     };
     assertConnection();
     const keys = await this.deps.core.executionSigningKeys();
