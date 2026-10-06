@@ -1731,7 +1731,8 @@ export class RelayedSession {
     this.fenceForRecovery();
     this.recoveryStopTask = (async () => {
       await this.closeMcpFacade();
-      this.stopPreview("claim_lost");
+      const previewStop = this.stopPreview("claim_lost");
+      void previewStop.catch(() => undefined);
       const initialRef = this.creationReturned ? this.acpSessionRef : null;
       const stop = async (ref: string): Promise<void> => {
         const stopRunner = this.deps.runner.stopForRecovery;
@@ -1751,9 +1752,11 @@ export class RelayedSession {
       // below; that failure alone is neither stop evidence nor a permanent
       // veto on recovery's separately journaled ACP-settlement stage.
       if (this.closeTask) await Promise.allSettled([this.closeTask]);
-      if (initialStop) await initialStop;
-      else if (this.acpSessionRef !== null) await stop(this.acpSessionRef);
-      else throw new RemoteInstanceError("recovery_required", "Bridge session creation has an unknown outcome; recovery stop is unproven.");
+      const runnerStop = initialStop ?? (this.acpSessionRef !== null ? stop(this.acpSessionRef) :
+        Promise.reject(new RemoteInstanceError("recovery_required", "Bridge session creation has an unknown outcome; recovery stop is unproven.")));
+      const stops = await Promise.allSettled([runnerStop, previewStop]);
+      const failure = stops.find((result): result is PromiseRejectedResult => result.status === "rejected");
+      if (failure) throw failure.reason;
       // The execution is already `stopping` under this session's own recovery
       // fence; only admission ownership can still be current here.
       this.assertRecoveryOwned();
@@ -1900,7 +1903,7 @@ export class RelayedSession {
    */
   private async afterClose(reason: SessionClosedReason, nativeCompletion: boolean): Promise<void> {
     await this.closeMcpFacade();
-    if (!nativeCompletion) this.stopPreview(reason);
+    if (!nativeCompletion) await this.stopPreview(reason);
     this.completedSettlementInProgress = false;
     if (!nativeCompletion) this.releaseUnlessRecovering();
   }
@@ -1922,11 +1925,11 @@ export class RelayedSession {
   }
 
   /** The session's preview goes with the session (not with a completed turn). */
-  private stopPreview(reason: string): void {
+  private async stopPreview(reason: string): Promise<void> {
     const sessionId = this.previewSessionId;
     if (sessionId === null || !this.deps.preview) return;
     this.deps.preview.forget?.(sessionId);
-    void this.deps.preview.stop(sessionId, reason).catch(error => this.logger.warn({ event: "preview.stop_failed", assignmentId: this.assignment.id, err: error }, "session preview could not be stopped"));
+    await this.deps.preview.stop(sessionId, reason);
   }
 
   get isClosed(): boolean {

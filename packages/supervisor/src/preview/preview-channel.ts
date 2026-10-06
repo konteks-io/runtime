@@ -103,10 +103,13 @@ export class PreviewChannel {
     this.forwarderFor(channelId, sessionId).handle(chunk);
   }
 
-  /** The preview for this session stopped: every open viewer stream is closed. */
-  previewStopped(sessionId: string): void {
+  /** Withdraw streams at stop intent or failure; this is not process-exit proof. */
+  previewUnavailable(sessionId: string): void {
     this.forwarders.get(`preview:${sessionId}`)?.closeAll(1001);
   }
+
+  /** Confirmed stop also withdraws any streams opened during cleanup. */
+  previewStopped(sessionId: string): void { this.previewUnavailable(sessionId); }
 
   /** Relay reset or retirement of the channel: drop its streams and its mux state. */
   closeChannel(channelId: string): void {
