@@ -7,10 +7,10 @@ import { z } from "zod";
 import { isRetiredAgentId } from "@konteks/backstage-plugin-common";
 import { RemoteInstanceError } from "@konteks/remote-common";
 import { RunnerConfigSchema, type RunnerConfig } from "@konteks/remote-agent-runner";
-import { EmbeddedReleaseRootSchema, findAgentBridge, selectNativeArtifacts, verifyNativeRelease, verifyOfflineAgentPackage, type EmbeddedReleaseRoot, type VerifiedNativeRelease } from "@konteks/remote-release";
+import { EmbeddedReleaseRootSchema, findAgentBridge, selectNativeArtifacts, verifyNativeRelease, type EmbeddedReleaseRoot, type VerifiedNativeRelease } from "@konteks/remote-release";
 import { SupervisorConfigSchema } from "../config.js";
 import { IdentitySchema, ManifestRecordSchema } from "../state/store.js";
-import { verifyInstalledNativeBridges } from "./installed.js";
+import { NativeBridgeVerification } from "./bridge-verification.js";
 import { NativeGitToolSchema, verifyNativeGitTool } from "./git-workspace.js";
 import { resolveNativeCodexHome } from "./codex-home.js";
 import { resolveNativeClaudeExecutable } from "./claude-executable.js";
@@ -144,6 +144,7 @@ type HostAdapter = NonNullable<ReturnType<typeof hostAgentInstallAdapter>>;
 /** One load: every private directory it checked is checked again, unchanged, before the configuration is returned. */
 class InstallationLoader {
   private readonly directories = new Map<string, Stats>();
+  private readonly bridges = new NativeBridgeVerification();
 
   constructor(private readonly options: NativeInstallationOptions) {}
 
@@ -160,6 +161,7 @@ class InstallationLoader {
     const release = await verifiedRelease(record, dataDir, releaseDir, roots, this.options.nowMs);
     const { runners, unavailableAgents } = await this.agentRunners(root, record, release, releaseDir);
     await this.assertDirectoriesUnchanged();
+    await this.bridges.complete();
     const config = supervisorConfig(record, dataDir, releaseDir, this.options);
     return { record, config, runners, roots, release, retiredAgents, unavailableAgents };
   }
@@ -187,7 +189,7 @@ class InstallationLoader {
       else await this.hostRunner(root, record, agent, { runners, unavailableAgents });
     }
     const bundledRunners = runners.filter(runner => bundled.includes(runner.RUNNER_AGENT_ID as NativeRuntimeRecord["agents"][number]));
-    if (bundledRunners.length > 0 || bundled.length === record.agents.length) await verifyInstalledNativeBridges(release, bundledRunners, this.options.platform);
+    if (bundledRunners.length > 0 || bundled.length === record.agents.length) await this.bridges.verifyRunners(release, bundledRunners, this.options.platform);
     return { runners, unavailableAgents };
   }
 
@@ -211,7 +213,7 @@ class InstallationLoader {
     const workspace = join(root, "workspaces", agent);
     for (const path of [prefix, credentials, workspace]) await this.directory(path);
     const artifact = artifacts.find(candidate => candidate.agentId === agent)!;
-    const profile = await verifyOfflineAgentPackage(prefix, artifact);
+    const profile = await this.bridges.verifyPackage(prefix, artifact);
     const { codexHome, claudeExecutable } = await agentExecutables(agent, record);
     return RunnerConfigSchema.parse({
       RUNNER_AGENT_ID: agent, RUNNER_AUTH_MODE: "agent_local_subscription",

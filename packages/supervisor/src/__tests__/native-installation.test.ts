@@ -1,5 +1,7 @@
 import { createHash, sign } from "node:crypto";
-import { chmod, link, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import nativeFiles from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EventEmitter } from "node:events";
@@ -9,11 +11,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { bundleManifestSigningBytes, computeBundleManifestDigest, controlCall, SupervisorStatusSchema, writeSecretFile } from "@konteks/remote-common";
 import type { BridgeProcess } from "@konteks/remote-agent-runner";
 import { buildReleaseFixture, installOfflineAgentPackage } from "@konteks/remote-release";
+import * as releasePackages from "@konteks/remote-release";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
 import { antigravityInstallAdapter, nativeAgentOffered, openCodeInstallAdapter } from "../native/host-agents.js";
 import { OPENCODE_MIN_BINARY_BYTES } from "../native/opencode-installation.js";
 import { loadNativeInstallation, NativeRuntimeRecordSchema, parseNativeRuntimeRecord, previewTuning, resolveNativeCodexSocket } from "../native/installation.js";
 import { verifyInstalledNativeBridges } from "../native/installed.js";
+import { NativeBridgeVerification } from "../native/bridge-verification.js";
 import { createNativeService } from "../native/service.js";
 import { SupervisorStore } from "../state/store.js";
 import { acquireNativeRootLock } from "../native/root-lock.js";
@@ -28,11 +32,12 @@ beforeEach(async () => {
 });
 afterEach(async () => { vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }); });
 
-async function fixture() {
+type FixturePlatform = { os: "macos" | "windows" | "debian"; architecture: "amd64" | "arm64" };
+async function fixture(platform: FixturePlatform = { os: "macos", architecture: "arm64" }) {
   const keys = buildReleaseFixture();
-  const agent = offlineFixture();
+  const agent = offlineFixture(platform.os, platform.architecture);
   const bytes = "verified-test-bridge-not-executed";
-  const artifact = { id: "connector", kind: "connector", format: "executable", os: "macos", architecture: "arm64", url: "https://release.example/connector", digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}`, sizeBytes: Buffer.byteLength(bytes) };
+  const artifact = { id: "connector", kind: "connector", format: "executable", ...platform, url: "https://release.example/connector", digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}`, sizeBytes: Buffer.byteLength(bytes) };
   const body = { bundleVersion: "1.0.0", protocol: { min: "1.0", max: "1.0" }, deploymentKind: "native_connector", components: ["agent_runner"], images: [], agentBridges: [], nativeArtifacts: [artifact, agent.artifact], expiresAt: "2027-01-01T00:00:00Z" };
   const unsigned = { ...body, digest: computeBundleManifestDigest(body as never) };
   const manifest = { ...unsigned, signature: { algorithm: "Ed25519", keyId: keys.keyId, value: sign(null, bundleManifestSigningBytes(unsigned as never), keys.privateKey).toString("base64url") } };
@@ -47,9 +52,9 @@ async function fixture() {
   const archive = join(releaseDir, "agent.tgz");
   await writeFile(archive, agent.archive, { mode: 0o600 });
   await installOfflineAgentPackage(archive, join(releaseDir, "agents", "codex"), agent.artifact as never);
-  const executable = join(releaseDir, "agents", "codex", "bin", "node");
-  const options = { roots: [{ ...keys.root, coreControlKeys: [{ keyId: keys.keyId, publicKeyJwk: keys.root.publicKeyJwk }] }], platform: { os: "macos" as const, architecture: "arm64" as const }, nowMs: Date.parse("2026-09-06T00:00:00Z") };
-  return { record, manifest, releaseDir, executable, options };
+  const executable = join(releaseDir, "agents", "codex", "bin", platform.os === "windows" ? "node.exe" : "node");
+  const options = { roots: [{ ...keys.root, coreControlKeys: [{ keyId: keys.keyId, publicKeyJwk: keys.root.publicKeyJwk }] }], platform, nowMs: Date.parse("2026-09-06T00:00:00Z") };
+  return { record, manifest, releaseDir, executable, options, agentArtifact: agent.artifact as Parameters<NativeBridgeVerification["verifyPackage"]>[1] };
 }
 
 describe("preview tuning from the service environment", () => {
@@ -62,6 +67,60 @@ describe("preview tuning from the service environment", () => {
 });
 
 describe("closed native runtime installation", () => {
+  it("fully verifies a bundled package once within one installation load", async () => {
+    const f = await fixture();
+    const verify = vi.spyOn(releasePackages, "verifyOfflineAgentPackage");
+    try {
+      const loaded = await loadNativeInstallation(root, f.options);
+      expect(loaded.runners).toHaveLength(1);
+      expect(verify).toHaveBeenCalledTimes(1);
+    } finally { verify.mockRestore(); }
+  });
+  it("independently fully verifies the package on each installation load", async () => {
+    const f = await fixture();
+    const verify = vi.spyOn(releasePackages, "verifyOfflineAgentPackage");
+    try {
+      await loadNativeInstallation(root, f.options);
+      await loadNativeInstallation(root, f.options);
+      expect(verify).toHaveBeenCalledTimes(2);
+    } finally { verify.mockRestore(); }
+  });
+  it("still fully verifies bundled packages at the separate startup boundary", async () => {
+    const f = await fixture();
+    const verify = vi.spyOn(releasePackages, "verifyOfflineAgentPackage");
+    try {
+      const loaded = await loadNativeInstallation(root, f.options);
+      await verifyInstalledNativeBridges(loaded.release, loaded.runners, f.options.platform);
+      expect(verify).toHaveBeenCalledTimes(2);
+    } finally { verify.mockRestore(); }
+  });
+  it("refuses a same-size package write with restored mtime during verification", async () => {
+    const f = await fixture(), original = releasePackages.verifyOfflineAgentPackage;
+    const before = await stat(f.executable);
+    const verify = vi.spyOn(releasePackages, "verifyOfflineAgentPackage").mockImplementationOnce(async (...args) => {
+      const profile = await original(...args);
+      await writeFile(f.executable, Buffer.alloc(before.size, 120));
+      await utimes(f.executable, before.atime, before.mtime);
+      return profile;
+    });
+    try { await expect(loadNativeInstallation(root, f.options)).rejects.toThrow(); }
+    finally { verify.mockRestore(); }
+  });
+  it("refuses package replacement during final private-directory checks", async () => {
+    const f = await fixture(), original = nativeFiles.lstat;
+    const verify = vi.spyOn(releasePackages, "verifyOfflineAgentPackage");
+    const inspect = vi.spyOn(nativeFiles, "lstat").mockImplementation(async (...args: Parameters<typeof nativeFiles.lstat>) => {
+      const info = await original(...args);
+      if (args[0] === root && verify.mock.calls.length > 0) {
+        await rm(f.executable);
+        await writeFile(f.executable, "changed after package checks", { mode: 0o700 });
+      }
+      return info;
+    });
+    syncBuiltinESMExports();
+    try { await expect(loadNativeInstallation(root, f.options)).rejects.toThrow(); }
+    finally { inspect.mockRestore(); syncBuiltinESMExports(); verify.mockRestore(); }
+  });
   it("loads only the digest-matching installer-selected Git executable", async () => {
     const f = await fixture(), git = await testGitTool();
     await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, git }));
@@ -133,18 +192,29 @@ describe("closed native runtime installation", () => {
       await new Promise<void>((resolve, reject) => listener.close(error => error ? reject(error) : resolve()));
     }
   });
-  it.each(["linked", "hard-linked", "public", "oversized"])("rejects %s runtime records without executing anything", async kind => {
+  it.each(["linked", "hard-linked", "oversized"])("rejects %s runtime records without executing anything", async kind => {
     const f = await fixture();
     const path = join(root, "native-runtime.json");
     if (kind === "linked") {
       await writeSecretFile(join(root, "another.json"), JSON.stringify(f.record));
       await rm(path);
-      await symlink(join(root, "another.json"), path);
+      const target = process.platform === "win32" ? join(root, "linked-record-directory") : join(root, "another.json");
+      if (process.platform === "win32") await mkdir(target, { mode: 0o700 });
+      await symlink(target, path, process.platform === "win32" ? "junction" : "file");
     }
     if (kind === "hard-linked") await link(path, join(root, "alias.json"));
-    if (kind === "public") await chmod(path, 0o644);
     if (kind === "oversized") await writeSecretFile(path, " ".repeat(1024 * 1024 + 1));
     await expect(loadNativeInstallation(root, f.options)).rejects.toMatchObject({ code: "install_state_corrupt" });
+  });
+  it("rejects public POSIX record modes without claiming Windows ACL validation", async () => {
+    const f = await fixture();
+    await chmod(join(root, "native-runtime.json"), 0o644);
+    if (process.platform === "win32") {
+      // chmod's POSIX bits do not describe Windows access control.
+      expect((await loadNativeInstallation(root, f.options)).record).toEqual(f.record);
+    } else {
+      await expect(loadNativeInstallation(root, f.options)).rejects.toMatchObject({ code: "install_state_corrupt" });
+    }
   });
   it("derives native configuration and isolated agent paths without inheriting appliance environment", async () => {
     const f = await fixture();
@@ -312,7 +382,7 @@ describe("closed native runtime installation", () => {
     await chmod(f.executable, 0o700);
     await expect(loadNativeInstallation(root, f.options)).rejects.toMatchObject({ code: "bundle_untrusted" });
     await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, releaseId: "alias" }));
-    await symlink(f.releaseDir, join(root, "releases", "alias"));
+    await symlink(f.releaseDir, join(root, "releases", "alias"), "junction");
     await expect(loadNativeInstallation(root, f.options)).rejects.toThrow();
   });
   it("cannot bootstrap trust from an editable roots file or run the wrong platform", async () => {
@@ -320,5 +390,71 @@ describe("closed native runtime installation", () => {
     await writeSecretFile(join(f.releaseDir, "roots.json"), JSON.stringify({ roots: f.options.roots }));
     await expect(loadNativeInstallation(root, { ...f.options, roots: [] })).rejects.toMatchObject({ code: "bundle_untrusted" });
     await expect(loadNativeInstallation(root, { ...f.options, platform: { os: "debian", architecture: "amd64" } })).rejects.toThrow();
+  });
+});
+
+describe("one-load bundled bridge verification", () => {
+  it.each<FixturePlatform>([
+    { os: "windows", architecture: "amd64" },
+    { os: "macos", architecture: "arm64" },
+    { os: "macos", architecture: "amd64" },
+    { os: "debian", architecture: "arm64" },
+    { os: "debian", architecture: "amd64" },
+  ])("verifies the exact $os/$architecture package once", async platform => {
+    const f = await fixture(platform), verify = vi.spyOn(releasePackages, "verifyOfflineAgentPackage");
+    try {
+      const loaded = await loadNativeInstallation(root, f.options);
+      expect(loaded.runners[0]!.RUNNER_NATIVE_PACKAGE_PROFILE).toMatchObject(platform);
+      expect(verify).toHaveBeenCalledTimes(1);
+    } finally { verify.mockRestore(); }
+  });
+
+  const mutations = [
+    { name: "same-size bytes with restored mtime", mutate: async (f: Awaited<ReturnType<typeof fixture>>) => {
+      const before = await stat(f.executable);
+      await writeFile(f.executable, Buffer.alloc(before.size, 120));
+      await utimes(f.executable, before.atime, before.mtime);
+    } },
+    { name: "identical bytes at a replaced physical file", mutate: async (f: Awaited<ReturnType<typeof fixture>>) => {
+      const bytes = await readFile(f.executable);
+      await rm(f.executable); await writeFile(f.executable, bytes, { mode: 0o700 });
+    } },
+    { name: "a removed file", mutate: async (f: Awaited<ReturnType<typeof fixture>>) => { await rm(f.executable); } },
+    { name: "an extra file", mutate: async (f: Awaited<ReturnType<typeof fixture>>) => { await writeFile(join(f.releaseDir, "agents", "codex", "extra"), "extra", { mode: 0o600 }); } },
+    { name: "an extra empty directory", mutate: async (f: Awaited<ReturnType<typeof fixture>>) => { await mkdir(join(f.releaseDir, "agents", "codex", "extra"), { mode: 0o700 }); } },
+    { name: "a hardlink outside the package", mutate: async (f: Awaited<ReturnType<typeof fixture>>) => { await link(f.executable, join(root, "linked-node")); } },
+    { name: "a linked directory", mutate: async (f: Awaited<ReturnType<typeof fixture>>) => { await symlink(join(f.releaseDir, "agents", "codex", "bin"), join(f.releaseDir, "agents", "codex", "linked-bin"), "junction"); } },
+    { name: "a changed file mode", mutate: async (f: Awaited<ReturnType<typeof fixture>>) => { await chmod(f.executable, 0o400); } },
+  ];
+  it.each(mutations)("refuses reuse after $name", async ({ mutate }) => {
+    const f = await fixture(), scope = new NativeBridgeVerification(), prefix = join(f.releaseDir, "agents", "codex");
+    await scope.verifyPackage(prefix, f.agentArtifact);
+    await mutate(f);
+    await expect(scope.verifyPackage(prefix, f.agentArtifact)).rejects.toMatchObject({ code: "bundle_untrusted" });
+    await expect(scope.complete()).rejects.toMatchObject({ code: "bundle_untrusted" });
+  });
+  it("does not let another entry's future timestamp hide tampering", async () => {
+    const f = await fixture(), scope = new NativeBridgeVerification(), prefix = join(f.releaseDir, "agents", "codex");
+    await utimes(f.executable, new Date("2035-01-01"), new Date("2035-01-01"));
+    await scope.verifyPackage(prefix, f.agentArtifact);
+    await writeFile(join(prefix, "bridge", "index.js"), "changed");
+    await expect(scope.complete()).rejects.toMatchObject({ code: "bundle_untrusted" });
+  });
+  it("keeps cloned profile and exact artifact authority separate from caller mutations", async () => {
+    const f = await fixture(), scope = new NativeBridgeVerification(), prefix = join(f.releaseDir, "agents", "codex");
+    const profile = await scope.verifyPackage(prefix, f.agentArtifact), version = profile.bridge.version;
+    profile.bridge.version = "0.0.0";
+    expect((await scope.verifyPackage(prefix, f.agentArtifact)).bridge.version).toBe(version);
+    await expect(scope.verifyPackage(prefix, { ...f.agentArtifact, id: "changed-authority" })).rejects.toMatchObject({ code: "bundle_untrusted" });
+    await scope.complete();
+  });
+  it("closes the proof scope after completion and after a failed final fence", async () => {
+    const f = await fixture(), scope = new NativeBridgeVerification(), prefix = join(f.releaseDir, "agents", "codex");
+    await scope.verifyPackage(prefix, f.agentArtifact); await scope.complete();
+    await expect(scope.verifyPackage(prefix, f.agentArtifact)).rejects.toMatchObject({ code: "bundle_untrusted" });
+    const refused = new NativeBridgeVerification();
+    await refused.verifyPackage(prefix, f.agentArtifact); await rm(f.executable);
+    await expect(refused.complete()).rejects.toMatchObject({ code: "bundle_untrusted" });
+    await expect(refused.verifyPackage(prefix, f.agentArtifact)).rejects.toMatchObject({ code: "bundle_untrusted" });
   });
 });
