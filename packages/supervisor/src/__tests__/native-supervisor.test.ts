@@ -4,7 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Server } from "node:net";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { bundleManifestSigningBytes, canonicalize, computeBundleManifestDigest, jcsDigest, writeSecretFile, RemoteInstanceError, type RemoteWorkAssignment } from "@konteks/remote-common";
+import { bundleManifestSigningBytes, canonicalize, computeBundleManifestDigest, jcsDigest, writeSecretFile, RemoteInstanceError,
+  REMOTE_RUNTIME_UPDATE_CAPABILITY,
+  type RemoteWorkAssignment,
+} from "@konteks/remote-common";
 import { buildReleaseFixture, fetchedAgentPlatformPin, installOfflineAgentPackage } from "@konteks/remote-release";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
 import { RunnerConfigSchema, type BridgeProcess } from "@konteks/remote-agent-runner";
@@ -68,20 +71,57 @@ async function fixture() {
 }
 
 describe("native Supervisor composition", () => {
+  it("publishes late runtime update readiness into local status from the same fresh inventory as Core", async () => {
+    const f = await fixture();
+    const supervisor = new Supervisor(f.config, {
+      native: {
+        ...f.options.native,
+        update: {
+          fetchManifest: async () => null,
+          launch: async () => ({ pid: 1 }),
+          readLedger: async () => ({ schemaVersion: 1, attempts: [] }),
+        },
+      },
+    });
+    supervisors.push(supervisor);
+    const internal = supervisor as unknown as { recoveryAuthority(): string | null };
+    const accepted = vi.spyOn(internal, "recoveryAuthority").mockReturnValue(null);
+    await supervisor.start();
+    expect(supervisor.status().components[0]?.capabilities).not.toContain(
+      REMOTE_RUNTIME_UPDATE_CAPABILITY,
+    );
+    const heartbeat = vi.spyOn(supervisor.core, "heartbeat").mockResolvedValue(heartbeatLease());
+    supervisor.relay = { status: () => ({ state: "offline" }) } as never;
+    try {
+      accepted.mockReturnValue("accepted-generation");
+      await supervisor.heartbeat.start();
+      const message = await supervisor.heartbeat.publish();
+      expect(message.components[0]?.capabilities).toContain(REMOTE_RUNTIME_UPDATE_CAPABILITY);
+      expect(supervisor.status().components).toEqual(message.components);
+      // Losing accepted authority removes the capability on the next collection.
+      accepted.mockReturnValue(null);
+      const withdrawn = await supervisor.heartbeat.publish();
+      expect(withdrawn.components[0]?.capabilities).not.toContain(REMOTE_RUNTIME_UPDATE_CAPABILITY);
+      expect(supervisor.status().components).toEqual(withdrawn.components);
+      expect(heartbeat).toHaveBeenCalledTimes(2);
+    } finally {
+      supervisor.relay = null;
+    }
+  });
   it("shows a runner's changed readiness immediately in local auth status", async () => {
     const f = await fixture(), supervisor = new Supervisor(f.config, f.options);
     supervisors.push(supervisor);
     await supervisor.start();
     const control = supervisor.controlHandler();
     const emitter = { event: () => undefined } as never;
-    const before = await control({ op: "auth.status", agentId: "codex" }, emitter) as { agents: Array<{ readiness: string }> };
+    const before = (await control({ op: "auth.status", agentId: "codex" }, emitter)) as { agents: Array<{ readiness: string }> };
     expect(before.agents[0]?.readiness).toBe("not_configured");
     await (supervisor as unknown as { onRunnerEvent(agentId: string, event: unknown): Promise<void> }).onRunnerEvent("codex", {
       kind: "readiness_changed", agent: { ...before.agents[0], readiness: "ready", connectionState: "ready", recoveryAction: undefined },
     });
-    const after = await control({ op: "auth.status", agentId: "codex" }, emitter) as { agents: Array<{ readiness: string }> };
+    const after = (await control({ op: "auth.status", agentId: "codex" }, emitter)) as { agents: Array<{ readiness: string }> };
     expect(after.agents[0]?.readiness).toBe("ready");
-    const roster = await control({ op: "agents" }, emitter) as { agents: Array<{ readiness: string }> };
+    const roster = (await control({ op: "agents" }, emitter)) as { agents: Array<{ readiness: string }> };
     expect(roster.agents[0]?.readiness).toBe("ready");
     expect((supervisor as unknown as { lastSnapshot: { agents: Array<{ readiness: string }> } }).lastSnapshot.agents[0]?.readiness).toBe("ready");
   });
@@ -154,7 +194,7 @@ describe("native Supervisor composition", () => {
     disconnect.abort();
     await vi.waitFor(() => expect(cancel).toHaveBeenCalledWith((started as { loginId: string }).loginId));
     expect((supervisor as unknown as { activeLogins: Map<string, unknown> }).activeLogins.size).toBe(0);
-    const next = await supervisor.controlHandler()({ op: "auth.login", agentId: "codex", organization: false }, { event: events, signal: new AbortController().signal }) as { loginId: string };
+    const next = (await supervisor.controlHandler()({ op: "auth.login", agentId: "codex", organization: false }, { event: events, signal: new AbortController().signal })) as { loginId: string };
     await supervisor.controlHandler()({ op: "auth.cancel", loginId: next.loginId }, { event: () => undefined, signal: new AbortController().signal });
     expect(events).toHaveBeenCalledWith({ kind: "failed", loginId: next.loginId, code: "login_cancelled", message: "login cancelled" });
     expect((supervisor as unknown as { activeLogins: Map<string, unknown> }).activeLogins.size).toBe(0);
@@ -466,7 +506,7 @@ describe("native Supervisor composition", () => {
     expect((supervisor as unknown as Record<string, unknown>).gateway).toBeUndefined();
     expect((supervisor as unknown as Record<string, unknown>).internal).toBeUndefined();
     expect((await supervisor.inventory.collect()).components.map(component => component.kind)).toEqual(["agent_runner"]);
-    const doctor = await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string }> };
+    const doctor = (await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never)) as { checks: Array<{ id: string }> };
     expect(doctor.checks.some(check => check.id === "gateway" || check.id === "component-harness")).toBe(false);
     await supervisor.stop();
     expect(f.stop).toHaveBeenCalledOnce();
@@ -536,9 +576,9 @@ describe("native Supervisor composition", () => {
     const supervisor = new Supervisor(f.config, f.options); supervisors.push(supervisor);
     await supervisor.start();
     const handle = supervisor.controlHandler();
-    const listed = await handle({ op: "agents" }, { event: () => undefined } as never) as { agents: Array<Record<string, unknown>> };
+    const listed = (await handle({ op: "agents" }, { event: () => undefined } as never)) as { agents: Array<Record<string, unknown>> };
     expect(listed.agents).toEqual([{ agentId: "codex", readiness: "unavailable", connectionState: "unavailable", startFailure: "The signed Codex app-server did not become ready in time" }]);
-    const doctor = await handle({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string; status: string; detail: string }> };
+    const doctor = (await handle({ op: "doctor" }, { event: () => undefined } as never)) as { checks: Array<{ id: string; status: string; detail: string }> };
     expect(doctor.checks.find(check => check.id === "agent-codex")).toMatchObject({ status: "fail", detail: "could not start (The signed Codex app-server did not become ready in time); trying again in the background" });
     // Never advertised to Core: the inventory still leaves it out.
     expect((await supervisor.inventory.collect()).agents).toEqual([]);
@@ -554,7 +594,7 @@ describe("native Supervisor composition", () => {
     const internals = supervisor as unknown as { startActiveLoop(): Promise<void>; activeLoopStarting: Promise<void> | null };
     await internals.activeLoopStarting?.catch(() => undefined);
     await internals.startActiveLoop();
-    const doctor = await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string; detail: string }> };
+    const doctor = (await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never)) as { checks: Array<{ id: string; detail: string }> };
     expect(doctor.checks.find(check => check.id === "reconciliation")?.detail).toBe("Konteks no longer accepts this connector process; it restarts to reconnect as a new one");
     expect(onLivenessLost).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(15_000);
@@ -574,7 +614,7 @@ describe("native Supervisor composition", () => {
     expect(report).toMatchObject({ capabilityAdvertised: false, idleStopMinutes: 30, maxRunning: 3, previews: [{ sessionId: "sess-1", state: "running", url: "http://127.0.0.1:43100", viewerConnected: false }] });
     // This fixture has no relay: a viewer could never reach a preview, so none is advertised.
     expect((await supervisor.inventory.collect()).components[0]?.capabilities).not.toContain("preview.dev_server");
-    const doctor = await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string; status: string }> };
+    const doctor = (await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never)) as { checks: Array<{ id: string; status: string }> };
     expect(doctor.checks.find(check => check.id === "preview")).toMatchObject({ status: "warn" });
   });
 
@@ -601,7 +641,7 @@ describe("native Supervisor composition", () => {
     expect((await supervisor.inventory.collect()).components[0]?.capabilities).not.toContain("browser_tool");
     (supervisor as unknown as { previewCapable: () => boolean }).previewCapable = () => true;
     expect((await supervisor.inventory.collect()).components[0]?.capabilities).toContain("browser_tool");
-    const doctor = await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string; status: string; detail: string }> };
+    const doctor = (await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never)) as { checks: Array<{ id: string; status: string; detail: string }> };
     expect(doctor.checks.find(check => check.id === "browser")).toMatchObject({ status: "pass", detail: expect.stringMatching(/^Playwright MCP 0\.0\.82 for codex; runs on your own Node;/) });
   });
 
@@ -613,7 +653,7 @@ describe("native Supervisor composition", () => {
     (without as unknown as { previewCapable: () => boolean }).previewCapable = () => true;
     expect(without.runners.get("codex")?.browserVersion?.()).toBeNull();
     expect((await without.inventory.collect()).components[0]?.capabilities).not.toContain("browser_tool");
-    const report = await without.controlHandler()({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string; status: string; detail: string }> };
+    const report = (await without.controlHandler()({ op: "doctor" }, { event: () => undefined } as never)) as { checks: Array<{ id: string; status: string; detail: string }> };
     expect(report.checks.find(check => check.id === "browser")).toMatchObject({ status: "warn", detail: BROWSER_NO_PACKAGE_MESSAGE });
   });
 
@@ -624,7 +664,9 @@ describe("native Supervisor composition", () => {
       RUNNER_NATIVE_OPENCODE_BINARY: "/Users/person/.nvm/versions/node/v22/lib/node_modules/@opencode/cli/bin/opencode.exe", RUNNER_BRIDGE_VERSION: "2.0.18",
     });
     const browser = { version: "0.0.82", packageAgent: "claude-code" as const, nodeSource: "person" as const, node: "/usr/local/bin/node", launcher: "/pkg/konteks/browser-mcp.js", entrypoint: "/pkg/node_modules/@playwright/mcp/cli.js" };
-    const doctorOf = async (supervisor: Supervisor) => (await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string; status: string; detail: string; recoveryActions: unknown[] }> }).checks;
+    const doctorOf = async (supervisor: Supervisor) =>
+      (
+        (await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never)) as { checks: Array<{ id: string; status: string; detail: string; recoveryActions: unknown[] }> }).checks;
 
     it("runs beside Codex, and doctor names its version, install, settings check, sign-ins, free models and browser without a path", async () => {
       const f = await fixture();
@@ -680,7 +722,8 @@ describe("native Supervisor composition", () => {
       RUNNER_AGENT_ID: "antigravity", RUNNER_CREDENTIAL_DIR: join(root, "credentials", "antigravity"), RUNNER_WORKSPACE_DIR: join(root, "antigravity-work"),
       RUNNER_BRIDGE_PREFIX: folder(), RUNNER_NATIVE_ANTIGRAVITY_ROOT: folder(), RUNNER_BRIDGE_VERSION: "1.2.1",
     });
-    const doctorOf = async (supervisor: Supervisor) => (await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string; status: string; detail: string; recoveryActions: unknown[] }> }).checks;
+    const doctorOf = async (supervisor: Supervisor) => (
+          (await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never)) as { checks: Array<{ id: string; status: string; detail: string; recoveryActions: unknown[] }> }).checks;
 
     it("runs beside Codex; doctor names it, its start check and sign-in commands without a path, and the Require review line after an MCP-servers-off quarantine", async () => {
       const f = await fixture();
@@ -788,7 +831,8 @@ describe("native Supervisor composition", () => {
       await vi.waitFor(() => expect([...supervisor.runners.keys()]).toEqual(["codex", "antigravity"]), { timeout: 5_000 });
       expect((await doctorOf(supervisor)).find(entry => entry.id === "antigravity")).toMatchObject({ status: "warn", detail: expect.stringContaining("start check passed") });
     });
-  });
+  },
+  );
 
   it("tells the local operator which release Konteks accepts for this machine", async () => {
     const f = await fixture();

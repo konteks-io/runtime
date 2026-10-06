@@ -17,6 +17,8 @@ import { fileURLToPath } from "node:url";
 import { codexLocalProxyFiles, inventoryOfflineFiles, offlineAgentPatches } from "./offline-agent-files.mjs";
 import { patchCodexAcpLiveUsers } from "./codex-acp-live-user-patch.mjs";
 import { patchClaudeSettings } from "./claude-acp-settings-patch.mjs";
+import { assertMacOsArtifactTree, macOsArtifactOptions } from "./macos-artifact-compatibility.mjs";
+import { prepareMacCodexResourceTree } from "./macos-codex-resources.mjs";
 
 const args = Object.fromEntries(process.argv.slice(2).map((value, index, all) => value.startsWith("--") ? [value.slice(2), all[index + 1]] : []).filter(pair => pair.length === 2));
 if (!args.agent || !args.os || !args.architecture || !args.out || !args.profile || !args.approval || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{7,255}$/.test(args.approval)) throw new Error("offline agent packaging requires an explicit redistribution approval reference");
@@ -79,6 +81,11 @@ try {
     writeFileSync(join(root, "konteks", "package.json"), '{"type":"module"}\n');
     chmodSync(join(root, "konteks", "codex-local-proxy.js"), 0o755);
   }
+  let resourceClosures;
+  if (args.os === "macos" && args.agent === "codex") {
+    ({ resourceClosures } = await prepareMacCodexResourceTree({ root, os: args.os, agent: args.agent, architecture: args.architecture }));
+  }
+  if (args.os === "macos") assertMacOsArtifactTree(root, { ...macOsArtifactOptions(args.architecture), ...(resourceClosures ? { resourceClosures } : {}) });
   const files = await inventoryOfflineFiles(root, walk(root), runtimeName);
   if (files.length < 1 || files.length > 20_000 || files.reduce((sum, file) => sum + file.sizeBytes, 0) > 1024 ** 3) throw new Error("offline package exceeds the installed-profile bounds");
   validatePaths(files.map(file => file.path));

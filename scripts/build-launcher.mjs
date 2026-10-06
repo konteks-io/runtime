@@ -12,12 +12,14 @@ const shell = process.platform === "win32";
 const npx = shell ? "npx.cmd" : "npx";
 import { copyFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { assertMacOsArtifact, macOsArtifactOptions } from "./macos-artifact-compatibility.mjs";
 
 const args = Object.fromEntries(process.argv.slice(2).map((value, index, all) => (value.startsWith("--") ? [value.slice(2), all[index + 1]] : [])).filter((pair) => pair.length === 2));
 const os = args.os;
 const out = args.out;
+const macOptions = os === "macos" ? macOsArtifactOptions(args.architecture) : null;
 if (!os || !out) {
-  console.error("usage: build-launcher.mjs --os macos|windows|debian --out dist/<artifact>");
+  console.error("usage: build-launcher.mjs --os macos|windows|debian --architecture arm64|amd64 --out dist/<artifact>");
   process.exit(2);
 }
 const roots = process.env.KONTEKS_RELEASE_ROOTS_JSON;
@@ -64,7 +66,10 @@ execFileSync(npx, ["postject", executable, "NODE_SEA_BLOB", join(work, "launcher
 // Injection invalidates the Mach-O signature; an unsigned arm64 binary will not
 // launch at all. Ad-hoc sign here so the artifact runs; sign-launcher.mjs
 // replaces this with the Developer ID signature when one is configured.
-if (os === "macos") execFileSync("codesign", ["--force", "--sign", "-", executable], { stdio: "inherit" });
+if (os === "macos") {
+  execFileSync("codesign", ["--force", "--sign", "-", executable], { stdio: "inherit" });
+  assertMacOsArtifact(executable, macOptions);
+}
 // The MSI installs this beside konteks-remote.exe: the connector's doctor
 // reads it as "this launcher runs the installed release's code".
 if (os === "windows") writeFileSync(join(work, "launcher.json"), `${JSON.stringify({ runsInstalledRelease: true, version: process.env.KONTEKS_LAUNCHER_VERSION ?? "0.0.0" })}\n`);

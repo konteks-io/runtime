@@ -6,6 +6,7 @@ import type { RetainedProcessOwner } from "@konteks/remote-common";
 import { AgentRuntime } from "../runtime.js";
 import { RunnerConfigSchema } from "../config.js";
 import type { IdentityProbe } from "../auth/identity.js";
+import { AgentScopeStore } from "../auth/scope-store.js";
 import type { BridgeProcess, SpawnBridgeOptions } from "../bridge/process.js";
 import { RequestError } from "@agentclientprotocol/sdk";
 
@@ -28,7 +29,14 @@ afterEach(async () => {
 
 const retainedOwner = (pid: number): RetainedProcessOwner =>
   ({ version: 1, platform: "darwin", pid, processGroupId: pid, startToken: `start-${pid}`, commandDigest: "A".repeat(43) });
-const modelOptions = [{ id: "model", name: "Model", category: "model", type: "select", currentValue: "sonnet", options: [{ value: "sonnet", name: "Sonnet" }, { value: "opus", name: "Opus" }] }];
+const modelOption = {
+  id: "model", name: "Model", category: "model", type: "select", currentValue: "sonnet",
+  options: [{ value: "sonnet", name: "Sonnet" }, { value: "opus", name: "Opus" }],
+  _meta: { konteksModelOffer: {
+    source: "codex-model-list.v1", offeredValues: ["sonnet", "opus"], defaultValue: "sonnet",
+  } },
+};
+const modelOptions = [modelOption];
 
 async function fixture(options: { limit?: number; ttlMs?: number; now?: () => Date; modelCapabilityTtlMs?: number; probe?: () => Promise<IdentityProbe>;
   newSessionFails?: () => boolean | Error; closeSession?: () => Promise<object> } = {}) {
@@ -55,7 +63,7 @@ async function fixture(options: { limit?: number; ttlMs?: number; now?: () => Da
         closeSession: vi.fn(options.closeSession ?? (async () => ({}))),
         setSessionConfigOption: vi.fn(async ({ configId, value }: { configId: string; value: string }) => {
           selectedConfig.set(configId, value);
-          return { configOptions: [...selectedConfig].map(([id, currentValue]) => ({
+          return { configOptions: [...selectedConfig].map(([id, currentValue]) => id === modelOption.id ? { ...modelOption, currentValue } : ({
             id, name: id, type: "select" as const, currentValue,
             options: [{ value: currentValue, name: currentValue }],
           })) };
@@ -263,12 +271,38 @@ it("reads the identity again when a discovery fails for good, so readiness stops
   });
   await f.runtime.probe(false);
   expect(f.runtime.readiness().readiness).toBe("ready");
-  // Its sign-in went away outside Konteks (its home cleared): every session is refused.
-  signedIn = false;
-  refuse = true;
-  await expect(f.runtime.discoverModelCapability("model")).rejects.toThrow();
-  await vi.waitFor(() => expect(f.runtime.readiness()).toMatchObject({ readiness: "not_configured", recoveryAction: "login_locally" }));
-
+  const refresh = vi.spyOn(f.runtime, "probe");
+  let releaseWrite!: () => void;
+  const writable = new Promise<void>(resolve => { releaseWrite = resolve; });
+  let writeFinished = false;
+  const originalWrite = AgentScopeStore.prototype.write;
+  const write = vi.spyOn(AgentScopeStore.prototype, "write").mockImplementation(async function (this: AgentScopeStore, state) {
+    await writable;
+    await originalWrite.call(this, state);
+    writeFinished = true;
+  });
+  try {
+    // Its sign-in went away outside Konteks (its home cleared): every session is refused.
+    signedIn = false;
+    refuse = true;
+    await expect(f.runtime.discoverModelCapability("model")).rejects.toThrow();
+    await vi.waitFor(() => expect(f.runtime.readiness()).toMatchObject({ readiness: "not_configured", recoveryAction: "login_locally" }));
+    expect(refresh).toHaveBeenCalledOnce();
+    expect(refresh).toHaveBeenCalledWith(false, false, { fresh: true });
+    // Readiness is visible before persistence settles; fixture teardown must join that exact probe.
+    expect(writeFinished).toBe(false);
+    expect(write).toHaveBeenCalledOnce();
+    releaseWrite();
+    await refresh.mock.results[0]!.value;
+    expect(writeFinished).toBe(true);
+  } finally {
+    releaseWrite();
+    try { await refresh.mock.results[0]?.value; }
+    finally {
+      write.mockRestore();
+      refresh.mockRestore();
+    }
+  }
 });
 
 it("re-reads the offered models once the discovery TTL has passed", async () => {
@@ -362,16 +396,43 @@ it("drops the last offered models when a refresh says the agent needs signing in
   const f = await fixture({ now: () => new Date(now), modelCapabilityTtlMs: 60_000, newSessionFails: () => fail });
   await f.runtime.probe(false);
   await f.runtime.discoverModelCapability("model");
-  now += 90_000;
-  fail = new RequestError(-32000, "Authentication required");
-  await f.runtime.discoverModelCapability("model");
-  await vi.waitFor(() => expect(f.owners[2]?.bridge.stop).toHaveBeenCalled());
-  // Nothing is kept now: the next read is a discovery of its own, and it fails.
-  await vi.waitFor(async () => {
-    const spawned = f.spawn.mock.calls.length;
-    await expect(f.runtime.discoverModelCapability("model")).rejects.toThrow();
-    expect(f.spawn.mock.calls.length).toBe(spawned + 1);
+  const refresh = vi.spyOn(f.runtime, "probe");
+  let releaseWrite!: () => void;
+  const writable = new Promise<void>(resolve => { releaseWrite = resolve; });
+  let finishedWrites = 0;
+  const originalWrite = AgentScopeStore.prototype.write;
+  const write = vi.spyOn(AgentScopeStore.prototype, "write").mockImplementation(async function (this: AgentScopeStore, state) {
+    await writable;
+    await originalWrite.call(this, state);
+    finishedWrites += 1;
   });
+  try {
+    now += 90_000;
+    fail = new RequestError(-32000, "Authentication required");
+    await f.runtime.discoverModelCapability("model");
+    await vi.waitFor(() => expect(f.owners[2]?.bridge.stop).toHaveBeenCalled());
+    // Nothing is kept now: the next read is a discovery of its own, and it fails.
+    await vi.waitFor(async () => {
+      const spawned = f.spawn.mock.calls.length;
+      await expect(f.runtime.discoverModelCapability("model")).rejects.toThrow();
+      expect(f.spawn.mock.calls.length).toBe(spawned + 1);
+    });
+    expect(refresh.mock.calls.length).toBeGreaterThanOrEqual(2);
+    for (const call of refresh.mock.calls) expect(call).toEqual([false, false, { fresh: true }]);
+    await vi.waitFor(() => expect(write).toHaveBeenCalledTimes(refresh.mock.calls.length));
+    // Auth and model changes are visible before persistence; join every induced probe before teardown.
+    expect(finishedWrites).toBe(0);
+    releaseWrite();
+    await Promise.all(refresh.mock.results.map(result => result.value));
+    expect(finishedWrites).toBe(refresh.mock.calls.length);
+  } finally {
+    releaseWrite();
+    try { await Promise.allSettled(refresh.mock.results.map(result => result.value)); }
+    finally {
+      write.mockRestore();
+      refresh.mockRestore();
+    }
+  }
 });
 
 it("refuses a restart-only retained stop for an identity live under a current owner and yields an idle one", async () => {

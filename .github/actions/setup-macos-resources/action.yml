@@ -1,0 +1,25 @@
+name: Set up pinned Mac resource build tools
+description: Provision the same source build prerequisites for preflight and release packaging.
+runs:
+  using: composite
+  steps:
+    - name: Set up public Python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      with:
+        python-version: '3.12'
+    - name: Set up Rust 1.95.0
+      uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+    - name: Set up pinned Bazel launcher
+      uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86
+      with:
+        bazelisk-version: 1.28.1
+    - name: Set up public autoconf for the pinned zsh source
+      shell: bash
+      env:
+        HOMEBREW_NO_AUTO_UPDATE: '1'
+        HOMEBREW_NO_INSTALL_CLEANUP: '1'
+      run: |
+        set -euo pipefail
+        if ! command -v autoconf >/dev/null 2>&1; then
+          brew install autoconf
+        fi

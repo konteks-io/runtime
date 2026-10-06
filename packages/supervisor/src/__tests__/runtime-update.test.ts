@@ -54,6 +54,46 @@ function completeLauncherUpdate(f: ReturnType<typeof fixture>): void {
 }
 
 describe("fixed signed site runtime updates", () => {
+  it("begins only the bounded local attempt through the current lease and rejects executable input", async () => {
+    const now = "2026-10-01T00:00:00.000Z";
+    const view = {
+      updateId: "local-update",
+      instanceId: "instance",
+      targetBundle: "1.1.0",
+      manifestDigest: "a".repeat(43),
+      state: "updating",
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: "2026-10-01T00:30:00.000Z",
+    };
+    const fetchFn = vi.fn(
+      async () => new Response(JSON.stringify({ update: view }), { status: 202 }),
+    );
+    const core = new CoreClient({
+      baseUrl: "https://core.example",
+      clock: new FixedClock(Date.parse(now)),
+      key: () => generateInstanceKey(),
+      credential: () => "current-runtime-lease",
+      fetchFn,
+    });
+    const body = {
+      attemptId: "native-attempt",
+      targetBundle: view.targetBundle,
+      manifestDigest: view.manifestDigest,
+    };
+    expect(await core.beginLocalRuntimeUpdate("instance", body)).toEqual({ update: view });
+    const [url, options] = fetchFn.mock.calls[0]! as unknown as [string | URL, RequestInit];
+    expect(String(url)).toBe(
+      "https://core.example/api/remote-instances/internal/remote-instances/instance/runtime-updates/local",
+    );
+    expect(new Headers(options.headers).get("authorization")).toBe("Bearer current-runtime-lease");
+    expect(JSON.parse(String(options.body))).toEqual(body);
+    await expect(
+      core.beginLocalRuntimeUpdate("instance", { ...body, command: "private shell" } as never),
+    ).rejects.toThrow();
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
   it("reports only the bounded fixed action through the current runtime's authenticated Core endpoint", async () => {
     const fetchFn = vi.fn(async () => new Response(JSON.stringify({ accepted: true })));
     const core = new CoreClient({ baseUrl: "https://core.example", clock: new FixedClock(Date.parse("2026-10-01T00:00:00Z")),
@@ -67,6 +107,51 @@ describe("fixed signed site runtime updates", () => {
     await expect(core.reportRuntimeUpdate("instance", { ...report, output: "private logs" } as never)).rejects.toThrow();
     expect(fetchFn).toHaveBeenCalledTimes(1);
   });
+
+  it.each(["instanceId", "targetBundle", "manifestDigest"] as const)(
+    "rejects a local admission response with another %s",
+    async (field) => {
+      const now = new Date().toISOString();
+      const view = {
+        updateId: "local-update",
+        instanceId: "instance",
+        targetBundle: "1.1.0",
+        manifestDigest: "a".repeat(43),
+        state: "updating",
+        createdAt: now,
+        updatedAt: now,
+        expiresAt: new Date(Date.now() + 30_000).toISOString(),
+      };
+      const body = {
+        attemptId: "native-attempt",
+        targetBundle: view.targetBundle,
+        manifestDigest: view.manifestDigest,
+      };
+      const wrong = {
+        ...view,
+        [field]:
+          field === "manifestDigest"
+            ? "b".repeat(43)
+            : field === "targetBundle"
+              ? "1.2.0"
+              : "other",
+      };
+      const fetchFn = vi.fn(
+        async () => new Response(JSON.stringify({ update: wrong }), { status: 202 }),
+      );
+      const core = new CoreClient({
+        baseUrl: "https://core.example",
+        clock: new FixedClock(Date.parse(now)),
+        key: () => generateInstanceKey(),
+        credential: () => "fixture-lease",
+        fetchFn,
+      });
+      await expect(core.beginLocalRuntimeUpdate("instance", body)).rejects.toMatchObject({
+        code: "registration_mismatch",
+      });
+      expect(fetchFn).toHaveBeenCalledOnce();
+    },
+  );
 
   it("verifies the exact signed intent and current lease, instance, runner and epoch before touching disk", async () => {
     const f = fixture(), receiver = f.receiver();

@@ -99,8 +99,10 @@ interface ModelCapabilityEntry {
 }
 
 function sameRetainedOwner(a: RetainedProcessOwner, b: RetainedProcessOwner): boolean {
-  return a.version === b.version && a.platform === b.platform && a.pid === b.pid && a.processGroupId === b.processGroupId &&
-    a.startToken === b.startToken && a.commandDigest === b.commandDigest;
+  return (
+    a.version === b.version && a.platform === b.platform && a.pid === b.pid && a.processGroupId === b.processGroupId &&
+    a.startToken === b.startToken && a.commandDigest === b.commandDigest
+  );
 }
 
 class FileSessionRefStore implements SessionRefStore {
@@ -151,8 +153,11 @@ export const CODEX_SESSION_GOVERNANCE = {
 } as const;
 
 /** Codex sessions are pinned to Ask for approval; a host agent refuses its own unsafe modes. */
-function sessionGovernance(agentId: string, host: HostAgentRunnerAdapter | null): Pick<SessionManagerOptions, "defaultSessionConfig" | "refusedModes"> {
-  if (agentId === "codex") return { defaultSessionConfig: CODEX_SESSION_GOVERNANCE.defaultSessionConfig, refusedModes: CODEX_SESSION_GOVERNANCE.refusedModes };
+function sessionGovernance(agentId: string, host: HostAgentRunnerAdapter | null,
+): Pick<SessionManagerOptions, "defaultSessionConfig" | "refusedModes" | "requireRawModelOffer"> {
+  if (agentId === "codex") return { defaultSessionConfig: CODEX_SESSION_GOVERNANCE.defaultSessionConfig, refusedModes: CODEX_SESSION_GOVERNANCE.refusedModes,
+      requireRawModelOffer: true,
+    };
   return host?.refusedSessionModes ? { refusedModes: host.refusedSessionModes } : {};
 }
 
@@ -185,12 +190,16 @@ function signalTokenUsage(result: IdentityProbe): boolean | undefined {
 /** The record holds `owner`'s exact live process. */
 function liveOwnerOf(record: ExecutionOwner, owner: RetainedProcessOwner): boolean {
   const identity = record.durable?.retainedProcessOwner;
-  return identity !== undefined && !record.finalized && !record.durable!.exited && sameRetainedOwner(identity, owner);
+  return (
+    identity !== undefined && !record.finalized && !record.durable!.exited && sameRetainedOwner(identity, owner)
+  );
 }
 
 /** A process that failed to start is worth a fresh one unless the failure was a definite refusal. */
 function startupRetryable(error: unknown): boolean {
-  return !(error instanceof RemoteInstanceError) || error.code === "agent_unavailable" || error.retryable;
+  return (
+    !(error instanceof RemoteInstanceError) || error.code === "agent_unavailable" || error.retryable
+  );
 }
 
 function startupErrorFields(error: unknown): { errorClass: string; errorCode: string; diagnostic: string | undefined } {
@@ -203,8 +212,8 @@ function startupErrorFields(error: unknown): { errorClass: string; errorCode: st
 
 /** Exponential backoff with jitter, at most 2 s, before a fresh process. */
 function freshProcessDelayMs(attempt: number, random: () => number): number {
-  const exponentialMs = 500 * (2 ** (attempt - 1));
-  return Math.min(2_000, Math.max(1, Math.round(exponentialMs * (0.75 + (random() * 0.5)))));
+  const exponentialMs = 500 * 2 ** (attempt - 1);
+  return Math.min(2_000, Math.max(1, Math.round(exponentialMs * (0.75 + random() * 0.5))));
 }
 
 function runtimeDefaults(options: AgentRuntimeOptions): { events: RunnerEventBus; logger: Logger; now: () => Date } {
@@ -369,7 +378,7 @@ export class AgentRuntime {
   private async refreshSiteLoginOptions(): Promise<void> {
     if (!this.host?.siteLoginOptions) return;
     try {
-      this.siteLoginOptionIds = [...await this.host.siteLoginOptions(this.options.config)];
+      this.siteLoginOptionIds = [...(await this.host.siteLoginOptions(this.options.config))];
     } catch (error) {
       this.logger.warn({ errorCode: error instanceof RemoteInstanceError ? error.code : "sign_in_options_failed" }, "the agent's sign-in options could not be read");
     }
@@ -391,7 +400,9 @@ export class AgentRuntime {
 
   /** What a host agent's credentials say depends on what Core takes (Antigravity's no-licence reason). */
   private coreBillingChanged(previous: HostAgentSettings, settings: HostAgentSettings): boolean {
-    return previous.coreAcceptsRouteBilling !== settings.coreAcceptsRouteBilling && this.host?.identity !== undefined;
+    return (
+      previous.coreAcceptsRouteBilling !== settings.coreAcceptsRouteBilling && this.host?.identity !== undefined
+    );
   }
 
   /** How one turn's usage is labelled: sessions/usage-label.ts. */
@@ -490,7 +501,9 @@ export class AgentRuntime {
 
   /** Only unfinalized owners hold capacity; retained keys still refuse reuse. */
   private capacityFree(limit: number | undefined): boolean {
-    return typeof limit === "number" && Number.isSafeInteger(limit) && limit >= 1 && this.heldExecutionOwners() < limit;
+    return (
+      typeof limit === "number" && Number.isSafeInteger(limit) && limit >= 1 && this.heldExecutionOwners() < limit
+    );
   }
 
   private reserveExecutionBridge(ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string): Promise<BridgeProcess> {
@@ -643,7 +656,9 @@ export class AgentRuntime {
   }
 
   private stoppedPreReadyOwner(owner: ExecutionOwner, previous: BridgeProcess): boolean {
-    return owner.live === previous && !owner.stopping && !owner.finalized && previous.exited && this.sessions.sessionsBoundTo(previous) === 0;
+    return (
+      owner.live === previous && !owner.stopping && !owner.finalized && previous.exited && this.sessions.sessionsBoundTo(previous) === 0
+    );
   }
 
   /** The initialized candidate, or null when this attempt failed in a way worth a fresh one (its process already stopped). */
@@ -842,7 +857,9 @@ export class AgentRuntime {
 
   /** Parks a healthy, unowned process in the single idle slot; `false` means stop it as before. */
   private parkIdleExecutionBridge(owner: ExecutionOwner): boolean {
-    return owner.live !== null && owner.durable !== null && this.parkIdle(owner.live, owner.durable);
+    return (
+      owner.live !== null && owner.durable !== null && this.parkIdle(owner.live, owner.durable)
+    );
   }
 
   private parkIdle(bridge: BridgeProcess, durable: BridgeStopOwner): boolean {
@@ -965,7 +982,9 @@ export class AgentRuntime {
    * as opposed to never signed in).
    */
   signInLost(): boolean {
-    return this.authRequired || (this.credentials?.some(credential => credential.state === "needs_sign_in") ?? false);
+    return (
+      this.authRequired || (this.credentials?.some(credential => credential.state === "needs_sign_in") ?? false)
+    );
   }
 
   utilization(): { activeSessions: number; activeTurns: number } {

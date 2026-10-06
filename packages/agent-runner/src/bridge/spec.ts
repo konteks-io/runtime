@@ -68,8 +68,11 @@ function localAbsolutePath(value: string): boolean {
   return isAbsolute(value) && !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(value);
 }
 
-function personalRunner(config: RunnerConfig, family: AgentBridgeFamily, profile: NativeAgentPackageProfile | undefined, agentId: string): profile is NativeAgentPackageProfile {
-  return profile !== undefined && family.agentId === agentId && config.RUNNER_AUTH_MODE === "agent_local_subscription";
+function personalRunner(config: RunnerConfig, family: AgentBridgeFamily, profile: NativeAgentPackageProfile | undefined, agentId: string,
+): profile is NativeAgentPackageProfile {
+  return (
+    profile !== undefined && family.agentId === agentId && config.RUNNER_AUTH_MODE === "agent_local_subscription"
+  );
 }
 
 /**
@@ -126,7 +129,8 @@ function useSharedCodexSocket(config: RunnerConfig, profile: NativeAgentPackageP
   env.KONTEKS_NATIVE_CODEX_SOCKET = socket;
 }
 
-function useNativePackage(config: RunnerConfig, profile: NativeAgentPackageProfile, basePath: string, env: NodeJS.ProcessEnv): void {
+function useNativePackage(config: RunnerConfig, profile: NativeAgentPackageProfile, basePath: string, env: NodeJS.ProcessEnv,
+): void {
   keepOperatorCaTrust(env);
   const separator = profile.os === "windows" ? ";" : ":";
   const prefixes = [dirname(join(config.RUNNER_BRIDGE_PREFIX, profile.tooling.entrypoint))];
@@ -137,6 +141,32 @@ function useNativePackage(config: RunnerConfig, profile: NativeAgentPackageProfi
     env.APPDATA = join(config.RUNNER_CREDENTIAL_DIR, "AppData", "Roaming");
     env.LOCALAPPDATA = join(config.RUNNER_CREDENTIAL_DIR, "AppData", "Local");
   }
+  useWindowsCodexTooling(config, profile, env);
+}
+
+const WINDOWS_CODEX_EXECUTABLES = {
+  amd64: "node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe",
+  arm64: "node_modules/@openai/codex-win32-arm64/vendor/aarch64-pc-windows-msvc/bin/codex.exe",
+} as const;
+
+/** ACP must run the signed tooling pin, rather than its own older nested Codex dependency. */
+function useWindowsCodexTooling(
+  config: RunnerConfig,
+  profile: NativeAgentPackageProfile,
+  env: NodeJS.ProcessEnv,
+): void {
+  if (profile.agentId !== "codex" || profile.os !== "windows") return;
+  const entrypoint =
+    profile.tooling.runtime === "native"
+      ? profile.tooling.entrypoint
+      : WINDOWS_CODEX_EXECUTABLES[profile.architecture];
+  if (!profile.files.some((file) => file.path === entrypoint && file.executable)) {
+    throw new RemoteInstanceError(
+      "bundle_untrusted",
+      "The signed Windows Codex tooling executable is missing from the verified package.",
+    );
+  }
+  env.CODEX_PATH = join(config.RUNNER_BRIDGE_PREFIX, ...entrypoint.split("/"));
 }
 
 /**

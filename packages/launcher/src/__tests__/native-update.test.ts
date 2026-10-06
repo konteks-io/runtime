@@ -244,6 +244,105 @@ describe("native update transaction", () => {
   }
   const previous: NativeRuntimeRecord = { schemaVersion: 1, deploymentKind: "native_connector", instanceId: "instance", workspaceId: "tenant", releaseId: "release-prev", manifestDigest: "sha256:prev", bundleVersion: "1.0.0", coreUrl: "https://core.example", relayUrl: "wss://relay.example/runtime", controlPort: 47_311, agents: ["claude-code"] };
 
+  it("admits local progress after verified staging and before draining, then reports only after the applied health-gated attempt", async () => {
+    const h = harness({ previous });
+    const stage = h.deps.stage;
+    h.deps.stage = async (input) => {
+      h.calls.push("stage");
+      return stage(input);
+    };
+    const finish = vi.fn(async (state: "succeeded" | "failed") => {
+      expect(h.ledger.at(-1)).toMatchObject({ outcome: "applied" });
+      expect(h.currentRecord().releaseId).toBe("release-next");
+      h.calls.push(`progress:${state}`);
+    });
+    h.deps.beginProgress = vi.fn(async (input) => {
+      h.calls.push("progress:begin");
+      expect(input).toMatchObject({
+        root: "/root",
+        previous,
+        attempt: { outcome: "in_progress", bundleVersion: "1.1.0", manifestDigest: "sha256:next" },
+      });
+      expect(h.calls).not.toContain("control:drain@release-prev");
+      return { finish };
+    });
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated", restarted: true });
+    expect(h.calls.indexOf("stage")).toBeLessThan(h.calls.indexOf("progress:begin"));
+    expect(h.calls.indexOf("progress:begin")).toBeLessThan(
+      h.calls.indexOf("control:drain@release-prev"),
+    );
+    expect(finish).toHaveBeenCalledWith("succeeded");
+  });
+
+  it("reports failed local progress after rollback without changing the transaction's original failure", async () => {
+    const h = harness({ previous, gate: "no_answer" });
+    const finish = vi.fn(async () => {
+      expect(h.currentRecord()).toEqual(previous);
+    });
+    h.deps.beginProgress = vi.fn(async () => ({ finish }));
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toThrow();
+    expect(finish).toHaveBeenCalledWith("failed");
+    expect(h.ledger.at(-1)).toMatchObject({ outcome: "rolled_back" });
+  });
+
+  it("keeps trusted local recovery available when Core progress admission or its terminal report is unavailable", async () => {
+    const h = harness({ previous });
+    h.deps.beginProgress = vi.fn(async () => {
+      throw new Error("private server diagnostic");
+    });
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated" });
+    expect(h.deps.beginProgress).toHaveBeenCalledOnce();
+    const again = harness({ previous });
+    const finish = vi.fn(async () => {
+      throw new Error("private report diagnostic");
+    });
+    again.deps.beginProgress = vi.fn(async () => ({ finish }));
+    await expect(
+      runNativeUpdate({ root: "/root", output: again.output }, again.deps),
+    ).resolves.toMatchObject({ state: "updated" });
+    expect(finish).toHaveBeenCalledWith("succeeded");
+  });
+
+  it("never announces local execution for a failed stage or a previously stopped service", async () => {
+    const failed = harness({ previous });
+    failed.deps.stage = async () => {
+      throw new Error("not trusted");
+    };
+    failed.deps.beginProgress = vi.fn();
+    await expect(
+      runNativeUpdate({ root: "/root", output: failed.output }, failed.deps),
+    ).rejects.toThrow("not trusted");
+    expect(failed.deps.beginProgress).not.toHaveBeenCalled();
+    const stopped = harness({ previous, running: false });
+    stopped.deps.beginProgress = vi.fn();
+    await expect(
+      runNativeUpdate({ root: "/root", output: stopped.output }, stopped.deps),
+    ).resolves.toMatchObject({ state: "updated", restarted: false });
+    expect(stopped.deps.beginProgress).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["en", 180_000, "3 min", "s so far"],
+    ["id", 180_000, "3 menit", "dtk"],
+    ["en", 90_000, "90 s", "s so far"],
+    ["id", 90_000, "90 dtk", "dtk"],
+  ] as const)("presents %s human durations (%s ms) during an actual failed update and retains canonical ledger/JSON", async (locale, deadlineMs, duration, elapsed) => {
+    const h = harness({ previous, gate: "no_answer" });
+    h.deps.healthDeadlineMs = deadlineMs;
+    vi.stubEnv("KONTEKS_SETUP_LOCALE", locale);
+    const lines: string[] = [];
+    const output = createOutput({ json: false, stdout: { write: (text: string) => { lines.push(text.trimEnd()); return true; } } as never });
+    vi.stubEnv("KONTEKS_SETUP_LOCALE", "en");
+    const failure = await runNativeUpdate({ root: "/root", output }, h.deps).catch(error => error);
+    expect(lines.some(line => line.includes(duration))).toBe(true);
+    expect(lines.some(line => line.includes(elapsed))).toBe(true);
+    expect(h.currentRecord().releaseId).toBe("release-prev");
+    expect(h.ledger.at(-1)).toMatchObject({ outcome: "rolled_back", detail: "The updated connector stopped making progress before it answered on its control socket." });
+    const json: string[] = [];
+    createOutput({ json: true, stderr: { write: (text: string) => { json.push(text); return true; } } as never }).error(failure);
+    expect(JSON.parse(json.join(""))).toMatchObject({ error: { message: "The updated connector stopped making progress before it answered on its control socket." } });
+  });
+
   it("drains, stops, commits, restarts and gates the successor, recording an applied attempt", async () => {
     const h = harness({ previous });
     const outcome = await runNativeUpdate({ root: "/root", output: h.output }, h.deps);
@@ -549,7 +648,8 @@ describe("native update transaction", () => {
   it("gives up when the old service never exits, leaving the record unchanged", async () => {
     const h = harness({ previous });
     const execute = h.deps.execute;
-    h.deps.execute = async command => (command.command === "stop" ? 0 : command.command === "status" ? 0 : execute(command));
+    h.deps.execute = async (command) =>
+      command.command === "stop" ? 0 : command.command === "status" ? 0 : execute(command);
     h.deps.stopDeadlineMs = 3_000;
     await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toMatchObject({ code: "temporarily_unavailable" });
     expect(h.calls).not.toContain("commit");
@@ -626,7 +726,7 @@ describe("native update transaction", () => {
   it("drains and stops a Windows connector left running after Task Scheduler reports Ready", async () => {
     const h = harness({ previous });
     const execute = h.deps.execute;
-    h.deps.execute = async command => command.command === "status" ? 1 : execute(command);
+    h.deps.execute = async (command) => (command.command === "status" ? 1 : execute(command));
     let alive = true;
     h.deps.serviceOwner = async () => ({ pid: 4242, alive: async () => alive, terminate: async () => { alive = false; h.calls.push("terminate-owned"); } });
     h.deps.readStopReceipt = async () => "prior-stop";
@@ -752,7 +852,7 @@ describe("native update transaction", () => {
     let committed = false, receipts = 0;
     const commit = h.deps.commit;
     h.deps.commit = async options => { committed = true; return commit(options); };
-    h.deps.readStopReceipt = async () => committed ? "stale" : `fresh-${receipts++}`;
+    h.deps.readStopReceipt = async () => (committed ? "stale" : `fresh-${receipts++}`);
     await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toThrow(/doctor failure\(s\): runner_spawn/);
     expect(h.calls.slice(-3)).toEqual(["restore:release-next", "start", "control:status@release-prev"]);
     expect(h.currentRecord().releaseId).toBe("release-prev");

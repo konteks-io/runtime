@@ -9,6 +9,17 @@ export { projectAcpToolDiagnostics, AcpToolDiagnosticsSchema } from "@konteks/ba
  * the wire names.
  */
 export { AcpNativeObservationSchema } from "@konteks/backstage-plugin-common/remote-instance-internal";
+export {
+  DirectModelSelectionSchema,
+  DirectModelSelectionPolicySchema,
+  directModelSelectionsEqual,
+  REMOTE_DIRECT_MODEL_FALLBACK_CAPABILITY,
+  REMOTE_DIRECT_MODEL_FALLBACK_MIN_CORE_CONTRACT_VERSION,
+} from "@konteks/backstage-plugin-common/remote-instance-internal";
+export type {
+  DirectModelSelection,
+  DirectModelSelectionPolicy,
+} from "@konteks/backstage-plugin-common/remote-instance-internal";
 export { RuntimeRoleSchema, RemoteWorkKindSchema } from "@konteks/backstage-plugin-common";
 export type {
   RuntimePermissionAnswerDeliveryRequest,
@@ -141,10 +152,15 @@ export {
   RuntimeUpdateDeliveryRequestSchema,
   RuntimeUpdateReportSchema,
   RuntimeUpdateFailureSchema,
+  RuntimeUpdateLocalBeginRequestSchema,
+  RuntimeUpdateLocalBeginResultSchema,
+  REMOTE_RUNTIME_UPDATE_PROGRESS_MIN_CORE_CONTRACT_VERSION,
   type RuntimeUpdateIntent,
   type RuntimeUpdateDeliveryRequest,
   type RuntimeUpdateReport,
   type RuntimeUpdateFailure,
+  type RuntimeUpdateLocalBeginRequest,
+  type RuntimeUpdateLocalBeginResult,
   AgentLoginUserCodeSchema,
   agentLoginUrlAllowed,
   // OpenCode's sign-ins the site may start.

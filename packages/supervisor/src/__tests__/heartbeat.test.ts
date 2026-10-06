@@ -6,6 +6,7 @@ import { FixedClock, computeAgentModelOfferedValuesSnapshotDigest, generateInsta
 import { HeartbeatPublisher, type HeartbeatOptions } from "../heartbeat/heartbeat.js";
 import { SupervisorStore } from "../state/store.js";
 import { CORE_AUDIENCE } from "../core/client.js";
+import type { InventorySnapshot } from "../inventory/snapshot.js";
 
 let root: string;
 const publishers: HeartbeatPublisher[] = [];
@@ -18,12 +19,90 @@ async function fixture() {
   const heartbeat = vi.fn(async (_body: unknown) => result);
   const transport = { send: vi.fn(), activeKind: "relay" };
   const onResult = vi.fn(async () => undefined), onFailure = vi.fn(async () => undefined);
-  const inventory = { collect: vi.fn(async () => ({ components: [], agents: [], hostPressure: 0, activeSessions: 0, activeTurns: 0 })) };
+  const inventory = { collect: vi.fn(async (): Promise<InventorySnapshot> => ({ components: [], agents: [], hostPressure: 0, activeSessions: 0, activeTurns: 0,
+      gitVersion: null,
+      diskFreeBytes: 0,
+    })),
+  };
   const options = { store, key: () => key, clock, instanceId: () => "instance", inventory, roleBindings: () => [], activeAssignmentIds: () => [], modelCapabilitySnapshots: () => [], configRevision: () => 0, bundleVersion: "1.0.0", softMaxConcurrent: () => undefined, acceptingWork: () => true, intervalSeconds: () => 15, renewalDelayMs: () => 5000, core: { heartbeat }, transport, onResult, onFailure };
   const publisher = new HeartbeatPublisher({ ...options, runnerIncarnation: () => "process" } as HeartbeatOptions); publishers.push(publisher);
   return { store, key, heartbeat, transport, inventory, onResult, onFailure, publisher, result, options };
 }
 describe("signed HTTPS heartbeat lifecycle", () => {
+  it("publishes the whole freshly collected inventory to its local consumer before sending it", async () => {
+    const f = await fixture();
+    const snapshot: InventorySnapshot = {
+      components: [
+        {
+          kind: "agent_runner",
+          version: "1.0.0",
+          healthStatus: "healthy",
+          capabilities: ["remote-runtime-update.v1"],
+          lastProbeAt: f.options.clock.nowIso(),
+        },
+      ],
+      agents: [],
+      hostPressure: 0.25,
+      activeSessions: 2,
+      activeTurns: 1,
+      gitVersion: "2.46.0",
+      diskFreeBytes: 4096,
+    };
+    const onInventory = vi.fn();
+    f.inventory.collect.mockResolvedValue(snapshot);
+    const publisher = new HeartbeatPublisher({
+      ...f.options,
+      runnerIncarnation: () => "process",
+      onInventory,
+    } as HeartbeatOptions);
+    publishers.push(publisher);
+    f.heartbeat.mockImplementationOnce(async () => {
+      expect(onInventory).toHaveBeenCalledWith(snapshot);
+      return f.result;
+    });
+    await publisher.start();
+    const message = await publisher.publish();
+    expect(onInventory).toHaveBeenCalledOnce();
+    expect(message.components).toEqual(snapshot.components);
+    expect(message.utilization).toMatchObject({ activeSessions: 2, activeTurns: 1 });
+  });
+  it.each(["ownership_changed", "stopped"] as const)(
+    "does not publish collected inventory after %s",
+    async (reason) => {
+      const f = await fixture(),
+        gate = Promise.withResolvers<InventorySnapshot>();
+      const collected = vi.fn();
+      let current = true;
+      f.inventory.collect.mockImplementationOnce(() => gate.promise);
+      const publisher = new HeartbeatPublisher({
+        ...f.options,
+        runnerIncarnation: () => "process",
+        onInventory: collected,
+        captureLeaseFence: () => () => {
+          if (!current) throw new Error("owner changed during inventory");
+        },
+      } as HeartbeatOptions);
+      publishers.push(publisher);
+      await publisher.start();
+      const flight = publisher.publish();
+      const refused = expect(flight).rejects.toThrow();
+      await vi.waitFor(() => expect(f.inventory.collect).toHaveBeenCalledOnce());
+      if (reason === "stopped") publisher.stop();
+      else current = false;
+      gate.resolve({
+        components: [],
+        agents: [],
+        hostPressure: 0,
+        activeSessions: 0,
+        activeTurns: 0,
+        gitVersion: null,
+        diskFreeBytes: 0,
+      });
+      await refused;
+      expect(collected).not.toHaveBeenCalled();
+      expect(f.heartbeat).not.toHaveBeenCalled();
+    },
+  );
   it("honors a floor reserved after publisher startup and signs the actual process", async () => {
     const f = await fixture(); await f.publisher.start();
     await f.store.reserveHeartbeatFloor(20);

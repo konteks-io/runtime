@@ -11,6 +11,7 @@ import {
   RemoteTransferBindingSchema,
   RemoteExecutionReadyResultSchema,
   RemoteInstanceError,
+  directModelSelectionsEqual,
   allEqual,
   createLogger,
   redactValue,
@@ -19,6 +20,7 @@ import {
   type AcpJsonRpcError,
   type AgentTurnUsageObservation,
   type Clock,
+  type DirectModelSelection,
   type Logger,
   type PendingPermissionView,
   type RemoteWorkAssignment,
@@ -50,6 +52,10 @@ import {
   type CanonicalAcpToolIdentity,
 } from "./activity.js";
 import { NativeExecutionGate, type NativeExecutionGateOptions } from "../native/execution-gate.js";
+import {
+  admittedDirectModelReceipt,
+  assertDirectModelAuthority,
+} from "../native/direct-model-selection.js";
 import { continuedSession, isDirectAssignment, isNativeTurn } from "../work/continued-session.js";
 import { hostToolGovernance, type HostToolBypass, type HostToolGovernance } from "./host-tool-governance.js";
 import { McpToolCallLedger } from "./permission-tool-identity.js";
@@ -124,7 +130,10 @@ export interface RelayedSessionDeps {
    */
   activateExecution?: () => Promise<{ continueReference?: string; restoreReference?: string }>;
   /** Registers execution readiness with Core before the session is announced. */
-  registerReady: (assignment: RemoteWorkAssignment, binding: RemoteTransferBinding, acpSessionRef: string) => Promise<RemoteExecutionReadyResult>;
+  registerReady: (assignment: RemoteWorkAssignment, binding: RemoteTransferBinding, acpSessionRef: string,
+    modelSelection?: DirectModelSelection,
+  ) => Promise<RemoteExecutionReadyResult>;
+  directModelSelectionSupported?: () => boolean;
   /** Reserve an exclusive local channel after input verification, before bridge bootstrap. */
   reserveChannel?: (channelId: string, session: RelayedSession) => () => void;
   /** Actual WorkOrchestrator retained-admission fence, not a permission grant. */
@@ -336,6 +345,10 @@ export class RelayedSession {
   }
 
   private async bootstrapImpl(): Promise<{ acpSessionRef: string; resumed: boolean }> {
+    assertDirectModelAuthority(
+      this.assignment,
+      this.deps.directModelSelectionSupported?.() === true,
+    );
     const { prepared, binding } = await this.prepareSessionInputs();
     const mcpServers: SessionMcpServer[] = [];
     // A direct session is the person's own agent with nothing of Konteks in
@@ -393,14 +406,17 @@ export class RelayedSession {
   /** The binding is this assignment's (and this computer's), in its continued session, with a plain absolute working copy. */
   private bindingMatches(binding: RemoteTransferBinding, cwd: string): boolean {
     const continued = continuedSession(this.assignment.source);
-    return allEqual([
+    return (
+      allEqual([
       [binding.workspaceId, this.assignment.workspaceId], [binding.assignmentId, this.assignment.id], [binding.attempt, this.assignment.attempt],
       [binding.instanceId, this.assignment.instanceId], [binding.instanceId, this.deps.instanceId],
-    ]) && (continued === null || binding.sessionId === continued.sessionId) && isAbsolute(cwd) && !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(cwd);
+    ]) && (continued === null || binding.sessionId === continued.sessionId) && isAbsolute(cwd) && !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(cwd)
+    );
   }
 
   /** The platform tools, through a session-scoped loopback facade that holds Core's bearer. */
-  private async startCapabilityFacade(sessionId: string, direct: boolean, mcpServers: SessionMcpServer[]): Promise<void> {
+  private async startCapabilityFacade(sessionId: string, direct: boolean, mcpServers: SessionMcpServer[],
+  ): Promise<void> {
     if (!this.assignment.agentRoute.mcpCapabilityTokenRef || direct) return;
     const issue = await this.bootstrapStage("capability_redemption", () => this.deps.redeemCapabilityToken(this.assignment));
     this.deps.assertExecutionOwned?.();
@@ -426,11 +442,13 @@ export class RelayedSession {
       now: () => this.deps.clock.coreNow(),
     });
     this.mcpFacade = facade;
-    mcpServers.push({ type: "http", ...await this.bootstrapStage("facade", () => facade.start()) });
+    mcpServers.push({ type: "http", ...(await this.bootstrapStage("facade", () => facade.start())),
+    });
   }
 
   /** The preview tools (and the browser, when this computer has one) for a kind of work that runs a preview. */
-  private async startPreviewTools(sessionId: string, cwd: string, mcpServers: SessionMcpServer[]): Promise<SessionBrowser | undefined> {
+  private async startPreviewTools(sessionId: string, cwd: string, mcpServers: SessionMcpServer[],
+  ): Promise<SessionBrowser | undefined> {
     const preview = this.deps.preview;
     if (!preview || !PREVIEW_WORK_KINDS.has(this.assignment.kind)) return undefined;
     const browser = await this.startBrowserGateway(preview, sessionId);
@@ -561,7 +579,8 @@ export class RelayedSession {
    */
   private referencesFor(activation: ExecutionActivation | undefined): SessionReferences {
     const priorRef = activation?.continueReference ?? this.deps.continueReference;
-    const restoreRef = priorRef === undefined ? activation?.restoreReference ?? this.deps.restoreReference : undefined;
+    const restoreRef = priorRef === undefined ? (activation?.restoreReference ?? this.deps.restoreReference)
+        : undefined;
     return { priorRef, restoreRef };
   }
 
@@ -631,17 +650,34 @@ export class RelayedSession {
     this.deps.assertExecutionOwned?.();
   }
 
-  private sessionRequest(cwd: string, mcpServers: SessionMcpServer[], { priorRef, restoreRef }: SessionReferences, browser: SessionBrowser | undefined): RunnerSessionInput {
+  private sessionRequest(cwd: string, mcpServers: SessionMcpServer[], { priorRef, restoreRef }: SessionReferences, browser: SessionBrowser | undefined,
+  ): RunnerSessionInput {
     return {
       context: { instanceId: this.deps.instanceId, assignmentId: this.assignment.id, attempt: this.assignment.attempt, agentId: this.assignment.agentRoute.agentId },
       readinessDeadlineAt: new Date(Date.now() + Math.max(0, Date.parse(this.assignment.expiresAt) - this.deps.clock.coreNow())).toISOString(),
       cwd,
       mcpServers,
       ...(this.assignment.agentRoute.sessionConfig ? { sessionConfig: this.assignment.agentRoute.sessionConfig } : {}),
+      ...this.directModelOptions(),
       ...(priorRef ? { acpSessionRef: priorRef } : {}),
       ...this.restoreOptions(restoreRef),
       ...this.titleOptions(),
       ...(browser ? { browser } : {}),
+    };
+  }
+
+  /** Core's immutable pin, including this same assignment's durable accepted receipt on recovery. */
+  private directModelOptions(): Partial<RunnerSessionInput> {
+    const source = this.assignment.source;
+    if (source.kind !== "direct_session") return {};
+    const retained = this.deps.journal.assignments.get(
+      `${this.assignment.id}:${this.assignment.attempt}`,
+    )?.executionReady?.modelSelection;
+    const selection = source.modelSelection ?? retained;
+    if (selection) admittedDirectModelReceipt(this.assignment, selection, retained);
+    return {
+      ...(source.modelSelectionPolicy ? { modelSelectionPolicy: source.modelSelectionPolicy } : {}),
+      ...(selection ? { modelSelection: selection } : {}),
     };
   }
 
@@ -691,9 +727,10 @@ export class RelayedSession {
     try {
       const binding = this.preparedInputs!.binding;
       const ready = RemoteExecutionReadyResultSchema.parse(await this.bootstrapStage("readiness", () =>
-        this.deps.registerReady(this.assignment, binding, created.acpSessionRef)));
+        this.registerCreated(binding, created)),
+      );
       this.deps.assertExecutionOwned?.();
-      if (!this.readyMatches(ready, binding, created.acpSessionRef)) {
+      if (!this.readyMatches(ready, binding, created)) {
         throw new RemoteInstanceError("workspace_binding_invalid", "Core readiness does not match the prepared local session.");
       }
       if (this.closed) throw sessionClosed();
@@ -705,12 +742,31 @@ export class RelayedSession {
     }
   }
 
-  private readyMatches(ready: RemoteExecutionReadyResult, binding: RemoteTransferBinding, acpSessionRef: string): boolean {
-    return allEqual([
+  private registerCreated(
+    binding: RemoteTransferBinding,
+    created: RunnerSessionCreated,
+  ): Promise<RemoteExecutionReadyResult> {
+    admittedDirectModelReceipt(this.assignment, created.modelSelection);
+    if (created.modelSelection)
+      return this.deps.registerReady(
+        this.assignment,
+        binding,
+        created.acpSessionRef,
+        created.modelSelection,
+      );
+    return this.deps.registerReady(this.assignment, binding, created.acpSessionRef);
+  }
+
+  private readyMatches(ready: RemoteExecutionReadyResult, binding: RemoteTransferBinding,
+    created: RunnerSessionCreated,
+  ): boolean {
+    return (
+      allEqual([
       [ready.workspaceId, binding.workspaceId], [ready.instanceId, binding.instanceId], [ready.sessionId, binding.sessionId],
       [ready.assignmentId, binding.assignmentId], [ready.attempt, binding.attempt], [ready.agentId, this.assignment.agentRoute.agentId],
-      [ready.acpSessionRef, acpSessionRef], [ready.channelId, this.boundChannelId],
-    ]);
+      [ready.acpSessionRef, created.acpSessionRef], [ready.channelId, this.boundChannelId],
+    ]) && directModelSelectionsEqual(ready.modelSelection, created.modelSelection)
+    );
   }
 
   /** Open the session channel and announce `session_ready`; a delivery resumes any durable output it left. */
@@ -950,7 +1006,8 @@ export class RelayedSession {
     return this.acpSessionRef;
   }
 
-  private async onHolderRequest(ref: string, message: Extract<SessionToRuntimeMessage, { kind: "acp" }>): Promise<void> {
+  private async onHolderRequest(ref: string, message: Extract<SessionToRuntimeMessage, { kind: "acp" }>,
+  ): Promise<void> {
     if (message.params.sessionId !== ref) {
       if ("id" in message) await this.sendToCore({ kind: "acp_error", id: message.id, method: message.method, error: { code: -32602, class: "invalid_params", message: "request session does not match the channel", retryable: false } });
       return;
@@ -965,7 +1022,7 @@ export class RelayedSession {
     // can create any durable request or outbound transcript fact. Keep the
     // later check as well to close a race while input preparation awaits I/O.
     if (request.method === "session/prompt") this.deps.assertPromptAllowed?.();
-    if (!await this.journalReceived(ref, request)) return;
+    if (!(await this.journalReceived(ref, request))) return;
     await this.dispatchHolderRequest(ref, request);
   }
 
@@ -1099,8 +1156,11 @@ export class RelayedSession {
     await this.reportDenied(completion, this.terminalTurnFailure(message, completion));
   }
 
-  private terminalTurnFailure(message: AuthorizedMessage, completion: SessionToCoreMessage | undefined): boolean {
-    return isNativeTurn(this.assignment) && isPromptMessage(message) && completion?.kind === "acp_error";
+  private terminalTurnFailure(message: AuthorizedMessage, completion: SessionToCoreMessage | undefined,
+  ): boolean {
+    return (
+      isNativeTurn(this.assignment) && isPromptMessage(message) && completion?.kind === "acp_error"
+    );
   }
 
   private async reportDenied(completion: SessionToCoreMessage | undefined, terminalTurnFailure: boolean): Promise<void> {
@@ -1114,12 +1174,13 @@ export class RelayedSession {
     }
   }
 
-  private async dispatchAuthorized(context: { gate: NativeExecutionGate; operation: AuthorizedOperation; ref: string }, params: unknown): Promise<void> {
+  private async dispatchAuthorized(context: { gate: NativeExecutionGate; operation: AuthorizedOperation; ref: string }, params: unknown,
+  ): Promise<void> {
     const message = context.operation.envelope.message;
     if (message.kind !== "acp") return this.answerAuthorized(context, message);
     if (message.method === "session/prompt") return this.promptAuthorized(context, message.id, params as PromptParams);
-    if (message.method === "session/set_mode") return void await this.deps.runner.setMode(context.ref, message.id, params);
-    if (message.method === "session/set_config_option") return void await this.deps.runner.setConfigOption(context.ref, message.id, params);
+    if (message.method === "session/set_mode") return void (await this.deps.runner.setMode(context.ref, message.id, params));
+    if (message.method === "session/set_config_option") return void (await this.deps.runner.setConfigOption(context.ref, message.id, params));
     return this.cancelAuthorized(context);
   }
 
@@ -1178,7 +1239,9 @@ export class RelayedSession {
     const reserved = this.promptReservation;
     if (reserved === null || reserved === key) return false;
     const state = this.deps.journal.pendingRequests.get(reserved)?.authorization?.state;
-    return state === "admitted" || (state === "dispatch_started" && this.executionGate?.isDispatching(reserved) === true);
+    return (
+      state === "admitted" || (state === "dispatch_started" && this.executionGate?.isDispatching(reserved) === true)
+    );
   }
 
   /** Deny before dispatch: a known outcome with an ACP error that never reaches the runner. */
@@ -1273,7 +1336,7 @@ export class RelayedSession {
   }
 
   private async onRequestError(event: RunnerEventOf<"request_error">): Promise<void> {
-    if (event.method === "session/prompt" && await this.settledPromptError(event.requestId)) return;
+    if (event.method === "session/prompt" && (await this.settledPromptError(event.requestId))) return;
     const accepted = await this.completeReceived(event.requestId, event.method, { kind: "acp_error", id: event.requestId, method: event.method, error: { code: event.code, class: event.class, message: event.message, retryable: event.retryable } });
     if (accepted && event.method === "session/prompt" && isNativeTurn(this.assignment)) {
       // Say why before the close: its SIGTERM on the bridge was the only
@@ -1627,13 +1690,16 @@ export class RelayedSession {
    * command that never asked is the organisation's admin setting. The
    * connector lists the credential in use first.
    */
-  private async quarantineMessage(governance: HostToolGovernance, bypass: HostToolBypass): Promise<string> {
+  private async quarantineMessage(governance: HostToolGovernance, bypass: HostToolBypass,
+  ): Promise<string> {
     let credentialMethod: string | undefined;
     if (governance.quarantineMessageFor) {
       try { credentialMethod = (await this.deps.runner.readiness()).agent.credentials?.[0]?.method; }
       catch { credentialMethod = undefined; }
     }
-    return governance.quarantineMessageFor?.(bypass, credentialMethod) ?? governance.quarantineMessage;
+    return (
+      governance.quarantineMessageFor?.(bypass, credentialMethod) ?? governance.quarantineMessage
+    );
   }
 
   private async onElicitationRequest(requestId: string, params: CreateElicitationRequest): Promise<void> {
@@ -1975,7 +2041,9 @@ function cancelAnswer(pending: { sanitized: { kind: string } }): unknown {
 }
 
 function continuationReady(receipt: unknown): boolean {
-  return Boolean(receipt) && typeof receipt === "object" && "completion" in (receipt as object) && (receipt as { completion?: unknown }).completion === "native_continuation_ready";
+  return (
+    Boolean(receipt) && typeof receipt === "object" && "completion" in (receipt as object) && (receipt as { completion?: unknown }).completion === "native_continuation_ready"
+  );
 }
 
 type RunnerEventOf<K extends RunnerEvent["kind"]> = Extract<RunnerEvent, { kind: K }>;
@@ -2028,7 +2096,9 @@ function streamedText(update: { sessionUpdate: string; content?: { type?: string
 
 /** A received prompt that carries delivery authority (its output goes through the durable delivery path). */
 function receivedDeliveryPrompt(pending: { direction: string; method: string; authorization?: { claims?: object } | undefined }): boolean {
-  return pending.direction === "received" && pending.method === "session/prompt" && "deliveryIdentity" in (pending.authorization?.claims ?? {});
+  return (
+    pending.direction === "received" && pending.method === "session/prompt" && "deliveryIdentity" in (pending.authorization?.claims ?? {})
+  );
 }
 
 /** The durable completion must be this prompt's result. */

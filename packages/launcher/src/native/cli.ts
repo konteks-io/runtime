@@ -5,6 +5,8 @@ import { isRetiredAgentId, retiredAgentMessage } from "@konteks/backstage-plugin
 import { nativePaths, nativePlatform } from "./service.js";
 import { createOutput, type Output } from "../output.js";
 import { setVerbose } from "../verbose.js";
+import { setupLocale } from "../setup-locale.js";
+import type { SetupForeground } from "../foreground-progress.js";
 
 /**
  * The agents a native runtime runs: Claude Code and Codex from signed
@@ -32,6 +34,7 @@ export interface NativeCliActions {
 
 /** One customer architecture: the native connector. No provider-key or cloud-agent fallback switch. */
 export function createNativeProgram(actions: NativeCliActions): Command {
+  const locale = setupLocale();
   const program = new Command("konteks-remote").description("Konteks on this computer: connect it, run its agents, keep it updated")
     .option("--root <path>", "private user-scoped installation root")
     .option("--json", "machine-readable output", false)
@@ -48,9 +51,10 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     process.stdout.write(`${installedReleaseVersion(root) ?? process.env.KONTEKS_LAUNCHER_VERSION ?? "0.1.0"}\n`);
     process.exit(0);
   });
-  const context = (): NativeCommandContext => {
+  const context = (foreground?: SetupForeground): NativeCommandContext => {
     const options = program.opts<{ root?: string; json: boolean }>();
-    return { root: options.root ?? nativePaths({ os: nativePlatform().os }).root, output: createOutput({ json: options.json }) };
+    return { root: options.root ?? nativePaths({ os: nativePlatform().os }).root, output: createOutput({ json: options.json, locale, ...(foreground ? { foreground } : {}) }),
+    };
   };
   const id = (value: string): string => {
     if (!/^[A-Za-z0-9._-]{8,128}$/.test(value)) throw new InvalidArgumentError("activation id must be an opaque identifier; the code is prompted securely");
@@ -84,14 +88,17 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     .action(async (options: { activationId?: string; enroll: boolean; coreUrl: string; relayUrl: string; agents?: string[] }) => {
       if (!options.activationId && !options.enroll) throw new InvalidArgumentError("install needs either --activation-id or --enroll");
       if (options.activationId && options.enroll) throw new InvalidArgumentError("an activation install and an enrollment install are different doors; choose one");
-      await actions.install({ ...context(), ...options });
-    });
+      await actions.install({ ...context("install"), ...options });
+    },
+    );
   // The conversation the person's own coding agent relays. One
   // step per invocation; the agent runs what the step says and nothing else.
   program.command("onboard").description("connect this machine to Konteks, one question at a time")
     .option("--answer <text>", "the person's answer to the question the previous step asked")
     .option("--repo <path>", "the repository to register as the first System (default: the working directory)")
-    .action(async (options: { answer?: string; repo?: string }) => actions.onboard({ ...context(), ...(options.answer !== undefined ? { answer: options.answer } : {}), ...(options.repo ? { cwd: options.repo } : {}) }));
+    .action(async (options: { answer?: string; repo?: string }) => actions.onboard({ ...context("onboard"), ...(options.answer !== undefined ? { answer: options.answer } : {}), ...(options.repo ? { cwd: options.repo } : {}),
+      }),
+    );
   // The background half of `install --enroll`; `onboard` waits for it.
   program.command("stage-enrollment", { hidden: true }).description("unpack the agent packages an enrollment install recorded")
     .action(async () => actions.stageEnrollment(context()));
@@ -148,7 +155,9 @@ export function createNativeProgram(actions: NativeCliActions): Command {
   program.command("update").description("install the newest connector release and restart; running work finishes first, and a failed start goes back")
     .option("--check", "report the available release without installing anything", false)
     .option("--unattended", "launched by the connector itself; recorded as such in the update ledger", false)
-    .action(async (options: { check: boolean; unattended: boolean }) => actions.update({ ...context(), ...options }));
+    .action(async (options: { check: boolean; unattended: boolean }) => actions.update({ ...context(options.check || options.unattended ? undefined : "update"), ...options,
+      }),
+    );
   // Managed-git key registration is a command on the trusted machine,
   // because the private half must never leave it. The App shows this command.
   const git = program.command("git").description("this computer's key for Konteks-managed repositories");

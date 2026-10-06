@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { lstat, readFile, realpath } from "node:fs/promises";
 import { join, relative, resolve, win32 } from "node:path";
 import { compareAgentVersions, nativeConnectorFileNames } from "@konteks/remote-release";
+import { setupLocale, setupText } from "../setup-locale.js";
 
 /**
  * Set on a command the installed `konteks-remote` handed to a release, so the
@@ -186,6 +187,7 @@ export async function delegateToInstalledRelease(
   input: InstalledReleaseInput & { baked?: readonly string[]; stderr?: Pick<NodeJS.WritableStream, "write"> },
   deps: DelegateDeps = {},
 ): Promise<number | null> {
+  const locale = setupLocale(input.env);
   const target = await installedReleaseLauncher(input);
   if (!target) return null;
   const stderr = input.stderr ?? process.stderr;
@@ -193,6 +195,6 @@ export async function delegateToInstalledRelease(
     stderr.write(`[verbose] running the installed release ${target.bundleVersion}: ${target.executable}\n`);
   }
   const code = await (deps.run ?? runInstalledRelease)(target.executable, input.args, { env: launcherChildEnv(input.env, input.baked ?? []) });
-  if (code === null) stderr.write(`konteks-remote: could not start the installed release ${target.bundleVersion}; running this installer's own copy instead.\n`);
+  if (code === null) stderr.write(`${setupText("launcherDelegateFailed", { version: target.bundleVersion }, locale)}\n`);
   return code;
 }

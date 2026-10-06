@@ -1,7 +1,8 @@
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { lstat, mkdtemp, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { resolveNativeCodexHome } from "@konteks/remote-supervisor";
 import { closeAgentSetup, ensurePersonalAgent, setUpPersonalAgent, type AgentClosingDeps, type AgentSetupDeps, type AgentState } from "../native/agent-setup.js";
 import { createOutput } from "../output.js";
 
@@ -123,7 +124,12 @@ describe("setting up a missing Claude Code or Codex", () => {
     expect(deps.questions).toHaveLength(1);
     expect(deps.questions[0]).toMatch(/nothing is downloaded/i);
     expect(deps.runs).toEqual([]);
-    expect((await stat(home)).mode & 0o777).toBe(0o700);
+    const info = await lstat(home);
+    expect(info.isDirectory()).toBe(true);
+    expect(info.isSymbolicLink()).toBe(false);
+    expect(await resolveNativeCodexHome({ CODEX_HOME: home }, root)).toBe(await realpath(home));
+    // Windows stat.mode is not a DACL check; its resolver proves a canonical, stable directory.
+    if (process.platform !== "win32") expect(info.mode & 0o777).toBe(0o700);
   });
 
   it("agent add without a terminal names the platform's installer and the command to run after it", async () => {

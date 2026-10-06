@@ -561,6 +561,90 @@ describe("relayed session", () => {
       source: { kind: "direct_session", portability: "instance_bound", ownerInstanceId: "inst", sessionId: "s", turnRef: "turn-2", acpSessionRef: "acp-0" } };
     const options = [{ optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" }];
 
+    const modelSelection = {
+      configId: "model",
+      requestedValue: "requested-model",
+      effectiveValue: "actual-default",
+      resolution: "default_if_unoffered" as const,
+    };
+    const policyWork = {
+      ...directWork,
+      requiredCapabilities: ["direct-model-fallback.v1"],
+      agentRoute: { ...directWork.agentRoute, sessionConfig: { model: "requested-model" } },
+      source: {
+        ...directWork.source,
+        modelSelectionPolicy: {
+          kind: "same_agent_default_if_unoffered",
+          configId: "model",
+          requestedValue: "requested-model",
+        },
+      },
+    } as RemoteWorkAssignment;
+
+    it("refuses new model policy before preparation and provider effects unless signed Core 7.4 is accepted", async () => {
+      const prepareInputs = vi.fn();
+      const f = await build(
+        {
+          prepareInputs,
+          directModelSelectionSupported: () => false,
+        } as Partial<RelayedSessionDeps>,
+        policyWork,
+      );
+      try {
+        await expect(f.session.bootstrap()).rejects.toThrow();
+        expect(prepareInputs).not.toHaveBeenCalled();
+        expect(f.runner.createSession).not.toHaveBeenCalled();
+        expect(f.sent).toEqual([]);
+      } finally { await f.session.close("cancelled"); }
+    });
+
+    it("passes only admitted direct authority to the runner and its exact receipt to Core before announcing ready", async () => {
+      const registerReady = vi.fn(async () => ({
+        workspaceId: "ws",
+        instanceId: "inst",
+        sessionId: "s",
+        channelId: "session:s",
+        assignmentId: "asg",
+        attempt: 1,
+        claimId: "claim",
+        recoveryEpoch: 0,
+        runnerIncarnation: "runner-process",
+        agentId: "claude-code",
+        acpSessionRef: "acp-1",
+        readyRevision: 1,
+        registeredAt: clock.nowIso(),
+        modelSelection,
+      }));
+      const f = await build(
+        { registerReady, directModelSelectionSupported: () => true } as Partial<RelayedSessionDeps>,
+        policyWork,
+      );
+      vi.mocked(f.runner.createSession).mockResolvedValue({
+        acpSessionRef: "acp-1",
+        resumed: false,
+        capabilities: { forkSession: false, sessionResume: true },
+        modelSelection,
+      } as never);
+      try {
+        await f.session.bootstrap();
+        expect(f.runner.createSession).toHaveBeenCalledWith(
+          expect.objectContaining({
+            modelSelectionPolicy: (policyWork.source as { modelSelectionPolicy: unknown })
+              .modelSelectionPolicy,
+          }),
+          undefined,
+        );
+        expect(registerReady).toHaveBeenCalledWith(
+          policyWork,
+          expect.objectContaining({ sessionId: "s" }),
+          "acp-1",
+          modelSelection,
+        );
+        expect(f.sent[0]?.body).toMatchObject({ kind: 'session_ready', readyRevision: 1 });
+        expect(f.runner.prompt).not.toHaveBeenCalled();
+      } finally { await f.session.close("cancelled"); }
+    });
+
     it("gives the agent nothing of Konteks: no platform tools even when named, no result tool, no preview; it continues its own transcript", async () => {
       const redeemCapabilityToken = vi.fn(async () => { throw new Error("a direct session never redeems platform tools"); });
       const preview = { start: vi.fn(), stop: vi.fn(), status: vi.fn(), touch: vi.fn(), permit: vi.fn() };

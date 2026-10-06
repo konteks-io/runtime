@@ -10,6 +10,7 @@ import { acquireNativeRootLock, hostAgentInstallAdapter, loadNativeInstallation,
 import { addNativeAgent, installNative, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, removeNativeAgent, restoreNativeRecord } from "../native/install.js";
 import { startNativeConnector } from "../native/commands.js";
 import { createOutput } from "../output.js";
+import { terminalFetchConsent } from "../native/consent.js";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
 import { resolveBridgeSpawnSpec, resolveToolingCommand, resolveBridgeFamily } from "@konteks/remote-agent-runner";
 
@@ -99,6 +100,20 @@ describe("native install composition", () => {
     expect(await addNativeAgent({ root: f.root, agentId: "codex", output: f.options.output, deps: f.options.deps } as never)).toEqual(added);
     expect(f.fetchFn).not.toHaveBeenCalled();
   });
+  it("presents an Indonesian signed install while keeping its native record language-independent", async () => {
+    const f = await fixture();
+    vi.stubEnv("KONTEKS_SETUP_LOCALE", "id");
+    const lines: string[] = [];
+    const output = createOutput({ json: false, stdout: { write: (text: string) => { lines.push(text.trimEnd()); return true; } } as never });
+    const record = await installNative({ ...f.options, output } as never);
+    expect(lines[0]).toBe("Menghubungkan komputer ini ke Konteks. Ketik kode sekali pakai dari situs.");
+    expect(lines).toContain("Kode diterima. Mengekstrak agen di komputer ini; proses ini memerlukan sekitar satu menit.");
+    expect(lines.at(-1)).toBe("Terpasang. Selanjutnya, Konteks akan dimulai di komputer ini.");
+    expect(record.bundleVersion).toBe("1.1.0");
+    expect(JSON.stringify(record)).not.toMatch(/KONTEKS_SETUP_LOCALE|setupLocale|locale/);
+    expect(await readFile(join(f.root, "native-runtime.json"), "utf8")).not.toContain("KONTEKS_SETUP_LOCALE");
+  });
+
   it("moves a stopped installation off a port owned by another process without changing durable identity or work", async () => {
     const f = await fixture();
     const holder = createServer();
@@ -550,6 +565,38 @@ describe("native install composition", () => {
       expect(fetch).not.toHaveBeenCalled();
     } finally { locate.mockRestore(); fetch.mockRestore(); }
   });
+  it.each([
+    ["en", "Downloading Google Antigravity from Google and checking Google's signature; this takes a minute or two."],
+    ["id", "Mengunduh Google Antigravity dari Google dan memeriksa tanda tangan Google; proses ini memerlukan satu atau dua menit."],
+  ] as const)("presents %s fetched-agent setup after the person's consent and preserves the signed-install record", async (locale, progress) => {
+    const f = await fixture();
+    vi.stubEnv("KONTEKS_SETUP_LOCALE", locale);
+    const adapter = hostAgentInstallAdapter("antigravity")!;
+    const folder = join(f.root, "agents", "antigravity", "1.2.1-darwin-arm64");
+    const fields = { antigravityVersion: "1.2.1", antigravityRoot: folder };
+    const lines: string[] = [];
+    const output = createOutput({ json: false, stdout: { write: (text: string) => { lines.push(text.trimEnd()); return true; } } as never });
+    let fetched = false;
+    const spies = [
+      vi.spyOn(adapter, "assertFetchable").mockImplementation(() => undefined),
+      vi.spyOn(adapter, "locate").mockImplementation(async () => { if (!fetched) throw new Error("not fetched"); return fields; }),
+      vi.spyOn(adapter, "fetch").mockImplementation(async request => { expect(request).toEqual({ root: f.root, consent: true }); fetched = true; await mkdir(folder, { recursive: true, mode: 0o700 }); return fields; }),
+      vi.spyOn(adapter, "runnerSettings").mockImplementation(async record => {
+        if (record.antigravityRoot !== folder || !fetched) throw new Error("does not verify");
+        return { RUNNER_NATIVE_ANTIGRAVITY_ROOT: folder, RUNNER_BRIDGE_PREFIX: folder, RUNNER_BRIDGE_VERSION: "1.2.1" };
+      }),
+    ];
+    try {
+      const consent = terminalFetchConsent({ yes: true, locale, line: text => output.line(text) });
+      const record = await installNative({ ...f.options, agents: ["codex", "antigravity"], output, deps: { ...f.options.deps, consent } } as never);
+      expect(lines).toContain(progress);
+      expect(lines.indexOf(progress)).toBeGreaterThan(1);
+      expect(record).toMatchObject({ agents: ["codex", "antigravity"], ...fields });
+      expect(f.activate).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(record)).not.toMatch(/KONTEKS_SETUP_LOCALE|setupLocale|locale/);
+    } finally { for (const spy of spies) spy.mockRestore(); }
+  });
+
   it("installs, adds and removes Google Antigravity only on the person's yes, never consuming an activation on a no", async () => {
     const f = await fixture();
     const adapter = hostAgentInstallAdapter("antigravity")!;

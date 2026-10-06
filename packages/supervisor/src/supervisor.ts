@@ -13,6 +13,8 @@ import {
   ON_COMPUTER_LOGIN_OPTION,
   REMOTE_AGENT_LOGIN_ON_COMPUTER_CAPABILITY,
   REMOTE_RUNTIME_UPDATE_CAPABILITY,
+  REMOTE_DIRECT_MODEL_FALLBACK_MIN_CORE_CONTRACT_VERSION,
+  allEqual,
   SystemClock,
   createLogger,
   parseRfc3339,
@@ -407,7 +409,7 @@ export class Supervisor {
     if (knownIdentity && !existingKey) {
       throw new RemoteInstanceError("install_state_corrupt", MACHINE_KEY_LOST);
     }
-    this.key = existingKey ?? await this.store.loadOrCreateInstanceKey();
+    this.key = existingKey ?? (await this.store.loadOrCreateInstanceKey());
   }
 
   /** The stored activation, with its signed release verified against the installed one. */
@@ -485,7 +487,7 @@ export class Supervisor {
     // The QA browser is the connector's, not an agent package's: every
     // agent's sessions get it when an installed Claude Code or Codex package
     // carries it and some Node can run it.
-    this.connectorBrowser = native.browser ?? await resolveConnectorBrowser(native.runners);
+    this.connectorBrowser = native.browser ?? (await resolveConnectorBrowser(native.runners));
     if (this.connectorBrowser.available) {
       this.logger.info({ event: "browser.connector_ready", packageAgent: this.connectorBrowser.browser.packageAgent, nodeSource: this.connectorBrowser.browser.nodeSource }, "the QA browser is available to every agent on this computer");
     } else {
@@ -569,8 +571,9 @@ export class Supervisor {
       },
       // OpenCode's routes bill by provider and credential; only a
       // 7.1.0 Core takes the field (the shape is strict and digested).
-      optionBilling: (agentId, value, agent) => (!this.hostSettings.coreAcceptsRouteBilling ? undefined
-        : agentId === "opencode" ? openCodeOptionBilling(agent, value) : agentId === "antigravity" ? antigravityOptionBilling(agent) : undefined),
+      optionBilling: (agentId, value, agent) =>
+        !this.hostSettings.coreAcceptsRouteBilling ? undefined
+        : agentId === "opencode" ? openCodeOptionBilling(agent, value) : agentId === "antigravity" ? antigravityOptionBilling(agent) : undefined,
     });
   }
 
@@ -630,7 +633,8 @@ export class Supervisor {
       relayUrl,
       instanceId: () => this.instanceId ?? "",
       runnerIncarnation: () => this.runnerIncarnation,
-      appliedManifestId: () => this.recoveryAuthority() ? this.journal.recovery.current(this.instanceId ?? "", this.runnerIncarnation)?.manifest?.manifestId ?? null : null,
+      appliedManifestId: () => this.recoveryAuthority() ? (this.journal.recovery.current(this.instanceId ?? "", this.runnerIncarnation)?.manifest?.manifestId ?? null)
+          : null,
       lease: () => this.lease.current()?.lease ?? null,
       key: () => this.key,
       clock: this.clock,
@@ -775,8 +779,10 @@ export class Supervisor {
 
   /** Not stopping, and still the same state ownership, lease, identity and incarnation. */
   private ownerUnchanged(owner: CapturedOwner): boolean {
-    return !this.stopping && this.nativeOwnership === owner.ownership && this.lease.current() === owner.lease &&
-      this.instanceId === owner.instanceId && this.workspaceId === owner.workspaceId && this.runnerIncarnation === owner.runnerIncarnation;
+    return (
+      !this.stopping && this.nativeOwnership === owner.ownership && this.lease.current() === owner.lease &&
+      this.instanceId === owner.instanceId && this.workspaceId === owner.workspaceId && this.runnerIncarnation === owner.runnerIncarnation
+    );
   }
 
   private receiveRuntimeUpdate(request: RelayRequestOf<"onRuntimeUpdate">, connection: RelayConnectionOf<"onRuntimeUpdate">, verifier: CoreSignatureVerifier): Promise<void> {
@@ -793,26 +799,45 @@ export class Supervisor {
     const claims = decodeLeaseClaims(owner.lease.lease, { instanceId: owner.instanceId, audience: LEASE_AUDIENCE });
     return { instanceId: owner.instanceId, tenantId: owner.workspaceId, leaseId: claims.jti,
       runnerIncarnation: owner.runnerIncarnation, connectionEpoch: connection.connectionEpoch, leaseExpiresAt: owner.lease.expiresAt,
-      assertCurrent: () => this.assertRuntimeUpdateOwner(owner, accepted, connection) };
+      assertCurrent: () => this.assertRuntimeUpdateOwner(owner, accepted, claims, connection) };
   }
 
-  private assertRuntimeUpdateOwner(owner: CapturedOwner, accepted: string, connection: RelayConnectionOf<"onRuntimeUpdate">): void {
+  private assertRuntimeUpdateOwner(owner: CapturedOwner, accepted: string, claims: ReturnType<typeof decodeLeaseClaims>, connection: RelayConnectionOf<"onRuntimeUpdate">): void {
     connection.assertCurrent();
-    this.assertRuntimeUpdateAuthority(owner, accepted);
+    if (claims.lease_mode !== "active" || claims.administrative_status !== "active") {
+      throw new RemoteInstanceError("recovery_required", "Runtime update admission requires an active owner.");
+    }
+    this.assertRuntimeUpdateAuthority(owner, accepted, claims);
   }
 
-  private assertRuntimeUpdateAuthority(owner: CapturedOwner, accepted: string): void {
-    if (!this.ownerUnchanged(owner) || !this.leaseUsable() || this.recoveryAuthority() !== accepted) {
+  private assertRuntimeUpdateAuthority(owner: CapturedOwner, accepted: string, claims: ReturnType<typeof decodeLeaseClaims>): void {
+    if (!this.runtimeUpdateOwnerUnchanged(owner) || !this.runtimeUpdateLeaseUnchanged(owner, claims) || this.recoveryAuthority() !== accepted) {
       throw new RemoteInstanceError("recovery_required", "Runtime update ownership is no longer current.");
     }
     owner.ownership?.assertOwned();
   }
 
+  /** Update admission may span normal heartbeats; its process and root may not change. */
+  private runtimeUpdateOwnerUnchanged(owner: CapturedOwner): boolean {
+    return !this.stopping && owner.ownership !== null && this.nativeOwnership === owner.ownership &&
+      this.instanceId === owner.instanceId && this.workspaceId === owner.workspaceId && this.runnerIncarnation === owner.runnerIncarnation;
+  }
+
+  /** Only a usable renewal of the captured policy can retain update/report ownership. */
+  private runtimeUpdateLeaseUnchanged(owner: CapturedOwner, captured: ReturnType<typeof decodeLeaseClaims>): boolean {
+    const current = this.lease.current();
+    if (!current || !owner.instanceId || !this.leaseUsable()) return false;
+    const claims = decodeLeaseClaims(current.lease, { instanceId: owner.instanceId, audience: LEASE_AUDIENCE });
+    if (!sameLeaseRecord(current, leaseRecordFromClaims(current.lease, claims)) || current.workspaceId !== owner.workspaceId) return false;
+    return sameRuntimeUpdateLeasePolicy(captured, claims);
+  }
+
   private captureRuntimeUpdateReportOwner(): () => void {
     const owner = this.captureOwner();
     const accepted = this.recoveryAuthority();
-    if (!accepted) throw new RemoteInstanceError("recovery_required", "Runtime update reporting ownership is unavailable.");
-    const assertCurrent = () => this.assertRuntimeUpdateAuthority(owner, accepted);
+    if (!accepted || !owner.lease || !owner.instanceId) throw new RemoteInstanceError("recovery_required", "Runtime update reporting ownership is unavailable.");
+    const claims = decodeLeaseClaims(owner.lease.lease, { instanceId: owner.instanceId, audience: LEASE_AUDIENCE });
+    const assertCurrent = () => this.assertRuntimeUpdateAuthority(owner, accepted, claims);
     assertCurrent();
     return assertCurrent;
   }
@@ -975,7 +1000,7 @@ export class Supervisor {
         logger: this.logger,
         client: () => new NativeOutputClient({
           baseUrl: this.config.SUPERVISOR_CORE_URL, clock: this.clock,
-          credential: () => this.lease.mode() === "active" ? this.lease.current()?.lease ?? null : null,
+          credential: () => this.lease.mode() === "active" ? (this.lease.current()?.lease ?? null) : null,
         }),
       }),
       headroom: () => this.headroom(),
@@ -990,6 +1015,11 @@ export class Supervisor {
         journal: this.journal,
         transport: this.transport,
         runner,
+        directModelSelectionSupported: () =>
+          coreContractAtLeast(
+            this.coreContractVersion,
+            REMOTE_DIRECT_MODEL_FALLBACK_MIN_CORE_CONTRACT_VERSION,
+          ),
         onTurnActivity: () => this.nudgeHeartbeat(),
         preview: this.sessionPreviewAccess(),
         policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => this.configuration.humanDeferralAllowed && assignment.policy.humanDeferralAllowed),
@@ -1018,6 +1048,11 @@ export class Supervisor {
         registerReady: createNativeReadyRegistrar({
           clock: this.clock, journal: this.journal, client: this.core,
           instanceId: this.instanceId ?? "", workspaceId: this.workspaceId ?? "", runnerIncarnation: this.runnerIncarnation,
+          directModelSelectionSupported: () =>
+            coreContractAtLeast(
+              this.coreContractVersion,
+              REMOTE_DIRECT_MODEL_FALLBACK_MIN_CORE_CONTRACT_VERSION,
+            ),
           assertActive: () => {
             if (this.stopping || !this.nativeOwnership || this.lease.mode() !== "active") throw new RemoteInstanceError("capability_unavailable", "Native readiness requires an active owned instance.");
             this.nativeOwnership.assertOwned();
@@ -1037,11 +1072,11 @@ export class Supervisor {
             : {}),
           client: () => new NativeInputClient({
             baseUrl: this.config.SUPERVISOR_CORE_URL, roots: this.roots, clock: this.clock,
-            credential: () => this.lease.mode() === "active" ? this.lease.current()?.lease ?? null : null,
+            credential: () => this.lease.mode() === "active" ? (this.lease.current()?.lease ?? null) : null,
           }),
           outputClient: () => new NativeOutputClient({
             baseUrl: this.config.SUPERVISOR_CORE_URL, clock: this.clock,
-            credential: () => this.lease.mode() === "active" ? this.lease.current()?.lease ?? null : null,
+            credential: () => this.lease.mode() === "active" ? (this.lease.current()?.lease ?? null) : null,
           }),
           claimId: target => this.activeClaimId(target),
         }),
@@ -1164,22 +1199,25 @@ export class Supervisor {
       withLeaseAcquisition: operation => this.withLeaseAcquisition(operation),
       onFailure: error => this.onHeartbeatFailure(error),
       inventory: this.inventory,
-      onInventory: agents => {
-        this.modelCapabilities?.invalidateForAgents(agents);
-        void this.modelCapabilities?.refresh(agents).catch(error => this.logger.warn({ err: error }, "native model capability refresh failed"));
+      onInventory: (snapshot) => {
+        this.lastSnapshot = snapshot;
+        this.modelCapabilities?.invalidateForAgents(snapshot.agents);
+        void this.modelCapabilities?.refresh(snapshot.agents).catch(error => this.logger.warn({ err: error }, "native model capability refresh failed"),
+          );
       },
       roleBindings: () => this.roleBindings,
       activeAssignmentIds: () => this.work.activeAssignmentIds(),
       modelCapabilitySnapshots: () => this.modelCapabilities?.snapshots() ?? [],
       supportedAgents: agents => this.supportedAgents(agents),
       // The commands this release carries, only to a Core that takes 7.1 fields.
-      connectorCommands: () => (this.hostSettings.coreAcceptsRouteBilling ? this.connectorCommands() : undefined),
+      connectorCommands: () =>
+        this.hostSettings.coreAcceptsRouteBilling ? this.connectorCommands() : undefined,
       configRevision: () => this.control.configRevision,
       bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION,
       softMaxConcurrent: () => this.configuration.softMaxConcurrent ?? this.config.SUPERVISOR_SOFT_MAX_CONCURRENT,
       acceptingWork: () => !this.draining && !this.onUpdateProbation && this.lease.canPullNewWork() && this.reconciliation.isComplete,
       intervalSeconds: () => this.heartbeatIntervalSeconds ?? this.configuration.heartbeatIntervalSeconds,
-      renewalDelayMs: () => this.lease.current() ? this.lease.nextRenewalDelayMs() : 5000,
+      renewalDelayMs: () => (this.lease.current() ? this.lease.nextRenewalDelayMs() : 5000),
     });
   }
 
@@ -1485,13 +1523,17 @@ export class Supervisor {
    * incarnation that establishes through the ordinary path, so restart.
    */
   private retiredByCore(error: unknown, terminal: boolean): boolean {
-    return this.administrativeStatus !== "revoked" && !remoteErrorCodeIn(error, REVOKED_CODES) &&
-      (terminal || remoteErrorCodeIn(error, RETIRED_CODES));
+    return (
+      this.administrativeStatus !== "revoked" && !remoteErrorCodeIn(error, REVOKED_CODES) &&
+      (terminal || remoteErrorCodeIn(error, RETIRED_CODES))
+    );
   }
 
   /** A revoked or retired runtime is never retried in place. */
   private refusedForGood(error: unknown): boolean {
-    return this.administrativeStatus === "revoked" || remoteErrorCodeIn(error, [...REVOKED_CODES, ...RETIRED_CODES]);
+    return (
+      this.administrativeStatus === "revoked" || remoteErrorCodeIn(error, [...REVOKED_CODES, ...RETIRED_CODES])
+    );
   }
 
   private armRecoveryRetry(): void {
@@ -2527,7 +2569,8 @@ export class Supervisor {
    * then that it worked once the agent reads ready. A cancel stops the watch;
    * the window is the person's to close.
    */
-  private async startOnComputer(instanceId: string, loginId: string, agentId: OnComputerAgent, action: "start" | "cancel"): Promise<void> {
+  private async startOnComputer(instanceId: string, loginId: string, agentId: OnComputerAgent, action: "start" | "cancel",
+  ): Promise<void> {
     const report = this.onComputerReporter(instanceId, loginId, agentId);
     if (action === "cancel") { await this.stopOnComputerWatch(loginId); return; }
     if (this.onComputerWatches.has(loginId)) return;
@@ -2536,7 +2579,7 @@ export class Supervisor {
     if (onComputerDone(facts.state)) { await report({ state: "succeeded" }); return; }
     const plan = onComputerPlan(agentId, facts);
     if (!plan) { await report({ state: "failed", failure: "unavailable" }); return; }
-    if (!await this.openOnComputerStep(loginId, agentId, plan)) {
+    if (!(await this.openOnComputerStep(loginId, agentId, plan))) {
       await report({ state: "failed", failure: "unavailable" });
       return;
     }
@@ -2775,7 +2818,7 @@ export class Supervisor {
       ...(antigravity ? { antigravity } : {}),
       ...(this.updates ? { updateChannel: this.updateChannelReport() } : {}),
     };
-    return runDoctor({ ...inputs, ...await this.doctorLauncher() });
+    return runDoctor({ ...inputs, ...(await this.doctorLauncher()) });
   }
 
   private doctorState(snapshot: InventorySnapshot) {
@@ -2859,7 +2902,9 @@ export class Supervisor {
 
   /** A retried Google Antigravity is updating when the installation marks its left-out copy so. */
   private antigravityUpdating(): boolean {
-    return this.options.native?.unavailableAgents?.some(entry => entry.agentId === "antigravity" && entry.updating === true) === true;
+    return (
+      this.options.native?.unavailableAgents?.some(entry => entry.agentId === "antigravity" && entry.updating === true) === true
+    );
   }
 
   /**
@@ -3062,10 +3107,12 @@ export class Supervisor {
     const staleMs = probation.staleAttemptMs ?? 45 * 60_000;
     const checking = async (): Promise<boolean> => {
       const ledger = await probation.readLedger().catch(() => null);
-      return ledger?.attempts.some(attempt => attempt.outcome === "in_progress" && attempt.releaseId === probation.releaseId &&
-        Date.now() - Date.parse(attempt.startedAt) < staleMs) ?? false;
+      return (
+        ledger?.attempts.some(attempt => attempt.outcome === "in_progress" && attempt.releaseId === probation.releaseId &&
+        Date.now() - Date.parse(attempt.startedAt) < staleMs) ?? false
+      );
     };
-    if (!await checking()) return;
+    if (!(await checking())) return;
     this.onUpdateProbation = true;
     this.logger.info({ event: "update.probation_started", releaseId: probation.releaseId }, "an update is checking this release; it takes no new work until the update keeps it");
     let reading = false;
@@ -3112,11 +3159,15 @@ type AgentLoginReport = Parameters<CoreClient["reportAgentLogin"]>[1];
 type SiteLoginAgent = "codex" | "claude-code" | "opencode" | "antigravity";
 
 function isSiteLoginAgent(agentId: string): agentId is SiteLoginAgent {
-  return agentId === "codex" || agentId === "claude-code" || agentId === "opencode" || agentId === "antigravity";
+  return (
+    agentId === "codex" || agentId === "claude-code" || agentId === "opencode" || agentId === "antigravity"
+  );
 }
 
 function isOnComputerLogin(intent: AgentLoginIntent): boolean {
-  return intent.loginOption === ON_COMPUTER_LOGIN_OPTION && (ON_COMPUTER_AGENTS as readonly string[]).includes(intent.agentId);
+  return (
+    intent.loginOption === ON_COMPUTER_LOGIN_OPTION && (ON_COMPUTER_AGENTS as readonly string[]).includes(intent.agentId)
+  );
 }
 
 type SiteLoginSelection = ReturnType<typeof siteLoginSelection>;
@@ -3144,11 +3195,14 @@ function siteLoginRefused(agentId: SiteLoginAgent, site: SiteLoginSelection, run
 
 function siteLoginOptionRefused(site: SiteLoginSelection, runner: RunnerPort): boolean {
   if (site.requestedOption !== undefined && !site.requestedOption.success) return true;
-  return site.loginOption !== undefined && !(runner.siteLoginOptions?.() ?? []).includes(site.loginOption);
+  return (
+    site.loginOption !== undefined && !(runner.siteLoginOptions?.() ?? []).includes(site.loginOption)
+  );
 }
 
 function antigravityLoginIncomplete(agentId: SiteLoginAgent, site: SiteLoginSelection): boolean {
-  return agentId === "antigravity" && (site.loginOption === undefined || (site.loginOption === "gemini-enterprise" && site.gcp === undefined));
+  return (
+    agentId === "antigravity" && (site.loginOption === undefined || (site.loginOption === "gemini-enterprise" && site.gcp === undefined)));
 }
 
 function onComputerPlan(agentId: OnComputerAgent, facts: { state: Parameters<typeof planOnComputer>[0]["state"]; installCommand?: string | undefined; windowsInstallCommand?: string | undefined }): OnComputerPlan | null {
@@ -3189,7 +3243,9 @@ type AppliedRecovery = RuntimeRecoveryRecord & {
 };
 
 function appliedRecovery(recovery: RuntimeRecoveryRecord | undefined): recovery is AppliedRecovery {
-  return recovery?.state === "applied" && Boolean(recovery.manifest) && Boolean(recovery.receipt) && Boolean(recovery.acceptedAt);
+  return (
+    recovery?.state === "applied" && Boolean(recovery.manifest) && Boolean(recovery.receipt) && Boolean(recovery.acceptedAt)
+  );
 }
 
 function heartbeatDrainDeadline(result: HeartbeatResult): number | undefined {
@@ -3197,9 +3253,12 @@ function heartbeatDrainDeadline(result: HeartbeatResult): number | undefined {
 }
 
 /** The heartbeat's lease metadata matches the claims of the lease it carries. */
-function heartbeatMatchesClaims(result: HeartbeatResult, claims: ReturnType<typeof decodeLeaseClaims>, instanceId: string | null): boolean {
-  return result.instanceId === instanceId && result.leaseMode === claims.lease_mode &&
-    parseRfc3339(result.leaseExpiresAt) === claims.exp * 1000 && heartbeatDrainDeadline(result) === claims.drain_deadline;
+function heartbeatMatchesClaims(result: HeartbeatResult, claims: ReturnType<typeof decodeLeaseClaims>, instanceId: string | null,
+): boolean {
+  return (
+    result.instanceId === instanceId && result.leaseMode === claims.lease_mode &&
+    parseRfc3339(result.leaseExpiresAt) === claims.exp * 1000 && heartbeatDrainDeadline(result) === claims.drain_deadline
+  );
 }
 
 /** One outbox key per directive, rotation or acknowledged version of a control ACK. */
@@ -3232,17 +3291,34 @@ function drainDeadlineMs(drainDeadline: string | null): number | null {
 }
 
 /** The stored lease's metadata matches the record its decoded claims make. */
-function sameLeaseRecord(stored: StoredLease, expected: ReturnType<typeof leaseRecordFromClaims>): boolean {
-  return stored.mode === expected.mode &&
+function sameLeaseRecord(stored: StoredLease, expected: ReturnType<typeof leaseRecordFromClaims>,
+): boolean {
+  return (
+    stored.mode === expected.mode &&
     Date.parse(stored.expiresAt) === Date.parse(expected.expiresAt) &&
     Date.parse(stored.issuedAt) === Date.parse(expected.issuedAt) &&
-    drainDeadlineMs(stored.drainDeadline) === drainDeadlineMs(expected.drainDeadline);
+    drainDeadlineMs(stored.drainDeadline) === drainDeadlineMs(expected.drainDeadline)
+  );
+}
+
+/** A new token/expiry alone does not change a captured managed update's policy. */
+function sameRuntimeUpdateLeasePolicy(captured: ReturnType<typeof decodeLeaseClaims>, current: ReturnType<typeof decodeLeaseClaims>): boolean {
+  return current.iat >= captured.iat &&
+    allEqual([
+      [captured.sub, current.sub], [captured.workspace_id, current.workspace_id],
+      [captured.protocol, current.protocol], [captured.bundle_version, current.bundle_version],
+      [captured.ownership_scope, current.ownership_scope], [captured.administrative_status, current.administrative_status],
+      [captured.lease_mode, current.lease_mode],
+      [captured.drain_deadline, current.drain_deadline],
+    ]);
 }
 
 /** The journal entry is still the live claim of exactly this assignment's placement, kind and agent. */
 function claimMatchesTarget(entry: JournalEntry, target: RemoteWorkAssignment): boolean {
-  return entry.workspaceId === target.workspaceId && entry.placementId === target.placementId && entry.kind === target.kind &&
-    entry.agentId === target.agentRoute.agentId && ["claimed", "running", "checkpointed"].includes(entry.state);
+  return (
+    entry.workspaceId === target.workspaceId && entry.placementId === target.placementId && entry.kind === target.kind &&
+    entry.agentId === target.agentRoute.agentId && ["claimed", "running", "checkpointed"].includes(entry.state)
+  );
 }
 
 function stopInterval(timer: NodeJS.Timeout | null): void {

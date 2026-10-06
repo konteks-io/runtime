@@ -69,10 +69,90 @@ describe("bridge spawn spec", () => {
     const profile = offlineFixture().profile;
     const config = { ...RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "codex" }), RUNNER_NATIVE_PACKAGE_PROFILE: { ...profile, codexLocalProxy: { version: 1 as const, entrypoint: "konteks/proxy.js" } }, RUNNER_NATIVE_CODEX_HOME: "/operator/.codex", RUNNER_NATIVE_CODEX_SOCKET: "/operator/.codex/private/control.sock" };
     const env = bridgeEnvironment(config, findAgentBridge("codex")!);
-    expect(env.CODEX_PATH).toBe("/opt/konteks/bridges/konteks/proxy.js");
+    expect(env.CODEX_PATH).toBe(join(config.RUNNER_BRIDGE_PREFIX, "konteks", "proxy.js"));
     expect(env.KONTEKS_NATIVE_CODEX_SOCKET).toBe(config.RUNNER_NATIVE_CODEX_SOCKET);
     expect(() => bridgeEnvironment({ ...config, RUNNER_NATIVE_PACKAGE_PROFILE: profile }, findAgentBridge("codex")!)).toThrow(/signed native proxy/);
     expect(() => bridgeEnvironment({ ...config, RUNNER_NATIVE_CODEX_SOCKET: "ws://remote" }, findAgentBridge("codex")!)).toThrow(/absolute local socket/);
+  });
+
+  it.each([
+    ["amd64", "x64", "x86_64-pc-windows-msvc"],
+    ["arm64", "arm64", "aarch64-pc-windows-msvc"],
+  ])(
+    "uses the signed top-level Windows Codex executable for ACP (%s), not the bridge's older dependency",
+    (architecture, packageArch, triple) => {
+      vi.stubEnv("CODEX_PATH", "/inherited/untrusted-codex.exe");
+      const nativePath = `node_modules/@openai/codex-win32-${packageArch}/vendor/${triple}/bin/codex.exe`;
+      const nestedPath = `node_modules/@agentclientprotocol/codex-acp/${nativePath}`;
+      const fixture = offlineFixture("windows", architecture);
+      const inventoryFile = { digest: `sha256:${"a".repeat(64)}`, sizeBytes: 1, executable: true };
+      const profile = {
+        ...fixture.profile,
+        tooling: {
+          package: "@openai/codex",
+          version: "0.159.0",
+          entrypoint: "node_modules/@openai/codex/bin/codex.js",
+          runtime: "node" as const,
+        },
+        files: [
+          ...fixture.profile.files,
+          { ...inventoryFile, path: nestedPath },
+          { ...inventoryFile, path: nativePath },
+        ],
+      };
+      const config = {
+        ...RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "codex" }),
+        RUNNER_NATIVE_PACKAGE_PROFILE: profile,
+        RUNNER_BRIDGE_PREFIX: join(tmpdir(), "signed Codex package"),
+        RUNNER_NATIVE_CODEX_HOME: join(tmpdir(), "operator", ".codex"),
+      };
+      const spec = resolveBridgeSpawnSpec(config as never);
+      expect(spec.env.CODEX_PATH).toBe(join(config.RUNNER_BRIDGE_PREFIX, ...nativePath.split("/")));
+      expect(spec.env.KONTEKS_NATIVE_CODEX_SOCKET).toBeUndefined();
+      expect(spec.env.CODEX_PATH).not.toContain("codex-acp");
+      // The nested dependency alone cannot satisfy the signed top-level tooling selection.
+      expect(() =>
+        resolveBridgeSpawnSpec({
+          ...config,
+          RUNNER_NATIVE_PACKAGE_PROFILE: {
+            ...profile,
+            files: profile.files.filter((file) => file.path !== nativePath),
+          },
+        } as never),
+      ).toThrow(/signed.*Codex|Codex.*signed/);
+    },
+  );
+
+  it("selects an inventoried native Windows Codex entrypoint and leaves Unix socket selection unchanged", () => {
+    const profile = offlineFixture("windows", "amd64").profile;
+    const config = {
+      ...RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "codex" }),
+      RUNNER_NATIVE_PACKAGE_PROFILE: profile,
+      RUNNER_BRIDGE_PREFIX: join(tmpdir(), "signed Codex package"),
+      RUNNER_NATIVE_CODEX_HOME: join(tmpdir(), "operator", ".codex"),
+    };
+    expect(bridgeEnvironment(config as never, findAgentBridge("codex")!).CODEX_PATH).toBe(
+      join(config.RUNNER_BRIDGE_PREFIX, ...profile.tooling.entrypoint.split("/")),
+    );
+    expect(() =>
+      bridgeEnvironment(
+        {
+          ...config,
+          RUNNER_NATIVE_PACKAGE_PROFILE: {
+            ...profile,
+            files: profile.files.map((file) =>
+              file.path === profile.tooling.entrypoint ? { ...file, executable: false } : file,
+            ),
+          },
+        } as never,
+        findAgentBridge("codex")!,
+      ),
+    ).toThrow(/signed.*Codex|Codex.*signed/);
+    const unix = {
+      ...config,
+      RUNNER_NATIVE_PACKAGE_PROFILE: offlineFixture("macos", "arm64").profile,
+    };
+    expect(bridgeEnvironment(unix as never, findAgentBridge("codex")!).CODEX_PATH).toBeUndefined();
   });
 
   it("preserves explicit native additional CA trust without inheriting TLS bypasses or credentials", () => {
@@ -99,7 +179,7 @@ describe("bridge spawn spec", () => {
   it("spawns the vendored binary with a private HOME and a sanitized environment", () => {
     const config = RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "claude-code", RUNNER_CREDENTIAL_DIR: "/credentials", RUNNER_BRIDGE_PREFIX: "/opt/konteks/bridges", ANTHROPIC_API_KEY: "sk-ant-leak", KONTEKS_LEASE: "lease" });
     const spec = resolveBridgeSpawnSpec(config);
-    expect(spec.command).toBe("/opt/konteks/bridges/bin/claude-agent-acp");
+    expect(spec.command).toBe(join(config.RUNNER_BRIDGE_PREFIX, "bin", "claude-agent-acp"));
     expect(spec.env.HOME).toBe("/credentials");
     expect(spec.env.ANTHROPIC_API_KEY).toBeUndefined();
     expect(spec.env.KONTEKS_LEASE).toBeUndefined();
