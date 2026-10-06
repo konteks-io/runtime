@@ -195,25 +195,43 @@ function conflicting(first: string | null, second: string | null): boolean {
   return Boolean(first && second && first !== second);
 }
 
+function windowsRecord(value: unknown): value is WindowsProcessRecord {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  return Number.isSafeInteger(record.ProcessId) && Number.isSafeInteger(record.ParentProcessId) &&
+    ["CreationDate", "CommandLine", "ExecutablePath"].every(key => typeof record[key] === "string");
+}
+
+function windowsPair(first: unknown, second: unknown, pid: number): [WindowsProcessRecord | null, WindowsProcessRecord | null] {
+  if (first === null && second === null) return [null, null];
+  if (!windowsRecord(first) || !windowsRecord(second)) throw invalidOwner("Windows process identity observation is incomplete.");
+  if (!sameWindowsProcess(pid, first, second) || !first.CreationDate.trim()) throw invalidOwner("Windows process identity observation is unstable.");
+  return [first, second];
+}
+
+function windowsObservation(output: string): Record<string, unknown> {
+  let value: unknown;
+  try { value = JSON.parse(output); } catch { throw invalidOwner("Windows process observation is malformed."); }
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw invalidOwner("Windows process observation is malformed.");
+  return value as Record<string, unknown>;
+}
+
 function queryWindowsProcessPair(pid: number): [WindowsProcessRecord | null, WindowsProcessRecord | null] {
   if (process.platform !== "win32") return [null, null];
-  // One PowerShell host takes both observations. Get-Process reads the kernel
-  // creation time directly; Get-CimInstance has a multi-second cold start and
-  // made the first bridge race its owner-capture timeout on healthy machines.
-  const script = `$items=@(); for($i=0;$i -lt 2;$i++){ $p=Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if($null -ne $p){ $items += [pscustomobject]@{ProcessId=[int]$p.Id;ParentProcessId=0;CreationDate=[string]$p.StartTime.ToUniversalTime().Ticks;CommandLine='';ExecutablePath=[string]$p.Path} } }; ConvertTo-Json -InputObject @($items) -Compress`;
-  // On Windows ARM running an x64 Node bridge, the native PowerShell host can
-  // take over ten seconds to initialize even while the bridge stays healthy.
-  // Timeout must cover that cold start; a miss cannot be treated as ownership.
+  // Successful full enumeration distinguishes absence from an ID lookup error.
+  // Creation ticks remain the kernel identity used by existing durable owners.
+  const script = [
+    "$ErrorActionPreference='Stop'",
+    "$first=$null; $second=$null",
+    `for($i=0;$i -lt 2;$i++){ $observedProcesses=@(Get-Process -ErrorAction Stop | Where-Object Id -eq ${pid}); $record=$null; if($observedProcesses.Count -gt 1){ throw 'Ambiguous process identity' }; if($observedProcesses.Count -eq 1){ $p=$observedProcesses[0]; $path=''; try { $path=[string]$p.Path } catch { }; $record=[pscustomobject]@{ProcessId=[int]$p.Id;ParentProcessId=0;CreationDate=[string]$p.StartTime.ToUniversalTime().Ticks;CommandLine='';ExecutablePath=$path} }; if($i -eq 0){ $first=$record } else { $second=$record } }`,
+    "ConvertTo-Json -InputObject ([pscustomobject]@{complete=$true;first=$first;second=$second}) -Compress",
+  ].join("\n");
   const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script],
     { encoding: "utf8", windowsHide: true, timeout: 20_000, maxBuffer: 64 * 1024 });
-  if (result.status !== 0 || !result.stdout.trim()) return [null, null];
-  try {
-    const values = JSON.parse(result.stdout) as Array<Partial<WindowsProcessRecord>>;
-    if (!Array.isArray(values) || values.length !== 2 || values.some(value =>
-      !Number.isSafeInteger(value.ProcessId) || !Number.isSafeInteger(value.ParentProcessId) ||
-      typeof value.CreationDate !== "string" || typeof value.CommandLine !== "string" || typeof value.ExecutablePath !== "string")) return [null, null];
-    return values as [WindowsProcessRecord, WindowsProcessRecord];
-  } catch { return [null, null]; }
+  if (result.error || result.status !== 0) throw invalidOwner("Windows process identity query did not complete successfully.");
+  const value = windowsObservation(result.stdout);
+  if (value.complete !== true) throw invalidOwner("Windows process identity query is incomplete.");
+  return windowsPair(value.first, value.second, pid);
 }
 
 function windowsStopDeps(options: StopOptions) {
@@ -243,11 +261,14 @@ function terminateWindowsProcessTree(pid: number, force: boolean): void {
 }
 
 function windowsProcessTreeAlive(pid: number): boolean {
-  if (process.platform !== "win32") return false;
-  const script = `$all=@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId); $seen=@(${pid}); do { $before=$seen.Count; $seen += @($all | Where-Object { $seen -contains $_.ParentProcessId } | ForEach-Object ProcessId); $seen=@($seen | Select-Object -Unique) } while ($seen.Count -gt $before); if ($seen.Count -gt 1 -or ($all | Where-Object ProcessId -eq ${pid})) { exit 0 } else { exit 1 }`;
+  if (process.platform !== "win32" || !isBridgePid(pid)) throw invalidOwner("Windows process-tree observation is unavailable.");
+  const script = `$ErrorActionPreference='Stop'; $all=@(Get-CimInstance Win32_Process -ErrorAction Stop | Select-Object ProcessId,ParentProcessId); $seen=@(${pid}); do { $before=$seen.Count; $seen += @($all | Where-Object { $seen -contains $_.ParentProcessId } | ForEach-Object ProcessId); $seen=@($seen | Select-Object -Unique) } while ($seen.Count -gt $before); $present=($seen.Count -gt 1 -or @($all | Where-Object ProcessId -eq ${pid}).Count -gt 0); ConvertTo-Json -InputObject ([pscustomobject]@{present=[bool]$present}) -Compress`;
   const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script],
-    { windowsHide: true, timeout: 3_000, stdio: "ignore" });
-  return result.status === 0;
+    { encoding: "utf8", windowsHide: true, timeout: 20_000, maxBuffer: 64 * 1024 });
+  if (result.error || result.status !== 0) throw invalidOwner("Windows process-tree query did not complete successfully.");
+  const value = windowsObservation(result.stdout);
+  if (typeof value.present !== "boolean") throw invalidOwner("Windows process-tree observation is incomplete.");
+  return value.present;
 }
 
 function parseLinuxStat(bytes: Buffer | null, pid: number): LinuxStat | null {
