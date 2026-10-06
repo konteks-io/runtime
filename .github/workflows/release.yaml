@@ -95,6 +95,8 @@ jobs:
         run: npm run build
       - uses: actions/download-artifact@v4
         with:
+          pattern: native-*
+          merge-multiple: false
           path: dist/artifacts
       - name: Assemble, sign and verify the native manifest and the checksum manifest
         env:

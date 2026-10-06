@@ -1,7 +1,11 @@
 /** Check the real workflows' prerequisites and single-build boundary. */
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { basename, dirname, isAbsolute, join } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 const ci = readFileSync(new URL('../../.github/workflows/ci.yaml', import.meta.url), 'utf8').replaceAll('\r\n', '\n');
 const release = readFileSync(new URL('../../.github/workflows/release.yaml', import.meta.url), 'utf8').replaceAll('\r\n', '\n');
@@ -17,6 +21,66 @@ function nativeSteps(source, start, end) {
 
 const ciNative = nativeSteps(ci, '  windows-native:\n');
 const releaseNative = nativeSteps(release, '  build:\n', '\n  release:\n');
+const releaseDownload = nativeSteps(release, '      - uses: actions/download-artifact@v4\n', '      - name: Assemble, sign and verify');
+const nativeArtifacts = ['native-macos-arm64', 'native-macos-amd64', 'native-windows-amd64', 'native-debian-amd64', 'native-debian-arm64'];
+const diagnosticArtifacts = ['mac13-resource-measurement-macos-26', 'mac13-resource-measurement-macos-15-intel'];
+
+function fixture(t) {
+  const parent = realpathSync.native(tmpdir());
+  const root = realpathSync.native(mkdtempSync(join(parent, 'konteks-release-collection-')));
+  t.after(() => {
+    assert.ok(isAbsolute(root) && dirname(root) === parent && basename(root).startsWith('konteks-release-collection-'));
+    rmSync(root, { recursive: true, force: true });
+  });
+  return root;
+}
+
+function selectedArtifacts(names) {
+  const pattern = releaseDownload.match(/^\s+pattern: (\S+)$/m)?.[1];
+  assert.ok(pattern === undefined || pattern === 'native-*', 'release artifact selection must use the closed native prefix');
+  assert.doesNotMatch(releaseDownload, /merge-multiple: true/);
+  assert.match(releaseDownload, /path: dist\/artifacts/);
+  return names.filter(name => pattern === undefined || name.startsWith('native-'));
+}
+
+function artifactFile(root, artifact, name, bytes) {
+  const directory = join(root, 'artifacts', artifact);
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(join(directory, name), bytes);
+}
+
+function collect(root) {
+  const result = spawnSync(process.execPath, [fileURLToPath(new URL('../release-assets.mjs', import.meta.url)),
+    'collect', '--artifacts', join(root, 'artifacts'), '--out', join(root, 'release'), '--descriptors', join(root, 'descriptors')],
+  { encoding: 'utf8', windowsHide: true, timeout: 10000, maxBuffer: 256 * 1024 });
+  assert.equal(result.error, undefined);
+  return result;
+}
+
+test('publisher selects native platform artifacts while excluding sibling measurement logs', t => {
+  const root = fixture(t);
+  const selected = selectedArtifacts([...nativeArtifacts, ...diagnosticArtifacts]);
+  for (const name of selected) {
+    if (name.startsWith('native-')) {
+      artifactFile(root, name, `${name}.tgz`, `synthetic platform bytes: ${name}`);
+      artifactFile(root, name, `${name}.artifact.json`, '{}');
+    } else artifactFile(root, name, '001-tool-os.log', 'synthetic diagnostic bytes');
+  }
+  const result = collect(root);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(selected, nativeArtifacts);
+  assert.deepEqual(readdirSync(join(root, 'release')).sort(), nativeArtifacts.map(name => `${name}.tgz`).sort());
+  assert.deepEqual(readdirSync(join(root, 'descriptors')).sort(), nativeArtifacts.map(name => `${name}.artifact.json`).sort());
+  assert.match(releaseDownload, /pattern: native-\*/);
+});
+
+test('the real collector still refuses duplicate assets in two selected native platforms', t => {
+  const root = fixture(t);
+  for (const name of selectedArtifacts(nativeArtifacts.slice(0, 2))) artifactFile(root, name, 'collision.tgz', 'synthetic colliding asset');
+  const result = collect(root);
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /duplicate release asset collision\.tgz/);
+});
 
 test('actual Mac packaging preflight has its build prerequisites before it starts', () => {
   const preflight = ciNative.indexOf('      - name: Preflight the actual offline Mac agent and Graft packages before release\n');
