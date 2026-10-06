@@ -1076,6 +1076,7 @@ export class Supervisor {
         prepareInputs: native.prepareInputs ?? createNativeInputPreparer({
           logger: this.logger,
           root: native.runners.find(config => config.RUNNER_AGENT_ID === runner.agentId)!.RUNNER_WORKSPACE_DIR,
+          agentSkillHomes: native.runners.find(config => config.RUNNER_AGENT_ID === runner.agentId)!.RUNNER_NATIVE_SKILL_HOMES,
           clock: this.clock,
           mutate: this.stateMutations.run,
           ...(native.git ? { git: native.git } : {}),

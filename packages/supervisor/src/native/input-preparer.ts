@@ -41,6 +41,8 @@ import { NativeRepositoryCache } from "./repository-cache.js";
 interface NativeInputPreparerOptions {
   /** Private, runner-specific connector workspace root, never a user checkout. */
   root: string;
+  /** Operator-owned native discovery homes, resolved locally at installation. */
+  agentSkillHomes?: readonly string[] | undefined;
   clock: Clock;
   client: () => NativeInputClient;
   /** Current locally accepted claim; returning null denies preparation/continuation. */
@@ -725,7 +727,9 @@ class InputPreparation {
       // nothing that recheck does not, and cost a full authority round trip
       // (several locked reads plus owner callbacks) per stage — ten per
       // turn, ~100 s before the agent even started.
-      assertAuthorized: async () => undefined,
+      assertAuthorized: async () => { if (this.options.claimId(inputs.current) !== inputs.claimId) throw unavailable(); },
+      ...(this.options.agentSkillHomes ? { agentHomes: this.options.agentSkillHomes } : {}),
+      authorizeHomeSync: () => inputs.authorize(),
       fetchTree: (manifest) => inputs.read(manifest.transferId),
     });
   }

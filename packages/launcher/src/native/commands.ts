@@ -9,7 +9,7 @@ import { createNativeService, hostAgentInstallAdapter, loadNativeInstallation, o
 import { ReleaseAcceptedSchema, RemoteInstanceError, SupervisorStatusSchema, runCommand, sanitizeInheritedChildProcessEnv, writeSecretFile } from "@konteks/remote-common";
 import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyList, gitKeyRemove, previewStatus, status, supportBundle, type ControlContext } from "./control-commands.js";
 import { SupervisorControl } from "../control.js";
-import { addNativeAgent, fetchHostAgent, installNative, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, removeNativeAgent, restoreNativeRecord, stageNativeEnrollment } from "./install.js";
+import { addNativeAgent, configureNativeSkillHomes, fetchHostAgent, installNative, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, removeNativeAgent, restoreNativeRecord, stageNativeEnrollment } from "./install.js";
 import { terminalFetchConsent, type FetchConsent } from "./consent.js";
 import { closeAgentSetup, ensurePersonalAgent, isPersonalAgent, PERSONAL_AGENTS, productionAgentClosingDeps, setUpPersonalAgent } from "./agent-setup.js";
 import { confirm } from "../prompt.js";
@@ -1197,6 +1197,13 @@ export const nativeCliActions: NativeCliActions = {
     confirm: question => confirmOnTerminal(question),
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)), now: Date.now, platform: nativePlatform(),
   }),
+  configureSkills: async input => {
+    const record = await configureNativeSkillHomes({ root: input.root });
+    input.output.line(outputLocale(input.output) === "id"
+      ? "Folder Skill lokal sudah dikonfigurasi. Mulai konektor melalui alur normal; sesi berikutnya yang diizinkan akan memperbarui Skill bersama."
+      : "Local Skill folders are configured. Start the connector through its normal lifecycle; the next authorized session refreshes shared Skills.");
+    input.output.result({ state: "configured", agentSkillHomes: record.agentSkillHomes });
+  },
   serve: async input => {
     const own = await keepServiceOnOwnDefinition(input.root, productionOwnServiceDefinitionDeps(input.root))
       .catch(async error => {

@@ -2,6 +2,7 @@ import { lstat, realpath } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { RemoteInstanceError, RemoteSkillCatalogSchema, type RemoteDeliveryAcceptanceReceipt, type RemoteTransferBinding, type SessionToCoreMessage } from "@konteks/remote-common";
 import { stageOrganizationSkills, type StageOrganizationSkillsOptions, type StagedOrganizationSkills } from "./staging.js";
+import { syncAgentHomeSkills } from "./home-sync.js";
 
 /** Local-only preparation result: paths/instructions never enter relay frames. */
 export interface PreparedSessionInputs {
@@ -57,7 +58,7 @@ export async function prepareDirectSessionInputs(options: { cwd: string; binding
 }
 
 /** Caller resolves the approved source checkout and authoritative skill selection. */
-export async function prepareOrganizationSkillSession(options: StageOrganizationSkillsOptions & { cwd: string }): Promise<PreparedSessionInputs> {
+export async function prepareOrganizationSkillSession(options: StageOrganizationSkillsOptions & { cwd: string; agentHomes?: readonly string[]; authorizeHomeSync?: () => Promise<void> }): Promise<PreparedSessionInputs> {
   try {
     const cwd = await checkedDirectory(options.cwd);
     const snapshot = {
@@ -66,6 +67,19 @@ export async function prepareOrganizationSkillSession(options: StageOrganization
       authority: { binding: { ...options.authority.binding }, catalogDigest: options.authority.catalogDigest },
     };
     const staged = await stageOrganizationSkills(snapshot);
+    const homes = new Set(options.agentHomes ?? []);
+    if (homes.size) await options.authorizeHomeSync?.();
+    for (const home of homes) {
+      await syncAgentHomeSkills({ home, staged,
+        owner: { workspaceId: snapshot.authority.binding.workspaceId, instanceId: snapshot.authority.binding.instanceId },
+        assertAuthorized: async () => {
+          await options.assertAuthorized();
+          // Link publication must not expose a tree changed after staging.
+          await stageOrganizationSkills(snapshot);
+        },
+      });
+    }
+    if (homes.size) await options.authorizeHomeSync?.();
     return {
       binding: { ...snapshot.authority.binding }, cwd,
       skillInstructions: organizationSkillInstructions(staged),
