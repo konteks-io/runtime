@@ -93,7 +93,13 @@ test('native macOS CI inspects produced harmless dylibs without executing them',
     const allowed = compileDylib(source, join(directory, 'allowed.dylib'), '13.0');
     assert.doesNotThrow(() => assertMacOsArtifact(allowed, native));
     const tooNew = compileDylib(source, join(directory, 'too-new.dylib'), '14.0');
-    assert.throws(() => assertMacOsArtifact(tooNew, native), /minimum OS exceeds/);
+    assert.throws(() => assertMacOsArtifact(tooNew, native), error => {
+      assert(error.message.includes(JSON.stringify(tooNew)), 'Native refusal identifies the exact inspected artifact');
+      assert(error.cause instanceof Error, 'Native refusal retains the original metadata error');
+      assert.match(error.cause.message, /minimum OS exceeds advertised 13: 14\.0/);
+      assert(error.message.includes(error.cause.message), 'Original rejection remains readable');
+      return true;
+    });
     const opposite = process.arch === 'arm64' ? 'x86_64' : 'arm64';
     const wrong = compileDylib(source, join(directory, 'wrong.dylib'), '13.0', opposite);
     assert.throws(() => assertMacOsArtifact(wrong, native), /expected thin/);

@@ -17,6 +17,7 @@ jobs:
 
   build:
     needs: check
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -57,7 +58,12 @@ jobs:
           node -e 'const value = JSON.parse(process.env.KONTEKS_RELEASE_ROOTS_JSON); if (!Array.isArray(value.roots) || !value.roots.some(root => Array.isArray(root.coreControlKeys) && root.coreControlKeys.length > 0)) { throw new Error("KONTEKS_RELEASE_ROOTS_JSON must certify at least one Core control key; otherwise every production directive is rejected") }'
           node scripts/build-launcher.mjs --os "${{ matrix.os }}" --architecture "${{ matrix.architecture }}" --out "dist/${{ matrix.package }}"
           node scripts/sign-launcher.mjs --os "${{ matrix.os }}" --architecture "${{ matrix.architecture }}" --artifact "dist/${{ matrix.package }}"
+      - name: Set up pinned Mac resource build tools before packaging
+        timeout-minutes: 35
+        if: runner.os == 'macOS'
+        uses: ./.github/actions/setup-macos-resources
       - name: Build complete offline agent packages and describe every artifact
+        timeout-minutes: 120
         shell: bash
         env:
           REDISTRIBUTION_APPROVAL_REF: ${{ vars.KONTEKS_AGENT_REDISTRIBUTION_APPROVAL_REF }}

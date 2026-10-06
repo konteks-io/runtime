@@ -84,6 +84,7 @@ jobs:
 
   windows-native:
     name: native runtime on ${{ matrix.os }}
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -104,7 +105,11 @@ jobs:
       - name: Build workspace packages
         run: npm run build
       - name: Verify Mac binary compatibility decisions and produced native metadata
-        run: node --test --test-concurrency=1 scripts/macos-artifact-compatibility.test.mjs
+        run: node --test --test-concurrency=1 scripts/macos-artifact-compatibility.test.mjs scripts/macos-codex-resource-owners.test.mjs scripts/macos-codex-resource-preparation.test.mjs scripts/macos-codex-resources.test.mjs scripts/macos-voice-resource-closure.test.mjs
+      - name: Verify Mac resource inspection refusals on every native coordinate
+        run: node --test --test-concurrency=1 scripts/mac13-resource-probe/inspect-candidate.test.mjs scripts/mac13-resource-probe/probe.test.mjs scripts/mac13-resource-probe/cpal-patch.test.mjs scripts/mac13-resource-probe/voice-helper-relocation.test.mjs scripts/mac13-resource-probe/pipeline.test.mjs
+      - name: Verify reviewed Graft prebuild selection and native parser smoke boundaries
+        run: node --test --test-concurrency=1 scripts/offline-graft-prebuilds.test.mjs
       - name: Verify POSIX setup language, signed downloads and recovery
         if: runner.os != 'Windows'
         run: node --test --test-name-pattern="POSIX bootstrap" scripts/bootstrap-install.test.mjs
@@ -123,3 +128,92 @@ jobs:
       - name: Verify organization Skill staging on Windows
         if: runner.os == 'Windows'
         run: npx vitest run --maxWorkers=1 packages/supervisor/src/__tests__/skill-staging.test.ts -t "retains digest-bound executable metadata on Windows instead of guessing it from stat"
+      - name: Set up pinned Mac resource build tools before packaging
+        timeout-minutes: 35
+        if: runner.os == 'macOS'
+        uses: ./.github/actions/setup-macos-resources
+      - name: Preflight the actual offline Mac agent and Graft packages before release
+        id: macos-offline-preflight
+        timeout-minutes: 120
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          MATRIX_OS: ${{ matrix.os }}
+          REDISTRIBUTION_APPROVAL_REF: ${{ vars.KONTEKS_AGENT_REDISTRIBUTION_APPROVAL_REF }}
+        run: |
+          set -euo pipefail
+          test -n "$REDISTRIBUTION_APPROVAL_REF" || { echo "KONTEKS_AGENT_REDISTRIBUTION_APPROVAL_REF variable is required"; exit 1; }
+          case "$MATRIX_OS" in
+            macos-26) architecture=arm64 ;;
+            macos-15-intel) architecture=amd64 ;;
+            *) echo "Unsupported Mac package preflight coordinate: $MATRIX_OS"; exit 1 ;;
+          esac
+          output="$RUNNER_TEMP/konteks-offline-compatibility"
+          mkdir -p "$output"
+          failed=0
+          for agent in claude-code codex; do
+            echo "Inspecting the complete $agent package for macos/$architecture"
+            if ! node scripts/build-offline-agent.mjs --agent "$agent" --os macos --architecture "$architecture" --approval "$REDISTRIBUTION_APPROVAL_REF" --out "$output/$agent-macos-$architecture.tgz" --profile "$output/$agent-macos-$architecture.profile.json"; then
+              failed=1
+            fi
+          done
+          echo "Inspecting the complete Graft package for macos/$architecture"
+          if ! node scripts/build-offline-tool.mjs --tool graft --architecture "$architecture" --out "$output/konteks-graft-macos-$architecture.tgz"; then
+            failed=1
+          fi
+          exit "$failed"
+      - name: Bound the selected resource measurement diagnostics before upload
+        id: mac13-resource-diagnostic-bounds
+        if: runner.os == 'macOS' && !cancelled() && (steps.macos-offline-preflight.outcome == 'success' || steps.macos-offline-preflight.outcome == 'failure')
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --max-old-space-size=128 --input-type=module <<'NODE'
+          import { lstat, readdir, realpath, appendFile } from 'node:fs/promises';
+          import { join, resolve } from 'node:path';
+          const root = join(await realpath(process.env.RUNNER_TEMP), 'mac13-resource-probe-evidence');
+          let rootInfo = null;
+          try {
+            rootInfo = await lstat(root);
+          } catch (error) {
+            if (error.code !== 'ENOENT') throw error;
+          }
+          if (rootInfo === null) {
+            await appendFile(process.env.GITHUB_OUTPUT, 'ready=false\n');
+            console.log('No owned Mac resource measurement evidence was created.');
+          } else {
+            if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink() || await realpath(root) !== resolve(root)) throw Error('invalid diagnostic root');
+            const logs = join(root, 'logs');
+            const logInfo = await lstat(logs);
+            if (!logInfo.isDirectory() || logInfo.isSymbolicLink()) throw Error('invalid diagnostic logs');
+            const names = await readdir(logs);
+            if (names.length > 1024) throw Error('diagnostic file cap');
+            let total = 0;
+            for (const name of names) {
+              if (!/^[0-9]{3,}-[a-z0-9-]+\.log$/.test(name)) throw Error('unexpected diagnostic name');
+              const info = await lstat(join(logs, name));
+              if (!info.isFile() || info.isSymbolicLink() || info.size > 4 * 1024 ** 2) throw Error('diagnostic member cap');
+              total += info.size;
+            }
+            if (total > 16 * 1024 ** 2) throw Error('aggregate diagnostic cap');
+            try {
+              const receipt = await lstat(join(root, 'receipt.json'));
+              if (!receipt.isFile() || receipt.isSymbolicLink() || receipt.size > 8 * 1024 ** 2) throw Error('receipt cap');
+            } catch (error) {
+              if (error.code !== 'ENOENT') throw error;
+            }
+            await appendFile(process.env.GITHUB_OUTPUT, 'ready=true\n');
+          }
+          NODE
+      - name: Retain bounded Mac resource measurements only
+        if: runner.os == 'macOS' && !cancelled() && (steps.macos-offline-preflight.outcome == 'success' || steps.macos-offline-preflight.outcome == 'failure') && steps.mac13-resource-diagnostic-bounds.outputs.ready == 'true'
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac13-resource-measurement-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/mac13-resource-probe-evidence/logs/*.log
+            ${{ runner.temp }}/mac13-resource-probe-evidence/receipt.json
+          if-no-files-found: warn
+          retention-days: 14
