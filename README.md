@@ -439,4 +439,17 @@ Copyright 2026 Konteks. Licensed under the Apache License, Version 2.0; see
 `LICENSE`. Third-party components and adapted code are listed in
 `THIRD_PARTY_NOTICES.md`.
 
+## Optional native trace export
+
+Set `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` in the connector service environment to
+an explicit HTTP(S) OTLP trace endpoint. Without it, tracing stays disabled.
+`OTEL_SDK_DISABLED=true` disables export. Credentials must not appear in the URL.
+The connector exports bootstrap and preview tool spans with bounded identifiers,
+stable failure codes, exit status and accurate outcomes; it does not export
+commands, provider bodies or exception messages. Events use the actual active
+span context. The bounded batch queue holds at most 1,024 spans and flushes at
+shutdown. Telemetry configuration never grants or replaces execution authority.
+
+For controller-owned local E2E, set `KONTEKS_E2E_NATIVE_OTLP_TRACES_ENDPOINT` in
+the ignored controller `.env`; it applies only to the native connector process.
 Agent rules: see AGENTS.md (map and guardrails).

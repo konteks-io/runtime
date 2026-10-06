@@ -2,6 +2,9 @@ import { createServer, request as httpRequest, type Server } from "node:http";
 import { connect, createServer as createTcpServer, type AddressInfo } from "node:net";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
+import { context, propagation, trace, SpanStatusCode } from "@opentelemetry/api";
+import { InMemorySpanExporter, NodeTracerProvider, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-node";
+import { createLogger, nativeSpanLogContext, withNativeSpan } from "@konteks/remote-common";
 import { BROWSER_ORIGINS_PATH } from "@konteks/remote-agent-runner";
 import { NO_PREVIEW_MESSAGE, PreviewBrowserGateway } from "../preview/browser-gateway.js";
 
@@ -50,6 +53,33 @@ async function gateway(target: () => string | null, extra: Partial<ConstructorPa
 }
 
 describe("the QA browser's gateway", () => {
+  it("records each refusal in its own error span instead of the completed bootstrap span", async () => {
+    const exporter = new InMemorySpanExporter();
+    const provider = new NodeTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] });
+    provider.register();
+    const logged: Array<ReturnType<typeof nativeSpanLogContext>> = [];
+    const logger = createLogger({ name: "browser-trace-test", level: "silent" });
+    logger.info = () => { logged.push(nativeSpanLogContext()); };
+    try {
+      const g = await withNativeSpan("native.bootstrap.stage", undefined, { assignmentId: "assignment", stage: "browser_gateway" }, () => gateway(() => "http://127.0.0.1:43100", { logger, context: { assignmentId: "assignment", attempt: 1 } }));
+      expect((await viaProxy(g.proxyUrl, "http://example.com/private-canary")).status).toBe(403);
+      expect(await tunnel(g.proxyUrl, "example.com:443")).toContain("403 Refused");
+      const handlers = g.gw as unknown as { onUpgrade(request: unknown, socket: PassThrough, head: Buffer): void };
+      handlers.onUpgrade({ url: "http://example.com/private-canary", rawHeaders: [], method: "GET" }, new PassThrough(), Buffer.alloc(0));
+      await provider.forceFlush();
+      const refusals = exporter.getFinishedSpans().filter(span => span.name === "native.preview.request");
+      expect(refusals).toHaveLength(3);
+      expect(logged).toHaveLength(3);
+      for (const [index, span] of refusals.entries()) {
+        expect(span.status.code).toBe(SpanStatusCode.ERROR);
+        expect(span.attributes).toMatchObject({ "http.response.status_code": 403, "konteks.outcome": "refused", "konteks.assignmentId": "assignment" });
+        expect(logged[index]?.traceparent).toContain(span.spanContext().spanId);
+        expect(JSON.stringify(span.attributes)).not.toContain("private-canary");
+      }
+      expect(new Set(refusals.map(span => span.spanContext().spanId)).size).toBe(3);
+      await g.gw.close();
+    } finally { await provider.shutdown(); trace.disable(); context.disable(); propagation.disable(); }
+  });
   it("forwards only the session's preview origin, keeping its Host, and counts it as activity", async () => {
     const preview = await upstream("preview");
     const other = await upstream("other");
@@ -175,4 +205,22 @@ describe("origins Core opened for the session (environment_open)", () => {
     expect(refused).toContain("resolves to this computer");
     expect(g.gw.counters.tunnels).toBe(1);
   });
+});
+
+
+it("rebinds a cached browser proxy only after its successor is enabled", async () => {
+  const firstPreview = await upstream("first-owner");
+  const secondPreview = await upstream("second-owner");
+  const first = await gateway(() => firstPreview);
+  expect((await viaProxy(first.proxyUrl, firstPreview)).status).toBe(200);
+  await first.gw.close();
+  await expect(viaProxy(first.proxyUrl, firstPreview)).rejects.toThrow();
+  const second = await gateway(() => secondPreview, { localPort: Number(new URL(first.proxyUrl).port), initiallyInactive: true });
+  expect(second.proxyUrl).toBe(first.proxyUrl);
+  expect((await viaProxy(first.proxyUrl, secondPreview)).status).toBe(503);
+  second.gw.enable();
+  expect(await viaProxy(first.proxyUrl, secondPreview)).toMatchObject({ status: 200, body: expect.stringContaining("second-owner") });
+  expect((await viaProxy(first.proxyUrl, firstPreview)).status).toBe(403);
+  await second.gw.close();
+  expect(() => second.gw.enable()).toThrow();
 });

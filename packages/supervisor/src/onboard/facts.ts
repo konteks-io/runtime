@@ -60,6 +60,8 @@ class FactsDraft {
 
 /** What each family of evidence file adds to the draft. */
 const FAMILY_READERS: Record<ReadFile["candidate"]["family"], (draft: FactsDraft, path: string, text: string) => void> = {
+  // Prose proves file presence, not implementation facts.
+  documentation: () => {},
   codeowners: (draft, _path, text) => {
     for (const handle of parseCodeowners(text)) if (draft.handles.size < MAX_HANDLES) draft.handles.add(handle);
   },

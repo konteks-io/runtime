@@ -1,4 +1,4 @@
-import { startControlSocketServer, type ControlSocketServer } from "@konteks/remote-common";
+import { initializeNativeTracing, createLogger, type NativeTracing, startControlSocketServer, type ControlSocketServer } from "@konteks/remote-common";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createDaemon, type CreateDaemonOptions, type Daemon, type DaemonStep } from "../daemon.js";
@@ -95,6 +95,8 @@ export function createNativeService(options: NativeServiceOptions): Daemon {
   let supervisor: Supervisor | undefined;
   let control: ControlSocketServer | undefined;
   let stopLogKeeper: (() => void) | undefined;
+  let tracing: NativeTracing | undefined;
+  const logger = createLogger({ name: "native-tracing" });
   const exitStore = new SupervisorStore(join(options.root, "supervisor"));
   // The liveness callback reads `daemon` only after createDaemon has returned.
   const daemon: Daemon = createDaemon({
@@ -103,6 +105,8 @@ export function createNativeService(options: NativeServiceOptions): Daemon {
     ...(options.exitProcess ? { exitProcess: options.exitProcess } : {}),
     recordNonzeroExit: reason => exitStore.recordLastExit(reason),
     onStart: async () => {
+      tracing = initializeNativeTracing();
+      logger.info({ event: "native.tracing.configuration", enabled: tracing.enabled, ...(tracing.reason ? { reason: tracing.reason } : {}) }, "native tracing configured");
       stopLogKeeper = startConnectorLogKeeper(options.root);
       const installation = await loadNativeInstallation(options.root, options);
       // The connector of the release now serving: `konteks-connector`, or `connector` in a release from before the rename.
@@ -126,12 +130,14 @@ export function createNativeService(options: NativeServiceOptions): Daemon {
         onUnexpectedError: (error, operation) => supervisor?.logger.error({ err: error, operation }, "control operation failed"),
       });
     },
-    shutdownSteps: () => nativeShutdownSteps(
+    shutdownSteps: () => [...nativeShutdownSteps(
       () => { stopLogKeeper?.(); return supervisor; },
       () => control,
       () => writeSecretFile(join(options.root, "supervisor", NATIVE_SHUTDOWN_RECEIPT_FILE), randomUUID()),
       (phase, state) => exitStore.recordShutdownProgress(phase, state),
-    ),
+    ), { name: "flushNativeTracing", run: async () => {
+      await tracing?.shutdown().catch(() => logger.warn({ event: "native.tracing.shutdown_failed" }, "native tracing flush failed"));
+    } }],
   });
   return daemon;
 }

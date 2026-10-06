@@ -190,10 +190,24 @@ describe("supervised preview process manager", () => {
     expect(f.instance.health().lastFailure?.message).toContain("install step");
   });
 
+  it("records a failed install's bounded cause and session without command or output", async () => {
+    const warn = vi.fn();
+    const logger = { info: vi.fn(), warn } as never;
+    const f = manager({ logger }, { ok: true, plan: { command: "npm run dev", install: "npm install --secret=private-canary", healthPath: "/", env: {}, source: "preview_yaml", explanation: "x", notes: [] } });
+    await f.instance.start("session-failure", "/private/worktree");
+    await vi.waitFor(() => expect(f.children).toHaveLength(1));
+    f.children[0]!.stderr.write("private-output-canary\n");
+    f.children[0]!.exit(7);
+    const status = await f.instance.waitForSettled("session-failure", 2_000);
+    expect(status).toMatchObject({ failure: { code: "step_failed", phase: "install", exitCode: 7, timedOut: false } });
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({ event: "preview.failed", sessionId: "session-failure", failureCode: "step_failed", phase: "install", exitCode: 7, timedOut: false }), "preview did not start");
+    expect(JSON.stringify(warn.mock.calls)).not.toMatch(/private-canary|private-output-canary|private\/worktree|npm install/);
+  });
+
   it("does not count a conversation's missing app as a preview failure (09-30)", async () => {
     const f = manager({}, { ok: false, message: CONVERSATION_HAS_NO_APP, notes: [] });
     await f.instance.start("conversation", "/w");
-    expect(await f.instance.waitForSettled("conversation", 2_000)).toMatchObject({ state: "failed", message: CONVERSATION_HAS_NO_APP });
+    expect(await f.instance.waitForSettled("conversation", 2_000)).toMatchObject({ state: "failed", failure: { code: "no_app", phase: null }, message: CONVERSATION_HAS_NO_APP });
     expect(f.instance.health().lastFailure).toBeNull();
   });
 
@@ -202,19 +216,19 @@ describe("supervised preview process manager", () => {
     await early.instance.start("s", "/w");
     await vi.waitFor(() => expect(early.children).toHaveLength(1));
     early.children[0]!.exit(127);
-    expect(await early.instance.waitForSettled("s", 2_000)).toMatchObject({ state: "failed", message: expect.stringContaining("exit code 127") });
+    expect(await early.instance.waitForSettled("s", 2_000)).toMatchObject({ state: "failed", failure: { code: "server_exited", phase: "serve", exitCode: 127 }, message: expect.stringContaining("exit code 127") });
 
     const silent = manager({ readinessTimeoutMs: 1, now: Date.now });
     await silent.instance.start("s", "/w");
     const failed = await silent.instance.waitForSettled("s", 2_000);
-    expect(failed).toMatchObject({ state: "failed", message: expect.stringContaining("did not answer on 127.0.0.1:43100") });
+    expect(failed).toMatchObject({ state: "failed", failure: { code: "readiness_timeout", phase: "serve", timedOut: true }, message: expect.stringContaining("did not answer on 127.0.0.1:43100") });
     expect(silent.terminated).toHaveLength(1);
   });
 
   it("refuses a command the connector's command policy blocks", async () => {
     const f = manager({}, { ok: true, plan: { command: "git push origin main", healthPath: "/", env: {}, source: "preview_yaml", explanation: "x", notes: [] } });
     await f.instance.start("s", "/w");
-    expect(await f.instance.waitForSettled("s", 2_000)).toMatchObject({ state: "failed", message: expect.stringContaining("command policy") });
+    expect(await f.instance.waitForSettled("s", 2_000)).toMatchObject({ state: "failed", failure: { code: "command_refused", phase: "serve" }, message: expect.stringContaining("command policy") });
     expect(f.children).toHaveLength(0);
   });
 
@@ -224,7 +238,7 @@ describe("supervised preview process manager", () => {
     await f.instance.start("a", "/a");
     await f.instance.start("b", "/b");
     const refused = await f.instance.start("c", "/c");
-    expect(refused).toMatchObject({ state: "failed", message: expect.stringContaining("2 previews are already running") });
+    expect(refused).toMatchObject({ state: "failed", failure: { code: "capacity_exceeded", phase: null }, message: expect.stringContaining("2 previews are already running") });
     await f.instance.waitForSettled("b", 2_000);
     await f.instance.stop("a", "agent");
     expect(f.stopped).toContain("a");

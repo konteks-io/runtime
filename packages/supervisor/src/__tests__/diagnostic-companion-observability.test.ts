@@ -40,13 +40,13 @@ const active = {
 };
 
 describe("diagnostic companion operational observation", () => {
-  it("links a retained companion to its matching active operation with a child trace", () => {
+  it("links a retained companion to its matching active operation with its exported parent trace", () => {
     const observation = diagnosticCompanionOperationalObservation(record, active);
 
     expect(observation).toMatchObject({
       event: "runtime.diagnostic_companion.persisted",
       outcome: "succeeded",
-      observability: {
+      context: {
         assignmentId: "assignment",
         attempt: 1,
         claimId: "claim",
@@ -59,8 +59,8 @@ describe("diagnostic companion operational observation", () => {
       },
     });
     if (observation.event !== "runtime.diagnostic_companion.persisted") throw new Error("expected persisted observation");
-    expect(observation.observability.traceparent.split("-")[1]).toBe("0123456789abcdef0123456789abcdef");
-    expect(observation.observability.traceparent.split("-")[2]).not.toBe("0123456789abcdef");
+    expect(observation.context.traceparent.split("-")[1]).toBe("0123456789abcdef0123456789abcdef");
+    expect(observation.context.traceparent.split("-")[2]).toBe("0123456789abcdef");
   });
 
   it("makes an absent or mismatched operation an explicit coverage gap", () => {

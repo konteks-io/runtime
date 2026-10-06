@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { RemoteWorkAssignmentSchema, type RemoteWorkAssignment } from "@konteks/remote-common";
 import { continuedSession, isDirectAssignment, isNativeTurn } from "../work/continued-session.js";
+import { acceptedWorkKinds } from "../work/accepted-kinds.js";
 import { cancellationNamesAssignment } from "../control/cancellation-receiver.js";
 
 const base = {
@@ -33,4 +34,12 @@ describe("direct work on the connector", () => {
     expect(cancellationNamesAssignment(started, "conv-1")).toBe(false);
     expect(cancellationNamesAssignment(conversation as Parameters<typeof cancellationNamesAssignment>[0], "conv-1")).toBe(true);
   });
+});
+
+it("pulls Ops conversations and subjects them to native execution/cancellation guards", () => {
+  const ops = RemoteWorkAssignmentSchema.parse({ ...conversation, kind: "operations", agentRoute: { ...conversation.agentRoute, requiredRole: "ops" } });
+  expect(acceptedWorkKinds("7.8")).toContain("operations");
+  expect(isNativeTurn(ops)).toBe(true);
+  expect(cancellationNamesAssignment(ops as Parameters<typeof cancellationNamesAssignment>[0], "conv-1")).toBe(true);
+  expect(cancellationNamesAssignment(ops as Parameters<typeof cancellationNamesAssignment>[0], "other-session")).toBe(false);
 });

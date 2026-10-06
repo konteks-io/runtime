@@ -49,7 +49,6 @@ import { CancellationReceiver } from "./control/cancellation-receiver.js";
 import { ExecutionRevisionControlReceiver } from "./control/execution-revision-control-receiver.js";
 import { ExecutionRevisionFenceReceiptDelivery } from "./control/execution-revision-fence-receipt-delivery.js";
 import { DiagnosticCompanionReceiver } from "./control/diagnostic-companion-receiver.js";
-import { diagnosticCompanionOperationalObservation } from "./control/diagnostic-companion-observability.js";
 import { PermissionAnswerReceiver } from "./control/permission-answer-receiver.js";
 import { CancellationReplay } from "./control/cancellation-replay.js";
 import { ControlHandlers, compareSemver } from "./control/handlers.js";
@@ -729,21 +728,7 @@ export class Supervisor {
 
   /** Log a persisted diagnostic companion against the active operation it matches, if any. */
   private onDiagnosticCompanionAccepted(record: DiagnosticCompanionRecord): void {
-    const match = record.companion.match;
-    const active = this.journal.activeAssignments().find(entry =>
-      entry.assignmentId === match.assignmentId && entry.attempt === match.attempt,
-    );
-    const retained = active ? this.journal.execution.start(match.assignmentId, match.attempt) : undefined;
-    const operation = active && retained && active.claimId === retained.admission.claimId
-      ? {
-          assignmentId: active.assignmentId,
-          attempt: active.attempt,
-          claimId: retained.admission.claimId,
-          executionId: retained.admission.executionGeneration,
-          runtimeIncarnationId: retained.admission.runnerIncarnation,
-        }
-      : null;
-    const observation = diagnosticCompanionOperationalObservation(record, operation);
+    const observation = this.work.observeDiagnosticCompanion(record);
     if (observation.event === "runtime.diagnostic_companion.coverage_incomplete") {
       this.logger.warn(observation, "diagnostic companion coverage is incomplete");
     } else {
@@ -1039,6 +1024,7 @@ export class Supervisor {
         preview: this.sessionPreviewAccess(),
         policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => this.configuration.humanDeferralAllowed && assignment.policy.humanDeferralAllowed),
         broker: this.broker,
+        exactPermissionBindingSupported: () => coreContractAtLeast(this.coreContractVersion, "7.5"),
         registerDeferral: (body) => this.core.deferPermission(this.instanceId ?? "", body),
         instanceId: this.instanceId ?? "",
         redeemCapabilityToken: async (target) => {

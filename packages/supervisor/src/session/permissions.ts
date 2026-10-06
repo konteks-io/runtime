@@ -13,7 +13,7 @@ import { isSignInElicitation } from "./policy-responder.js";
 export interface SanitizedPermission {
   kind: "permission";
   requestDigest: string;
-  params: { title: string; toolKind?: string; options: Array<{ optionId: string; name: string; kind: string }> };
+  params: { title: string; toolKind?: string; toolCallBinding?: Extract<PendingPermissionView, { kind: "permission" }>["permission"]["toolCallBinding"]; options: Array<{ optionId: string; name: string; kind: string }> };
 }
 
 export interface SanitizedElicitation {
@@ -28,12 +28,16 @@ const MAX_MESSAGE = 4_096;
 
 const OptionSchema = z.object({ optionId: z.string().min(1).max(128), name: z.string().min(1).max(MAX_TITLE), kind: z.enum(["allow_once", "allow_always", "reject_once", "reject_always"]) }).strict();
 
-export function sanitizePermissionRequest(request: RequestPermissionRequest): SanitizedPermission {
+export function sanitizePermissionRequest(request: RequestPermissionRequest, context?: { cwd: string; observedInput?: unknown }): SanitizedPermission {
   const params: SanitizedPermission["params"] = {
     title: plainText(request.toolCall.title ?? "Tool call", MAX_TITLE),
     options: request.options.slice(0, 16).map((option) => OptionSchema.parse({ optionId: option.optionId, name: plainText(option.name, MAX_TITLE), kind: option.kind })),
   };
   if (request.toolCall.kind) params.toolKind = String(request.toolCall.kind).slice(0, 32);
+  if (context) {
+    const operation = BoundedJsonValueSchema.parse({ toolCallId: request.toolCall.toolCallId, kind: request.toolCall.kind ?? null, rawInput: context.observedInput ?? request.toolCall.rawInput ?? null, cwd: context.cwd });
+    params.toolCallBinding = { toolCallId: request.toolCall.toolCallId, contentDigest: jcsDigest(operation as JsonValue) };
+  }
   return { kind: "permission", requestDigest: jcsDigest(params as unknown as JsonValue), params };
 }
 
@@ -167,8 +171,8 @@ export class PermissionBroker {
 export function deferredPermissionBody(args: { sessionId: string; assignmentId: string; attempt: number; agentId: string; requestId: string; sanitized: SanitizedPermission | SanitizedElicitation }): DeferredPermissionBody {
   const common = { sessionId: args.sessionId, assignmentId: args.assignmentId, attempt: args.attempt, agentId: args.agentId, requestId: args.requestId };
   if (args.sanitized.kind === "permission") {
-    const { title, toolKind, options } = args.sanitized.params;
-    return { kind: "permission", ...common, permission: { title, ...(toolKind ? { toolKind } : {}), options } };
+    const { title, toolKind, options, toolCallBinding } = args.sanitized.params;
+    return { kind: "permission", ...common, permission: { title, ...(toolKind ? { toolKind } : {}), ...(toolCallBinding ? { toolCallBinding } : {}), options } };
   }
   return { kind: "elicitation", ...common, elicitation: { message: args.sanitized.params.message, requestedSchema: args.sanitized.params.requestedSchema, isSignIn: args.sanitized.isSignIn } };
 }
@@ -202,8 +206,16 @@ export async function registerDeferral(
 }
 
 /** Core's record of the request, when it is exactly the request raised; null (failing closed) otherwise. */
+function sameToolBinding(view: PendingPermissionView, body: DeferredPermissionBody): boolean {
+  if (body.kind !== "permission" || view.kind !== "permission") return true;
+  const expected = body.permission.toolCallBinding;
+  const actual = view.permission.toolCallBinding;
+  if (!expected) return !actual;
+  return actual?.toolCallId === expected.toolCallId && actual.contentDigest === expected.contentDigest;
+}
+
 function registeredRequest(view: PendingPermissionView, body: DeferredPermissionBody, logger: Logger | undefined): PendingPermissionView | null {
-  if (view.kind === body.kind && view.requestId === body.requestId && view.assignmentId === body.assignmentId && view.agentId === body.agentId) return view;
+  if (sameToolBinding(view, body) && view.kind === body.kind && view.requestId === body.requestId && view.assignmentId === body.assignmentId && view.agentId === body.agentId) return view;
   logger?.warn({ requestId: body.requestId, assignmentId: body.assignmentId, stage: "permission_deferral", outcome: "mismatched" }, "Core registered a different pending request; failing closed");
   return null;
 }

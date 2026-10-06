@@ -54,6 +54,9 @@ import { isOnboardWorkAssignment, onboardTerminalResult, type OnboardWorkAssignm
 import { continuedSession, logicalSessionId } from "./continued-session.js";
 import { integrationTerminalResult, isIntegrationWorkAssignment, type IntegrationWorkAssignment, type IntegrationWorkCarrier } from "../integration/carrier.js";
 
+import type { DiagnosticCompanionInboxRecord } from "../state/diagnostic-companion-inbox.js";
+import { diagnosticCompanionOperationalObservation } from "../control/diagnostic-companion-observability.js";
+
 /**
  * Pull → claim → dispatch → report. Core owns admission and placement; the
  * supervisor validates every assignment locally, claims exactly the agent
@@ -184,6 +187,27 @@ export class WorkOrchestrator {
 
   activeCount(): number {
     return this.deps.journal.activeAssignments().length;
+  }
+
+  /** Join diagnostic intake to existing ownership; never create an admission. */
+  observeDiagnosticCompanion(record: DiagnosticCompanionInboxRecord) {
+    const match = record.companion.match;
+    const active = this.deps.journal.activeAssignments().find(entry =>
+      entry.assignmentId === match.assignmentId && entry.attempt === match.attempt,
+    );
+    const retained = active ? this.deps.journal.execution.start(match.assignmentId, match.attempt) : undefined;
+    const operation = active && retained && active.claimId === retained.admission.claimId
+      ? {
+          assignmentId: active.assignmentId, attempt: active.attempt,
+          claimId: retained.admission.claimId, executionId: retained.admission.executionGeneration,
+          runtimeIncarnationId: retained.admission.runnerIncarnation,
+        }
+      : null;
+    const observation = diagnosticCompanionOperationalObservation(record, operation);
+    if (observation.event === "runtime.diagnostic_companion.persisted") {
+      this.sessions.get(`${match.assignmentId}:${match.attempt}`)?.bindDiagnosticContext(observation.context);
+    }
+    return observation;
   }
 
   /** Logical session ids with an open (not yet closed) session on this machine. */
@@ -822,6 +846,10 @@ export class WorkOrchestrator {
     if (!runner) throw new Error("no runner for the placed agent");
     const session = new RelayedSession(assignment, this.relayedSessionDeps(dispatch, runner));
     this.sessions.set(key, session);
+    // Intake can precede bootstrap; replay only the retained diagnostic join.
+    for (const record of this.deps.journal.diagnosticCompanions.all()) {
+      if (record.companion.match.assignmentId === assignment.id && record.companion.match.attempt === assignment.attempt) this.observeDiagnosticCompanion(record);
+    }
     // Bootstrap runs off-lane. Its cloud/file preflight may take arbitrarily
     // long without holding assignment delivery; durable local execution
     // activation happens only after that preflight succeeds.
@@ -882,12 +910,9 @@ export class WorkOrchestrator {
   private relayedSessionDeps(dispatch: NativeDispatch, runner: RunnerPort): RelayedSessionDeps {
     const { assignment } = dispatch;
     const { restoreReference, sessionId, retainedReference } = this.sessionContinuation(assignment);
-    const mcpLocalTransport = retainedReference && sessionId
-      ? this.deps.journal.execution.mcpLocalTransportForReference(retainedReference, sessionId, assignment.agentRoute.agentId)
-      : undefined;
     return {
       ...this.deps.sessionDeps(assignment, runner),
-      ...(mcpLocalTransport ? { mcpLocalTransport, mcpLocalTransportReference: retainedReference! } : {}),
+      ...this.retainedSessionTransports(assignment, retainedReference, sessionId),
       assertLegacyCodexThreadUnloaded: legacyReference => this.legacyCodexThreadUnloaded(dispatch, legacyReference),
       assertExecutionOwned: dispatch.assertExecutionOwned,
       assertRecoveryOwned: dispatch.assertRecoveryOwned,
@@ -899,6 +924,18 @@ export class WorkOrchestrator {
       onUsage: this.deps.onUsage,
       onExecutionAuthorityLost: () => this.recoverLostExecutionAuthority(assignment.id, assignment.attempt),
       onClosed: async (closed, reason) => this.onSessionClosed(closed, reason, dispatch.assertAuthority),
+    };
+  }
+
+  private retainedSessionTransports(assignment: RemoteWorkAssignment, retainedReference: string | undefined, sessionId: string | undefined): Pick<RelayedSessionDeps, "mcpLocalTransport" | "sessionToolTransports" | "mcpLocalTransportReference"> {
+    if (!retainedReference || !sessionId) return {};
+    const execution = this.deps.journal.execution;
+    const mcpLocalTransport = execution.mcpLocalTransportForReference(retainedReference, sessionId, assignment.agentRoute.agentId);
+    const sessionToolTransports = execution.sessionToolTransportsForReference(retainedReference, sessionId, assignment.agentRoute.agentId);
+    return {
+      ...(mcpLocalTransport ? { mcpLocalTransport } : {}),
+      ...(sessionToolTransports ? { sessionToolTransports } : {}),
+      ...(mcpLocalTransport || sessionToolTransports ? { mcpLocalTransportReference: retainedReference } : {}),
     };
   }
 
@@ -983,7 +1020,7 @@ export class WorkOrchestrator {
   }
 
   /** The execution's durable bindings, each recorded under the dispatch's ownership checks. */
-  private executionRecordDeps(dispatch: NativeDispatch): Pick<RelayedSessionDeps, "recordCompletedSettlement" | "reserveExecutionReference" | "recordExecutionProcessOwner" | "replaceExecutionProcessOwner" | "recordMcpLocalTransport"> {
+  private executionRecordDeps(dispatch: NativeDispatch): Pick<RelayedSessionDeps, "recordCompletedSettlement" | "reserveExecutionReference" | "recordExecutionProcessOwner" | "replaceExecutionProcessOwner" | "recordMcpLocalTransport" | "recordSessionToolTransports"> {
     const execution = this.deps.journal.execution;
     const owned = dispatch.assertExecutionOwned;
     return {
@@ -1004,6 +1041,10 @@ export class WorkOrchestrator {
       replaceExecutionProcessOwner: async (previous, replacement) => {
         await execution.replaceBootstrapProcessOwner(dispatch.admission!, previous, replacement, owned);
         owned();
+      },
+      recordSessionToolTransports: async identity => {
+        owned();
+        await execution.bindSessionToolTransports(dispatch.admission!, identity, owned);
       },
       recordMcpLocalTransport: async identity => {
         owned();

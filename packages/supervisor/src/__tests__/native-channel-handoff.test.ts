@@ -109,9 +109,11 @@ it.each(["fresh", "live"] as const)("binds a %s conversation bootstrap to the tr
     await journal.execution.reserveAllocation(identity, current);
   }
   const priorTransport = { port: await closedLoopbackPort(), credential: "p".repeat(43) };
+  const priorTools = { version: 1 as const, result: { port: await closedLoopbackPort(), credential: "r".repeat(43) } };
   await journal.execution.open(previous, current, previous.openedAt);
   await journal.execution.bindReference(previous, "prior-ref", current);
   await journal.execution.bindMcpLocalTransport(previous, priorTransport, current);
+  await journal.execution.bindSessionToolTransports(previous, priorTools, current);
   await journal.execution.bindProcessOwner(previous, processOwner, current);
   await journal.execution.markCompletedTurnSettled(previous, "prior-ref", "2026-09-06T00:00:01.000Z", current);
   await journal.assignments.put({ assignmentId: previous.assignmentId, attempt: 1, claimId: previous.claimId,
@@ -161,6 +163,7 @@ it.each(["fresh", "live"] as const)("binds a %s conversation bootstrap to the tr
     await internal.bootstrapping.get(`${successor.assignmentId}:1`);
     expect(createSession).toHaveBeenCalledOnce();
     expectBootstrapTransport(mode, journal.execution.execution(successor)?.mcpLocalTransport, priorTransport, createSession.mock.calls[0]?.[0]);
+    if (mode === "live") expect(journal.execution.execution(successor)?.sessionToolTransports).toEqual(priorTools);
   } finally { await session?.close("cancelled"); }
 });
 

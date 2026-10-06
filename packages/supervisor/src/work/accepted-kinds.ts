@@ -5,7 +5,7 @@ import { REMOTE_DIRECT_MIN_CORE_CONTRACT_VERSION, REMOTE_INTEGRATION_MIN_CORE_CO
 // composed, so its two kinds are accepted too. Leaving them out meant Core
 // never offered a discovery run's evidence work, and grouping evidence was
 // never read.
-const BASE_KINDS: readonly RemoteWorkKind[] = ["planning", "delivery", "validation", "qa", "assistant_execution", "search_generation", "onboarding", "repository_relocation"];
+const BASE_KINDS: readonly RemoteWorkKind[] = ["planning", "delivery", "validation", "qa", "assistant_execution", "operations", "search_generation", "onboarding", "repository_relocation"];
 
 /**
  * The work kinds this connector names in a pull. A Core built before a kind

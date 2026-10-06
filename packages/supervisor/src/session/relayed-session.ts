@@ -1,6 +1,8 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { SessionToolTransportsSchema, type SessionToolTransports } from "../mcp/local-transport.js";
+import { lstat, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { basename, isAbsolute, join } from "node:path";
+import { ObservabilityContextV1Schema, type ObservabilityContextV1 } from "@konteks/backstage-plugin-common";
 import type { CreateElicitationRequest, RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import {
   SessionToCoreMessageSchema,
@@ -12,6 +14,9 @@ import {
   directModelSelectionsEqual,
   allEqual,
   createLogger,
+  redactValue,
+  nativeSpanLogContext,
+  withNativeSpan,
   type AcpJsonRpcError,
   type AgentTurnUsageObservation,
   type Clock,
@@ -100,15 +105,18 @@ export interface RelayedSessionDeps {
    * requestDigest an answer permit echoes, and the deadline. Absent only in
    * legacy local tests; a production session always registers.
    */
+  exactPermissionBindingSupported?: () => boolean;
   registerDeferral?: (body: DeferredPermissionBody) => Promise<PendingPermissionView>;
   instanceId: string;
   /** Redeems/renews one logical `mcpCapabilityTokenRef`; bearer stays in memory. */
   redeemCapabilityToken: (assignment: RemoteWorkAssignment) => Promise<CapabilityTokenIssue>;
   /** Retained local address/header for the same provider thread, never Core delegation. */
   mcpLocalTransport?: McpLocalTransportIdentity;
+  sessionToolTransports?: SessionToolTransports;
   mcpLocalTransportReference?: string;
   /** Persist the local transport identity before the provider sees its MCP config. */
   recordMcpLocalTransport?: (identity: McpLocalTransportIdentity) => Promise<void>;
+  recordSessionToolTransports?: (identity: SessionToolTransports) => Promise<void>;
   /** Legacy first load only: the owner must prove this reference absent. */
   assertLegacyCodexThreadUnloaded?: (reference: string) => Promise<boolean>;
   /** The runner's workspace folder: the confinement root the tool policy judges against. */
@@ -237,6 +245,9 @@ export class RelayedSession {
   /** The QA browser's gateway (validation, QA, delivery and conversation sessions of any agent) and its output folder. */
   private browserGateway: PreviewBrowserGateway | null = null;
   private browserOutputDir: string | null = null;
+  private diagnosticContext: ObservabilityContextV1 | undefined;
+  private readonly toolTransports: SessionToolTransports = { version: 1 };
+  private retainedTools: SessionToolTransports | undefined;
   /** The logical session whose preview this session's agent drives. */
   private previewSessionId: string | null = null;
   readonly counters = { unknownCompletions: 0, malformedResponses: 0 };
@@ -246,13 +257,26 @@ export class RelayedSession {
     this.mcpCalls = assignment.agentRoute.agentId === "codex" ? new McpToolCallLedger() : null;
     // Bound only after input preparation proves Core's claim-bound session.
     this.boundChannelId = null;
-    this.logger = deps.logger ?? createLogger({ name: "relayed-session" });
+    this.logger = (deps.logger ?? createLogger({ name: "relayed-session" })).child({}, {
+      formatters: { log: object => {
+        const context = nativeSpanLogContext(this.diagnosticContext);
+        return redactValue({ ...object, ...(context ? { context } : {}) }) as Record<string, unknown>;
+      } },
+    });
     this.executionGate = isNativeTurn(assignment) && deps.executionAuthority
       ? new NativeExecutionGate({ ...deps.executionAuthority, assignment, logger: this.logger, journal: deps.journal, clock: deps.clock,
         assertOwned: () => {
           if (!deps.assertExecutionOwned) throw new RemoteInstanceError("execution_fenced", "Execution ownership is unavailable.");
           deps.assertExecutionOwned();
         }, onAuthorityLost: () => this.onExecutionAuthorityLost() }) : null;
+  }
+
+  /** Diagnostic-only late binding; it never grants execution or tool access. */
+  bindDiagnosticContext(candidate: unknown): boolean {
+    const parsed = ObservabilityContextV1Schema.safeParse(candidate);
+    if (!parsed.success || parsed.data.assignmentId !== this.assignment.id || parsed.data.attempt !== this.assignment.attempt || this.closed) return false;
+    this.diagnosticContext = parsed.data;
+    return true;
   }
 
   private async onExecutionAuthorityLost(): Promise<void> {
@@ -306,17 +330,19 @@ export class RelayedSession {
    */
   private async bootstrapStage<T>(stage: string, operation: () => Promise<T>): Promise<T> {
     const startedAt = Date.now();
-    try {
-      const result = await operation();
-      // One line per finished stage, so a slow bootstrap says where.
-      this.logger.info({ event: "native.bootstrap.stage", assignmentId: this.assignment.id, attempt: this.assignment.attempt,
-        stage, durationMs: Date.now() - startedAt }, "native session bootstrap stage finished");
-      return result;
-    } catch (error) {
-      this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, stage, ...stageFailure(error) },
-        "native session bootstrap stage failed");
-      throw error;
-    }
+    return withNativeSpan("native.bootstrap.stage", this.diagnosticContext, { assignmentId: this.assignment.id, attempt: this.assignment.attempt, stage }, async () => {
+      try {
+        const result = await operation();
+        // One line per finished stage, so a slow bootstrap says where.
+        this.logger.info({ event: "native.bootstrap.stage", assignmentId: this.assignment.id, attempt: this.assignment.attempt,
+          stage, outcome: "succeeded", durationMs: Date.now() - startedAt }, "native session bootstrap stage finished");
+        return result;
+      } catch (error) {
+        this.logger.warn({ event: "native.bootstrap.stage.failed", outcome: "failed", assignmentId: this.assignment.id, attempt: this.assignment.attempt, stage, ...stageFailure(error) },
+          "native session bootstrap stage failed");
+        throw error;
+      }
+    });
   }
 
   private async bootstrapImpl(): Promise<{ acpSessionRef: string; resumed: boolean }> {
@@ -330,6 +356,7 @@ export class RelayedSession {
     // it: no platform tools even when a capability is named, no preview or
     // browser (not a preview kind), no result tool.
     const direct = isDirectAssignment(this.assignment);
+    this.retainedTools = this.deps.sessionToolTransports ? SessionToolTransportsSchema.parse(this.deps.sessionToolTransports) : undefined;
     await this.startCapabilityFacade(binding.sessionId, direct, mcpServers);
     const browser = await this.startPreviewTools(binding.sessionId, prepared.cwd, mcpServers);
     // The turn result tool: every Konteks session gets it, so a turn that asks
@@ -430,14 +457,16 @@ export class RelayedSession {
       start: () => preview.start(sessionId, cwd),
       stop: () => preview.stop(sessionId, "agent"),
       status: () => preview.status(sessionId),
-    }, { logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt }, browser: browser !== undefined });
+    }, { logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt }, browser: browser !== undefined,
+      observability: () => this.diagnosticContext, initiallyInactive: true,
+      ...(this.retainedTools?.preview ? { localTransport: this.retainedTools.preview } : {}) });
     this.previewTools = tools;
     this.previewSessionId = sessionId;
     // A viewer may start this worktree's preview too (the same process
     // manager and inference as preview_start).
     preview.permit?.(sessionId, cwd);
-    mcpServers.push({ type: "http", ...(await this.bootstrapStage("preview_tools", () => tools.start())),
-    });
+    mcpServers.push({ type: "http", ...await this.bootstrapStage("preview_tools", () => tools.start()) });
+    this.toolTransports.preview = tools.localTransportIdentity();
     return browser;
   }
 
@@ -452,6 +481,8 @@ export class RelayedSession {
     if (browserVersion === null || !preview.origin || !preview.browsersPath) return undefined;
     const origin = preview.origin.bind(preview);
     const gateway = new PreviewBrowserGateway({
+      ...(this.retainedTools?.browser ? { localPort: this.retainedTools.browser.port } : {}),
+      initiallyInactive: true, observability: () => this.diagnosticContext,
       target: () => origin(sessionId),
       onActivity: () => preview.touch(sessionId),
       logger: this.logger,
@@ -459,15 +490,29 @@ export class RelayedSession {
     });
     this.browserGateway = gateway;
     const proxyUrl = await this.bootstrapStage("browser_gateway", () => gateway.start());
-    this.browserOutputDir = await mkdtemp(join(tmpdir(), "konteks-browser-"));
+    this.browserOutputDir = await this.prepareBrowserOutput();
+    this.toolTransports.browser = { port: Number(new URL(proxyUrl).port), outputDirectoryName: basename(this.browserOutputDir) };
     return { proxyUrl, outputDir: this.browserOutputDir, browsersPath: preview.browsersPath };
   }
 
+  private async prepareBrowserOutput(): Promise<string> {
+    if (!this.retainedTools?.browser) return mkdtemp(join(tmpdir(), "konteks-browser-"));
+    const outputDir = join(tmpdir(), this.retainedTools.browser.outputDirectoryName);
+    await mkdir(outputDir, { mode: 0o700 }).catch(error => { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; });
+    const stat = await lstat(outputDir);
+    const privateOwner = process.platform === "win32" || (stat.uid === process.getuid?.() && (stat.mode & 0o077) === 0);
+    if (![stat.isDirectory(), !stat.isSymbolicLink(), privateOwner].every(Boolean)) {
+      throw new RemoteInstanceError("recovery_required", "The retained browser output directory is not private.");
+    }
+    return outputDir;
+  }
+
   private async startResultTool(mcpServers: SessionMcpServer[]): Promise<void> {
-    const resultTools = new StructuredResultToolServer({ logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt } });
+    const resultTools = new StructuredResultToolServer({ logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt },
+      ...(this.retainedTools?.result ? { localTransport: this.retainedTools.result } : {}), initiallyInactive: true });
     this.resultTools = resultTools;
-    mcpServers.push({ type: "http", ...(await this.bootstrapStage("result_tool", () => resultTools.start())),
-    });
+    mcpServers.push({ type: "http", ...await this.bootstrapStage("result_tool", () => resultTools.start()) });
+    this.toolTransports.result = resultTools.localTransportIdentity();
   }
 
   /**
@@ -512,10 +557,20 @@ export class RelayedSession {
     const references = this.referencesFor(activation);
     this.assertTransportReference(references);
     await this.assertLegacyCodexThread(references);
+    await this.recordToolTransports();
     this.mcpFacade?.enable();
+    this.previewTools?.enable();
+    this.resultTools?.enable();
+    this.browserGateway?.enable();
     if (this.closed) throw sessionClosed();
     this.deps.assertExecutionOwned?.();
     return references;
+  }
+
+  private async recordToolTransports(): Promise<void> {
+    if (isDirectAssignment(this.assignment) || !this.deps.recordSessionToolTransports) return;
+    await this.bootstrapStage("session_tool_transport_identity", () => this.deps.recordSessionToolTransports!(this.toolTransports));
+    this.deps.assertExecutionOwned?.();
   }
 
   /**
@@ -548,10 +603,16 @@ export class RelayedSession {
   }
 
   private legacyCodexTransport(reference: string | undefined): boolean {
-    return (
-      this.assignment.agentRoute.agentId === "codex" && Boolean(this.assignment.agentRoute.mcpCapabilityTokenRef) &&
-      Boolean(reference) && !this.deps.mcpLocalTransport
-    );
+    return this.assignment.agentRoute.agentId === "codex" && Boolean(reference) && this.missingRetainedTransport();
+  }
+
+  private missingRetainedTransport(): boolean {
+    return [
+      [this.mcpFacade, this.deps.mcpLocalTransport],
+      [this.previewTools, this.retainedTools?.preview],
+      [this.resultTools, this.retainedTools?.result],
+      [this.browserGateway, this.retainedTools?.browser],
+    ].some(([server, identity]) => Boolean(server) && !identity);
   }
 
   /** Durable reference and process ownership around the runner's session creation. */
@@ -1521,7 +1582,7 @@ export class RelayedSession {
   }
 
   private permissionContext(): Parameters<PolicyResponder["evaluatePermission"]>[1] {
-    return { assignmentId: this.assignment.id, agentId: this.assignment.agentRoute.agentId, workspaceRoot: this.policyRoot(),
+    return { assignmentId: this.assignment.id, agentId: this.assignment.agentRoute.agentId, operations: this.assignment.kind === "operations", workspaceRoot: this.policyRoot(),
       cwd: this.sessionCwd(), browserTools: this.browserGateway !== null, sessionServers: this.sessionServers, ...(this.mcpCalls ? { ledger: this.mcpCalls } : {}),
       admittedMcpTools: this.deps.admittedMcpTools?.(this.assignment) ?? [] };
   }
@@ -1556,10 +1617,16 @@ export class RelayedSession {
   private async deferPermission(ref: string, requestId: string, request: RequestPermissionRequest, decision: Extract<PolicyDecision, { kind: "defer" }>): Promise<void> {
     if (!this.assignment.policy.humanDeferralAllowed) return void (await this.answerPermission(ref, requestId, cancelledPermission()));
     const asked = decision.allowOnceOnly ? { ...request, options: request.options.filter(option => option.kind !== "allow_always") } : request;
-    const sanitized = sanitizePermissionRequest(asked);
+    const sanitized = this.sanitizedDeferredPermission(asked);
     const pending = await this.deferToHuman(ref, requestId, "session/request_permission", sanitized);
     if (!pending) return void (await this.answerPermission(ref, requestId, cancelledPermission()));
     await this.sendToCore({ kind: "acp", method: "session/request_permission", id: requestId, params: { sessionId: ref, toolCall: { toolCallId: asked.toolCall.toolCallId, title: sanitized.params.title, ...(sanitized.params.toolKind ? { kind: sanitized.params.toolKind } : {}) }, options: sanitized.params.options } as never });
+  }
+
+  private sanitizedDeferredPermission(request: RequestPermissionRequest): SanitizedPermission {
+    const context = this.deps.exactPermissionBindingSupported?.()
+      ? { cwd: this.sessionCwd(), observedInput: this.toolGovernance?.bindingInput?.(request.toolCall.toolCallId) } : undefined;
+    return sanitizePermissionRequest(request, context);
   }
 
   /** Put the policy's note on a refused tool call (an ACP `tool_call_update` carrying only content). */

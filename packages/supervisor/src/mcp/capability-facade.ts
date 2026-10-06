@@ -3,6 +3,7 @@ import { createServer, type IncomingHttpHeaders, type IncomingMessage, type Serv
 import { Readable } from "node:stream";
 import { createLogger, plainRecord, RemoteInstanceError, type Logger } from "@konteks/remote-common";
 import type { CapabilityTokenIssue } from "../core/client.js";
+import type { McpLocalTransportIdentity } from "./local-transport.js";
 import { bearerMatches, readBounded, sendJson } from "../loopback-http.js";
 
 const MAX_REQUEST_BYTES = 1024 * 1024;
@@ -35,7 +36,7 @@ interface BrowserAccessGrant {
 }
 
 /** Local transport continuity only. This credential never grants Core authority. */
-export interface McpLocalTransportIdentity { port: number; credential: string }
+export type { McpLocalTransportIdentity } from "./local-transport.js";
 
 interface McpCapabilityFacadeOptions {
   initial: CapabilityTokenIssue;

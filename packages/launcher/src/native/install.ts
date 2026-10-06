@@ -686,9 +686,10 @@ async function addBundledAgent(add: { root: string; options: NativeAgentAddOptio
   const fetchFn = fetchOf(options.deps);
   const release = await releaseForAgent(options, load.roots, current, fetchFn);
   const agents = [...current.agents, options.agentId];
+  const bundled = agents.filter(agent => !isHostAgentId(agent));
   const profiles = await agentProfiles(options.agentId, current);
-  assertOfflinePackages(selectNativeArtifacts(release, { ...load.platform, agentIds: agents }));
-  const releaseId = await stageAgents({ root, release, platform: load.platform, agents, bundled: agents, fetchFn, beforeRename: () => add.lock.assertOwned(), discardOnFailure: true });
+  assertOfflinePackages(selectNativeArtifacts(release, { ...load.platform, agentIds: bundled }));
+  const releaseId = await stageAgents({ root, release, platform: load.platform, agents, bundled, fetchFn, beforeRename: () => add.lock.assertOwned(), discardOnFailure: true });
   await agentFolders(root, options.agentId);
   const successor = NativeRuntimeRecordSchema.parse({
     ...current,

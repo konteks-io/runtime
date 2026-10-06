@@ -393,7 +393,7 @@ it.each(["valid", "lost-during-keys", "lost-during-admission", "wrong-producer",
 });
 
 async function sessionFixture(work: RemoteWorkAssignment = assignment, acceptDeliveryOutput?: (authority: { claimId: string; invocationRef: string }) => Promise<RemoteDeliveryAcceptanceReceipt>,
-  logger?: { warn: (...args: unknown[]) => void; info: (...args: unknown[]) => void; error: (...args: unknown[]) => void; debug: (...args: unknown[]) => void }) {
+  logger?: { child: (...args: unknown[]) => unknown; warn: (...args: unknown[]) => void; info: (...args: unknown[]) => void; error: (...args: unknown[]) => void; debug: (...args: unknown[]) => void }) {
   const f = work.source.kind === "harness_delivery" ? await deliveryFixture() : await fixture();
   const entry = f.journal.assignments.get(`${work.id}:${work.attempt}`)!;
   await f.journal.assignments.put({ ...entry, kind: work.kind });
@@ -420,6 +420,16 @@ async function sessionFixture(work: RemoteWorkAssignment = assignment, acceptDel
 }
 
 describe("native session dispatch uses genuine execution admission", () => {
+  it("protects an Ops conversation with genuine admission and refuses an unsigned prompt", async () => {
+    const ops = { ...assignment, kind: "operations" as const, agentRoute: { ...assignment.agentRoute, requiredRole: "ops" as const } };
+    const f = await sessionFixture(ops);
+    await expect(f.session.onToRuntime({ kind: "acp", id: "unsigned-ops", method: "session/prompt", params: { sessionId: "acp", prompt: [{ type: "text", text: "execute" }] } })).rejects.toMatchObject({ code: "operation_permit_required" });
+    expect(f.runner.prompt).not.toHaveBeenCalled();
+    await f.session.onToRuntime(f.envelope);
+    expect(f.runner.prompt).toHaveBeenCalledOnce();
+    expect(f.beforePrompt).toHaveBeenCalledOnce();
+  });
+
   it("closes a prepared delivery assignment after its authorized pre-prompt cancellation", async () => {
     const work = { ...assignment, kind: "delivery" as const, taskId: "task", correlationId: "invocation",
       agentRoute: { agentId: "codex", requiredRole: "generator" as const, sessionConfig: { model: "model-a" } },
@@ -479,7 +489,7 @@ describe("native session dispatch uses genuine execution admission", () => {
     const acceptDeliveryOutput = vi.fn<(authority: { claimId: string; invocationRef: string }) => Promise<RemoteDeliveryAcceptanceReceipt>>()
       .mockRejectedValueOnce(new RemoteInstanceError("capability_unavailable", "refused", { diagnostic: "response_status_invalid" }))
       .mockResolvedValueOnce(receipt);
-    const logger = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    const logger = { child: vi.fn().mockReturnThis(), warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() };
     const work = { ...assignment, kind: "delivery" as const, taskId: "task", correlationId: "invocation",
       agentRoute: { agentId: "codex", requiredRole: "generator" as const, sessionConfig: { model: "model-a" } },
       source: { kind: "harness_delivery" as const, portability: "instance_bound" as const, ownerInstanceId: "instance", executionSessionId: "session",

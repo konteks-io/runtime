@@ -457,3 +457,40 @@ it("uncertain bootstrap without a known reference cannot claim ACP settlement", 
   await expect(journal.execution.markAcpSettled(admission, "unknown", now, current)).rejects.toThrow();
   expect(journal.execution.execution(admission)?.phase).toBe("stopping");
 });
+
+
+it.each(["live", "restored"] as const)("retains private companion transport identity through %s succession and journal reload", async mode => {
+  const journal = new SupervisorJournal(dir); await journal.load();
+  const successor = { ...admission, runnerIncarnation: mode === "live" ? admission.runnerIncarnation : "restarted-process",
+    assignmentId: "correction", claimId: "correction-claim", executionGeneration: "correction-generation", openedAt: now };
+  const first = delivery(admission, { invocationId: "generate-1", dispatchGeneration: 0 });
+  const correction = delivery(successor, { invocationId: "generate-2", dispatchGeneration: 0,
+    predecessor: { invocationId: "generate-1", dispatchGeneration: 0 } });
+  const identity = { version: 1 as const, preview: { port: 43101, credential: "p".repeat(43) },
+    result: { port: 43102, credential: "r".repeat(43) }, browser: { port: 43103, outputDirectoryName: "konteks-browser-ABCdef" } };
+  await begin(journal, admission, first); await begin(journal, successor, correction);
+  await journal.execution.open(admission, current, admission.openedAt);
+  await journal.execution.bindReference(admission, "generator-ref", current);
+  await journal.execution.bindSessionToolTransports(admission, identity, current);
+  expect(journal.execution.sessionToolTransportsForReference("generator-ref", "repository-generator-session", "codex")).toBeUndefined();
+  await expect(journal.execution.bindSessionToolTransports(admission, { ...identity, result: { ...identity.result, port: 43104 } }, current)).rejects.toThrow();
+  await expect(journal.execution.bindSessionToolTransports(admission, identity, () => { throw new Error("fenced"); })).rejects.toThrow("fenced");
+  await journal.execution.bindProcessOwner(admission, processOwner, current);
+  await journal.execution.markCompletedTurnSettled(admission, "generator-ref", now, current);
+  const reopened = new SupervisorJournal(dir); await reopened.load();
+  const lookup = (ref: string, session = "repository-generator-session", agent = "codex") => reopened.execution.sessionToolTransportsForReference(ref, session, agent);
+  expect(lookup("generator-ref")).toEqual(identity);
+  expect(lookup("foreign-ref")).toBeUndefined();
+  expect(lookup("generator-ref", "foreign-session")).toBeUndefined();
+  expect(lookup("generator-ref", undefined, "other-agent")).toBeUndefined();
+  lookup("generator-ref")!.result!.port = 9999;
+  expect(lookup("generator-ref")).toEqual(identity);
+  const transfer = { predecessor: admission, successor, sessionId: "repository-generator-session",
+    acpSessionRef: "generator-ref", processOwner, continuedAt: "2026-09-06T00:00:02.000Z" };
+  if (mode === "live") await reopened.execution.transferLiveContinuation(transfer, current);
+  else await reopened.execution.transferRestoredContinuation(transfer, current);
+  const rotated = new SupervisorJournal(dir); await rotated.load();
+  expect(rotated.execution.execution(successor)?.sessionToolTransports).toEqual(identity);
+  expect(rotated.execution.sessionToolTransportsForReference("generator-ref", "repository-generator-session", "codex")).toBeUndefined();
+  await expect(rotated.execution.bindSessionToolTransports(successor, identity, current)).resolves.toBeUndefined();
+});

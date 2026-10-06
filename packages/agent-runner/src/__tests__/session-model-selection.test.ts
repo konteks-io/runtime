@@ -182,9 +182,10 @@ describe("admitted direct model selection before work", () => {
     "confirms only the retained agent-default pin on a live resume without config options (still offered: %s)",
     async (stillOffered) => {
       const test = fixture(rawOption(), undefined, undefined, true);
-      test.bridge.initializeResult.agentCapabilities = { sessionCapabilities: { resume: {} } };
+      test.bridge.initializeResult.agentCapabilities = { sessionCapabilities: { resume: {}, close: {} } };
       const resumeSession = vi.fn(async () => ({}));
-      Object.assign(test.connection, { resumeSession });
+      const closeSession = vi.fn(async () => ({}));
+      Object.assign(test.connection, { resumeSession, closeSession });
       const first = await test.manager.create(defaultArgs());
       await settleFirstTurn(test, first.acpSessionRef);
       test.setSessionConfigOption.mockClear();
@@ -207,6 +208,7 @@ describe("admitted direct model selection before work", () => {
       else await expect(continuation).rejects.toThrow();
       expect(test.connection.prompt).toHaveBeenCalledTimes(1);
       expect(resumeSession).toHaveBeenCalledTimes(1);
+      expect(closeSession).toHaveBeenCalledWith({ sessionId: "provider-session" });
       expect(
         test.setSessionConfigOption.mock.calls.filter(([request]) => request.configId === "model"),
       ).toEqual([[{ sessionId: "provider-session", configId: "model", value: "actual-default" }]]);

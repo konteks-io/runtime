@@ -1,3 +1,4 @@
+export { projectAcpToolDiagnostics, AcpToolDiagnosticsSchema } from "@konteks/backstage-plugin-common/remote-instance-internal";
 /**
  * The boundary between the runtime and the shared contract package
  * (`@konteks/backstage-plugin-common`). Every wire type, schema and constant

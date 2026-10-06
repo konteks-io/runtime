@@ -40,6 +40,8 @@ export interface AdmittedMcpTool { server: string; tools: readonly string[] }
  */
 export interface PermissionContext {
   assignmentId: string;
+  /** Derived from the trusted Core assignment, never from tool request input. */
+  operations?: boolean;
   agentId: string;
   workspaceRoot: string;
   cwd?: string;
@@ -149,8 +151,8 @@ export class EvaluatorPolicyResponder implements PolicyResponder {
     return admittedTool(identity, context) && this.humanDeferralAllowed() ? { kind: "defer", allowOnceOnly: true } : { kind: "deny", optionId: deny };
   }
 
-  private deferOrDeny(deny: string | null): PolicyDecision {
-    return this.humanDeferralAllowed() ? { kind: "defer" } : { kind: "deny", optionId: deny };
+  private deferOrDeny(deny: string | null, allowOnceOnly = false): PolicyDecision {
+    return this.humanDeferralAllowed() ? { kind: "defer", ...(allowOnceOnly ? { allowOnceOnly: true as const } : {}) } : { kind: "deny", optionId: deny };
   }
 
   /**
@@ -169,8 +171,9 @@ export class EvaluatorPolicyResponder implements PolicyResponder {
       agentId: context.agentId,
       toolUseId: request.toolCall.toolCallId,
     });
-    if (evaluation.allowed && options.allow !== null) return { kind: "allow", optionId: options.allow };
     if (!evaluation.allowed) return deniedBy(evaluation, options.deny);
+    if (opsAction(request, context)) return this.deferOrDeny(options.deny, true);
+    if (options.allow !== null) return { kind: "allow", optionId: options.allow };
     return this.deferOrDeny(options.deny);
   }
 
@@ -178,4 +181,9 @@ export class EvaluatorPolicyResponder implements PolicyResponder {
     if (isSignInElicitation(request)) return { kind: "decline" };
     return this.humanDeferralAllowed() ? { kind: "defer" } : { kind: "decline" };
   }
+}
+
+const OPS_ACTION_KINDS = new Set(["execute", "edit", "delete", "move"]);
+function opsAction(request: RequestPermissionRequest, context: PermissionContext): boolean {
+  return context.operations === true && identityOf(request, context).kind !== "mcp" && OPS_ACTION_KINDS.has(request.toolCall.kind ?? "");
 }

@@ -38,10 +38,10 @@ export function agentSatisfiesRole(agent: ConnectedAgentView, role: RuntimeRole,
 
 /**
  * Roles the ready ACP agent alone satisfies (code validation and adversarial
- * review included). Not "ops": the shared vocabulary is not proof of an
- * installed operations carrier.
+ * review included). Ops uses the composed native conversation carrier with
+ * signed execution and explicit operational-action approval.
  */
-const READY_AGENT_ROLES: ReadonlySet<RuntimeRole> = new Set<RuntimeRole>(["planner", "generator", "assistant", "qa"]);
+const READY_AGENT_ROLES: ReadonlySet<RuntimeRole> = new Set<RuntimeRole>(["planner", "generator", "assistant", "qa", "ops"]);
 /**
  * What an `onboard` runtime advertises when git is present. Both
  * capabilities go together: one machine's git either reads repositories and

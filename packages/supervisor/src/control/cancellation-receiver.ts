@@ -1,3 +1,4 @@
+import { isConversationWorkKind } from "@konteks/backstage-plugin-common";
 import { allEqual, RemoteInstanceError, RuntimeCancellationDeliveryRequestSchema } from "@konteks/remote-common";
 import { deliveryNotCurrent } from "./delivery-scope.js";
 import type { CoreSignatureVerifier } from "./core-signature.js";
@@ -15,7 +16,7 @@ export function cancellationNamesAssignment(assignment: StartedAssignment, sessi
   const source = assignment.source;
   if (source.kind === "harness_delivery") return source.executionSessionId === sessionId;
   if (assignment.kind === "direct" && source.kind === "direct_session") return source.sessionId === sessionId;
-  return assignment.kind === "assistant_execution" && source.kind === "conversation" && source.sessionId === sessionId;
+  return isConversationWorkKind(assignment.kind) && source.kind === "conversation" && source.sessionId === sessionId;
 }
 
 /**

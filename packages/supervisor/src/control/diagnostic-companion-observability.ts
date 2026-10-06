@@ -1,4 +1,4 @@
-import { createRuntimeAdmissionObservabilityContext } from "@konteks/remote-common";
+import { ObservabilityContextV1Schema } from "@konteks/backstage-plugin-common";
 import type { DiagnosticCompanionInboxRecord } from "../state/diagnostic-companion-inbox.js";
 
 interface ActiveDiagnosticCompanionOperation {
@@ -58,13 +58,15 @@ export function diagnosticCompanionOperationalObservation(
   return {
     event: "runtime.diagnostic_companion.persisted" as const,
     outcome: "succeeded" as const,
-    observability: createRuntimeAdmissionObservabilityContext({
+    // Correlate logs with the exported parent. A random local span id would
+    // imply an exported runtime span that this log-only boundary does not own.
+    context: ObservabilityContextV1Schema.parse({
+      ...carrier,
       runtimeIncarnationId: operation.runtimeIncarnationId,
       assignmentId: operation.assignmentId,
       attempt: operation.attempt,
       claimId: operation.claimId,
       executionId: operation.executionId,
-      trace: { traceparent: carrier.traceparent, ...(carrier.tracestate ? { tracestate: carrier.tracestate } : {}) },
     }),
     diagnosticCompanion: {
       deliveryId: companion.deliveryId,

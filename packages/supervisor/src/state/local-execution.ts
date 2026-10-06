@@ -2,7 +2,7 @@ import { z } from "zod";
 import { AssignmentRequestReferenceSchema, RemoteInstanceError, RemoteWorkAssignmentSchema, allEqual, canonicalize, jcsDigest, type AssignmentRequestReference, type JsonValue, type RemoteWorkAssignment, type RetainedProcessOwner } from "@konteks/remote-common";
 import { LocalAdmissionSchema, type LocalAdmission } from "./local-admission.js";
 import { AssignmentAllocationRecordSchema, AssignmentOperationRecordSchema, AssignmentReplyRecordSchema, AssignmentStreamRecordSchema, assignmentOperationKey, assignmentReplyKey, assignmentRequestKey, assignmentStreamKey, initialAssignmentStream, validateAssignmentStreamRecords, type AssignmentReplyRecordValue } from "./assignment-stream.js";
-import type { McpLocalTransportIdentity } from "../mcp/capability-facade.js";
+import { McpLocalTransportIdentitySchema, SessionToolTransportsSchema, type McpLocalTransportIdentity, type SessionToolTransports } from "../mcp/local-transport.js";
 
 const id = z.string().min(1).max(256);
 const digest = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
@@ -11,7 +11,6 @@ const BindingSchema = SeedSchema.extend({ instanceId: id, workspaceId: id, excha
 const scope = { instanceId: id, workspaceId: id };
 const AdmissionSchema = LocalAdmissionSchema;
 const RetainedProcessOwnerSchema = z.object({ version: z.literal(1), platform: z.enum(["darwin", "linux", "win32"]), pid: z.number().int().positive(), processGroupId: z.number().int().positive(), startToken: id, commandDigest: digest }).strict();
-const McpLocalTransportIdentitySchema = z.object({ port: z.number().int().min(1).max(65535), credential: z.string().regex(/^[A-Za-z0-9_-]{43}$/) }).strict();
 const LegacyCodexAdmissionSchema = z.object({ reference: id, ownerGeneration: id }).strict();
 const LiveContinuationTransferSchema = z.object({ predecessor: AdmissionSchema, successor: AdmissionSchema,
   sessionId: id, acpSessionRef: id, processOwner: RetainedProcessOwnerSchema, continuedAt: z.string().datetime() }).strict();
@@ -72,7 +71,7 @@ const StartSchema = StartInputSchema.safeExtend({ delivery: z.enum(["unallocated
 });
 type LocalAdmissionStart = z.infer<typeof StartSchema>;
 const CancellationSchema = z.object({ ...scope, runnerIncarnation: id, manifestId: id, assignmentId: id, attempt: AdmissionSchema.shape.attempt, decisionDigest: digest, cancelledAt: z.string().datetime() }).strict();
-const ExecutionFieldsSchema = z.object({ schemaVersion: z.literal(1), admission: AdmissionSchema, openedAt: z.string().datetime(), acpSessionRef: id.nullable(), referenceFence: id.nullable(), processOwner: RetainedProcessOwnerSchema.optional(), mcpLocalTransport: McpLocalTransportIdentitySchema.optional(), legacyCodexAdmission: LegacyCodexAdmissionSchema.optional(), phase: z.enum(["opened", "stopping", "process_stopped", "acp_settled", "continued", "interrupted_unqualified"]), stoppingAt: z.string().datetime().nullable(), processStoppedAt: z.string().datetime().optional(), interruptedAt: z.string().datetime().optional(), acpSettledAt: z.string().datetime().nullable(), completedTurnSettledAt: z.string().datetime().optional(), continuedFromGeneration: id.optional(), restoredFromGeneration: id.optional(), restoreAcpSessionRef: id.optional(), continuedToGeneration: id.optional(), continuedAt: z.string().datetime().optional(), lifecycleProfileDigest: z.null(), executionProfileDigest: z.null() }).strict();
+const ExecutionFieldsSchema = z.object({ schemaVersion: z.literal(1), admission: AdmissionSchema, openedAt: z.string().datetime(), acpSessionRef: id.nullable(), referenceFence: id.nullable(), processOwner: RetainedProcessOwnerSchema.optional(), mcpLocalTransport: McpLocalTransportIdentitySchema.optional(), sessionToolTransports: SessionToolTransportsSchema.optional(), legacyCodexAdmission: LegacyCodexAdmissionSchema.optional(), phase: z.enum(["opened", "stopping", "process_stopped", "acp_settled", "continued", "interrupted_unqualified"]), stoppingAt: z.string().datetime().nullable(), processStoppedAt: z.string().datetime().optional(), interruptedAt: z.string().datetime().optional(), acpSettledAt: z.string().datetime().nullable(), completedTurnSettledAt: z.string().datetime().optional(), continuedFromGeneration: id.optional(), restoredFromGeneration: id.optional(), restoreAcpSessionRef: id.optional(), continuedToGeneration: id.optional(), continuedAt: z.string().datetime().optional(), lifecycleProfileDigest: z.null(), executionProfileDigest: z.null() }).strict();
 type ExecutionFields = z.infer<typeof ExecutionFieldsSchema>;
 
 /** Every field a continued execution must hold, and nothing of a live one. */
@@ -345,12 +344,22 @@ export class LocalExecutionJournal {
   }
 
   /** The local transport is reusable only for this exact retained provider session. */
-  mcpLocalTransportForReference(ref: string, sessionId: string, agentId: string): McpLocalTransportIdentity | undefined {
+  private completedExecutionForReference(ref: string, sessionId: string, agentId: string): LocalExecutionState | undefined {
     this.index();
     const generation = this.references.get(ref);
     const state = generation && this.executions.get(generation);
     if (!state || !this.transportReusable(state, sessionId, agentId)) return undefined;
-    return state.mcpLocalTransport ? structuredClone(state.mcpLocalTransport) : undefined;
+    return state;
+  }
+
+  mcpLocalTransportForReference(ref: string, sessionId: string, agentId: string): McpLocalTransportIdentity | undefined {
+    const state = this.completedExecutionForReference(ref, sessionId, agentId);
+    return state?.mcpLocalTransport ? structuredClone(state.mcpLocalTransport) : undefined;
+  }
+
+  sessionToolTransportsForReference(ref: string, sessionId: string, agentId: string): SessionToolTransports | undefined {
+    const state = this.completedExecutionForReference(ref, sessionId, agentId);
+    return state?.sessionToolTransports ? structuredClone(state.sessionToolTransports) : undefined;
   }
 
   /** An opened execution whose turn completed, in this logical session and for this agent. */
@@ -498,6 +507,15 @@ export class LocalExecutionJournal {
       if (!existing || existing.phase !== "opened") throw conflict();
       if (existing.mcpLocalTransport && !equal(existing.mcpLocalTransport, identity)) throw conflict();
       return existing.mcpLocalTransport ? existing : { ...existing, mcpLocalTransport: identity };
+    });
+  }
+
+  async bindSessionToolTransports(admission: LocalAdmission, candidate: SessionToolTransports, assertCurrent: () => void): Promise<void> {
+    const identity = SessionToolTransportsSchema.parse(candidate);
+    await this.transition(admission, assertCurrent, existing => {
+      if (!existing || existing.phase !== "opened") throw conflict();
+      if (existing.sessionToolTransports && !equal(existing.sessionToolTransports, identity)) throw conflict();
+      return existing.sessionToolTransports ? existing : { ...existing, sessionToolTransports: identity };
     });
   }
 
@@ -1039,6 +1057,7 @@ function liveSuccessor(before: SettledExecution, value: LiveContinuationTransfer
     acpSessionRef: value.acpSessionRef, referenceFence: value.successor.executionGeneration, processOwner: value.processOwner, phase: "opened", stoppingAt: null,
     acpSettledAt: null, continuedFromGeneration: value.predecessor.executionGeneration,
     ...(before.mcpLocalTransport ? { mcpLocalTransport: before.mcpLocalTransport } : {}),
+    ...(before.sessionToolTransports ? { sessionToolTransports: before.sessionToolTransports } : {}),
     lifecycleProfileDigest: null, executionProfileDigest: null });
 }
 
@@ -1048,5 +1067,6 @@ function restoredSuccessor(before: SettledExecution, value: LiveContinuationTran
     acpSessionRef: null, referenceFence: null, phase: "opened", stoppingAt: null, acpSettledAt: null,
     restoredFromGeneration: value.predecessor.executionGeneration, restoreAcpSessionRef: value.acpSessionRef,
     ...(before.mcpLocalTransport ? { mcpLocalTransport: before.mcpLocalTransport } : {}),
+    ...(before.sessionToolTransports ? { sessionToolTransports: before.sessionToolTransports } : {}),
     lifecycleProfileDigest: null, executionProfileDigest: null });
 }

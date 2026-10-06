@@ -1,6 +1,8 @@
+import type { McpLocalTransportIdentity } from "../mcp/local-transport.js";
 import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { createLogger, RemoteInstanceError, type Logger } from "@konteks/remote-common";
+import type { ObservabilityContextV1 } from "@konteks/backstage-plugin-common";
+import { withNativeSpan, createLogger, RemoteInstanceError, type Logger } from "@konteks/remote-common";
 import { BROWSER_MCP_SERVER_NAME } from "@konteks/remote-agent-runner";
 import type { PreviewStarter, PreviewStatus } from "./process-manager.js";
 import { CONVERSATION_HAS_NO_APP, CONVERSATION_HAS_NO_APP_AGENT_NOTE } from "./config.js";
@@ -104,13 +106,16 @@ function textAnswer(text: string): ToolAnswer {
 }
 
 export class PreviewMcpServer {
-  private readonly credential = randomBytes(32).toString("base64url");
+  private readonly credential: string;
   private readonly logger: Logger;
   private server: Server | null = null;
   private closed = false;
+  private active: boolean;
 
-  constructor(private readonly host: PreviewToolHost, private readonly options: { logger?: Logger; context?: Record<string, unknown>; browser?: boolean } = {}) {
+  constructor(private readonly host: PreviewToolHost, private readonly options: { logger?: Logger; context?: Record<string, unknown>; observability?: () => ObservabilityContextV1 | undefined; browser?: boolean; localTransport?: McpLocalTransportIdentity; initiallyInactive?: boolean } = {}) {
     this.logger = options.logger ?? createLogger({ name: "preview-mcp" });
+    this.credential = options.localTransport?.credential ?? randomBytes(32).toString("base64url");
+    this.active = !options.initiallyInactive;
   }
 
   async start(): Promise<{ name: string; url: string; headers: Array<{ name: string; value: string }> }> {
@@ -119,7 +124,7 @@ export class PreviewMcpServer {
     this.server = server;
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
-      server.listen(0, "127.0.0.1", () => { server.off("error", reject); resolve(); });
+      server.listen(this.options.localTransport?.port ?? 0, "127.0.0.1", () => { server.off("error", reject); resolve(); });
     });
     const address = server.address();
     if (!address || typeof address === "string") throw new RemoteInstanceError("capability_unavailable", "The preview tools did not bind a loopback port.");
@@ -127,9 +132,21 @@ export class PreviewMcpServer {
     return { name: PREVIEW_MCP_SERVER_NAME, url: `http://127.0.0.1:${address.port}/mcp`, headers: [{ name: "authorization", value: `Bearer ${this.credential}` }] };
   }
 
+  localTransportIdentity(): McpLocalTransportIdentity {
+    const address = this.server?.address();
+    if (!address || typeof address === "string") throw new RemoteInstanceError("capability_unavailable", "The preview tools have no bound transport.");
+    return { port: address.port, credential: this.credential };
+  }
+
+  enable(): void {
+    if (this.closed || !this.server) throw new RemoteInstanceError("execution_fenced", "The preview tools are unavailable.");
+    this.active = true;
+  }
+
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.active = false;
     const server = this.server;
     this.server = null;
     if (server) {
@@ -143,12 +160,18 @@ export class PreviewMcpServer {
     response.setHeader("Cache-Control", "no-store");
     if (this.closed) return this.fail(response, 503, "closed");
     if (!bearerMatches(request.headers.authorization, this.credential)) return this.fail(response, 401, "invalid_local_credential");
+    if (!this.active) return this.fail(response, 503, "assignment_not_active");
     if (request.method !== "POST") {
       response.setHeader("Allow", "POST");
       return this.fail(response, 405, "method_not_allowed");
     }
+    return this.answerRequest(request, response);
+  }
+
+  private async answerRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const payload = await readJsonBody(request, MAX_REQUEST_BYTES);
     if (payload === null) return sendJson(response, 400, { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } });
+    if (this.closed || !this.active) return this.fail(response, 503, "assignment_not_active");
     const batch = Array.isArray(payload.value);
     const answers = await this.answerAll((batch ? payload.value : [payload.value]) as JsonRpcRequest[]);
     if (answers.length === 0) {
@@ -169,6 +192,7 @@ export class PreviewMcpServer {
 
   private async safeDispatch(item: JsonRpcRequest): Promise<unknown | null> {
     try {
+      if (this.closed || !this.active) return { jsonrpc: "2.0", id: item?.id ?? null, error: { code: -32603, message: "Assignment not active" } };
       return await this.dispatch(item);
     } catch {
       return { jsonrpc: "2.0", id: (item as JsonRpcRequest | null)?.id ?? null, error: { code: -32603, message: "Internal error" } };
@@ -205,6 +229,13 @@ export class PreviewMcpServer {
   }
 
   private async call(name: string): Promise<ToolAnswer> {
+    return withNativeSpan("native.preview.tool", this.options.observability?.(), {
+      assignmentId: this.options.context?.assignmentId, attempt: this.options.context?.attempt,
+      tool: ["preview_start", "preview_stop", "preview_status"].includes(name) ? name : "unsupported",
+    }, () => this.callImpl(name), result => previewOutcome(result));
+  }
+
+  private async callImpl(name: string): Promise<ToolAnswer> {
     const run = this.tool(name);
     if (run === null) return textAnswer(`Unknown tool ${name}. The preview tools are preview_start, preview_status and preview_stop.`);
     let status: PreviewStatus;
@@ -214,8 +245,16 @@ export class PreviewMcpServer {
       this.logger.warn({ event: "preview.tool_failed", tool: name, ...this.options.context, code: error instanceof RemoteInstanceError ? error.code : "unexpected" }, "preview tool call failed");
       return textAnswer(`The preview tool failed: ${error instanceof Error ? error.message.slice(0, 300) : "unexpected error"}.`);
     }
-    this.logger.info({ event: "preview.tool_called", tool: name, state: status.state, ...this.options.context }, "preview tool called");
+    this.logToolStatus(name, status);
     return { content: [{ type: "text", text: describeStatus(status, { browser: this.options.browser === true }) }], structuredContent: status, ...(name === "preview_start" && status.state === "failed" ? { isError: true } : {}) };
+  }
+
+  private logToolStatus(name: string, status: PreviewStatus): void {
+    const failure = status.failure;
+    const facts = { event: "preview.tool_called", ...this.options.context, sessionId: status.sessionId, tool: name, state: status.state,
+      ...(failure ? previewFailureFacts(failure) : {}) };
+    if (name === "preview_start" && status.state === "failed" && failure?.code !== "no_app") this.logger.warn(facts, "preview tool called");
+    else this.logger.info(facts, "preview tool called");
   }
 
   private tool(name: string): (() => Promise<PreviewStatus> | PreviewStatus) | null {
@@ -227,8 +266,13 @@ export class PreviewMcpServer {
     }
   }
 
-  private fail(response: ServerResponse, status: number, code: string): void {
-    sendJson(response, status, { error: code });
+  private async fail(response: ServerResponse, status: number, code: string): Promise<void> {
+    await withNativeSpan("native.preview.request", this.options.observability?.(), {
+      assignmentId: this.options.context?.assignmentId, attempt: this.options.context?.attempt, stage: "request_validation",
+    }, async () => {
+      this.logger.warn({ event: "preview.request_refused", ...this.options.context, outcome: "refused", code, httpStatus: status }, "preview request refused");
+      sendJson(response, status, { error: code });
+    }, () => ({ outcome: "refused", errorCode: code, httpStatus: status }));
   }
 }
 
@@ -263,3 +307,17 @@ const STATUS_LINES: readonly StatusLines[] = [
   status => lineIf(status.state === "starting", () => "Still starting: call preview_status in a little while."),
   status => lineIf(status.state === "running" || status.state === "starting", () => `Stops by itself after ${status.idleStopMinutes} minutes with no viewer and no agent activity.`),
 ];
+
+function previewOutcome(result: ToolAnswer) {
+  const failure = result.structuredContent?.failure;
+  return {
+    outcome: failure?.code === "no_app" ? "unavailable" as const : result.isError ? "failed" as const : "succeeded" as const,
+    ...(failure ? { errorCode: failure.code, ...(failure.exitCode != null ? { exitCode: failure.exitCode } : {}), timedOut: failure.timedOut } : {}),
+  };
+}
+
+function previewFailureFacts(failure: NonNullable<PreviewStatus["failure"]>) {
+  return { failureCode: failure.code, phase: failure.phase,
+    ...(failure.exitCode !== undefined ? { exitCode: failure.exitCode } : {}),
+    ...(failure.timedOut !== undefined ? { timedOut: failure.timedOut } : {}) };
+}

@@ -44,6 +44,7 @@ export interface HostToolGovernance {
    * person): Antigravity pairs the server's own report of an allowed change
    * with it.
    */
+  bindingInput?(toolCallId: string): unknown;
   answered?(toolCallId: string, allowed: boolean): void;
   /**
    * The quarantine line for this bypass given the credential the agent runs
@@ -64,6 +65,7 @@ export function hostToolGovernance(agentId: string): HostToolGovernance | null {
     bypassDiagnostic: "dsh_tool_governance_bypassed",
     quarantineMessage: "DeepSeek Harness ran a tool without asking Konteks first. Update or reinstall DeepSeek Harness, then restart the connector.",
     observe: update => dsh.observe(update),
+    bindingInput: toolCallId => dsh.bindingInput(toolCallId),
     decide: (request, context) => dsh.decide(request, context.cwd, { browserTools: context.browserTools === true }),
   };
 }

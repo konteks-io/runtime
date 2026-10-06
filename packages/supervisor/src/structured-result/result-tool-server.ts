@@ -1,3 +1,4 @@
+import type { McpLocalTransportIdentity } from "../mcp/local-transport.js";
 import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { Ajv, type ErrorObject, type ValidateFunction } from "ajv";
@@ -137,21 +138,24 @@ function initializeResult(params: unknown): Record<string, unknown> {
 }
 
 export class StructuredResultToolServer {
-  private readonly credential = randomBytes(32).toString("base64url");
+  private readonly credential: string;
   private readonly mcpSessionId = randomBytes(16).toString("hex");
   private readonly logger: Logger;
   private readonly relistWaitMs: number;
   private server: Server | null = null;
   private closed = false;
+  private active: boolean;
   private turn: BoundTurn | null = null;
   private readonly streams = new Set<ServerResponse>();
   private listWaiters: Array<() => void> = [];
   /** The agent was told the list changed and did not read it again: do not wait for it next time. */
   private relistIgnored = false;
 
-  constructor(private readonly options: { logger?: Logger; context?: Record<string, unknown>; relistWaitMs?: number } = {}) {
+  constructor(private readonly options: { logger?: Logger; context?: Record<string, unknown>; relistWaitMs?: number; localTransport?: McpLocalTransportIdentity; initiallyInactive?: boolean } = {}) {
     this.logger = options.logger ?? createLogger({ name: "structured-result" });
     this.relistWaitMs = options.relistWaitMs ?? DEFAULT_RELIST_WAIT_MS;
+    this.credential = options.localTransport?.credential ?? randomBytes(32).toString("base64url");
+    this.active = !options.initiallyInactive;
   }
 
   async start(): Promise<{ name: string; url: string; headers: Array<{ name: string; value: string }> }> {
@@ -160,7 +164,7 @@ export class StructuredResultToolServer {
     this.server = server;
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
-      server.listen(0, "127.0.0.1", () => { server.off("error", reject); resolve(); });
+      server.listen(this.options.localTransport?.port ?? 0, "127.0.0.1", () => { server.off("error", reject); resolve(); });
     });
     const address = server.address();
     if (!address || typeof address === "string") throw new RemoteInstanceError("capability_unavailable", "The result tool did not bind a loopback port.");
@@ -168,9 +172,21 @@ export class StructuredResultToolServer {
     return { name: STRUCTURED_RESULT_MCP_SERVER_NAME, url: `http://127.0.0.1:${address.port}/mcp`, headers: [{ name: "authorization", value: `Bearer ${this.credential}` }] };
   }
 
+  localTransportIdentity(): McpLocalTransportIdentity {
+    const address = this.server?.address();
+    if (!address || typeof address === "string") throw new RemoteInstanceError("capability_unavailable", "The result tool has no bound transport.");
+    return { port: address.port, credential: this.credential };
+  }
+
+  enable(): void {
+    if (this.closed || !this.server) throw new RemoteInstanceError("execution_fenced", "The result tool is unavailable.");
+    this.active = true;
+  }
+
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.active = false;
     this.turn = null;
     for (const waiter of this.listWaiters.splice(0)) waiter();
     for (const stream of this.streams) stream.end();
@@ -243,6 +259,7 @@ export class StructuredResultToolServer {
     response.setHeader("Cache-Control", "no-store");
     if (this.closed) return this.fail(response, 503, "closed");
     if (!bearerMatches(request.headers.authorization, this.credential)) return this.fail(response, 401, "invalid_local_credential");
+    if (!this.active) return this.fail(response, 503, "assignment_not_active");
     if (isStreamRequest(request)) return this.openStream(request, response);
     if (request.method !== "POST") {
       response.setHeader("Allow", "POST");
@@ -257,6 +274,7 @@ export class StructuredResultToolServer {
 
   /** A JSON-RPC message or batch; notifications get no answer, and a batch of only those gets 202. */
   private answerRpc(response: ServerResponse, payload: unknown): void {
+    if (this.closed || !this.active) return this.fail(response, 503, "assignment_not_active");
     const batch = Array.isArray(payload);
     const { answers, listed } = this.answerAll((batch ? payload : [payload]) as JsonRpcRequest[]);
     if (listed) response.once("finish", () => this.settleListWaiters());
@@ -366,4 +384,3 @@ export class StructuredResultToolServer {
     sendJson(response, status, { error: code });
   }
 }
-

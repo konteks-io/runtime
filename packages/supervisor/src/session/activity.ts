@@ -1,4 +1,4 @@
-import { isSecretKey, plainRecord, redactText } from "@konteks/remote-common";
+import { isSecretKey, plainRecord, projectAcpToolDiagnostics, redactText } from "@konteks/remote-common";
 import { ANTIGRAVITY_TOOL_KINDS, antigravityCallTool } from "./antigravity-tool-governance.js";
 import { DSH_TOOL_KINDS } from "./dsh-tool-governance.js";
 import { KONTEKS_CODE_MODE_SERVERS, parseKonteksCodeModeBlock } from "./opencode-code-mode.js";
@@ -33,8 +33,11 @@ export function omitPrivateAcpToolPayload(value: unknown): unknown {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
   const update = value as Record<string, unknown>;
   if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") return value;
-  return Object.fromEntries(Object.entries(update).filter(([key]) =>
-    key !== "rawInput" && key !== "rawOutput" && key !== "_meta"));
+  const diagnostics = projectAcpToolDiagnostics(update.status, update.rawOutput);
+  return { ...Object.fromEntries(Object.entries(update).filter(([key]) =>
+    key !== "rawInput" && key !== "rawOutput" && key !== "_meta" && key !== "diagnostics")),
+    ...(diagnostics ? { diagnostics } : {}),
+  };
 }
 
 type ToolCanonicalizer = (candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined) => unknown;
