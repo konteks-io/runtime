@@ -53,8 +53,9 @@ whole permission path.
   quarantines that agent on this connector (other agents keep running).
   `quarantineMessageFor` names the Gemini Enterprise "Terminal
   auto-execution: Require review" setting when that credential is in use.
-- File changes are judged against the workspace root, or the session's own
-  folder for a direct session (`policyRoot()`).
+- File changes are judged against each session's verified working copy
+  (`policyRoot()`), including non-direct assignments. This ACP permission
+  check does not confine reads or shell execution.
 
 ## Gotchas
 

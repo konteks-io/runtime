@@ -603,13 +603,19 @@ describe("relayed session", () => {
           await ask("relative", { kind: "edit", title: "Write notes", rawInput: { file_path: "notes.txt" } });
           await ask("other", { kind: "edit", title: "Write elsewhere", rawInput: { file_path: join(other, "x.txt") } });
           await ask("push", { kind: "execute", title: "git push", rawInput: { command: "git push origin main" } });
+          await ask("ordinary", { kind: "execute", title: "npm run build", rawInput: { command: "npm run build" } });
+          await ask("delete-other", { kind: "delete", locations: [{ path: join(other, "x.txt") }] });
+          await ask("move-other", { kind: "move", rawInput: { file_path: join(own, "notes.txt"), destination: join(other, "notes.txt") } });
+          await ask("mixed", { kind: "edit", locations: [{ path: join(own, "notes.txt") }, { path: join(other, "x.txt") }] });
           const answer = (id: string) => (vi.mocked(f.runner.answer).mock.calls.find(call => call[1] === id)?.[2] as { outcome: { optionId?: string } } | undefined)?.outcome.optionId;
-          return { inside: answer("inside"), relative: answer("relative"), other: answer("other"), push: answer("push") };
+          return { inside: answer("inside"), relative: answer("relative"), other: answer("other"), push: answer("push"),
+            ordinary: answer("ordinary"), deleteOther: answer("delete-other"), moveOther: answer("move-other"), mixed: answer("mixed") };
         } finally { await f.session.close("cancelled"); }
       };
-      expect(await decide(directWork)).toEqual({ inside: "allow", relative: "allow", other: "reject", push: "reject" });
-      // Konteks's own conversations keep the workspace root (unchanged here).
-      expect((await decide({ ...assignment, agentRoute: { ...assignment.agentRoute, mcpCapabilityTokenRef: undefined } } as RemoteWorkAssignment)).other).toBe("allow");
+      const expected = { inside: "allow", relative: "allow", other: "reject", push: "reject",
+        ordinary: "allow", deleteOther: "reject", moveOther: "reject", mixed: "reject" };
+      expect(await decide(directWork)).toEqual(expected);
+      expect(await decide({ ...assignment, agentRoute: { ...assignment.agentRoute, mcpCapabilityTokenRef: undefined } } as RemoteWorkAssignment)).toEqual(expected);
     });
 
     // A Codex "Edit files" call named four paths, one written

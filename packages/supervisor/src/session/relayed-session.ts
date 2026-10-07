@@ -1586,14 +1586,9 @@ export class RelayedSession {
     this.toolGovernance?.answered?.(governed.toolCallId, option?.kind === "allow_once");
   }
 
-  /**
-   * The folder the tool policy judges file changes against: the runner's
-   * workspace, except for a direct session, whose agent may change files only
-   * in its own private session folder, never another session's. Kept to direct sessions: Konteks's own kinds are proven against the
-   * workspace root today, and their tighter root is a change of its own.
-   */
+  /** The tool policy judges file changes against this session's verified working copy. */
   private policyRoot(): string {
-    return isDirectAssignment(this.assignment) ? this.sessionCwd() : this.deps.workspaceRoot;
+    return this.sessionCwd();
   }
 
   /** What goes in front of the person's text: the staged skills line; nothing for a direct session, so a leading `/command` stays first. */
