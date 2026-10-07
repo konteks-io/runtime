@@ -53,7 +53,11 @@ jobs:
     # install.ps1 trusts the MSI through its own Ed25519 check of the signed
     # SHA256SUMS (there is no Windows code-signing certificate yet), so that
     # check runs where people run it: Windows PowerShell 5.1, and pwsh too.
-    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-11-arm]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -62,6 +66,12 @@ jobs:
       - name: Ed25519 verifier in Windows PowerShell 5.1 (RFC 8032 vectors, a real release manifest)
         shell: powershell
         run: .\scripts\test-bootstrap-verifier.ps1
+      - name: Windows OS architecture support in PowerShell 5.1
+        shell: powershell
+        run: .\scripts\test-bootstrap-platform.ps1
+      - name: Windows OS architecture support in PowerShell 7
+        shell: pwsh
+        run: .\scripts\test-bootstrap-platform.ps1
       - name: The same in PowerShell 7
         shell: pwsh
         run: .\scripts\test-bootstrap-verifier.ps1

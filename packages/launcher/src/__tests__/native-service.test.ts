@@ -26,15 +26,14 @@ describe("native install layout", () => {
 
 describe("native background service definitions", () => {
   const root = '/Users/Test User/Library/Application Support/konteks-remote';
-  it("keeps the Windows scheduled action windowless and waits for the connector's exit", async () => {
+  it("keeps the Windows background host windowless and waits for its connector", async () => {
     const root = "C:\\Users\\Test User\\literal %PATH% & O'Brien\\remote";
     const executable = `${root}\\releases\\next\\konteks-connector.exe`;
     const service = nativeServiceDefinition({ os: 'windows', home: 'C:\\Users\\Test User', root, executable, userId: 'S-1-5-21-123-456-789-1001' });
-    expect(service.contents).toContain('<Command>%SystemRoot%\\System32\\wscript.exe</Command>');
-    expect(service.contents).not.toContain(`<Command>${executable}</Command>`);
-    expect(service.contents).toContain('//B //NoLogo');
+    expect(JSON.parse(service.contents).kind).toBe('windows-login-background');
+    expect(service.contents).not.toContain('<Task');
     const helper = service.supportFiles?.[0];
-    expect(helper?.path).toBe(`${root}\\service.js`);
+    expect(helper?.path).toBe(`C:\\Users\\Test User\\AppData\\Roaming\\Konteks\\background\\${service.label}.js`);
     expect(helper?.contents).toContain('WScript.Quit(shell.Run(');
     expect(helper?.contents).toContain(', 0, true)');
     const encoded = helper!.contents.match(/-EncodedCommand ([A-Za-z0-9+/=]+)/)![1]!;
@@ -45,12 +44,12 @@ describe("native background service definitions", () => {
     expect(script).toContain(`$env:KONTEKS_SERVICE_PROGRAM = '${executable.replace(/'/g, "''")}'`);
     expect(script).toContain(`$env:KONTEKS_SERVICE_ROOT = '${root.replace(/'/g, "''")}'`);
     expect(script).toContain('serve --root "%KONTEKS_SERVICE_ROOT%" >> "%KONTEKS_SERVICE_LOG%" 2>&1');
-    expect(script).toContain('exit $connector.ExitCode');
+    expect(script).toContain('if ($child.ExitCode -eq 0) { break }');
     // A hidden PowerShell host still creates a console for cmd unless this
     // ProcessStartInfo option is set (Windows installation RCA 2026-10-04).
     expect(script).toContain('$start.CreateNoWindow = $true');
     const run = vi.fn(() => 17), quit = vi.fn();
-    runInNewContext(helper!.contents, { WScript: { CreateObject: () => ({ Run: run }), Quit: quit } });
+    runInNewContext(helper!.contents, { WScript: { Arguments: { length: 0 }, CreateObject: () => ({ Run: run }), Quit: quit } });
     expect(run).toHaveBeenCalledWith(expect.stringContaining('-EncodedCommand'), 0, true);
     expect(quit).toHaveBeenCalledWith(17);
     const writes: string[] = [];
@@ -95,25 +94,15 @@ describe("native background service definitions", () => {
     expect(service.contents).not.toMatch(/sudo|bash|docker|User=root/);
   });
 
-  it("uses a least-privilege Windows logon task without a stored password", () => {
+  it("uses a per-user login shortcut without credentials or elevation", () => {
     const root = 'C:\\Users\\Test User\\AppData\\Local\\konteks-remote';
-    const service = nativeServiceDefinition({ os: 'windows', home: 'C:\\Users\\Test User', root, executable: `${root}\\bin\\konteks-remote.exe`, userId: 'S-1-5-21-123-456-789-1001' });
-    expect(service.contents).toContain('<LogonType>InteractiveToken</LogonType>');
-    expect(service.contents).toContain('encoding="UTF-16"');
-    expect(service.contents).toContain('<RunLevel>LeastPrivilege</RunLevel>');
-    expect(service.contents).toContain('<UserId>S-1-5-21-123-456-789-1001</UserId>');
-    expect(service.contents).toContain('<Arguments>//B //NoLogo //E:JScript &quot;C:\\Users\\Test User\\AppData\\Local\\konteks-remote\\service.js&quot;</Arguments>');
-    expect(service.install).toEqual([{ command: 'schtasks.exe', args: ['/Create', '/TN', service.label, '/XML', service.path, '/F'] }]);
-    // Status means running, not registered: `schtasks /Query` succeeds for a stopped task too.
-    expect(service.status.command).toBe('powershell.exe');
-    expect(service.status.args.slice(0, 3)).toEqual(['-NoProfile', '-NonInteractive', '-Command']);
-    expect(service.status.args[3]).toContain("-ErrorAction Stop");
-    expect(service.status.args[3]).toContain("$task.State -in @('Running', 'Queued')");
-    expect(service.status.args[3]).toContain("$task.State -in @('Ready', 'Disabled')");
-    // Failure to query a task must not masquerade as a stopped task whose
-    // RestartOnFailure ownership it is safe to leave registered.
-    expect(service.status.args[3]).toContain("CmdletizationQuery_NotFound*");
-    expect(service.status.args[3]).toContain("exit 2");
+    const service = nativeServiceDefinition({ os: 'windows', home: 'C:\\Users\\Test User', root, executable: `${root}\\releases\\next\\konteks-connector.exe`, userId: 'S-1-5-21-123-456-789-1001' });
+    expect(JSON.parse(service.contents).shortcut).toContain('C:\\Users\\Test User\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\');
+    const start = Buffer.from(service.start.args.at(-1)!, 'base64').toString('utf16le');
+    expect(start).toContain('$start.CreateNoWindow = $true');
+    expect(start).not.toMatch(/RunAs|password/i);
+    const status = Buffer.from(service.status.args.at(-1)!, 'base64').toString('utf16le');
+    expect(status).toContain('StartTime.ToUniversalTime().Ticks.ToString()');
   });
 
   it("starts by rewriting and re-registering the definition, so a start after an update runs the new release", async () => {
@@ -127,15 +116,15 @@ describe("native background service definitions", () => {
     expect(write).toHaveBeenCalledWith(next.supportFiles![0]!.path, next.supportFiles![0]!.contents);
     const bytes = write.mock.calls[1]?.[1];
     expect(bytes).toBeInstanceOf(Uint8Array);
-    expect(Buffer.from(bytes!).subarray(0, 2)).toEqual(Buffer.from([0xff, 0xfe]));
-    expect(Buffer.from(bytes!).subarray(2).toString('utf16le')).toContain("<Command>%SystemRoot%\\System32\\wscript.exe</Command>");
+    expect(JSON.parse(Buffer.from(bytes!).toString("utf8")).kind).toBe("windows-login-background");
+    expect(Buffer.from(bytes!).toString("utf8")).toContain("release-next");
     expect(calls).toEqual([next.status, ...next.install, next.start]);
     // Only a running service is left alone.
     const running = vi.fn(async () => 0), untouched = vi.fn(async () => undefined);
     await expect(startNativeServiceDefinition(next, { execute: running, write: untouched })).resolves.toBe('already_running');
     expect(untouched).not.toHaveBeenCalled();
     // A registration the OS refuses is an error, not a silent start.
-    await expect(startNativeServiceDefinition(next, { execute: async command => command === next.status ? 1 : command === next.install[0] ? 1 : 0, write })).rejects.toThrow(/schtasks/);
+    await expect(startNativeServiceDefinition(next, { execute: async command => command === next.status ? 1 : command === next.install[0] ? 1 : 0, write })).rejects.toThrow(/powershell/);
   });
 
   it("keeps different install roots isolated and requires explicit user identity", () => {

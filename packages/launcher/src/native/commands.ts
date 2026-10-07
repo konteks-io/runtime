@@ -30,7 +30,7 @@ import { prepareDeliveryGraft } from "./graft.js";
 import { earlierFailure, earlierFailureNote, keepLauncherCurrent, productionUpdateDeps, refreshInstalledLauncher, runNativeUpdate, selfUpdateNote } from "./update-transaction.js";
 import { productionUninstallDeps, uninstallNative } from "./uninstall.js";
 import type { NativeCliActions, NativeCommandContext } from "./cli.js";
-import { captureWindowsServiceOwner, endWindowsServiceTask, waitForWindowsServiceExit, type NativeServiceProcessOwner } from "./windows-service-owner.js";
+import { captureWindowsServiceOwner, stopWindowsBackgroundHost, waitForWindowsServiceExit, type NativeServiceProcessOwner } from "./windows-service-owner.js";
 
 const environment = () => sanitizeInheritedChildProcessEnv({ env: process.env });
 /** Runs one service or OS command and keeps how it ended; `--verbose` prints it. */
@@ -76,7 +76,7 @@ export const SERVICE_RELOAD_WINDOW_MS = 10 * 60_000;
 const SERVICE_RELOAD_GRACE_MS = 60_000;
 const SERVICE_RELOAD_FILE = "service-reload.json";
 
-type OwnServiceDefinitionOutcome = "not_installed" | "current" | "next_start" | "restarting";
+type OwnServiceDefinitionOutcome = "not_installed" | "current" | "next_start" | "restarting" | "handoff";
 
 export interface OwnServiceDefinitionDeps {
   definition: (root: string) => Promise<NativeServiceDefinition>;
@@ -116,24 +116,44 @@ export interface OwnServiceDefinitionDeps {
  * `SERVICE_RELOAD_WINDOW_MS` is refused, so a reload that does not take can
  * never become a restart loop.
  *
- * Files are compared as bytes in the encoding the service manager reads
- * (`encodeServiceDefinition`), so a Windows task file in any other encoding is
- * rewritten too, and a refused registration puts back exactly the bytes it
- * found. A Windows task that is missing although its file is current
- * (a start whose registration failed) is registered again.
+ * Definitions are compared as bytes. A failed Windows shortcut registration
+ * restores the previous manifest, and a missing shortcut is registered again.
+ * A legacy Windows task hands ownership to the hidden login host.
  */
 export async function keepServiceOnOwnDefinition(root: string, deps: OwnServiceDefinitionDeps): Promise<OwnServiceDefinitionOutcome> {
   const definition = await deps.definition(root);
-  const onDisk = await deps.read(definition.path).then(asBytes, () => null);
+  const { onDisk, migrating } = await installedServiceBytes(definition, deps);
   if (onDisk === null) return "not_installed";
   const expected = encodeServiceDefinition(definition);
   const rewritten = !onDisk.equals(expected);
   const helperChanged = await writeChangedSupportFiles(definition, deps);
   let reregistered = false;
-  if (rewritten) await rewriteDefinition(definition, deps, expected, onDisk);
-  else reregistered = await registerMissingTask(definition, deps);
+  if (migrating) return migrateBackgroundService(definition, deps);
+  if (rewritten) await rewriteDefinition(definition, deps, onDisk);
+  else reregistered = await registerMissingStartup(definition, deps);
   const unchanged = rewritten || helperChanged || reregistered ? "next_start" : "current";
   return reloadOntoDefinition(definition, deps, rewritten, unchanged);
+}
+
+async function installedServiceBytes(definition: NativeServiceDefinition, deps: OwnServiceDefinitionDeps): Promise<{ onDisk: Buffer | null; migrating: boolean }> {
+  const current = await deps.read(definition.path).then(asBytes, () => null);
+  if (current || !definition.legacyPath) return { onDisk: current, migrating: false };
+  const legacy = await deps.read(definition.legacyPath).then(asBytes, () => null);
+  return { onDisk: legacy, migrating: legacy !== null };
+}
+
+async function migrateBackgroundService(definition: NativeServiceDefinition, deps: OwnServiceDefinitionDeps): Promise<OwnServiceDefinitionOutcome> {
+  await registerStartup(definition, deps);
+  await deps.write(definition.path, definition.contents);
+  return handoffBackgroundService(definition, deps);
+}
+
+async function handoffBackgroundService(definition: NativeServiceDefinition, deps: OwnServiceDefinitionDeps): Promise<OwnServiceDefinitionOutcome> {
+  if (!definition.handoff) throw new Error("This service cannot migrate its background host.");
+  const command = definition.handoff(deps.pid);
+  const run = serviceRun(await deps.execute(command));
+  if (run.code !== 0) throw new NativeServiceCommandError("start", command, run);
+  return "handoff";
 }
 
 function asBytes(value: Uint8Array | string): Buffer {
@@ -153,10 +173,9 @@ async function writeChangedSupportFiles(definition: NativeServiceDefinition, dep
 }
 
 /**
- * Task Scheduler stores its own XML copy. Replace it without starting
- * another connector; its next start will use this release's helper.
+ * Refresh the login shortcut without starting another connector.
  */
-async function registerTask(definition: NativeServiceDefinition, deps: OwnServiceDefinitionDeps): Promise<void> {
+async function registerStartup(definition: NativeServiceDefinition, deps: OwnServiceDefinitionDeps): Promise<void> {
   for (const command of definition.install) {
     const run = serviceRun(await deps.execute(command));
     if (run.code !== 0) throw new NativeServiceCommandError("register", command, run);
@@ -164,21 +183,21 @@ async function registerTask(definition: NativeServiceDefinition, deps: OwnServic
 }
 
 /** The definition as the service manager reads it; a refused Windows registration puts back the bytes it found. */
-async function rewriteDefinition(definition: NativeServiceDefinition, deps: OwnServiceDefinitionDeps, expected: Buffer, onDisk: Buffer): Promise<void> {
-  await deps.write(definition.path, definition.fileEncoding ? expected : definition.contents);
+async function rewriteDefinition(definition: NativeServiceDefinition, deps: OwnServiceDefinitionDeps, onDisk: Buffer): Promise<void> {
+  await deps.write(definition.path, definition.contents);
   if (deps.os !== "windows") return;
-  try { await registerTask(definition, deps); }
+  try { await registerStartup(definition, deps); }
   catch (error) {
     await deps.write(definition.path, onDisk);
     throw error;
   }
 }
 
-/** A Windows task whose file is current but that is not registered (a failed start) is registered again. */
-async function registerMissingTask(definition: NativeServiceDefinition, deps: OwnServiceDefinitionDeps): Promise<boolean> {
+/** Recreate a missing Windows login shortcut. */
+async function registerMissingStartup(definition: NativeServiceDefinition, deps: OwnServiceDefinitionDeps): Promise<boolean> {
   if (deps.os !== "windows" || !definition.registered || serviceRun(await deps.execute(definition.registered)).code !== 1) return false;
-  deps.log("the Konteks task is not registered with Windows; registering it so it starts at the next sign-in");
-  await registerTask(definition, deps);
+  deps.log("the Konteks login shortcut is missing; registering it for the next sign-in");
+  await registerStartup(definition, deps);
   return true;
 }
 
@@ -239,8 +258,9 @@ async function forceStopService(definition: NativeServiceDefinition): Promise<vo
 
 async function forceStopWindowsService(definition: NativeServiceDefinition): Promise<void> {
   const owner = await captureWindowsServiceOwner(dirname(definition.path));
-  await endWindowsServiceTask(definition, execute);
+  await stopWindowsBackgroundHost(definition, execute);
   await owner?.terminate();
+  await waitForWindowsServiceExit(owner, definition, { execute, sleep: ms => new Promise(done => setTimeout(done, ms)), now: Date.now, stopDeadlineMs: 30_000 }, { line: () => undefined });
 }
 
 /** The pid the service manager runs for this service; null where it names none. */
@@ -532,7 +552,11 @@ async function stopOwnedNativeConnector(input: NativeCommandContext, definition:
 }
 
 async function requestOwnedShutdown(input: NativeCommandContext, definition: NativeServiceDefinition, deps: NativeStopDeps): Promise<void> {
-  if (!deps.shutdown) return executeNativeStop(definition, deps);
+  if (definition.windowsBackground) await executeNativeStop(definition, deps);
+  if (!deps.shutdown) {
+    if (!definition.windowsBackground) await executeNativeStop(definition, deps);
+    return;
+  }
   await deps.shutdown(input.root).catch(() => {
     setupLine(input.output, "serviceStopUnacknowledged");
   });
@@ -568,6 +592,7 @@ async function stopConfirmed(root: string, definition: NativeServiceDefinition, 
 ): Promise<boolean> {
   const receipt = await deps.readReceipt(root);
   const status = await deps.execute(definition.status);
+  if (definition.windowsBackground && status === 1 && deps.serviceOwner) return await deps.serviceOwner(root) === null;
   return (
     receipt !== null && receipt !== before.previousReceipt && status !== null && before.stoppedCodes.includes(status)
   );
@@ -1205,6 +1230,7 @@ export const nativeCliActions: NativeCliActions = {
         await recordServiceStartFailure(input.root, { at: new Date().toISOString(), message: `The background service could not be registered again: ${detail}` }).catch(() => undefined);
         return "current" as const;
       });
+    if (own === "handoff") return;
     if (own === "next_start") process.stderr.write("service definition rewritten by this release; it applies from the next start\n");
     if (own === "restarting") {
       // Nothing is claimed yet: the service manager stops this process within

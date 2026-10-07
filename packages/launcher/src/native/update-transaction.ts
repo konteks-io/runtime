@@ -18,7 +18,7 @@ import {
 import { readNativeRecord, restoreNativeRecord } from "./install.js";
 import { CONNECTOR_LOG_FILE, type NativeServiceCommand, type NativeServiceDefinition } from "./service.js";
 import { commitNativeUpdate, stageNativeUpdate, type NativeUpdateDeps, type NativeUpdateStage } from "./update.js";
-import { captureWindowsServiceOwner, endWindowsServiceTask, waitForWindowsServiceExit, type NativeServiceProcessOwner } from "./windows-service-owner.js";
+import { captureWindowsServiceOwner, stopWindowsBackgroundHost, waitForWindowsServiceExit, type NativeServiceProcessOwner } from "./windows-service-owner.js";
 import { beginNativeUpdateProgress, type NativeUpdateProgressHandle } from "./update-progress.js";
 
 interface UpdateControlClient {
@@ -316,6 +316,7 @@ class UpdateTransaction {
 
   private async requestStop(): Promise<void> {
     if (this.update.owner) {
+      if (this.update.definition.windowsBackground) await stopWindowsBackgroundHost(this.update.definition, this.deps.execute);
       await this.control.call({ op: "shutdown" }, z.unknown()).catch(() => {
         setupLine(this.input.output, "updateShutdownUnacknowledged");
       });
@@ -526,7 +527,7 @@ async function restartUnchanged(input: NativeUpdateInput, definition: NativeServ
 async function endOwnedForRestart(owner: NativeServiceProcessOwner, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps,
 ): Promise<void> {
   if (!(await owner.alive())) return;
-  await endWindowsServiceTask(definition, deps.execute);
+  await stopWindowsBackgroundHost(definition, deps.execute);
   await owner.terminate();
 }
 

@@ -17,7 +17,8 @@ itself) are product content, copied into every GitHub Release by
   computer, then `update` and `start`), `-VerifyOnly` (defines the verifier only, used by the CI test); `-User` / `-Enroll`
   only say the Windows user-local path is not available yet.
 - Tests: `scripts/bootstrap-install.test.mjs` (in `npm test`),
-  `scripts/test-bootstrap-verifier.ps1` (CI, PowerShell 5.1 and 7).
+  `scripts/test-bootstrap-verifier.ps1` and `scripts/test-bootstrap-platform.ps1`
+  (CI, PowerShell 5.1 and 7).
 
 ## Invariants
 

@@ -450,48 +450,43 @@ describe("native update transaction", () => {
     };
     await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated", restarted: true });
   });
-  describe("on Windows, where a stopped scheduled task still exists", () => {
+  describe("on Windows, where the login shortcut persists after stopping", () => {
     const root = "C:\\Users\\a\\AppData\\Local\\konteks-remote";
     const connector = (releaseId: string) => `${root}\\releases\\${releaseId}\\konteks-connector.exe`;
     const definitionFor = (record: NativeRuntimeRecord) => nativeServiceDefinition({ os: "windows", home: "C:\\Users\\a", root, executable: connector(record.releaseId), userId: "S-1-5-21-1-2-3-1001" });
-    /** Task Scheduler as far as the connector sees it: the task exists throughout, running or not, and runs the <Command> it was last registered with. */
+    /** The login shortcut persists while the hidden host starts and stops. */
     function windows(h: ReturnType<typeof harness>) {
-      const task = { running: true, command: connector(previous.releaseId), target: connector(previous.releaseId) };
+      const task = { running: true, command: "%SystemRoot%\\System32\\wscript.exe", target: connector(previous.releaseId) };
       const written = new Map<string, string>();
-      const scheduler = async (command: NativeServiceCommand): Promise<number> => {
-        if (command.command === "powershell.exe") return task.running ? 0 : 1;
-        if (command.command !== "schtasks.exe") throw new Error(`unexpected ${command.command}`);
-        switch (command.args[0]) {
-          case "/Query": return 0; // exists, whether or not it runs
-          case "/Create": task.command = /<Command>(.*?)<\/Command>/.exec(written.get(command.args[4]!)!)![1]!; return 0;
-          case "/Run": {
-            const helper = written.get(`${root}\\service.js`)!;
-            const encoded = /-EncodedCommand ([A-Za-z0-9+/=]+)/.exec(helper)![1]!;
-            const script = Buffer.from(encoded, "base64").toString("utf16le");
-            task.target = /\$env:KONTEKS_SERVICE_PROGRAM = '([^']+)'/.exec(script)![1]!;
-            task.running = true;
-            return 0;
-          }
-          case "/End": task.running = false; return 0;
-          default: return 1;
-        }
-      };
+      let registered = true;
       const harnessExecute = h.deps.execute, harnessStart = h.deps.start;
+      const scheduler = async (command: NativeServiceCommand): Promise<number> => {
+        const definition = definitionFor(h.currentRecord());
+        const same = (expected: NativeServiceCommand) => JSON.stringify(command) === JSON.stringify(expected);
+        if (same(definition.status)) return task.running ? 0 : 1;
+        if (same(definition.registered!)) return registered ? 0 : 1;
+        if (same(definition.install[0]!)) { registered = true; return 0; }
+        if (same(definition.stop)) { task.running = false; await harnessExecute({ command: "stop", args: [] }); return 0; }
+        if (same(definition.start)) {
+          const manifest = JSON.parse(written.get(definition.path)!) as { executable: string };
+          task.target = manifest.executable; task.running = true; return 0;
+        }
+        throw new Error(`unexpected Windows command ${command.command}`);
+      };
       h.deps.serviceDefinition = async () => definitionFor(h.currentRecord());
-      // The harness's control socket follows the task: /End stops what serves, a start serves the record.
-      h.deps.execute = async command => { const code = await scheduler(command); if (command.args[0] === "/End") await harnessExecute({ command: "stop", args: [] }); return code; };
-      h.deps.start = async input => { await startNativeServiceDefinition(definitionFor(h.currentRecord()), { execute: scheduler, write: async (path, contents) => { written.set(path, typeof contents === "string" ? contents : Buffer.from(contents).subarray(2).toString("utf16le")); } }); await harnessStart(input); };
+      h.deps.execute = scheduler;
+      h.deps.start = async input => { await startNativeServiceDefinition(definitionFor(h.currentRecord()), { execute: scheduler, write: async (path, contents) => { written.set(path, typeof contents === "string" ? contents : Buffer.from(contents).toString("utf8")); } }); await harnessStart(input); };
       return task;
     }
 
-    it("stops without waiting out the deadline and restarts the task on the new release", async () => {
+    it("stops without waiting out the deadline and restarts the hidden host on the new release", async () => {
       const h = harness({ previous });
       const task = windows(h);
       await expect(runNativeUpdate({ root, output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated", restarted: true });
       expect(task).toEqual({ running: true, command: "%SystemRoot%\\System32\\wscript.exe", target: connector("release-next") });
     });
 
-    it("rolls back to a task that runs the previous release again", async () => {
+    it("rolls back to a hidden host running the previous release", async () => {
       const h = harness({ previous, gate: "new_failure" });
       const task = windows(h);
       await expect(runNativeUpdate({ root, output: h.output }, h.deps)).rejects.toThrow();

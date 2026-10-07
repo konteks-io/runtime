@@ -13,6 +13,13 @@ This repository (`konteks-io/runtime`) is the only source for the connector.
 The older `remote-instance` repository keeps architecture and proof history
 only; do not build or deploy from it.
 
+On Windows, the connector runs while you are signed in. Installation adds a
+per-user Startup shortcut that launches a hidden background watchdog at login.
+The watchdog restarts the connector after crashes without opening Command Prompt
+windows. `konteks-remote stop` stops it for the current session; it starts again
+at the next sign-in. Uninstall removes the shortcut. Existing Konteks scheduled
+tasks migrate automatically when the updated connector starts.
+
 ## How it fits
 
 - **Konteks Core** (HTTPS): enrollment, leases, heartbeats, work assignments,
@@ -76,6 +83,9 @@ shown in the app. These are the terminal entry points:
 curl -fsSL https://github.com/konteks-io/runtime/releases/latest/download/install.sh | sh -s -- --activation-id <id>
 ```
 
+On Windows, run this line in either Command Prompt or PowerShell (including
+Windows PowerShell 5.1 and PowerShell 7):
+
 ```powershell
 powershell -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm https://github.com/konteks-io/runtime/releases/latest/download/install.ps1))) -ActivationId <id>"
 ```
@@ -90,6 +100,7 @@ nothing is downloaded. `--agents` names exactly the agents to use, each
 required. `konteks-remote agent add claude-code|codex` offers the same later.
 
 Supported platforms: macOS 13+ (Apple silicon and Intel), Windows 10/11 (x64),
+Windows 11 ARM64 (the x64 package runs through Windows emulation),
 Debian 12/13 and Ubuntu 22.04/24.04 (amd64, arm64).
 
 ### Build and test from source
