@@ -59,8 +59,11 @@ whole permission path.
   organization-skill directories verified by input preparation. Roots are local
   typed context, never tool arguments; a judged read must name a path. dsh
   read/read_image/grep/glob calls ask through its hook and reach this policy.
-  OpenCode/Antigravity use the same roots for asked and observed named reads,
-  retaining their provider controls and tripwires. Vendor-internal skill loads,
+  OpenCode named read/search tools ask before these roots are judged; an
+  unasked completion trips even without a named path. Its omitted grep/glob
+  path uses the pinned provider's session cwd default. Antigravity uses the
+  same roots for asked and observed named reads. Provider controls and
+  tripwires remain. Vendor-internal skill loads,
   opaque unasked reads and shell execution still require separate controls.
   These ACP permission checks do not provide process/OS confinement.
 

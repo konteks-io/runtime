@@ -104,8 +104,8 @@ export interface OpenCodePermissionRule {
  * The Konteks permission rules, in order. OpenCode applies the LAST matching
  * rule and puts its own defaults before ours (verified with `opencode
  * debug agents`), so the leading `* ask` overrides every default, and the
- * `.env` rows are restated after our `read` allow, which would otherwise
- * re-open them. `external_directory`, Code Mode's built-in browser and
+ * named file reads and searches all ask before the session judges their
+ * paths. `external_directory`, Code Mode's built-in browser and
  * OpenCode's own Code Mode tools are denied outright (no request reaches
  * Konteks). The start self-check asserts these rows end every agent's
  * resolved list, followed by nothing but OpenCode's own denies (2.0.21
@@ -113,13 +113,13 @@ export interface OpenCodePermissionRule {
  */
 export const OPENCODE_KONTEKS_PERMISSIONS: readonly OpenCodePermissionRule[] = Object.freeze([
   { action: "*", resource: "*", effect: "ask" },
-  { action: "read", resource: "*", effect: "allow" },
+  { action: "read", resource: "*", effect: "ask" },
   { action: "read", resource: "*.env", effect: "ask" },
   { action: "read", resource: "*.env.*", effect: "ask" },
-  { action: "read", resource: "*.env.example", effect: "allow" },
-  { action: "list", resource: "*", effect: "allow" },
-  { action: "glob", resource: "*", effect: "allow" },
-  { action: "grep", resource: "*", effect: "allow" },
+  { action: "read", resource: "*.env.example", effect: "ask" },
+  { action: "list", resource: "*", effect: "ask" },
+  { action: "glob", resource: "*", effect: "ask" },
+  { action: "grep", resource: "*", effect: "ask" },
   { action: "todowrite", resource: "*", effect: "allow" },
   { action: "external_directory", resource: "*", effect: "deny" },
   // Code Mode's catalogue (`execute`) also holds tools that run WITHOUT any

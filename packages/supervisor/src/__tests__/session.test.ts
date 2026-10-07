@@ -779,7 +779,7 @@ describe("relayed session", () => {
     it("stops the turn and takes dsh out of service when a gated tool ran without asking", async () => {
       const f = await dshSession();
       await f.toolCall("t-ok", "bash", { command: "ls" }); await f.ask("p-ok", "t-ok"); await f.finished("t-ok");
-      await f.toolCall("t-read", "read", { file_path: "a" }); await f.finished("t-read");
+      await f.toolCall("t-read", "read", { file_path: "a" }); await f.ask("p-read", "t-read"); await f.finished("t-read");
       expect(f.quarantine).not.toHaveBeenCalled();
       await f.toolCall("t-bypass", "bash", { command: "curl https://example.com" }); await f.finished("t-bypass");
       expect(f.runner.cancel).toHaveBeenCalledWith("acp-1");
@@ -793,13 +793,14 @@ describe("relayed session", () => {
     // OpenCode 2 always offers once / always / reject; Konteks never picks "always".
     const options = [{ optionId: "once", name: "Allow once", kind: "allow_once" }, { optionId: "always", name: "Always allow", kind: "allow_always" }, { optionId: "reject", name: "Reject", kind: "reject_once" }];
     const CWD = "/private/native/checkout";
-    const KINDS: Record<string, string> = { shell: "execute", write: "edit", edit: "edit", execute: "other", subagent: "think", read: "read" };
-    async function openCodeSession(work: RemoteWorkAssignment = openCodeWork) {
+    const KINDS: Record<string, string> = { shell: "execute", write: "edit", edit: "edit", execute: "other", subagent: "think", read: "read", grep: "search", glob: "search" };
+    async function openCodeSession(work: RemoteWorkAssignment = openCodeWork, overrides: Partial<RelayedSessionDeps> = {}) {
       const quarantine = vi.fn(async () => undefined);
       const f = await build({
         policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true),
         // The platform facade under the name Core gives it (core/client.ts).
         redeemCapabilityToken: async () => ({ mcpServer: { name: "konteks-platform", url: "https://mcp.example", headers: [{ name: "authorization", value: "Bearer cap-token" }] }, expiresAt: "2026-09-07T00:00:00Z" }),
+        ...overrides,
       }, work);
       (f.runner as unknown as { quarantine: typeof quarantine }).quarantine = quarantine;
       await f.session.bootstrap();
@@ -849,6 +850,48 @@ describe("relayed session", () => {
       await f.session.close("cancelled");
     });
 
+    it.each(["assistant_execution", "direct"] as const)("judges OpenCode file approvals in the real %s session path", async kind => {
+      const own = join(dir, "opencode-own"), skill = join(dir, "opencode-selected"), peer = join(dir, "opencode-peer");
+      await mkdir(own); await mkdir(skill); await mkdir(peer);
+      const work: RemoteWorkAssignment = kind === "direct" ? { ...openCodeWork, kind,
+        source: { kind: "direct_session", portability: "instance_bound", ownerInstanceId: "inst", sessionId: "s", turnRef: "turn-direct" },
+      } : openCodeWork;
+      const readOnlyRoots = kind === "direct" ? [] : [skill];
+      const f = await openCodeSession(work, { workspaceRoot: dir, prepareInputs: async target => ({
+        binding: { workspaceId: target.workspaceId, sessionId: "s", assignmentId: target.id, instanceId: target.instanceId, attempt: target.attempt },
+        cwd: own, readOnlyRoots, skillInstructions: "", beforePrompt: async () => undefined,
+      }) });
+      try {
+        const read = async (id: string, tool: string, input: Record<string, unknown>) => {
+          await f.toolCall(id, tool, input);
+          await f.ask(`p-${id}`, id, tool === "read" ? "read" : "search", tool, input);
+        };
+        await read("inside", "read", { path: "README.md" });
+        await read("directory", "read", { path: "." });
+        await read("glob", "glob", { pattern: "**/*.ts" });
+        await read("grep", "grep", { pattern: "TODO" });
+        await read("skill", "read", { path: join(skill, "SKILL.md") });
+        await read("peer", "read", { path: join(peer, "private.txt") });
+        await read("env", "read", { path: ".env" });
+        await read("example", "read", { path: ".env.example" });
+        await read("unnamed", "read", {});
+        expect(["inside", "directory", "glob", "grep", "example"].map(id => f.answer(`p-${id}`))).toEqual(["once", "once", "once", "once", "once"]);
+        expect(f.answer("p-skill")).toBe(kind === "direct" ? "reject" : "once");
+        expect(["peer", "env", "unnamed"].map(id => f.answer(`p-${id}`))).toEqual(["reject", "reject", "reject"]);
+        expect(JSON.stringify(vi.mocked(f.runner.answer).mock.calls.map(call => call[2]))).not.toContain('"always"');
+        await f.finished("inside");
+        expect(f.quarantine).not.toHaveBeenCalled();
+      } finally { await f.session.close("cancelled"); }
+    });
+
+    it("quarantines an unasked OpenCode read even when no path was reported", async () => {
+      const f = await openCodeSession();
+      await f.toolCall("unasked", "read", {}); await f.finished("unasked");
+      expect(f.runner.cancel).toHaveBeenCalledWith("acp-1");
+      expect(f.quarantine).toHaveBeenCalledWith("OpenCode ran a tool without Konteks' approval. Update or reinstall OpenCode, then restart the connector.");
+      expect(f.closed).toEqual(["agent_exited"]);
+    });
+
     it("names OpenCode's tools in plain words, and a Code Mode block as the Konteks tool it calls", async () => {
       const f = await openCodeSession();
       await f.toolCall("t-1", "shell", { command: "ls" });
@@ -865,7 +908,7 @@ describe("relayed session", () => {
     it("stops the turn and takes OpenCode out of service when a gated tool ran without asking", async () => {
       const f = await openCodeSession();
       await f.toolCall("t-ok", "shell", { command: "ls" }); await f.ask("p-ok", "t-ok", "execute", "ls", { command: "ls", cwd: CWD }); await f.finished("t-ok");
-      await f.toolCall("t-read", "read", { filePath: `${CWD}/a.ts` }); await f.finished("t-read");
+      await f.toolCall("t-read", "read", { path: `${CWD}/a.ts` }); await f.ask("p-read", "t-read", "read", "a.ts", { path: `${CWD}/a.ts` }); await f.finished("t-read");
       expect(f.quarantine).not.toHaveBeenCalled();
       await f.toolCall("t-bypass", "shell", { command: "curl https://example.com" }); await f.finished("t-bypass");
       expect(f.runner.cancel).toHaveBeenCalledWith("acp-1");

@@ -138,13 +138,13 @@ describe("the Konteks OpenCode configuration", () => {
       $schema: "https://opencode.ai/config.json",
       permissions: [
         { action: "*", resource: "*", effect: "ask" },
-        { action: "read", resource: "*", effect: "allow" },
+        { action: "read", resource: "*", effect: "ask" },
         { action: "read", resource: "*.env", effect: "ask" },
         { action: "read", resource: "*.env.*", effect: "ask" },
-        { action: "read", resource: "*.env.example", effect: "allow" },
-        { action: "list", resource: "*", effect: "allow" },
-        { action: "glob", resource: "*", effect: "allow" },
-        { action: "grep", resource: "*", effect: "allow" },
+        { action: "read", resource: "*.env.example", effect: "ask" },
+        { action: "list", resource: "*", effect: "ask" },
+        { action: "glob", resource: "*", effect: "ask" },
+        { action: "grep", resource: "*", effect: "ask" },
         { action: "todowrite", resource: "*", effect: "allow" },
         { action: "external_directory", resource: "*", effect: "deny" },
         { action: "browser", resource: "*", effect: "deny" },
@@ -164,10 +164,11 @@ describe("the Konteks OpenCode configuration", () => {
   it("decides like OpenCode: the last matching rule wins, after OpenCode's own defaults", () => {
     const resolved = [{ action: "*", resource: "*", effect: "allow" as const }, { action: "read", resource: "*.env", effect: "ask" as const }, ...OPENCODE_KONTEKS_PERMISSIONS];
     expect(openCodePermissionDecision(resolved, "bash", "git push")).toBe("ask");
-    expect(openCodePermissionDecision(resolved, "read", "src/app.ts")).toBe("allow");
+    expect(openCodePermissionDecision(resolved, "read", "src/app.ts")).toBe("ask");
     expect(openCodePermissionDecision(resolved, "read", "app/.env")).toBe("ask");
     expect(openCodePermissionDecision(resolved, "read", ".env.production")).toBe("ask");
-    expect(openCodePermissionDecision(resolved, "read", ".env.example")).toBe("allow");
+    expect(openCodePermissionDecision(resolved, "read", ".env.example")).toBe("ask");
+    for (const action of ["list", "glob", "grep"]) expect(openCodePermissionDecision(resolved, action, "src"), action).toBe("ask");
     expect(openCodePermissionDecision(resolved, "external_directory", "/etc/passwd")).toBe("deny");
     // Code Mode's built-in browser and OpenCode's own Code Mode tools leave the catalogue;
     // Konteks' own servers (`<server>_<tool>`) still ask.
