@@ -1,5 +1,5 @@
 <#
-konteks-remote bootstrap (Windows 10/11 x64, PowerShell) - version 1.
+konteks-remote bootstrap (Windows 10/11 x64, Windows 11 ARM64, PowerShell) - version 1.
 
 Usage (copied verbatim from the Konteks App or MCP activation response):
   powershell -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm https://github.com/konteks-io/runtime/releases/latest/download/install.ps1))) -ActivationId <id>"
@@ -173,6 +173,13 @@ function ConvertFrom-Ed25519Spki([string]$Text) {
   }
 }
 
+function Test-SetupPlatform([string]$Architecture, [int]$Build, [bool]$Is64Bit) {
+  if (-not $Is64Bit -or $Build -lt 10240) { return $false }
+  # Windows 11 on ARM runs the signed x64 package through OS emulation.
+  # Windows 10 on ARM supports only x86 emulation, which cannot run it.
+  return $Architecture -eq 'AMD64' -or ($Architecture -eq 'ARM64' -and $Build -ge 22000)
+}
+
 if ($VerifyOnly) { return }
 # --- end of the verifier -------------------------------------------------------
 
@@ -290,8 +297,8 @@ $SetupIndonesian = @{
   'Download and open the setup file for this connection.' = 'Unduh dan buka berkas pemasangan untuk koneksi ini.'
   '-ActivationId <id> is required for a new connection' = '-ActivationId <id> diperlukan untuk koneksi baru'
   'This Windows computer is not supported' = 'Komputer Windows ini tidak didukung'
-  'Setup requires Windows 10/11 x64. Windows on ARM is not supported.' = 'Pemasangan memerlukan Windows 10/11 x64. Windows pada ARM tidak didukung.'
-  'konteks-remote supports Windows 10/11 x64 only (Windows on ARM is not supported)' = 'konteks-remote hanya mendukung Windows 10/11 x64 (Windows pada ARM tidak didukung)'
+  'Setup requires Windows 10/11 x64 or Windows 11 ARM64 with x64 emulation.' = 'Pemasangan memerlukan Windows 10/11 x64 atau Windows 11 ARM64 dengan emulasi x64.'
+  'konteks-remote requires Windows 10/11 x64 or Windows 11 ARM64' = 'konteks-remote memerlukan Windows 10/11 x64 atau Windows 11 ARM64'
   'Prepare secure downloads' = 'Siapkan unduhan aman'
   'Download and verify' = 'Unduh dan verifikasi'
   '{0} of {1} - {2}' = '{0} dari {1} - {2}'
@@ -416,9 +423,12 @@ $ReleaseBase = if ($env:KONTEKS_RELEASE_BASE) { $env:KONTEKS_RELEASE_BASE } else
 $ExpectedPublisher = if ($env:KONTEKS_MSI_PUBLISHER) { $env:KONTEKS_MSI_PUBLISHER } else { 'CN=Konteks' }
 $ExpectedThumbprint = $env:KONTEKS_MSI_THUMBPRINT
 
-if ([Environment]::Is64BitOperatingSystem -eq $false -or $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') {
-  Write-SetupStage (Get-SetupText 'This Windows computer is not supported') @((Get-SetupText 'Setup requires Windows 10/11 x64. Windows on ARM is not supported.'))
-  throw (Get-SetupText 'konteks-remote supports Windows 10/11 x64 only (Windows on ARM is not supported)')
+# A 32-bit shell reports x86 even on a supported 64-bit computer. Use the
+# OS architecture when Windows provides it, including x64 emulation on ARM.
+$osArchitecture = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+if (-not (Test-SetupPlatform $osArchitecture ([Environment]::OSVersion.Version.Build) ([Environment]::Is64BitOperatingSystem))) {
+  Write-SetupStage (Get-SetupText 'This Windows computer is not supported') @((Get-SetupText 'Setup requires Windows 10/11 x64 or Windows 11 ARM64 with x64 emulation.'))
+  throw (Get-SetupText 'konteks-remote requires Windows 10/11 x64 or Windows 11 ARM64')
 }
 
 $work = Join-Path ([IO.Path]::GetTempPath()) ("konteks-remote-" + [Guid]::NewGuid().ToString('n'))
@@ -548,7 +558,8 @@ try {
   Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
 }
 
-$launcher = Join-Path ${env:ProgramFiles} 'konteks-remote\konteks-remote.exe'
+$nativeProgramFiles = if ($env:ProgramW6432) { $env:ProgramW6432 } else { $env:ProgramFiles }
+$launcher = Join-Path $nativeProgramFiles 'konteks-remote\konteks-remote.exe'
 if (-not (Test-Path $launcher)) { $launcher = 'konteks-remote' }
 $code = 0
 $commandFailure = $null
