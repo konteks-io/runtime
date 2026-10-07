@@ -122,10 +122,12 @@ describe("the OpenCode runner adapter", () => {
   });
 
   it("reports its verified version and billing usage like the bundled agents", () => {
+    const hostAgentVersion = openCodeRunnerAdapter.hostVersion(config());
+    if (hostAgentVersion === undefined) throw new Error("OpenCode fixture must report its verified version");
     const view = projectReadiness({
       family: findAgentBridge("opencode")!, authMode: "agent_local_subscription", connectionState: "ready", initializeResult: null,
       scope: INITIAL_SCOPE_STATE,
-      identity: "logged_out", bridgeVersionCompatible: true, hostAgentVersion: openCodeRunnerAdapter.hostVersion(config()), lastProbeAt: null,
+      identity: "logged_out", bridgeVersionCompatible: true, hostAgentVersion, lastProbeAt: null,
     });
     expect(view).toMatchObject({ agentId: "opencode", displayName: "OpenCode", readiness: "not_configured", tokenUsageObservable: true, hostAgentVersion: "2.0.18" });
     expect(openCodeRunnerAdapter.hostVersion(config({ RUNNER_BRIDGE_VERSION: "unknown" }))).toBeUndefined();
