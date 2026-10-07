@@ -376,10 +376,15 @@ export class AntigravityToolGovernance implements HostToolGovernance {
     if (asked) return this.askedOutcome(toolCallId, observed, asked.answer, cwd);
     if (INERT_TOOLS.has(observed.tool) || UNASKED_AT_PARITY.has(observed.tool)) return null;
     if (READ_TOOLS.has(observed.tool) && readKind(observed.kind)) {
-      // Named unasked reads use the same verified roots; overreach should have been refused.
-      return readPaths(observed, cwd).some(path => !isWithinReadRoots(path, cwd, readOnlyRoots)) ? { toolCallId, title: observed.tool } : null;
+      return this.unaskedReadBypass(toolCallId, observed, cwd, readOnlyRoots);
     }
     return this.unaskedWork(toolCallId, observed, cwd);
+  }
+
+  private unaskedReadBypass(toolCallId: string, observed: ObservedCall, cwd: string, readOnlyRoots: readonly string[]): HostToolBypass | null {
+    // An unasked read must positively name paths inside the same verified roots.
+    const paths = readPaths(observed, cwd);
+    return paths.length === 0 || paths.some(path => !isWithinReadRoots(path, cwd, readOnlyRoots)) ? { toolCallId, title: observed.tool } : null;
   }
 
   private askedOutcome(toolCallId: string, observed: ObservedCall, answer: boolean | undefined, cwd: string): HostToolBypass | null {
