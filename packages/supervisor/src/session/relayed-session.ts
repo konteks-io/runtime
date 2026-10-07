@@ -688,7 +688,8 @@ export class RelayedSession {
    */
   private restoreOptions(restoreRef: string | undefined): Partial<RunnerSessionInput> {
     if (!restoreRef) return {};
-    const fresh = this.assignment.source.kind === "conversation" && this.assignment.agentRoute.agentId === "claude-code";
+    const fresh = this.assignment.source.kind === "conversation" &&
+      (this.assignment.agentRoute.agentId === "claude-code" || this.assignment.kind === "operations");
     return { restoreAcpSessionRef: restoreRef, ...(fresh ? { freshProviderSessionOnRestore: true } : {}) };
   }
 

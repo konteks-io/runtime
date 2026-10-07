@@ -519,8 +519,8 @@ export class SessionManager {
     // transcript. Loading that transcript after a process restart can retain a
     // former assignment's smaller or expired MCP view even though ACP receives
     // the current mcpServers. Konteks already stages the durable conversation
-    // and tool-call memory into every restarted native turn, so create a fresh
-    // provider query for Claude: it preserves logical continuation without
+    // and tool-call memory into every restarted native turn. Selected managed
+    // conversations create a fresh provider query: this preserves continuation without
     // replaying a large transcript or inheriting stale authority. Live,
     // same-process continuation still uses continueLive below.
     const loadProviderHistory = loadFromRef !== undefined && args.freshProviderSessionOnRestore !== true;

@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { pino } from "pino";
 import { createServer, request as httpRequest } from "node:http";
@@ -249,7 +250,7 @@ describe("relayed session", () => {
     });
     await new Promise<void>(resolve => upstream.listen(0, "127.0.0.1", resolve));
     const address = upstream.address();
-    if (!address || typeof address === "string") throw new Error("missing upstream address");
+    assert(address && typeof address !== "string", "missing upstream address");
     const upstreamUrl = `http://127.0.0.1:${address.port}/mcp`;
     const capability = (bearer: string) => ({ mcpServer: { name: "konteks", url: upstreamUrl,
       headers: [{ name: "authorization", value: `Bearer ${bearer}` }] }, expiresAt: "2026-09-07T00:00:00Z" });
@@ -1227,6 +1228,19 @@ describe("relayed session", () => {
     expect(vi.mocked(runner.createSession)).toHaveBeenCalledWith(expect.objectContaining({
       restoreAcpSessionRef: "durable-restart-ref",
       freshProviderSessionOnRestore: true,
+    }), undefined);
+  });
+
+  it("restages an Ops conversation with current MCP authority after provider restart", async () => {
+    const ops = { ...assignment, kind: "operations" as const, agentRoute: { ...assignment.agentRoute, agentId: "dsh" } };
+    const { session, runner } = await build({
+      prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
+      reserveChannel: () => () => undefined,
+      restoreReference: "durable-restart-ref",
+    }, ops);
+    await session.bootstrap();
+    expect(vi.mocked(runner.createSession)).toHaveBeenCalledWith(expect.objectContaining({
+      restoreAcpSessionRef: "durable-restart-ref", freshProviderSessionOnRestore: true,
     }), undefined);
   });
 
