@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { chmod, mkdir, rename, writeFile } from "node:fs/promises";
 import { posix, win32 } from "node:path";
 
@@ -25,7 +26,8 @@ import { posix, win32 } from "node:path";
  */
 
 /** Existing exemptions; named file reads and searches must reach session policy.
- * The vendor skill loader and other in-process reads still require separate confinement. */
+ * Native implicit reads use the bound filesystem; arbitrary native code and
+ * shell operations still require separate confinement. */
 export const DSH_READ_ONLY_TOOLS: readonly string[] = Object.freeze([
   "todo_write", "skill", "web_fetch", "web_search",
   "list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource", "list_subagent_models", "job_list", "job_output",
@@ -130,7 +132,7 @@ export async function writeDshKonteksProfile(dir: string, platform: NodeJS.Platf
   if (platform !== "win32") await chmod(dir, 0o700);
   for (const file of rendered.files) {
     const target = paths(platform).join(dir, file.name);
-    const temporary = `${target}.${process.pid}.tmp`;
+    const temporary = `${target}.${randomUUID()}.tmp`;
     await writeFile(temporary, file.content, { mode: 0o600 });
     if (platform !== "win32") await chmod(temporary, 0o600);
     await rename(temporary, target);

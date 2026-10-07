@@ -140,6 +140,109 @@ describe("session manager bootstrap", () => {
     expect(resumeSession).toHaveBeenCalledTimes(2);
   });
 
+  it("snapshots trusted read roots before awaiting the durable reservation", async () => {
+    const { bridge } = fakeBridge();
+    let markReserved!: () => void, releaseGate!: () => void;
+    const reserved = new Promise<void>(resolve => { markReserved = resolve; });
+    const gate = new Promise<void>(resolve => { releaseGate = resolve; });
+    const createBridge = vi.fn(async (_ref: string, _lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], _cwd?: string, _roots?: readonly string[]) => ({ bridge, bootstrapAttempt: 1 }));
+    const manager = new SessionManager({ bridge: () => bridge, createBridge, events: new RunnerEventBus(), refStore: new InMemorySessionRefStore() });
+    const readOnlyRoots = ["/selected-skill"];
+    const lifecycle = { beforeCreate: async () => { markReserved(); await gate; },
+      recordProcessOwner: async () => undefined, assertCurrent: () => undefined };
+    const creating = manager.create({ context, cwd: "/w", readOnlyRoots, mcpServers: [], lifecycle });
+    await reserved;
+    readOnlyRoots.push("/peer-skill");
+    releaseGate();
+    await expect(creating).resolves.toMatchObject({ resumed: false });
+    expect(createBridge).toHaveBeenCalledWith(expect.any(String), lifecycle, "/w", ["/selected-skill"]);
+    const passedRoots = createBridge.mock.calls[0]![3];
+    expect(passedRoots).not.toBe(readOnlyRoots);
+    expect(Object.isFrozen(passedRoots)).toBe(true);
+  });
+
+  it("rebinds child file authority after reservation and before provider continuation", async () => {
+    const order: string[] = [];
+    const resumeSession = vi.fn(async () => { order.push("provider"); return {}; });
+    const { bridge } = fakeBridge({ resumeSession }, { agentCapabilities: { sessionCapabilities: { resume: {} } } });
+    const events = new RunnerEventBus();
+    const rebindBridge = vi.fn(async () => { order.push("rebind"); return bridge; });
+    const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore(), rebindBridge });
+    const readOnlyRoots = Object.freeze(["/selected-skill"]);
+    const first = await manager.create({ context: { ...context, agentId: "dsh" }, cwd: "/w", readOnlyRoots, mcpServers: [] });
+    const completed = nextEvent(events, "prompt_result");
+    manager.prompt(first.acpSessionRef, "p1", { prompt: [] });
+    await completed;
+    await manager.sealCompletedTurn(first.acpSessionRef);
+    const beforeCreate = vi.fn(async () => { order.push("durable"); });
+    const lifecycle = { beforeCreate, recordProcessOwner: async () => undefined, assertCurrent: () => undefined };
+    await expect(manager.continueLive({ context: { ...context, agentId: "dsh", assignmentId: "asg-2" }, cwd: "/w", readOnlyRoots,
+      mcpServers: [], acpSessionRef: first.acpSessionRef, lifecycle,
+    })).resolves.toMatchObject({ acpSessionRef: first.acpSessionRef, resumed: true });
+    expect(rebindBridge).toHaveBeenCalledWith(first.acpSessionRef, bridge, lifecycle, "/w", readOnlyRoots, expect.any(Function));
+    expect(order).toEqual(["durable", "rebind", "provider"]);
+    expect(resumeSession).toHaveBeenCalledWith({ sessionId: "bridge-s1", cwd: "/w", mcpServers: [] });
+  });
+
+  it("keeps the sealed reference through expected old-child exit and resumes on its replacement", async () => {
+    const closeSession = vi.fn(async () => ({}));
+    const old = fakeBridge({ closeSession }, { agentCapabilities: { loadSession: true, sessionCapabilities: { close: {} } } }), next = fakeBridge();
+    const events = new RunnerEventBus(), seen: RunnerEvent[] = [];
+    events.subscribe(event => seen.push(event));
+    const rebindBridge = vi.fn(async (_ref: string, _previous: BridgeProcess, _lifecycle: Parameters<SessionManager["create"]>[0]["lifecycle"] | undefined,
+      _cwd: string, _roots: readonly string[], retirePrevious: () => Promise<void>) => {
+      await retirePrevious();
+      manager.closeAll("agent_exited", old.bridge);
+      return next.bridge;
+    });
+    const manager = new SessionManager({ bridge: () => old.bridge, events, refStore: new InMemorySessionRefStore(), rebindBridge });
+    const first = await manager.create({ context: { ...context, agentId: "dsh" }, cwd: "/w", readOnlyRoots: ["/prior-skill"], mcpServers: [] });
+    const completed = nextEvent(events, "prompt_result");
+    manager.prompt(first.acpSessionRef, "p1", { prompt: [] });
+    await completed;
+    await manager.sealCompletedTurn(first.acpSessionRef);
+    const lifecycle = { beforeCreate: async () => undefined, recordProcessOwner: async () => undefined, assertCurrent: () => undefined };
+    await expect(manager.continueLive({ context: { ...context, agentId: "dsh", assignmentId: "asg-2" }, cwd: "/next", readOnlyRoots: ["/current-skill"],
+      mcpServers: [], acpSessionRef: first.acpSessionRef, lifecycle,
+    })).resolves.toMatchObject({ acpSessionRef: first.acpSessionRef, resumed: true });
+    expect(rebindBridge).toHaveBeenCalledWith(first.acpSessionRef, old.bridge, lifecycle, "/next", ["/current-skill"], expect.any(Function));
+    expect(closeSession).toHaveBeenCalledWith({ sessionId: "bridge-s1" });
+    expect(next.calls.loadSession).toEqual([{ sessionId: "bridge-s1", cwd: "/next", mcpServers: [] }]);
+    expect(next.calls.newSession).toBeUndefined();
+    expect(old.calls.loadSession).toBeUndefined();
+    expect(manager.activeSessions).toBe(1);
+    expect(seen.filter(event => event.kind === "session_exited")).toEqual([]);
+    const continued = nextEvent(events, "prompt_result");
+    manager.prompt(first.acpSessionRef, "p2", { prompt: [] });
+    await continued;
+    expect(next.calls.prompt).toHaveLength(1);
+    expect(old.calls.prompt).toHaveLength(1);
+  });
+
+  it("fences the reference when child rebinding is uncertain, without provider continuation", async () => {
+    const { bridge, calls } = fakeBridge({}, { agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {}, close: {} } } });
+    const events = new RunnerEventBus();
+    const rebindBridge = vi.fn(async () => { throw new RemoteInstanceError("recovery_required", "fixture child stop is unconfirmed"); });
+    const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore(), rebindBridge });
+    const first = await manager.create({ context: { ...context, agentId: "dsh" }, cwd: "/w", readOnlyRoots: ["/selected-skill"], mcpServers: [] });
+    const completed = nextEvent(events, "prompt_result");
+    manager.prompt(first.acpSessionRef, "p1", { prompt: [] });
+    await completed;
+    await manager.sealCompletedTurn(first.acpSessionRef);
+    const beforeCreate = vi.fn(async () => undefined);
+    const lifecycle = { beforeCreate, recordProcessOwner: async () => undefined, assertCurrent: () => undefined };
+    const successor = { context: { ...context, agentId: "dsh", assignmentId: "asg-2" }, mcpServers: [], acpSessionRef: first.acpSessionRef, lifecycle };
+    await expect(manager.continueLive({ ...successor, cwd: "/peer", readOnlyRoots: ["/peer-skill"] })).rejects.toMatchObject({ code: "recovery_required" });
+    expect(beforeCreate).toHaveBeenCalledOnce();
+    expect(rebindBridge).toHaveBeenCalledWith(first.acpSessionRef, bridge, lifecycle, "/peer", ["/peer-skill"], expect.any(Function));
+    expect(calls.resumeSession).toBeUndefined();
+    expect(calls.loadSession).toBeUndefined();
+    expect(calls.closeSession).toBeUndefined();
+    expect(manager.activeSessions).toBe(1);
+    await expect(manager.continueLive({ ...successor, cwd: "/w", readOnlyRoots: ["/selected-skill"] })).rejects.toMatchObject({ code: "recovery_required" });
+    expect(rebindBridge).toHaveBeenCalledOnce();
+  });
+
   it("refuses and cancels work the agent starts on its own after a turn, so the next turn still continues", async () => {
     const { bridge, calls } = fakeBridge({}, { agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {} } } });
     const events = new RunnerEventBus();
@@ -266,13 +369,15 @@ describe("session manager bootstrap", () => {
   });
 
   it("settles completed ACP operations before close without cancelling the local user's thread", async () => {
-    let current = true;
+    let current = true, exited = false;
     const closeSession = vi.fn(async () => ({}));
-    const { bridge, calls } = fakeBridge({ closeSession }, { agentCapabilities: { sessionCapabilities: { close: {} } } });
+    const { bridge: initialBridge, calls } = fakeBridge({ closeSession }, { agentCapabilities: { sessionCapabilities: { close: {} } } });
+    const bridge: BridgeProcess = { ...initialBridge, get exited() { return exited; } };
     const events = new RunnerEventBus();
     const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore() });
     const { acpSessionRef } = await manager.create({ context, cwd: "/w", mcpServers: [], lifecycle: {
       beforeCreate: async () => undefined,
+      recordProcessOwner: vi.fn(async () => undefined),
       assertCurrent: () => { if (!current) throw new Error("stale execution owner"); },
     } });
     let closed: Promise<void> | undefined;
@@ -285,7 +390,7 @@ describe("session manager bootstrap", () => {
     expect(manager.activeSessions).toBe(1); // Retained until qualified finalization.
     expect(closeSession).toHaveBeenCalledWith({ sessionId: "bridge-s1" });
     await manager.closeCompleted(acpSessionRef); // Retry a failed outer journal write.
-    bridge.exited = true;
+    exited = true;
     manager.closeAll("agent_exited", bridge);
     await manager.stopForRecovery(acpSessionRef);
     expect(closeSession).toHaveBeenCalledTimes(1);
@@ -379,7 +484,7 @@ describe("session manager bootstrap", () => {
     const manager = new SessionManager({ bridge: () => bridge, events: new RunnerEventBus(), refStore: new InMemorySessionRefStore() });
     let retainedRef = "";
     await expect(manager.create({ context, cwd: "/w", mcpServers: [],
-      sessionConfig: { model: "approved" }, lifecycle: { beforeCreate: async ref => { retainedRef = ref; }, assertCurrent: () => undefined } })).rejects.toMatchObject({ code: "agent_unavailable" });
+      sessionConfig: { model: "approved" }, lifecycle: { beforeCreate: async ref => { retainedRef = ref; }, recordProcessOwner: vi.fn(async () => undefined), assertCurrent: () => undefined } })).rejects.toMatchObject({ code: "agent_unavailable" });
     expect(manager.activeSessions).toBe(1);
     expect(() => manager.prompt(retainedRef, "forbidden", { prompt: [] })).toThrow(/fenced/);
     manager.close(retainedRef);

@@ -25,6 +25,7 @@ const inputSchema = z.object({
   context: SessionContextSchema,
   readinessDeadlineAt: z.string().datetime({ offset: true }),
   cwd: z.string().min(1).refine(isAbsolute).refine(value => !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(value)),
+  readOnlyRoots: z.array(z.string().min(1).refine(isAbsolute).refine(value => !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(value))).default([]),
   mcpServers: z.array(z.object({
     type: z.enum(["http", "sse"]), name: z.string().min(1).max(256), url: z.string().url(),
     headers: z.array(z.object({ name: z.string(), value: z.string() }).strict()).max(32),
@@ -240,7 +241,7 @@ export class NativeRunner implements RunnerPort {
 
   private sessionArgs(data: z.infer<typeof inputSchema>, lifecycle: RunnerSessionLifecycle | undefined,
   ) {
-    const { context, readinessDeadlineAt, cwd, sessionConfig,
+    const { context, readinessDeadlineAt, cwd, readOnlyRoots, sessionConfig,
       modelSelectionPolicy,
       modelSelection,
       acpSessionRef, freshProviderSessionOnRestore, sessionLabel, agentTitled, browser, integration,
@@ -251,7 +252,7 @@ export class NativeRunner implements RunnerPort {
     const browserServer = browser === undefined ? null : browserMcpServer(this.options.config, browser);
     const mcpServers = browserServer === null ? data.mcpServers : [...data.mcpServers, browserServer];
     return {
-      context, readinessDeadlineAt, cwd, mcpServers,
+      context, readinessDeadlineAt, cwd, readOnlyRoots: Object.freeze([...readOnlyRoots]), mcpServers,
       ...withoutUndefined({ sessionConfig,
         modelSelectionPolicy,
         modelSelection,

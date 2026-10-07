@@ -38,13 +38,12 @@ export interface HostAgentRunnerAdapter {
   /** Before any process of this agent starts: write the Konteks overlay or config it boots from. */
   prepareToSpawn(config: RunnerConfig): Promise<void>;
   /**
-   * For an agent whose execution process serves exactly one working copy
-   * (OpenCode: the working copy's instructions ride on a per-process config
-   * folder, and MCP servers are process-wide): prepare that process before it
-   * spawns. Its process is never parked for reuse by another session. Absent
-   * for agents whose processes serve any working copy.
+   * Prepare a child bound to one working copy or immutable read authority
+   * before it spawns (OpenCode's per-process config/MCP servers; DSH's fixed
+   * selected skill roots). Such a child is never parked for another session.
+   * Absent for agents whose processes serve any working copy.
    */
-  bindWorkingCopy?(config: RunnerConfig, family: AgentBridgeFamily, workingCopy: string): Promise<HostWorkingCopyBinding>;
+  bindWorkingCopy?(config: RunnerConfig, family: AgentBridgeFamily, workingCopy: string, readOnlyRoots: readonly string[], environment: NodeJS.ProcessEnv): Promise<HostWorkingCopyBinding>;
   /** A runtime-owned sign-in, used instead of the family's official login tooling when present. */
   startLogin?(options: HostAgentLoginOptions): LoginFlow;
   /** A runtime-owned sign-out, used instead of the family's official logout tooling when present; `spawn` is the runtime's own (Antigravity signs out over ACP). */
@@ -169,13 +168,24 @@ export interface HostTurnError {
   retryable: boolean;
 }
 
+/** Immutable local authority installed before an execution process starts. */
+export interface HostFileAuthority {
+  readonly cwd: string;
+  readonly readOnlyRoots: readonly string[];
+}
+
 /** One execution process's hold on its working copy (`bindWorkingCopy`). */
 export interface HostWorkingCopyBinding {
+  /** Present when the child enforces a fixed read authority for its lifetime. */
+  readonly authority?: HostFileAuthority;
+  /** Complete per-child arguments and OS working directory, when prepared. */
+  readonly args?: readonly string[];
+  readonly cwd?: string;
   /** The complete environment of the process serving this working copy. */
   readonly env: NodeJS.ProcessEnv;
   /** Before each prompt: re-check (and, where it is a copy, refresh) what the process reads from the working copy. */
   beforePrompt(): Promise<void>;
-  /** Once the process is gone: undo what `bindWorkingCopy` prepared, when no other process of the same working copy needs it. Idempotent. */
+  /** Remove preparation after the owning child no longer needs it; fixed read authority requires qualified group/tree cleanup. Idempotent; errors remain visible. */
   release(): Promise<void>;
 }
 

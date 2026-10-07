@@ -48,6 +48,7 @@ interface CreateSessionArgs {
   /** Absolute outer readiness deadline supplied by the claim owner. */
   readinessDeadlineAt?: string;
   cwd: string;
+  readOnlyRoots?: readonly string[];
   mcpServers: McpServer[];
   /** ACP session-config selections from the assignment (`agentRoute.sessionConfig`). */
   sessionConfig?: Record<string, string>;
@@ -97,7 +98,7 @@ export interface CreatedSession {
 }
 
 interface SessionRecord {
-  readonly bridge: BridgeProcess;
+  bridge: BridgeProcess;
   acpSessionRef: string;
   bridgeSessionId: string;
   context: SessionContext;
@@ -146,9 +147,11 @@ export interface SessionManagerOptions {
   requireRawModelOffer?: true;
   bridge: () => BridgeProcess | null;
   /** Native execution allocator; called only after the durable ref reservation. */
-  createBridge?: (acpSessionRef: string, lifecycle?: CreateSessionArgs["lifecycle"], cwd?: string) => Promise<{ bridge: BridgeProcess; bootstrapAttempt: number }>;
+  createBridge?: (acpSessionRef: string, lifecycle?: CreateSessionArgs["lifecycle"], cwd?: string, readOnlyRoots?: readonly string[]) => Promise<{ bridge: BridgeProcess; bootstrapAttempt: number }>;
   /** Bootstrap-only allocator. The previous bridge is already confirmed stopped. */
-  replaceBridge?: (acpSessionRef: string, previous: BridgeProcess, bootstrapAttempt: number, lifecycle?: CreateSessionArgs["lifecycle"], cwd?: string) => Promise<{ bridge: BridgeProcess; bootstrapAttempt: number }>;
+  replaceBridge?: (acpSessionRef: string, previous: BridgeProcess, bootstrapAttempt: number, lifecycle?: CreateSessionArgs["lifecycle"], cwd?: string, readOnlyRoots?: readonly string[]) => Promise<{ bridge: BridgeProcess; bootstrapAttempt: number }>;
+  /** A sealed continuation may need a clean child before refreshing provider authority. */
+  rebindBridge?: (acpSessionRef: string, previous: BridgeProcess, lifecycle: CreateSessionArgs["lifecycle"] | undefined, cwd: string, readOnlyRoots: readonly string[], retirePrevious: () => Promise<void>) => Promise<BridgeProcess>;
   /**
    * Before each prompt on a bridge: the agent's own preparation (OpenCode
    * re-checks, and on Windows refreshes, its working copy's instructions).
@@ -260,6 +263,8 @@ export class SessionManager {
   private readonly sessions = new Map<string, SessionRecord>();
   private readonly byBridgeId = new Map<string, SessionRecord>();
   private readonly creatingRefs = new Set<string>();
+  /** Only an idle sealed continuation may deliberately retire its old child. */
+  private readonly rebindingBridges = new Set<BridgeProcess>();
   /** Known private bridge IDs with in-flight/uncertain load outcomes. Not an
    * OS stop proof; uncertainty is never cleared just because load rejected. */
   private readonly creatingBridgeIds = new Set<string>();
@@ -454,7 +459,7 @@ export class SessionManager {
     args.lifecycle?.assertCurrent();
     await args.lifecycle?.beforeCreate(ref);
     args.lifecycle?.assertCurrent();
-    if (this.options.createBridge) return this.options.createBridge(ref, args.lifecycle, args.cwd);
+    if (this.options.createBridge) return this.options.createBridge(ref, args.lifecycle, args.cwd, args.readOnlyRoots);
     return { bridge: this.requireBridge(), bootstrapAttempt: 1 };
   }
 
@@ -482,7 +487,7 @@ export class SessionManager {
     const remainingMs = remainingReadinessMs(args, this.now());
     if (Number.isNaN(remainingMs) || remainingMs <= 0) throw error;
     await this.bootstrapBackoff(args, bootstrapAttempt, remainingMs);
-    const replacement = await this.options.replaceBridge(ref, bridge, bootstrapAttempt + 1, args.lifecycle, args.cwd);
+    const replacement = await this.options.replaceBridge(ref, bridge, bootstrapAttempt + 1, args.lifecycle, args.cwd, args.readOnlyRoots);
     this.logger.info({ ...contextLog(args), bootstrapAttempt: replacement.bootstrapAttempt, recoveredFromAttempt: bootstrapAttempt, recovery: "fresh_bridge" },
       "ACP session bootstrap acquired a fresh bridge");
     return replacement;
@@ -804,18 +809,55 @@ export class SessionManager {
     // the reference.
     this.assertAdmittedModes(args.sessionConfig);
     await args.lifecycle?.beforeCreate(ref);
-    // beforeCreate fsyncs the generation transfer. Install the successor fence
-    // synchronously before the first provider-facing continuation operation.
-    adoptSuccessor(record, args);
-    record.assertCurrent?.();
     try {
-      const refreshed = await this.refreshLiveAuthority(bridge, record, args);
+      // The supervisor has already durably transferred this sealed reference.
+      // A different fixed file authority needs a verified old-group stop and
+      // a fresh bound child before any provider load or resume.
+      const continuedBridge = await this.rebindContinuation(args, record, bridge);
+      record.bridge = continuedBridge;
+      adoptSuccessor(record, args);
+      record.assertCurrent?.();
+      const refreshed = await this.refreshReboundAuthority(continuedBridge, bridge, record, args);
       const modelSelection = await this.confirmContinuation(args, record, refreshed);
-      return { acpSessionRef: ref, resumed: true, capabilities: capabilitiesOf(bridge),
+      return { acpSessionRef: ref, resumed: true, capabilities: capabilitiesOf(continuedBridge),
         ...(modelSelection ? { modelSelection } : {}),
       };
     } catch (error) {
       throw fenceRecord(record, error);
+    }
+  }
+
+  private async rebindContinuation(args: CreateSessionArgs, record: SessionRecord, bridge: BridgeProcess): Promise<BridgeProcess> {
+    if (!this.options.rebindBridge) return bridge;
+    this.rebindingBridges.add(bridge);
+    try {
+      return await this.options.rebindBridge(record.acpSessionRef, bridge, args.lifecycle, args.cwd, args.readOnlyRoots ?? [], () => this.closeContinuationForRebind(args, record, bridge));
+    } finally { this.rebindingBridges.delete(bridge); }
+  }
+
+  /** Persist the completed native history before its immutable child is retired. */
+  private async closeContinuationForRebind(args: CreateSessionArgs, record: SessionRecord, bridge: BridgeProcess): Promise<void> {
+    if (bridge.initializeResult.agentCapabilities?.sessionCapabilities?.close == null) {
+      throw new RemoteInstanceError("recovery_required", "Agent cannot close its fixed-authority session before rebinding.");
+    }
+    const timeoutMs = Math.min(RELEASE_CLOSE_DEADLINE_MS, remainingReadinessMs(args, this.now()));
+    if (!(timeoutMs > 0)) throw new RemoteInstanceError("agent_unavailable", "The outer execution readiness deadline expired.", { retryable: true });
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const deadline = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new RemoteInstanceError("recovery_required", "Authority rebind session-close deadline elapsed.")), timeoutMs);
+        timer.unref();
+      });
+      await Promise.race([bridge.connection.closeSession({ sessionId: record.bridgeSessionId }), deadline]);
+      args.lifecycle?.assertCurrent();
+    } finally { if (timer) clearTimeout(timer); }
+  }
+
+  private async refreshReboundAuthority(bridge: BridgeProcess, previous: BridgeProcess, record: SessionRecord, args: CreateSessionArgs): Promise<BootstrapResponse | null | undefined> {
+    try { return await this.refreshLiveAuthority(bridge, record, args); }
+    catch (error) {
+      if (bridge !== previous) throw this.sessionLost(error);
+      throw error;
     }
   }
 
@@ -917,12 +959,18 @@ export class SessionManager {
     } finally { if (timer) clearTimeout(timer); }
   }
 
+  private retainExitingRecord(record: SessionRecord, ref: string): boolean {
+    if (this.rebindingBridges.has(record.bridge)) return true;
+    if (record.recoveryStopping || this.creatingRefs.has(ref)) { record.operationFailed = true; return true; }
+    return false;
+  }
+
   closeAll(reason: "agent_exited" | "closed", bridge?: BridgeProcess): void {
     for (const ref of [...this.sessions.keys()]) {
       const record = this.sessions.get(ref);
       if (!record || (bridge && record.bridge !== bridge)) continue;
       for (const pending of record.pendingClientRequests.values()) pending.reject(new Error(reason));
-      if (record.recoveryStopping || this.creatingRefs.has(ref)) { record.operationFailed = true; continue; }
+      if (this.retainExitingRecord(record, ref)) continue;
       this.sessions.delete(ref);
       this.byBridgeId.delete(record.bridgeSessionId);
       this.markUnclosed(record.bridge, 1);
@@ -1145,7 +1193,7 @@ export class SessionManager {
   /** One immutable policy baseline for every provider-session entry path. */
   private withDefaultSessionConfig(args: CreateSessionArgs): CreateSessionArgs {
     const sessionConfig = { ...(this.options.defaultSessionConfig ?? {}), ...(args.sessionConfig ?? {}) };
-    return { ...args, ...(Object.keys(sessionConfig).length ? { sessionConfig } : {}) };
+    return { ...args, readOnlyRoots: Object.freeze([...(args.readOnlyRoots ?? [])]), ...(Object.keys(sessionConfig).length ? { sessionConfig } : {}) };
   }
 
   /** An integration admission belongs to exactly one new session. */

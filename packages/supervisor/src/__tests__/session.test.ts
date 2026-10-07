@@ -632,7 +632,12 @@ describe("relayed session", () => {
       }, work);
       try {
         await f.session.bootstrap();
+        const request = vi.mocked(f.runner.createSession).mock.calls[0]![0];
+        expect(request).toMatchObject({ cwd: own, readOnlyRoots: [skill] });
+        expect(request.readOnlyRoots).not.toBe(readOnlyRoots);
+        expect(Object.isFrozen(request.readOnlyRoots)).toBe(true);
         readOnlyRoots.push(other);
+        expect(request.readOnlyRoots).toEqual([skill]);
         const ask = (id: string, kind: "read" | "edit", path: string) => {
           const params: RequestPermissionRequest = { sessionId: "acp-1", toolCall: { toolCallId: id, kind, rawInput: { file_path: path } },
             options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" }] };
@@ -641,10 +646,17 @@ describe("relayed session", () => {
         await ask("read-own", "read", "README.md");
         await ask("read-skill", "read", join(skill, "SKILL.md"));
         await ask("read-peer", "read", join(other, "private.txt"));
+        await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: "widen-peer", params: {
+          sessionId: "acp-1", toolCall: { toolCallId: "widen-peer", kind: "read", rawInput: {
+            file_path: join(other, "private.txt"), readOnlyRoots: [other],
+          } }, options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" }],
+        } });
         await ask("write-skill", "edit", join(skill, "SKILL.md"));
         expect(f.runner.answer).toHaveBeenCalledWith("acp-1", "read-own", { outcome: { outcome: "selected", optionId: "allow" } });
         expect(f.runner.answer).toHaveBeenCalledWith("acp-1", "read-skill", { outcome: { outcome: "selected", optionId: "allow" } });
         expect(f.runner.answer).toHaveBeenCalledWith("acp-1", "read-peer", { outcome: { outcome: "selected", optionId: "reject" } });
+        expect(f.runner.answer).toHaveBeenCalledWith("acp-1", "widen-peer", { outcome: { outcome: "selected", optionId: "reject" } });
+        expect(request.readOnlyRoots).toEqual([skill]);
         expect(f.runner.answer).toHaveBeenCalledWith("acp-1", "write-skill", { outcome: { outcome: "selected", optionId: "reject" } });
       } finally { await f.session.close("cancelled"); }
     });
@@ -862,6 +874,7 @@ describe("relayed session", () => {
         cwd: own, readOnlyRoots, skillInstructions: "", beforePrompt: async () => undefined,
       }) });
       try {
+        expect(f.runner.createSession).toHaveBeenCalledWith(expect.objectContaining({ cwd: own, readOnlyRoots }));
         const read = async (id: string, tool: string, input: Record<string, unknown>) => {
           await f.toolCall(id, tool, input);
           await f.ask(`p-${id}`, id, tool === "read" ? "read" : "search", tool, input);

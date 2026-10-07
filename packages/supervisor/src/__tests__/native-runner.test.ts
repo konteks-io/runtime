@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Server } from "node:net";
 import type { ClientSideConnection } from "@agentclientprotocol/sdk";
-import { RunnerConfigSchema, type BridgeProcess, type SpawnBridgeOptions, type RunnerEvent } from "@konteks/remote-agent-runner";
+import { RunnerConfigSchema, SessionManager, type BridgeProcess, type SpawnBridgeOptions, type RunnerEvent } from "@konteks/remote-agent-runner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NativeRunner } from "../native/runner.js";
 import type { RunnerPort } from "../runner-port.js";
@@ -49,6 +49,34 @@ describe("native in-process runner", () => {
     expect(f.connection.newSession).toHaveBeenCalledWith(expect.objectContaining({ _meta: { konteksSession: { version: 1,
       title: `[konteks/Todo List/initiative] [v3] Stand up the todo list API ${acpSessionRef.slice(-8)}` } } }));
   });
+  it("passes a detached trusted read-root snapshot to the real session manager", async () => {
+    const create = vi.spyOn(SessionManager.prototype, "create");
+    const f = fixture(); await f.runner.start();
+    const readOnlyRoots = [join(root, "selected-skill")];
+    await f.runner.createSession({ ...f.input, readOnlyRoots });
+    const received = create.mock.calls[0]![0];
+    expect(received).toMatchObject({ cwd: f.input.cwd, readOnlyRoots: [join(root, "selected-skill")] });
+    expect(received.readOnlyRoots).not.toBe(readOnlyRoots);
+    readOnlyRoots.push(join(root, "peer-skill"));
+    expect(received.readOnlyRoots).toEqual([join(root, "selected-skill")]);
+    expect(f.connection.newSession).toHaveBeenCalledOnce();
+  });
+
+  it("defaults legacy native inputs to no selected skill roots", async () => {
+    const create = vi.spyOn(SessionManager.prototype, "create");
+    const f = fixture(); await f.runner.start();
+    await f.runner.createSession(f.input);
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({ readOnlyRoots: [] }));
+    expect(f.connection.newSession).toHaveBeenCalledOnce();
+  });
+
+  it.each([{ readOnlyRoots: ["relative-skill"] }, { readOnlyRoots: ["/selected\nskill"] }])("refuses malformed trusted read roots before spawning execution: %j", async ({ readOnlyRoots }) => {
+    const f = fixture(); await f.runner.start();
+    await expect(f.runner.createSession({ ...f.input, readOnlyRoots })).rejects.toMatchObject({ code: "protocol_incompatible" });
+    expect(f.spawn).toHaveBeenCalledOnce();
+    expect(f.connection.newSession).not.toHaveBeenCalled();
+  });
+
   it("passes an integration session's admission to the bridge, bounded, and only on a new session", async () => {
     const f = fixture(); await f.runner.start();
     await f.runner.createSession({ ...f.input, integration: { admittedMcpServerNames: ["atlassian"], accountConnectors: false } });
@@ -172,7 +200,7 @@ describe("native in-process runner", () => {
 
   it("refuses prior-reference adoption without qualified predecessor ownership", async () => {
     const f = fixture(); await f.runner.start(); const beforeCreate = vi.fn(async () => undefined);
-    await expect(f.port.createSession({ ...f.input, acpSessionRef: "prior" }, { beforeCreate, assertCurrent: () => undefined })).rejects.toThrow("predecessor");
+    await expect(f.port.createSession({ ...f.input, acpSessionRef: "prior" }, { beforeCreate, recordProcessOwner: vi.fn(async () => undefined), assertCurrent: () => undefined })).rejects.toThrow("predecessor");
     expect(beforeCreate).not.toHaveBeenCalled(); expect(f.connection.newSession).not.toHaveBeenCalled();
   });
 
@@ -194,15 +222,16 @@ describe("native in-process runner", () => {
   });
   it("settles recovery and stops its dedicated execution bridge", async () => {
     const f = fixture(); await f.runner.start();
-    const gate = Promise.withResolvers<{ stopReason: string }>();
-    f.connection.prompt.mockImplementation(() => gate.promise);
+    let settlePrompt!: (result: { stopReason: string }) => void;
+    const prompt = new Promise<{ stopReason: string }>(resolve => { settlePrompt = resolve; });
+    f.connection.prompt.mockImplementation(() => prompt);
     const { acpSessionRef } = await f.port.createSession(f.input);
     await f.port.prompt(acpSessionRef, "prompt", { sessionId: acpSessionRef, prompt: [{ type: "text", text: "work" }] });
     let stopped = false;
     const stopping = f.runner.stopForRecovery(acpSessionRef).then(() => { stopped = true; });
     await vi.waitFor(() => expect(f.connection.cancel).toHaveBeenCalledTimes(1));
     expect(stopped).toBe(false);
-    gate.resolve({ stopReason: "cancelled" }); await stopping;
+    settlePrompt({ stopReason: "cancelled" }); await stopping;
     expect(f.spawn).toHaveBeenCalledTimes(2);
     expect(f.bridge.stop).toHaveBeenCalledOnce();
     expect((await f.port.readiness()).utilization).toEqual({ activeSessions: 1, activeTurns: 0 });
@@ -211,7 +240,7 @@ describe("native in-process runner", () => {
   it("passes the native ownership reservation before ACP new and fences later input", async () => {
     const f = fixture(); await f.runner.start(); let owned = true;
     const beforeCreate = vi.fn(async (ref: string) => { expect(ref).toMatch(/^acp-/); expect(f.connection.newSession).not.toHaveBeenCalled(); });
-    const { acpSessionRef } = await f.port.createSession(f.input, { beforeCreate, assertCurrent: () => { if (!owned) throw new Error("ownership lost"); } });
+    const { acpSessionRef } = await f.port.createSession(f.input, { beforeCreate, recordProcessOwner: vi.fn(async () => undefined), assertCurrent: () => { if (!owned) throw new Error("ownership lost"); } });
     expect(beforeCreate).toHaveBeenCalledWith(acpSessionRef);
     owned = false;
     await expect(f.port.prompt(acpSessionRef, "late", { sessionId: acpSessionRef, prompt: [{ type: "text", text: "work" }] })).rejects.toThrow("ownership lost");
