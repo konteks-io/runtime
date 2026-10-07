@@ -247,7 +247,10 @@ for (const os of ["Linux", "Darwin"]) {
             ? /Menghubungkan komputer ini ke Konteks/
             : /Connecting this computer to Konteks/,
         );
-        assert.match(result.output, locale === "id" ? /\nPemasangan selesai\n/ : /\nSetup complete\n/);
+        assert.match(
+          result.output,
+          locale === "id" ? /\nPemasangan selesai\n/ : /\nSetup complete\n/,
+        );
         assert.deepEqual(result.temporary, []);
       },
     );
@@ -459,6 +462,9 @@ function runWindowsBootstrap(options = {}) {
     hashUnavailable,
     authenticodeUnavailable,
     securityContext,
+    architecture,
+    osArchitecture,
+    entryShell,
   } = {
     msiCode: 0,
     cancelled: false,
@@ -476,6 +482,9 @@ function runWindowsBootstrap(options = {}) {
     hashUnavailable: false,
     authenticodeUnavailable: false,
     securityContext: "mock",
+    architecture: "AMD64",
+    osArchitecture: "AMD64",
+    entryShell: "direct",
     ...options,
   };
   const fixture = mkdtempSync(join(root, "windows bootstrap "));
@@ -528,8 +537,10 @@ $ErrorActionPreference = 'Stop'
 ${windowsSecurityContext(securityContext, discoveryModules, securityDiscoveryPath)}
 $env:USERPROFILE = ${psLiteral(profile)}
 $env:ProgramFiles = ${psLiteral(join(fixture, "Program Files"))}
+$env:ProgramW6432 = ${psLiteral(join(fixture, "Program Files"))}
 $env:LOCALAPPDATA = ${psLiteral(join(profile, "AppData", "Local"))}
-$env:PROCESSOR_ARCHITECTURE = 'AMD64'
+$env:PROCESSOR_ARCHITECTURE = ${psLiteral(architecture)}
+$env:PROCESSOR_ARCHITEW6432 = ${psLiteral(osArchitecture)}
 $env:KONTEKS_RELEASE_BASE = 'https://fixture.invalid/release'
 $env:KONTEKS_RELEASE_PUBKEY_SHA256 = '${sha256(key)}'
 ${fixtureLocale(locale)}
@@ -568,16 +579,15 @@ function konteks-remote {
 `,
   );
   const command = `& ([scriptblock]::Create([IO.File]::ReadAllText(${psLiteral(harnessPath)})))`;
-  const result = spawnSync(
-    powershell,
-    ["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
-    {
-      encoding: "utf8",
-      timeout: 60_000,
-      windowsHide: true,
-      env: { ...process.env, TEMP: temporaryPath, TMP: temporaryPath },
-    },
-  );
+  const childArgs = ["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command];
+  const invocation = windowsBootstrapEntry(entryShell, childArgs);
+  const result = spawnSync(invocation.command, invocation.args, {
+    encoding: "utf8",
+    timeout: 60_000,
+    windowsHide: true,
+    windowsVerbatimArguments: entryShell === "cmd",
+    env: { ...process.env, TEMP: temporaryPath, TMP: temporaryPath },
+  });
   if (result.error) throw result.error;
   const output = `${result.stdout}${result.stderr}`.replaceAll("\r\n", "\n");
   const scenario = `msi-${msiCode}-cancel-${cancelled}-tampered-${tampered}-download-failed-${downloadFailed}-update-${update}-update-exit-${updateCode}-start-exit-${startCode}-${sha256(JSON.stringify(options)).slice(0, 8)}`;
@@ -598,6 +608,59 @@ function konteks-remote {
     runtimeRoot,
   };
 }
+
+function windowsBootstrapEntry(shell, args) {
+  if (shell === "cmd") {
+    return {
+      command: process.env.ComSpec ?? "cmd.exe",
+      args: [
+        "/d",
+        "/v:off",
+        "/s",
+        "/c",
+        `""${powershell}" ${args.slice(0, -1).join(" ")} "${args.at(-1)}""`,
+      ],
+    };
+  }
+  if (shell === "powershell") {
+    const script = `& ${psLiteral(powershell)} ${args.map(psLiteral).join(" ")}; exit $LASTEXITCODE`;
+    return {
+      command: powershell,
+      args: ["-NoProfile", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")],
+    };
+  }
+  return { command: powershell, args };
+}
+
+for (const entryShell of ["cmd", "powershell"]) {
+  test(
+    `Windows bootstrap activation works from ${entryShell} and preserves failure exits`,
+    windowsOnly,
+    () => {
+      const installed = runWindowsBootstrap({ entryShell, update: false });
+      assert.equal(installed.status, 0, installed.output);
+      assert.deepEqual(installed.calls, [["install", "--activation-id", "activation-test-id"]]);
+      const failed = runWindowsBootstrap({ entryShell, updateCode: 7 });
+      assert.equal(failed.status, 7, failed.output);
+      assert.deepEqual(failed.calls, [["update"], ["start"]]);
+    },
+  );
+}
+
+test(
+  "Windows bootstrap installs the x64 package from a 32-bit shell on x64 Windows",
+  windowsOnly,
+  () => {
+    const result = runWindowsBootstrap({
+      architecture: "x86",
+      osArchitecture: "AMD64",
+      update: false,
+    });
+    assert.equal(result.status, 0, result.output);
+    assert.deepEqual(result.calls, [["install", "--activation-id", "activation-test-id"]]);
+    assert.equal(result.msiCall.FilePath, "msiexec.exe");
+  },
+);
 
 for (const update of [true, false]) {
   for (const locale of ["en", "id"]) {
@@ -935,13 +998,13 @@ test("Windows bootstrap shows the stages of an update", windowsOnly, () => {
   assert.equal(result.status, 0, result.output);
   assert.deepEqual(result.calls, [["update"], ["start"]], result.output);
   assert.match(result.output, /Downloading and verifying/);
-  assert.doesNotMatch(result.output, /Fetching the signed release manifest|Downloading the Windows installer|Verified the Windows installer|Installation can take a minute/,
+  assert.doesNotMatch(
+    result.output,
+    /Fetching the signed release manifest|Downloading the Windows installer|Verified the Windows installer|Installation can take a minute/,
   );
   assert.match(result.output, /updating the connected runtime/i);
   assert.match(result.output, /starting the runtime/i);
-  assert.match(
-    result.output,
-    /\n\n1 of 4 - Download and verify\n  Downloading and verifying/);
+  assert.match(result.output, /\n\n1 of 4 - Download and verify\n  Downloading and verifying/);
   assert.match(
     result.output,
     /\n\n2 of 4 - Install the Konteks command\n  Approve the Windows elevation prompt/,
