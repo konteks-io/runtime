@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { posix, win32 } from "node:path";
 import { setupText, type SetupCopyKey, type SetupLocale } from "../setup-locale.js";
+import { windowsBackgroundDefinition } from "./windows-background.js";
 
 /** The connector's own log in `<root>/logs`, where the OS keeps none (macOS); the supervisor keeps it small. */
 export const CONNECTOR_LOG_FILE = "connector.log";
@@ -51,10 +52,11 @@ export function nativePaths(input: { os: HostOs; home?: string; root?: string })
 export interface NativeServiceCommand { command: string; args: string[] }
 export interface NativeServiceDefinition {
   label: string;
+  windowsBackground?: boolean;
+  legacyPath?: string;
+  handoff?: (pid: number) => NativeServiceCommand;
   path: string;
   contents: string;
-  /** Windows Task Scheduler imports UTF-16LE XML; other managers use UTF-8. */
-  fileEncoding?: "utf16le";
   /** Private launch helpers, written before the service is registered. */
   supportFiles?: readonly { path: string; contents: string }[];
   install: NativeServiceCommand[];
@@ -68,7 +70,7 @@ export interface NativeServiceDefinition {
    * stopped service to exit.
    */
   status: NativeServiceCommand;
-  /** Exits 0 while the service is registered, running or not; only where `status` cannot say it (Windows), so `serve` can register a missing task. */
+  /** Exits 0 while the service is registered, running or not; only where `status` cannot say it (Windows), so `serve` can register a missing login shortcut. */
   registered?: NativeServiceCommand;
   /** Reads how often the OS has started the service and how it last exited (`parseServiceExits`); absent where the OS does not say. */
   exits?: NativeServiceCommand;
@@ -114,17 +116,9 @@ const LAUNCHD_RELOAD_SCRIPT = [
 /** Seconds launchd waits after SIGTERM before SIGKILL; above the connector's 15 s shutdown watchdog. */
 const LAUNCHD_EXIT_TIMEOUT_SECONDS = 30;
 
-/**
- * The bytes of a definition file, the one encoding every writer uses: Task
- * Scheduler reads UTF-16LE with a byte-order mark, the others UTF-8. A task
- * file in any other encoding is refused by `schtasks /Create` with "unable to
- * switch the encoding" (0.10.9 and older wrote UTF-8, and a failed
- * refresh put a decoded copy back re-encoded under its old declaration).
- */
-export function encodeServiceDefinition(definition: Pick<NativeServiceDefinition, "contents" | "fileEncoding">): Buffer {
-  return definition.fileEncoding === "utf16le"
-    ? Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(definition.contents, "utf16le")])
-    : Buffer.from(definition.contents, "utf8");
+/** All native service definitions are written and compared as UTF-8 bytes. */
+export function encodeServiceDefinition(definition: Pick<NativeServiceDefinition, "contents">): Buffer {
+  return Buffer.from(definition.contents, "utf8");
 }
 
 /** How a service command ended, with what it printed, so a failure can say why. */
@@ -264,11 +258,11 @@ interface ServiceDefinitionInput {
   args: string[];
 }
 
-/** One definition per service manager: launchd, systemd's user manager, Task Scheduler. */
+/** One definition per service manager: launchd, systemd's user manager, Windows login startup. */
 const SERVICE_DEFINITIONS: Readonly<Record<HostOs, (spec: ServiceDefinitionInput) => NativeServiceDefinition>> = {
   macos: launchAgentDefinition,
   debian: systemdUserDefinition,
-  windows: scheduledTaskDefinition,
+  windows: windowsLoginDefinition,
 };
 
 function launchAgentDefinition({ input, path, normalizedRoot, label, args }: ServiceDefinitionInput): NativeServiceDefinition {
@@ -320,93 +314,9 @@ function systemdUserDefinition({ input, path, label, args }: ServiceDefinitionIn
   };
 }
 
-function scheduledTaskDefinition({ input, path, normalizedRoot, label }: ServiceDefinitionInput): NativeServiceDefinition {
+function windowsLoginDefinition({ input, normalizedRoot, label }: ServiceDefinitionInput): NativeServiceDefinition {
   if (!input.userId || !/^S-1-\d+(?:-\d+)+$/.test(input.userId)) throw new Error("the current Windows user SID is required");
-  const file = path.join(normalizedRoot, "service.xml");
-  // Task Scheduler creates a visible console for a console executable even
-  // when the task is marked Hidden. wscript is a GUI host: it starts one
-  // hidden PowerShell host, waits for the connector and forwards its exit
-  // status so the scheduler still tracks the running task and owns restarts.
-  // Encode the literal command: WScript.Shell.Run expands %variables%, which
-  // must never reinterpret an installation path containing percent signs.
-  const helper = path.join(normalizedRoot, "service.js");
-  const script = windowsServiceHost({ executable: input.executable, root: normalizedRoot, logFile: path.join(normalizedRoot, "logs", CONNECTOR_LOG_FILE) });
-  const host = `"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -NoLogo -NoProfile -NonInteractive -EncodedCommand ${Buffer.from(script, "utf16le").toString("base64")}`;
-  return {
-    label, path: file, requiresLinger: false, fileEncoding: "utf16le",
-    supportFiles: [{ path: helper, contents: `var shell = WScript.CreateObject("WScript.Shell");\nWScript.Quit(shell.Run(${JSON.stringify(host)}, 0, true));\n` }],
-    contents: `<?xml version="1.0" encoding="UTF-16"?>\n<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>${input.userId}</UserId></LogonTrigger></Triggers>\n<Principals><Principal id="Owner"><UserId>${input.userId}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>${WINDOWS_TASK_RESTART_COUNT}</Count></RestartOnFailure></Settings>\n<Actions Context="Owner"><Exec><Command>%SystemRoot%\\System32\\wscript.exe</Command><Arguments>${xml(["//B", "//NoLogo", "//E:JScript", helper].map(windowsArg).join(" "))}</Arguments></Exec></Actions>\n</Task>\n`,
-    install: [{ command: "schtasks.exe", args: ["/Create", "/TN", label, "/XML", file, "/F"] }],
-    start: { command: "schtasks.exe", args: ["/Run", "/TN", label] },
-    stop: { command: "schtasks.exe", args: ["/End", "/TN", label] },
-    remove: [{ command: "schtasks.exe", args: ["/Delete", "/TN", label, "/F"] }],
-    // `schtasks /Query` succeeds whenever the task exists, running or not, so
-    // updates waited out the stop deadline and `start` never re-created the
-    // task for the new release. The task's state enum reads the same in every
-    // Windows language, unlike schtasks' text; the label is hex, so it quotes safely.
-    status: { command: "powershell.exe", args: ["-NoProfile", "-NonInteractive", "-Command", `$ErrorActionPreference = 'Stop'; try { $task = Get-ScheduledTask -TaskPath '\\' -TaskName '${label}' -ErrorAction Stop; if ($task.State -in @('Running', 'Queued')) { exit 0 }; if ($task.State -in @('Ready', 'Disabled')) { exit 1 }; exit 2 } catch { if ($_.FullyQualifiedErrorId -like 'CmdletizationQuery_NotFound*') { exit 1 }; exit 2 }`] },
-    registered: { command: "powershell.exe", args: ["-NoProfile", "-NonInteractive", "-Command", `if (Get-ScheduledTask -TaskPath '\\' -TaskName '${label}' -ErrorAction SilentlyContinue) { exit 0 }; exit 1`] },
-  };
-}
-
-/**
- * Task Scheduler's published schema types `RestartOnFailure/Count` as an
- * unsignedByte; 999, which its own dialog offers, is out of that range.
- */
-const WINDOWS_TASK_RESTART_COUNT = 255;
-/** The connector log's limit, as the supervisor keeps it on macOS and Linux (connector-log.ts). */
-const WINDOWS_LOG_MAX_BYTES = 20 * 1024 * 1024;
-
-/**
- * The hidden PowerShell host the Windows task runs. Task Scheduler keeps
- * nothing a task prints, so a connector that stopped as it started left no
- * trace; like launchd's StandardOutPath, the connector's stdout and
- * stderr are appended to `<root>\logs\connector.log` from its very first
- * byte. Windows PowerShell's own redirection turns a native program's stderr
- * into error records (and, under `Stop`, ends the pipeline at the first
- * line), so cmd redirects instead. cmd reads the paths from the environment:
- * it expands each `%NAME%` once and never re-reads a value, so a path's own
- * `%`, `&` and `'` stay literal. The log is kept small here, before the
- * connector holds it: cmd's handle does not append, so it cannot be emptied
- * in place while the connector runs. A start that fails before the connector
- * runs writes one line to the same log.
- */
-function windowsServiceHost(input: { executable: string; root: string; logFile: string }): string {
-  const literal = (value: string) => `'${value.replace(/'/g, "''")}'`;
-  // The connector parses its command line by the C runtime's rules, where
-  // backslashes before a closing quote escape it; doubled, they stay a path.
-  const rootArgument = input.root.replace(/(\\+)$/, "$1$1");
-  return [
-    "$ErrorActionPreference = 'Stop'",
-    `$log = ${literal(input.logFile)}`,
-    "try {",
-    "  [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($log))",
-    "  try {",
-    "    $previous = New-Object System.IO.FileInfo -ArgumentList $log",
-    `    if ($previous.Exists -and $previous.Length -gt ${WINDOWS_LOG_MAX_BYTES}) {`,
-    "      $rotated = $log + '.1'",
-    "      [System.IO.File]::Delete($rotated)",
-    "      [System.IO.File]::Move($log, $rotated)",
-    "    }",
-    "  } catch { }",
-    `  $env:KONTEKS_SERVICE_PROGRAM = ${literal(input.executable)}`,
-    `  $env:KONTEKS_SERVICE_ROOT = ${literal(rootArgument)}`,
-    "  $env:KONTEKS_SERVICE_LOG = $log",
-    "  $start = New-Object System.Diagnostics.ProcessStartInfo",
-    "  $start.FileName = [System.IO.Path]::Combine($env:SystemRoot, 'System32\\cmd.exe')",
-    `  $start.Arguments = '/d /v:off /s /c ""%KONTEKS_SERVICE_PROGRAM%" serve --root "%KONTEKS_SERVICE_ROOT%" >> "%KONTEKS_SERVICE_LOG%" 2>&1"'`,
-    "  $start.UseShellExecute = $false",
-    "  $start.CreateNoWindow = $true",
-    "  $connector = [System.Diagnostics.Process]::Start($start)",
-    "  $connector.WaitForExit()",
-    "  exit $connector.ExitCode",
-    "} catch {",
-    "  $message = 'the Konteks task could not start the connector: ' + $_.Exception.Message",
-    "  $line = '{\"level\":50,\"time\":' + [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + ',\"msg\":' + (ConvertTo-Json -InputObject $message -Compress) + '}'",
-    "  try { [System.IO.File]::AppendAllText($log, $line + [Environment]::NewLine) } catch { }",
-    "  exit 1",
-    "}",
-  ].join("\n");
+  return windowsBackgroundDefinition({ home: input.home, root: normalizedRoot, executable: input.executable, label, userId: input.userId });
 }
 
 function assertPath(value: string, os: HostOs): void {
@@ -423,10 +333,7 @@ function systemdArg(value: string): string {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/%/g, "%%").replace(/\$/g, "$$$$")}"`;
 }
 
-function windowsArg(value: string): string {
-  if (!/[\s"]/.test(value)) return value;
-  return `"${value.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/g, '$1$1')}"`;
-}
+
 
 /**
  * How often the OS service manager has started the service since it was

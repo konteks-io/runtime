@@ -30,27 +30,27 @@ describe("a service command that fails says which, how and what it printed", () 
     expect(failure.step).toBe("register");
     expect(failure.command).toEqual(service.install[0]);
     expect(failure.run.code).toBe(1);
-    expect(failure.message).toContain("schtasks.exe /Create exited 1: ERROR: Access is denied.");
+    expect(failure.message).toContain("powershell.exe exited 1: ERROR: Access is denied.");
     expect(failure.excerpt.length).toBeLessThanOrEqual(300);
     // A plain sentence and one next step the person can take.
     const described = describeServiceFailure("windows", failure);
-    expect(described).toMatch(/^Windows refused to create the Konteks task \(schtasks\.exe \/Create exited 1: ERROR: Access is denied\./);
+    expect(described).toMatch(/^Windows refused to create the Konteks task \(powershell\.exe exited 1: ERROR: Access is denied\./);
     expect(described).toMatch(/administrator PowerShell/);
   });
 
   it("says a command that could not run at all, and one that timed out, in words", async () => {
     const service = windows();
     const missing = await startNativeServiceDefinition(service, {
-      execute: async command => command === service.status ? 1 : { code: null, error: "spawn schtasks.exe ENOENT" },
+      execute: async command => command === service.status ? 1 : { code: null, error: "spawn powershell.exe ENOENT" },
       write: async () => undefined,
     }).catch((caught: unknown) => caught as NativeServiceCommandError);
-    expect(missing.message).toContain("schtasks.exe /Create could not be run: spawn schtasks.exe ENOENT");
+    expect(missing.message).toContain("powershell.exe could not be run: spawn powershell.exe ENOENT");
     const slow = await startNativeServiceDefinition(service, {
       execute: async command => command === service.status ? 1 : command === service.start ? { code: null, timedOut: true } : 0,
       write: async () => undefined,
     }).catch((caught: unknown) => caught as NativeServiceCommandError);
     expect(slow.step).toBe("start");
-    expect(describeServiceFailure("windows", slow)).toMatch(/^Windows did not run the Konteks task \(schtasks\.exe \/Run did not finish in time\)/);
+    expect(describeServiceFailure("windows", slow)).toMatch(/^Windows did not run the Konteks task \(powershell\.exe did not finish in time\)/);
   });
 
   it("keeps a failed write's own reason and names the file", async () => {
@@ -60,7 +60,7 @@ describe("a service command that fails says which, how and what it printed", () 
       write: async () => { throw Object.assign(new Error("EPERM: operation not permitted"), { code: "EPERM" }); },
     }).catch((caught: unknown) => caught as NativeServiceCommandError);
     expect(error.step).toBe("write");
-    expect(describeServiceFailure("windows", error)).toContain(`${windowsRoot}\\service.js`);
+    expect(describeServiceFailure("windows", error)).toContain(windows().supportFiles![0]!.path);
     expect(describeServiceFailure("windows", error)).toContain("EPERM: operation not permitted");
   });
 
@@ -71,7 +71,7 @@ describe("a service command that fails says which, how and what it printed", () 
   });
 });
 
-describe("the Windows task keeps a connector log, like launchd's", () => {
+describe("the Windows background host keeps a connector log, like launchd's", () => {
   const script = (service: ReturnType<typeof windows>) => {
     const encoded = service.supportFiles![0]!.contents.match(/-EncodedCommand ([A-Za-z0-9+/=]+)/)![1]!;
     return Buffer.from(encoded, "base64").toString("utf16le");
@@ -83,14 +83,14 @@ describe("the Windows task keeps a connector log, like launchd's", () => {
     const service = nativeServiceDefinition({ os: "windows", home: "C:\\Users\\Test User", root, executable, userId: "S-1-5-21-1-2-3-1001" });
     const text = script(service);
     const literal = (value: string) => `'${value.replace(/'/g, "''")}'`;
-    expect(text).toContain(`$log = ${literal(`${root}\\logs\\connector.log`)}`);
+    expect(text).toContain("$log = Join-Path $root 'logs\\connector.log'");
     expect(text).toContain(`$env:KONTEKS_SERVICE_PROGRAM = ${literal(executable)}`);
     expect(text).toContain(`$env:KONTEKS_SERVICE_ROOT = ${literal(root)}`);
     // cmd expands each variable once and never re-reads its value, so a path's
     // own percent signs, ampersands and apostrophes stay literal.
     expect(text).toContain(`'/d /v:off /s /c ""%KONTEKS_SERVICE_PROGRAM%" serve --root "%KONTEKS_SERVICE_ROOT%" >> "%KONTEKS_SERVICE_LOG%" 2>&1"'`);
     expect(text).not.toContain(`& '${executable}'`);
-    expect(text).toContain("exit $connector.ExitCode");
+    expect(text).toContain("if ($child.ExitCode -eq 0) { break }");
     // A start that fails before the connector runs is written to the log too.
     expect(text).toMatch(/catch \{[\s\S]*AppendAllText\(\$log/);
     // The `${name}:` rule: a variable followed by a colon inside double quotes breaks the script.
@@ -100,11 +100,11 @@ describe("the Windows task keeps a connector log, like launchd's", () => {
   it("keeps the log small at start, where the scheduler's appending handle is not yet open", () => {
     const text = script(windows());
     expect(text).toContain("20971520");
-    expect(text).toContain("[System.IO.File]::Move($log, $rotated)");
+    expect(text).toContain("[IO.File]::Move($log, $log + '.1')");
   });
 
-  it("asks Task Scheduler for at most 255 restarts, the published schema's limit for Count", () => {
-    expect(windows().contents).toContain("<Count>255</Count>");
+  it("caps crash backoff without periodically launching a scheduled task", () => {
+    expect(script(windows())).toContain("[Math]::Min(60, $delay * 2)");
   });
 
   it("doubles a root's trailing backslashes so the connector reads the closing quote", () => {
@@ -160,13 +160,13 @@ describe("doctor and support say the last failed start when the connector is not
 
   it("records the failure, reports it with the log's last lines, and forgets it after a start that works", async () => {
     const root = await mkdtemp(join(tmpdir(), "service-report-")); dirs.push(root);
-    await recordServiceStartFailure(root, { at: "2026-10-02T10:00:00.000Z", message: "Windows refused to create the Konteks task (schtasks.exe /Create exited 1: ERROR: Access is denied.)." });
+    await recordServiceStartFailure(root, { at: "2026-10-02T10:00:00.000Z", message: "Windows refused to create the Konteks task (powershell.exe exited 1: ERROR: Access is denied.)." });
     expect(await readServiceStartFailure(root)).toMatchObject({ at: "2026-10-02T10:00:00.000Z" });
     await mkdir(join(root, "logs"), { recursive: true });
     await writeFile(join(root, "logs", "connector.log"), `${Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n")}\nsecret sk-ant-abcdefghijklmnop\n`);
     const report = await localServiceReport(root, { tailLines: 5 });
     expect(report.lines[0]).toBe("Konteks is not running on this computer, so only these local checks ran.");
-    expect(report.lines).toContain("Last start (2026-10-02T10:00:00.000Z): Windows refused to create the Konteks task (schtasks.exe /Create exited 1: ERROR: Access is denied.).");
+    expect(report.lines).toContain("Last start (2026-10-02T10:00:00.000Z): Windows refused to create the Konteks task (powershell.exe exited 1: ERROR: Access is denied.).");
     expect(report.lines).toContain(`Connector log: ${join(root, "logs", "connector.log")}`);
     expect(report.value.logTail).toHaveLength(5);
     expect(report.value.logTail.at(-2)).toBe("line 29");
@@ -185,9 +185,9 @@ describe("doctor and support say the last failed start when the connector is not
   });
 });
 
-describe("service.xml is UTF-16 with a BOM wherever it is written, and heals when it is not", () => {
+describe("the Windows startup manifest is UTF-8 and repairs an outdated definition", () => {
   /** What 0.10.9 and older wrote (their renderer and a plain UTF-8 write): schtasks says "unable to switch the encoding". */
-  const utf8Task = (definition: ReturnType<typeof windows>) => Buffer.from(definition.contents.replace('encoding="UTF-16"', 'encoding="UTF-8"'), "utf8");
+  const utf8Task = (_definition: ReturnType<typeof windows>) => Buffer.from("<Task/>", "utf8");
 
   function serveDeps(definition: ReturnType<typeof windows>, onDisk: Uint8Array | null, registered = true) {
     const files = new Map<string, Uint8Array>();
@@ -210,9 +210,9 @@ describe("service.xml is UTF-16 with a BOM wherever it is written, and heals whe
   it("encodes and decodes the task file one way for start and serve alike", () => {
     const definition = windows();
     const bytes = encodeServiceDefinition(definition);
-    expect([...bytes.subarray(0, 2)]).toEqual([0xff, 0xfe]);
+    expect(JSON.parse(bytes.toString("utf8")).kind).toBe("windows-login-background");
     expect(decodeServiceDefinition(bytes)).toBe(definition.contents);
-    expect(decodeServiceDefinition(utf8Task(definition))).toContain('encoding="UTF-8"');
+    expect(decodeServiceDefinition(utf8Task(definition))).toBe("<Task/>");
   });
 
   it("start writes the task file serve compares against", async () => {
@@ -222,7 +222,7 @@ describe("service.xml is UTF-16 with a BOM wherever it is written, and heals whe
     expect(Buffer.from(writes.get(definition.path) as Uint8Array).equals(encodeServiceDefinition(definition))).toBe(true);
   });
 
-  it("serve rewrites a UTF-8 task file as UTF-16 with a BOM and creates the task again", async () => {
+  it("serve rewrites an outdated manifest and refreshes the shortcut", async () => {
     const definition = windows();
     const { files, create, value } = serveDeps(definition, utf8Task(definition));
     expect(await keepServiceOnOwnDefinition("root", value)).toBe("next_start");
@@ -257,21 +257,20 @@ describe("service.xml is UTF-16 with a BOM wherever it is written, and heals whe
   it("asks Windows whether the task exists, whatever its state", () => {
     const definition = windows();
     expect(definition.registered?.command).toBe("powershell.exe");
-    expect(definition.registered?.args.at(-1)).toBe(`if (Get-ScheduledTask -TaskPath '\\' -TaskName '${definition.label}' -ErrorAction SilentlyContinue) { exit 0 }; exit 1`);
+    expect(Buffer.from(definition.registered!.args.at(-1)!, "base64").toString("utf16le")).toContain("if (StartupCurrent)");
   });
 });
 
 /**
  * Only a real Windows can prove these; CI's windows-native job runs them.
- * The task test needs an elevated runner, which CI is, so it proves
- * Task Scheduler accepts the XML and its encoding, not a standard user's rights.
+ * Shortcuts are isolated under a disposable home directory.
  */
 describe.runIf(process.platform === "win32")("on a real Windows", () => {
   const dirs: string[] = [];
   afterEach(async () => { await Promise.all(dirs.splice(0).map(dir => rm(dir, { recursive: true, force: true }))); });
   const hostScript = (service: ReturnType<typeof windows>) => Buffer.from(service.supportFiles![0]!.contents.match(/-EncodedCommand ([A-Za-z0-9+/=]+)/)![1]!, "base64").toString("utf16le");
 
-  it("Windows PowerShell parses the task's host script", () => {
+  it("Windows PowerShell parses the hidden host script", () => {
     const service = windows();
     const check = "$errors = $null; [System.Management.Automation.Language.Parser]::ParseInput([Console]::In.ReadToEnd(), [ref]$null, [ref]$errors) | Out-Null; if ($errors) { $errors | ForEach-Object { [Console]::Error.WriteLine($_.ToString()) }; exit 1 }";
     const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", check], { input: hostScript(service), encoding: "utf8", timeout: 15_000 });
@@ -279,31 +278,72 @@ describe.runIf(process.platform === "win32")("on a real Windows", () => {
     expect(result.status).toBe(0);
   }, 20_000);
 
-  it("runs the connector with a path full of cmd and PowerShell metacharacters, appends its output to the log and forwards its exit code", async () => {
+  it("runs the connector with a path full of cmd and PowerShell metacharacters, appends its output to the log and stops after clean exit", async () => {
     const base = await mkdtemp(join(tmpdir(), "konteks host %PATH% & O'Brien ")); dirs.push(base);
-    // A batch file stands in for the connector: it says the arguments it got, on stdout and stderr, and exits 7.
+    // A batch file stands in for the connector: it says the arguments it got, on stdout and stderr, and exits cleanly.
     const executable = join(base, "connector.cmd");
-    await writeFile(executable, "@echo args: %*\r\n@echo to stderr 1>&2\r\n@exit /b 7\r\n");
+    await writeFile(executable, "@echo args: %*\r\n@echo to stderr 1>&2\r\n@exit /b 0\r\n");
     const service = nativeServiceDefinition({ os: "windows", home: base, root: base, executable, userId: "S-1-5-21-1-2-3-1001" });
     const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(hostScript(service), "utf16le").toString("base64")], { encoding: "utf8" });
-    expect(result.status).toBe(7);
+    expect(result.status).toBe(0);
     const log = await readFile(join(base, "logs", "connector.log"), "utf8");
     expect(log).toContain(`args: serve --root "${base}"`);
     expect(log).toContain("to stderr");
   });
 
-  it.runIf(process.env.CI === "true")("Task Scheduler accepts the task XML exactly as start writes it", async () => {
-    const base = await mkdtemp(join(tmpdir(), "konteks-task-")); dirs.push(base);
-    const sid = spawnSync("whoami.exe", ["/user", "/fo", "csv", "/nh"], { encoding: "utf8" }).stdout.match(/S-1-\d+(?:-\d+)+/)![0];
-    const service = nativeServiceDefinition({ os: "windows", home: base, root: base, executable: process.execPath, userId: sid });
-    await writeFile(service.path, encodeServiceDefinition(service));
-    const name = `${service.label}-ci`;
-    const created = spawnSync("schtasks.exe", ["/Create", "/TN", name, "/XML", service.path, "/F"], { encoding: "utf8" });
+  it("restarts two crashes and then stops on a clean connector exit", async () => {
+    const base = await mkdtemp(join(tmpdir(), "konteks-crash-")); dirs.push(base);
+    const executable = join(base, "connector.cmd");
+    await writeFile(executable, [
+      "@echo off", "set run=0", 'if exist "%~dp0runs.txt" set /p run=<"%~dp0runs.txt"',
+      "set /a run+=1", 'echo %run%>"%~dp0runs.txt"', "echo launch=%run%",
+      "if %run% LSS 3 exit /b 7", "exit /b 0", "",
+    ].join("\r\n"));
+    const service = nativeServiceDefinition({ os: "windows", home: base, root: base, executable, userId: "S-1-5-21-1-2-3-1001" });
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(hostScript(service), "utf16le").toString("base64")], { encoding: "utf8", windowsHide: true, timeout: 30_000 });
+    expect(result.status).toBe(0);
+    expect((await readFile(join(base, "runs.txt"), "utf8")).trim()).toBe("3");
+    expect(await readFile(join(base, "logs", "connector.log"), "utf8")).toMatch(/launch=1[\s\S]*launch=2[\s\S]*launch=3/);
+  }, 35_000);
+
+  it("migrates only its own legacy task and preserves literal root paths", async () => {
+    const base = await mkdtemp(join(tmpdir(), "konteks migration %PATH% & O'Brien ")); dirs.push(base);
+    const userId = spawnSync("whoami.exe", ["/user", "/fo", "csv", "/nh"], { encoding: "utf8" }).stdout.match(/S-1-\d+(?:-\d+)+/)![0];
+    const executable = join(base, "releases", "old", "konteks-connector.exe");
+    await mkdir(join(base, "releases", "old"), { recursive: true });
+    await writeFile(executable, ""); await writeFile(join(base, "service.xml"), "<Task/>");
+    const service = nativeServiceDefinition({ os: "windows", home: base, root: base, executable, userId });
+    const literal = (value: string) => "'" + value.replace(/'/g, "''") + "'";
+    const script = (value: string) => spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(value, "utf16le").toString("base64")], { encoding: "utf8", windowsHide: true });
+    const run = (command: NativeServiceCommand) => spawnSync(command.command, command.args, { encoding: "utf8", windowsHide: true });
+    const register = (program: string, args: string) => script(`$ErrorActionPreference='Stop'; $a=New-ScheduledTaskAction -Execute ${literal(program)} -Argument ${literal(args)}; $p=New-ScheduledTaskPrincipal -UserId ${literal(userId)} -LogonType Interactive -RunLevel Limited; Register-ScheduledTask -TaskName '${service.label}' -Action $a -Principal $p -Force | Out-Null`);
+    const query = () => script(`if (Get-ScheduledTask -TaskName '${service.label}' -ErrorAction SilentlyContinue) { exit 0 }; exit 1`);
     try {
-      expect(`${created.stdout}${created.stderr}`).not.toMatch(/ERROR/);
-      expect(created.status).toBe(0);
+      expect(register("C:\\Windows\\System32\\cmd.exe", "/c exit 0").status).toBe(0);
+      expect(run(service.install[0]!).status).toBe(1);
+      expect(query().status).toBe(0);
+      expect(register(executable, `serve --root "${base}"`).status).toBe(0);
+      expect(run(service.install[0]!).status).toBe(0);
+      expect(query().status).toBe(1);
+      expect(run(service.registered!).status).toBe(0);
+      await expect(readFile(join(base, "service.xml"))).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
-      spawnSync("schtasks.exe", ["/Delete", "/TN", name, "/F"]);
+      script(`Unregister-ScheduledTask -TaskName '${service.label}' -Confirm:$false -ErrorAction SilentlyContinue`);
+      expect(run(service.remove[0]!).status).toBe(0);
     }
+  }, 45_000);
+
+  it("registers and removes a login shortcut under its own home", async () => {
+    const base = await mkdtemp(join(tmpdir(), "konteks-startup-")); dirs.push(base);
+    const service = nativeServiceDefinition({ os: "windows", home: base, root: base, executable: process.execPath, userId: "S-1-5-21-1-2-3-1001" });
+    const run = (command: NativeServiceCommand) => spawnSync(command.command, command.args, { encoding: "utf8", windowsHide: true });
+    try {
+      expect(run(service.registered!).status).toBe(1);
+      expect(run(service.install[0]!).status).toBe(0);
+      expect(run(service.registered!).status).toBe(0);
+    } finally {
+      expect(run(service.remove[0]!).status).toBe(0);
+    }
+    expect(run(service.registered!).status).toBe(1);
   });
 });

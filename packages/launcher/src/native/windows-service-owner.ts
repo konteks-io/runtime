@@ -32,7 +32,7 @@ const sameIdentity = (a: WindowsServiceProcess, b: WindowsServiceProcess) => a.p
 const uncertain = (message: string) => new RemoteInstanceError("temporarily_unavailable", message);
 
 /** Find only a release connector whose complete parsed argv serves this root.
- * Task Scheduler's Ready state does not describe surviving child processes. */
+ * The background host's state does not describe surviving child processes. */
 export async function captureWindowsServiceOwner(root: string, deps: WindowsServiceOwnerDeps = { read: readWindowsServiceProcesses, terminate: terminateWindowsServiceProcesses }): Promise<NativeServiceProcessOwner | null> {
   const initial = await deps.read();
   const leader = serviceLeader(root, initial);
@@ -293,11 +293,9 @@ function processRecordText(record: Partial<WindowsServiceProcess>): boolean {
   return typeof record.startToken === "string" && typeof record.executable === "string" && typeof record.command === "string";
 }
 
-/** A Ready/absent task is known not to own a run. Unknown state must be ended. */
-export async function endWindowsServiceTask(definition: NativeServiceDefinition, execute: NativeServiceExecute, status?: number | null): Promise<void> {
-  const state = status === undefined ? serviceRun(await execute(definition.status)).code : status;
-  if (state === 1) return;
-  if (serviceRun(await execute(definition.stop)).code !== 0) throw uncertain("Windows could not end this connector's task; its processes were preserved.");
+/** Disable restarts even when the watchdog is between connector runs. */
+export async function stopWindowsBackgroundHost(definition: NativeServiceDefinition, execute: NativeServiceExecute): Promise<void> {
+  if (serviceRun(await execute(definition.stop)).code !== 0) throw uncertain("Windows could not stop this connector's background host; its processes were preserved.");
 }
 
 interface WindowsServiceStopDeps {
@@ -311,7 +309,7 @@ interface WindowsServiceStopDeps {
 }
 
 /** Wait for graceful exit, then end only the captured tree after its grace. */
-export function waitForWindowsServiceExit(owner: NativeServiceProcessOwner, definition: NativeServiceDefinition, deps: WindowsServiceStopDeps, output: { line(text: string): void }): Promise<void> {
+export function waitForWindowsServiceExit(owner: NativeServiceProcessOwner | null, definition: NativeServiceDefinition, deps: WindowsServiceStopDeps, output: { line(text: string): void }): Promise<void> {
   return new WindowsServiceExitWait(owner, definition, deps, output).run();
 }
 
@@ -320,7 +318,7 @@ class WindowsServiceExitWait {
   private readonly deadlineMs: number;
   private readonly graceMs: number;
   private forced = false;
-  constructor(private readonly owner: NativeServiceProcessOwner, private readonly definition: NativeServiceDefinition, private readonly deps: WindowsServiceStopDeps, private readonly output: { line(text: string): void }) {
+  constructor(private readonly owner: NativeServiceProcessOwner | null, private readonly definition: NativeServiceDefinition, private readonly deps: WindowsServiceStopDeps, private readonly output: { line(text: string): void }) {
     this.started = deps.now();
     this.deadlineMs = deps.stopDeadlineMs ?? 90_000;
     this.graceMs = Math.min(deps.stopGraceMs ?? 30_000, this.deadlineMs);
@@ -337,16 +335,16 @@ class WindowsServiceExitWait {
   }
 
   private async exited(): Promise<boolean> {
-    if (await this.owner.alive()) return false;
-    await endWindowsServiceTask(this.definition, this.deps.execute);
-    return true;
+    if (this.owner && await this.owner.alive()) return false;
+    await stopWindowsBackgroundHost(this.definition, this.deps.execute);
+    return serviceRun(await this.deps.execute(this.definition.status)).code === 1;
   }
 
   private async forceAfterGrace(): Promise<boolean> {
     if (this.forced || this.deps.now() - this.started < this.graceMs) return false;
     setupLine(this.output, "updateForceStop", { duration: setupDuration(this.output, this.graceMs) });
-    await endWindowsServiceTask(this.definition, this.deps.execute);
-    await this.owner.terminate();
+    await stopWindowsBackgroundHost(this.definition, this.deps.execute);
+    await this.owner?.terminate();
     this.forced = true;
     return true;
   }

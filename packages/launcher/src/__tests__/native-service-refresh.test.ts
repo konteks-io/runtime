@@ -35,7 +35,7 @@ function launchdPrint(input: { pid?: number; program?: string; logFile?: string 
   ].join("\n");
 }
 
-function deps(definition: NativeServiceDefinition, input: { onDisk?: string | null; loaded?: string | null; last?: { digest: string; at: number } | null; os?: "macos" | "debian"; now?: number; executeCode?: number } = {}) {
+function deps(definition: NativeServiceDefinition, input: { onDisk?: string | null; loaded?: string | null; last?: { digest: string; at: number } | null; os?: "macos" | "debian" | "windows"; now?: number; executeCode?: number } = {}) {
   const calls = {
     write: vi.fn(async (_path: string, _contents: string | Uint8Array) => undefined),
     detach: vi.fn(async (_command: NativeServiceCommand, _logFile: string) => undefined),
@@ -155,19 +155,19 @@ describe("the serving release keeps its service on its own definition", () => {
     await expect(keepServiceOnOwnDefinition(root, failing.value)).rejects.toThrow(/daemon-reload exited unsuccessfully/);
   });
 
-  it("only rewrites the Windows task file, which Task Scheduler takes at the next start", async () => {
+  it("refreshes the Windows login shortcut for the next start", async () => {
     const windows = nativeServiceDefinition({ os: "windows", home: "C:\\Users\\Ada", root: "C:\\Users\\Ada\\AppData\\Local\\konteks-remote", executable: "C:\\Users\\Ada\\AppData\\Local\\konteks-remote\\releases\\release-new\\konteks-connector.exe", userId: "S-1-5-21-1-2-3-1001" });
-    const { value, calls } = deps(windows, { onDisk: "<Task/>" });
+    const { value, calls } = deps(windows, { os: "windows", onDisk: "<Task/>" });
     expect(await keepServiceOnOwnDefinition(root, value)).toBe("next_start");
-    // In the encoding Task Scheduler reads.
-    expect(calls.write).toHaveBeenCalledWith(windows.path, encodeServiceDefinition(windows));
-    expect(calls.execute).not.toHaveBeenCalled();
+    // The startup manifest is UTF-8 JSON.
+    expect(calls.write).toHaveBeenCalledWith(windows.path, windows.contents);
+    expect(calls.execute).toHaveBeenCalledWith(windows.install[0]);
     expect(calls.detach).not.toHaveBeenCalled();
   });
 });
 
 
-describe("Windows task refresh", () => {
+describe("Windows login startup refresh", () => {
   function setup() {
     const definition = nativeServiceDefinition({ os: "windows", home: "C:\\Users\\ada", root: "C:\\Users\\ada\\remote", executable: "C:\\Users\\ada\\remote\\releases\\new\\konteks-connector.exe", userId: "S-1-5-21-1-2-3-1001" });
     const base = deps(definition).value;
@@ -180,20 +180,20 @@ describe("Windows task refresh", () => {
     };
     return { definition, files, value, execute };
   }
-  it("writes the helper and replaces the task without starting another connector, then is idempotent", async () => {
+  it("writes the helper and refreshes startup without starting another connector, then is idempotent", async () => {
     const { definition, files, value, execute } = setup();
     expect(await keepServiceOnOwnDefinition("root", value)).toBe("next_start");
     expect(files.get(definition.supportFiles![0]!.path)).toBe(definition.supportFiles![0]!.contents);
     expect(execute.mock.calls).toEqual(definition.install.map(command => [command]));
     expect(execute).not.toHaveBeenCalledWith(definition.start);
     expect(await keepServiceOnOwnDefinition("root", value)).toBe("current");
-    // Only asked whether the task exists; not registered again.
+    // Only asked whether the shortcut exists; not registered again.
     expect(execute.mock.calls.filter(call => (call as unknown[])[0] === definition.install[0])).toHaveLength(definition.install.length);
   });
   it("restores failed registration so the next start retries it", async () => {
     const { definition, files, value, execute } = setup();
     execute.mockResolvedValueOnce(1);
-    await expect(keepServiceOnOwnDefinition("root", value)).rejects.toThrow("schtasks.exe /Create exited 1");
+    await expect(keepServiceOnOwnDefinition("root", value)).rejects.toThrow("powershell.exe exited 1");
     // The exact bytes it found, never a re-encoded copy.
     expect(Buffer.from(files.get(definition.path)!).toString("utf8")).toBe("older task");
     expect(await keepServiceOnOwnDefinition("root", value)).toBe("next_start");
@@ -207,5 +207,29 @@ describe("Windows task refresh", () => {
     files.clear();
     expect(await keepServiceOnOwnDefinition("root", value)).toBe("not_installed");
     expect(files.size).toBe(0);
+  });
+});
+
+
+describe("Windows legacy task migration", () => {
+  function migration(fail: boolean) {
+    const definition = nativeServiceDefinition({ os: "windows", home: "C:\\Users\\Ada", root: "C:\\Users\\Ada\\remote", executable: "C:\\Users\\Ada\\remote\\releases\\new\\konteks-connector.exe", userId: "S-1-5-21-1-2-3-1001" });
+    const { value, calls } = deps(definition, { os: "windows", executeCode: fail ? 1 : 0 });
+    value.read = async path => { if (path === definition.legacyPath) return "<Task/>"; throw new Error("missing"); };
+    return { definition, value, calls };
+  }
+  it("registers login startup before writing its manifest and hands over after this process exits", async () => {
+    const { definition, value, calls } = migration(false);
+    expect(await keepServiceOnOwnDefinition("root", value)).toBe("handoff");
+    expect(calls.execute.mock.calls).toEqual([[definition.install[0]], [definition.handoff!(value.pid)]]);
+    const manifestCall = calls.write.mock.calls.findIndex(([path]) => path === definition.path);
+    expect(calls.execute.mock.invocationCallOrder[0]).toBeLessThan(calls.write.mock.invocationCallOrder[manifestCall]!);
+    expect(calls.execute.mock.invocationCallOrder[1]).toBeGreaterThan(calls.write.mock.invocationCallOrder[manifestCall]!);
+  });
+  it("keeps migration retryable when legacy task ownership or shortcut registration is refused", async () => {
+    const { definition, value, calls } = migration(true);
+    await expect(keepServiceOnOwnDefinition("root", value)).rejects.toThrow("powershell.exe exited 1");
+    expect(calls.write.mock.calls.some(([path]) => path === definition.path)).toBe(false);
+    expect(calls.execute).toHaveBeenCalledTimes(1);
   });
 });

@@ -4,7 +4,7 @@
 
 The command people (and their agents) run: install and onboarding, agent
 add/remove, sign-in relays, status/doctor/support, service registration
-(launchd, user systemd, Windows Task Scheduler), the update transaction and
+(launchd, user systemd, Windows login startup), the update transaction and
 uninstall. It talks to the running supervisor over the local control socket
 (`packages/common/src/control-socket.ts`).
 
@@ -51,15 +51,16 @@ uninstall. It talks to the running supervisor over the local control socket
   (`SERVICE_RELOAD_WINDOW_MS`); a foreground `serve` is never restarted.
 - launchd plists set `ExitTimeOut` (`LAUNCHD_EXIT_TIMEOUT_SECONDS` = 30, above
   the daemon's watchdog), or launchd SIGKILLs a stopping connector after 5 s.
-- Windows Task XML is UTF-16LE with a BOM, written and compared as bytes via
-  `encodeServiceDefinition`; a failed registration restores the exact bytes it
-  found. `RestartOnFailure/Count` stays 255 (schema unsignedByte).
+- Windows installs a per-user Startup shortcut to a hidden WScript/PowerShell
+  watchdog (`src/native/windows-background.ts`). It locks one host per root,
+  restarts crashes with capped backoff, and stops on clean exit. Legacy tasks
+  migrate only after their user and action are verified against the root.
 - A failed service step is a `NativeServiceCommandError` (step, command, exit
   code, output excerpt), told by `describeServiceFailure`, and recorded in
   `supervisor/service-start-failure.json` for `doctor` and `support`.
 - **Update transaction.** It captures service ownership before stopping. On
   Windows, verified connector and descendant identities prove exit even when
-  Task Scheduler is Ready; shutdown excludes the updater's own branch and
+  the background host is between runs; shutdown excludes the updater's own branch and
   refuses ambiguous or reused process identities. Other platforms watch the
   service pid and process group. An abort cancels draining or restarts the
   unchanged release. `keepLauncherCurrent` keeps
