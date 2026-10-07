@@ -26,7 +26,8 @@ describe("a service command that fails says which, how and what it printed", () 
       ? { code: 1, stdout: "", stderr: `ERROR: Access is denied.\r\n${"x".repeat(5_000)}` } : 0;
     const error = await startNativeServiceDefinition(service, { execute: failing, write: async () => undefined }).catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(NativeServiceCommandError);
-    const failure = error as NativeServiceCommandError;
+    if (!(error instanceof NativeServiceCommandError)) throw new Error("Expected service registration to fail with NativeServiceCommandError.");
+    const failure = error;
     expect(failure.step).toBe("register");
     expect(failure.command).toEqual(service.install[0]);
     expect(failure.run.code).toBe(1);
@@ -43,12 +44,14 @@ describe("a service command that fails says which, how and what it printed", () 
     const missing = await startNativeServiceDefinition(service, {
       execute: async command => command === service.status ? 1 : { code: null, error: "spawn powershell.exe ENOENT" },
       write: async () => undefined,
-    }).catch((caught: unknown) => caught as NativeServiceCommandError);
+    }).catch((caught: unknown) => caught);
+    if (!(missing instanceof NativeServiceCommandError)) throw new Error("Expected the missing service command to fail with NativeServiceCommandError.");
     expect(missing.message).toContain("powershell.exe could not be run: spawn powershell.exe ENOENT");
     const slow = await startNativeServiceDefinition(service, {
       execute: async command => command === service.status ? 1 : command === service.start ? { code: null, timedOut: true } : 0,
       write: async () => undefined,
-    }).catch((caught: unknown) => caught as NativeServiceCommandError);
+    }).catch((caught: unknown) => caught);
+    if (!(slow instanceof NativeServiceCommandError)) throw new Error("Expected the timed out service command to fail with NativeServiceCommandError.");
     expect(slow.step).toBe("start");
     expect(describeServiceFailure("windows", slow)).toMatch(/^Windows did not run the Konteks task \(powershell\.exe did not finish in time\)/);
   });
@@ -58,7 +61,8 @@ describe("a service command that fails says which, how and what it printed", () 
     const error = await startNativeServiceDefinition(service, {
       execute: async () => 1,
       write: async () => { throw Object.assign(new Error("EPERM: operation not permitted"), { code: "EPERM" }); },
-    }).catch((caught: unknown) => caught as NativeServiceCommandError);
+    }).catch((caught: unknown) => caught);
+    if (!(error instanceof NativeServiceCommandError)) throw new Error("Expected the service definition write to fail with NativeServiceCommandError.");
     expect(error.step).toBe("write");
     expect(describeServiceFailure("windows", error)).toContain(windows().supportFiles![0]!.path);
     expect(describeServiceFailure("windows", error)).toContain("EPERM: operation not permitted");
@@ -238,8 +242,9 @@ describe("the Windows startup manifest is UTF-8 and repairs an outdated definiti
     const original = utf8Task(definition);
     const { files, create, value } = serveDeps(definition, original);
     create.mockResolvedValueOnce({ code: 1, stderr: "ERROR: The task XML is malformed. (1,40)::ERROR: unable to switch the encoding" });
-    const error = await keepServiceOnOwnDefinition("root", value).catch((caught: unknown) => caught as NativeServiceCommandError);
+    const error = await keepServiceOnOwnDefinition("root", value).catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(NativeServiceCommandError);
+    if (!(error instanceof NativeServiceCommandError)) throw new Error("Expected service registration refresh to fail with NativeServiceCommandError.");
     expect(error.message).toContain("unable to switch the encoding");
     expect(Buffer.from(files.get(definition.path)!).equals(original)).toBe(true);
     // The next serve tries again, and heals it.

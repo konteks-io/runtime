@@ -13,6 +13,10 @@ import { createOutput } from "../output.js";
 import { nativeServiceDefinition, startNativeServiceDefinition, type NativeServiceCommand } from "../native/service.js";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
 
+function requestUrl(input: Parameters<typeof fetch>[0]): string {
+  return typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+}
+
 const roots: string[] = [];
 afterEach(async () => { vi.unstubAllEnvs(); for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
 
@@ -52,7 +56,10 @@ async function fixture({ oldVersion = "1.0.0", nextVersion = "1.1.0", openCode =
     await writeSecretFile(join(root, "supervisor", "manifest.json"), JSON.stringify({ manifest: release.manifest, manifestDigest: release.manifest.digest }));
     return { instanceId: "instance", manifest: release.manifest, manifestDigest: release.manifest.digest, provisioningWindowExpiresAt: "2026-10-01T00:00:00Z" };
   });
-  const fetchFn = vi.fn(async (url: string) => new Response(url === claude.artifact.url ? claude.archive : url === next.artifact.url ? next.bytes : old.bytes));
+  const fetchFn = vi.fn<typeof fetch>().mockImplementation(async input => {
+    const url = requestUrl(input);
+    return new Response(url === claude.artifact.url ? claude.archive : url === next.artifact.url ? next.bytes : old.bytes);
+  });
   const output = createOutput({ json: true });
   const installed = await installNative({ root, activationId: "activation-123", coreUrl: "https://core.example", relayUrl: "wss://relay.example/runtime", agents: openCode ? ["claude-code", "opencode"] : ["claude-code"], output, deps: { roots: trust, platform, manifest: oldManifest, activate, fetchFn, git: null } } as never);
   await writeFile(join(root, "credentials", "claude-code", "keep"), "credential-owned-by-agent");
@@ -79,14 +86,14 @@ describe("native update staging and commit", () => {
     const f = await fixture();
     vi.stubEnv(NATIVE_UPDATE_TARGET_ENV, JSON.stringify({ bundleVersion: "1.1.0", manifestDigest: f.manifest.digest }));
     let channelReads = 0;
-    const fetchFn = vi.fn(async (url: string) => {
-      if (String(url).endsWith("native-manifest.json")) {
+    const fetchFn = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
+      if (requestUrl(input).endsWith("native-manifest.json")) {
         channelReads += 1;
         return new Response(JSON.stringify(channelReads === 1 ? f.manifest : f.oldManifest));
       }
-      return f.fetchFn(url);
+      return f.fetchFn(input, init);
     });
-    const staged = await stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, fetchFn: fetchFn as never } });
+    const staged = await stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, fetchFn } });
     expect(staged).toMatchObject({ status: "staged", release: { manifest: { bundleVersion: "1.1.0", digest: f.manifest.digest } } });
     expect(channelReads).toBe(1);
   });
@@ -182,7 +189,7 @@ describe("native update staging and commit", () => {
     expect(await stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, manifest: f.oldManifest } })).toMatchObject({ status: "current" });
     await expect(stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, roots: [], manifest: f.manifest } })).rejects.toMatchObject({ code: "bundle_untrusted" });
     // A digest mismatch during download leaves no candidate behind.
-    const corrupt = vi.fn(async (url: string) => url.endsWith("connector-1.1.0") ? new Response(Buffer.from("tampered-bytes-of-the-same-length")) : f.fetchFn(url));
+    const corrupt = vi.fn<typeof fetch>().mockImplementation(async (input, init) => requestUrl(input).endsWith("connector-1.1.0") ? new Response(Buffer.from("tampered-bytes-of-the-same-length")) : f.fetchFn(input, init));
     await expect(stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, fetchFn: corrupt, manifest: f.manifest } })).rejects.toThrow();
     expect((await readdir(join(f.root, "releases"))).filter(name => name.startsWith(".candidate-"))).toEqual([]);
     expect(await readNativeRecord(f.root)).toEqual(f.installed);
@@ -206,21 +213,33 @@ describe("native update transaction", () => {
     const definition = { label: "svc", path: "/svc", contents: "", install: [], start: { command: "start", args: [] }, stop: { command: "stop", args: [] }, remove: [], status: { command: "status", args: [] }, requiresLinger: false };
     // What the release being served answers, per control op.
     const replies: Record<string, (served: NativeRuntimeRecord) => unknown> = {
+      "codex.maintenance.preflight": () => ({ idle: true }),
       drain: () => ({ activeAssignments: 0 }),
       "drain.status": () => ({ draining: true, reason: "update", activeAssignments: 0, openSessions: 0 }),
       "drain.cancel": () => ({ draining: false, reason: null, activeAssignments: 0, openSessions: 0 }),
-      status: served => ({ version: { bundle: input.gate === "wrong_version" ? "1.0.0" : served.bundleVersion } }),
+      status: served => ({
+        instanceId: served.instanceId, workspaceId: served.workspaceId, administrativeStatus: "active",
+        connectivity: { transport: "relay", relayConnected: true, lastConnectedAt: null, reconciliationComplete: true },
+        lease: { mode: "active", expiresAt: null, drainDeadline: null },
+        version: { bundle: input.gate === "wrong_version" ? "1.0.0" : served.bundleVersion, protocol: "1.0", manifestDigest: served.manifestDigest, updateAvailable: false, targetBundle: null },
+        configRevision: 1,
+        components: [{ kind: "agent_runner", version: served.bundleVersion, healthStatus: "healthy", capabilities: [], lastProbeAt: "2026-09-15T00:00:00Z" }],
+        roles: [], roleBindings: [],
+        utilization: { acceptingWork: true, activeSessions: 0, activeTurns: 0, utilizationRatio: 0 },
+        pendingErase: 0, pendingRevocation: false, previewEnabled: false, previewExposure: null,
+        journal: { assignments: 0, outboxDepth: 0, recoveryRequired: 0 },
+      }),
       agents: served => ({ agents: served.agents.map(agentId => ({ agentId, readiness: "ready" })) }),
       doctor: served => ({ generatedAt: "2026-09-15T00:00:00Z", checks: [
         { id: "agent_login", title: "login", status: "fail", detail: "pre-existing", recoveryActions: [] },
         input.gate === "new_failure" && served.releaseId === "release-next" ? { id: "runner_spawn", title: "spawn", status: "fail", detail: "new", recoveryActions: [] } : { id: "runner_spawn", title: "spawn", status: "pass", detail: "ok", recoveryActions: [] },
       ] }),
     };
-    const control = (_root: string, record: NativeRuntimeRecord) => ({
-      call: async (request: { op: string }) => {
+    const control: NativeUpdateTransactionDeps["control"] = (_root, record) => ({
+      call: async (request, schema) => {
         calls.push(`control:${request.op}@${record.releaseId}`);
         if (!serving) throw new RemoteInstanceError("temporarily_unavailable", "socket closed");
-        return (replies[request.op] ?? (() => ({})))(serving);
+        return schema.parse((replies[request.op] ?? (() => ({})))(serving));
       },
     });
     const deps: NativeUpdateTransactionDeps = {
@@ -937,7 +956,10 @@ describe("native update transaction", () => {
   });
   it("cancels its own drain and leaves the release unchanged when active work never finishes", async () => {
     const h = harness({ previous });
-    h.deps.control = () => ({ call: async (request: { op: string }) => { h.calls.push(`control:${request.op}`); return request.op === "drain.status" ? { draining: true, reason: "update", activeAssignments: 1, openSessions: 1 } : { checks: [], generatedAt: "x" }; } });
+    h.deps.control = () => ({ call: async (request, schema) => {
+      h.calls.push(`control:${request.op}`);
+      return schema.parse(request.op === "drain.status" ? { draining: true, reason: "update", activeAssignments: 1, openSessions: 1 } : { checks: [], generatedAt: "x" });
+    } });
     h.deps.drainDeadlineMs = 2_500;
     await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toMatchObject({ code: "active_work" });
     expect(h.calls).toContain("control:drain.cancel");

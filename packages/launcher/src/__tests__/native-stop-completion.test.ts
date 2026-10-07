@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { stopNativeConnector } from "../native/commands.js";
 import { createOutput } from "../output.js";
+import { nativePlatform, nativeServiceDefinition, type NativeServiceCommand } from "../native/service.js";
 
 describe("ordinary native stop completion", () => {
   it("disables crash restarts before gracefully stopping an owned Windows connector", async () => {
@@ -20,7 +21,7 @@ describe("ordinary native stop completion", () => {
     expect(execute).toHaveBeenCalledWith(stop);
     expect(execute.mock.invocationCallOrder[0]).toBeLessThan(shutdown.mock.invocationCallOrder[0]!);
   });
-  it("does not terminate Windows processes when the hidden background host cannot be stopped", async () => {
+  it("does not terminate Windows processes when unknown task state cannot be ended", async () => {
     const stop = { command: "stop", args: [] }, status = { command: "status", args: [] };
     let now = 0;
     const terminate = vi.fn();
@@ -31,6 +32,26 @@ describe("ordinary native stop completion", () => {
       deadlineMs: 1_000, stopGraceMs: 200, pollMs: 100,
     } as never)).rejects.toMatchObject({ code: "temporarily_unavailable" });
     expect(terminate).not.toHaveBeenCalled();
+  });
+  it("does not shut down or terminate an owned connector when the background host stop is refused", async () => {
+    const root = "C:\\private\\remote";
+    const definition = nativeServiceDefinition({ os: "windows", home: "C:\\Users\\Test User", root,
+      executable: `${root}\\releases\\fixture\\konteks-connector.exe`, userId: "S-1-5-21-1-2-3-1001" });
+    const alive = vi.fn(async () => true), terminate = vi.fn(async () => undefined);
+    const shutdown = vi.fn(async () => undefined), sleep = vi.fn(async () => undefined);
+    const execute = vi.fn(async (command: NativeServiceCommand) => command === definition.stop ? 2 : 0);
+    expect(definition.windowsBackground).toBe(true);
+    await expect(stopNativeConnector({ root, output: createOutput({ json: true }) }, {
+      definition: async () => definition, execute, readReceipt: async () => "old-receipt",
+      serviceOwner: async () => ({ pid: 42, alive, terminate }), shutdown, sleep, now: () => 0,
+      platform: nativePlatform("win32", "x64"), deadlineMs: 1_000, stopGraceMs: 200, pollMs: 100,
+    })).rejects.toMatchObject({ code: "temporarily_unavailable" });
+    expect(execute).toHaveBeenCalledOnce();
+    expect(execute).toHaveBeenCalledWith(definition.stop);
+    expect(shutdown).not.toHaveBeenCalled();
+    expect(alive).not.toHaveBeenCalled();
+    expect(terminate).not.toHaveBeenCalled();
+    expect(sleep).not.toHaveBeenCalled();
   });
   it("waits for the hidden host to release its state after the connector exits", async () => {
     const stop = { command: "stop", args: [] }, status = { command: "status", args: [] };
@@ -95,7 +116,7 @@ describe("ordinary native stop completion", () => {
     const input = { root: "/private/test-native-root", output: createOutput({ json: false, stdout: { write: () => true } as never }) };
     await expect(stopNativeConnector(input, {
       definition: async () => ({ stop, status }) as never,
-      execute: async command => { if (command === stop) { stopped = true; return 0; } return stopped ? 113 : 0; },
+      execute: async (command: NativeServiceCommand) => { if (command === stop) { stopped = true; return 0; } return stopped ? 113 : 0; },
       readReceipt: async () => "previous-stop",
       sleep: async () => { now += 100; },
       now: () => now,
