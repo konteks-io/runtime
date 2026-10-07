@@ -690,6 +690,38 @@ describe("relayed session", () => {
       } finally { await f.session.close("cancelled"); }
     });
 
+    it.each(["edit", "delete", "move"] as const)("notes why an unresolved %s call is refused before answering, without human deferral", async kind => {
+      const own = join(dir, "unresolved-write");
+      await mkdir(own);
+      const registerDeferral = vi.fn(async () => { throw new Error("An unresolved file change must not be deferred"); });
+      const f = await build({ workspaceRoot: dir, registerDeferral,
+        prepareInputs: async target => ({ binding: { workspaceId: target.workspaceId, sessionId: "s", assignmentId: target.id,
+          instanceId: target.instanceId, attempt: target.attempt }, cwd: own, skillInstructions: "", beforePrompt: async () => undefined }),
+        policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true),
+      });
+      try {
+        await f.session.bootstrap();
+        const sequence: string[] = [];
+        const send = f.transport.send.bind(f.transport);
+        vi.spyOn(f.transport, "send").mockImplementation(message => {
+          if ("kind" in message.body && message.body.kind === "acp" && message.body.method === "session/update") sequence.push("note");
+          send(message);
+        });
+        const answer = vi.spyOn(f.runner, "answer").mockImplementation(async () => { sequence.push("answer"); return { delivered: true }; });
+        const params: RequestPermissionRequest = { sessionId: "acp-1", toolCall: { toolCallId: "unresolved-write", kind, rawInput: { opaque_patch: "change source" } },
+          options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" }] };
+        const sentBefore = f.sent.length;
+        await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: "unresolved-write", params });
+        expect(answer).toHaveBeenCalledWith("acp-1", "unresolved-write", { outcome: { outcome: "selected", optionId: "reject" } });
+        expect(registerDeferral).not.toHaveBeenCalled();
+        expect(sequence).toEqual(["note", "answer"]);
+        expect(f.sent.slice(sentBefore)).toContainEqual(expect.objectContaining({ body: expect.objectContaining({ kind: "acp", method: "session/update",
+          params: expect.objectContaining({ update: { sessionUpdate: "tool_call_update", toolCallId: "unresolved-write", content: [{ type: "content", content: { type: "text",
+            text: "Konteks refused this file change: the call names no path to judge. Name every affected path inside the working copy and try again." } }] } }),
+        }) }));
+      } finally { await f.session.close("cancelled"); }
+    });
+
     it("threads a question it defers to a person onto the direct session", async () => {
       const registered: DeferredPermissionBody[] = [];
       const f = await build({ registerDeferral: async body => { registered.push(body); return null as never; } }, directWork);

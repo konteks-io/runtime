@@ -108,7 +108,7 @@ export interface RefusedPath {
 
 /** Why a tool call was refused: what the connector logs (no secrets, no host paths). */
 export interface PolicyRefusal {
-  reason: "outside_workspace" | "outside_read_roots" | "unresolved_read" | "bash_blocklist";
+  reason: "outside_workspace" | "outside_read_roots" | "unresolved_read" | "unresolved_write" | "bash_blocklist";
   /** File changes: how many paths the call named, and the ones outside. */
   pathCount?: number;
   outside?: RefusedPath[];
@@ -219,6 +219,27 @@ function executeEvaluation(context: ToolPolicyContext, blocklist: readonly strin
     : { allowed: true };
 }
 
+/** A recognized file change needs positive path authority before it can be allowed. */
+function writeEvaluation(context: ToolPolicyContext): WorkspaceToolPolicyEvaluation {
+  const paths = changedPaths(context.input);
+  if (paths.length === 0) return {
+    allowed: false,
+    denyMessage: `${POLICY_REFUSAL_PREFIX} file change: the call names no path to judge. Name every affected path inside the working copy and try again.`,
+    refusal: { reason: "unresolved_write", pathCount: 0 },
+  };
+  // One call can name several paths (an "Edit files" patch). Judge it as a whole.
+  const cwd = context.repoPath || context.workspaceRoot;
+  const outside = paths
+    .filter(path => !isWithinWorkspace(path, context.workspaceRoot))
+    .map(path => describeRefusedPath(path, context.workspaceRoot, cwd));
+  if (outside.length === 0) return { allowed: true };
+  return {
+    allowed: false,
+    denyMessage: outsideWorkspaceMessage(outside, paths.length, cwd),
+    refusal: { reason: "outside_workspace", pathCount: paths.length, outside: outside.slice(0, MAX_SHOWN_PATHS) },
+  };
+}
+
 export function createWorkspaceToolPolicy(options: { bashBlocklist?: readonly string[] } = {}): PolicyEvaluator {
   const blocklist = options.bashBlocklist ?? DEFAULT_BASH_BLOCKLIST;
   return {
@@ -227,24 +248,7 @@ export function createWorkspaceToolPolicy(options: { bashBlocklist?: readonly st
       if (context.toolName === "execute") {
         return executeEvaluation(context, blocklist);
       }
-      if (FILE_CHANGE_KINDS.has(context.toolName)) {
-        // One call can name several paths (an "Edit files" patch). It is
-        // allowed or refused as a whole, so name every path that is outside,
-        // and the working copy, so the agent can retry correctly.
-        const paths = changedPaths(context.input);
-        // `repoPath` is the session's working copy; the boundary may be wider.
-        const cwd = context.repoPath || context.workspaceRoot;
-        const outside = paths
-          .filter(path => !isWithinWorkspace(path, context.workspaceRoot))
-          .map(path => describeRefusedPath(path, context.workspaceRoot, cwd));
-        if (outside.length > 0) {
-          return {
-            allowed: false,
-            denyMessage: outsideWorkspaceMessage(outside, paths.length, cwd),
-            refusal: { reason: "outside_workspace", pathCount: paths.length, outside: outside.slice(0, MAX_SHOWN_PATHS) },
-          };
-        }
-      }
+      if (FILE_CHANGE_KINDS.has(context.toolName)) return writeEvaluation(context);
       return { allowed: true };
     },
   };

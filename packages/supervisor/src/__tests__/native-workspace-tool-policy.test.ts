@@ -35,6 +35,29 @@ describe("native workspace tool policy", () => {
       .resolves.toEqual({ kind: "allow", optionId: "allow" });
   });
 
+  it.each(["edit", "delete", "move"])("refuses a %s call with no recognized path instead of auto-approving it", async kind => {
+    const missingCarriers = [{}, { file_path: " " }, { file_path: null }, { opaque_path: join(root, "src", "a.ts") }, { locations: [{ line: 1 }] }];
+    for (const rawInput of missingCarriers) {
+      await expect(responder.evaluatePermission(request({ kind, rawInput }), context)).resolves.toMatchObject({
+        kind: "deny", optionId: "reject", refusal: { reason: "unresolved_write", pathCount: 0 },
+      });
+    }
+    await expect(responder.evaluatePermission(request({ kind, title: "Change src/a.ts", locations: [] }), context)).resolves.toMatchObject({
+      kind: "deny", optionId: "reject", message: `${POLICY_REFUSAL_PREFIX} file change: the call names no path to judge. Name every affected path inside the working copy and try again.`,
+    });
+  });
+
+  it.each(["edit", "delete", "move"])("retains every existing recognized %s path carrier and refuses mixed outside paths", async kind => {
+    for (const key of ["file_path", "filePath", "path", "notebook_path", "target_file", "destination"]) {
+      await expect(responder.evaluatePermission(request({ kind, rawInput: { [key]: join(root, "src", "a.ts") } }), context))
+        .resolves.toEqual({ kind: "allow", optionId: "allow" });
+    }
+    await expect(responder.evaluatePermission(request({ kind, locations: [{ path: join(root, "src", "a.ts") }] }), context))
+      .resolves.toEqual({ kind: "allow", optionId: "allow" });
+    await expect(responder.evaluatePermission(request({ kind, rawInput: { file_path: join(root, "src", "a.ts"), destination: join(root, "..", "peer.ts") } }), context))
+      .resolves.toMatchObject({ kind: "deny", optionId: "reject", refusal: { reason: "outside_workspace", pathCount: 2 } });
+  });
+
   it("allows the QA browser's tools only on a session given the browser, and never the unsafe ones", async () => {
     const browser = { ...context, browserTools: true };
     // Identity is the bridge's structured tool name, never the title.

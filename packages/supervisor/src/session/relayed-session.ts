@@ -1551,7 +1551,7 @@ export class RelayedSession {
   private async denyByPolicy(ref: string, requestId: string, request: RequestPermissionRequest, decision: Extract<PolicyDecision, { kind: "deny" }>): Promise<void> {
     if (decision.message) {
       const reason = decision.refusal?.reason;
-      if (reason === "outside_workspace" || reason === "outside_read_roots" || reason === "unresolved_read") {
+      if (reason === "outside_workspace" || reason === "outside_read_roots" || reason === "unresolved_read" || reason === "unresolved_write") {
         await this.noteRefusedToolCall(ref, request.toolCall.toolCallId, decision.message);
       }
     }
