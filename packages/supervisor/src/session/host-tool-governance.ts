@@ -21,6 +21,8 @@ export type HostPermissionDecision =
 export interface HostPermissionContext {
   /** The session's working copy. */
   cwd: string;
+  /** Verified selected skill directories; never write authority. */
+  readOnlyRoots?: readonly string[];
   /** The session's own MCP servers (Code Mode namespaces an OpenCode block may call). */
   servers: ReadonlySet<string>;
   /** The session was given the QA browser. */
@@ -37,7 +39,7 @@ export interface HostToolGovernance {
   /** The plain line the person sees when the agent is taken out of service. */
   readonly quarantineMessage: string;
   /** Record a session update; returns the call that ran without approval, if any. */
-  observe(update: unknown, cwd: string): HostToolBypass | null;
+  observe(update: unknown, cwd: string, readOnlyRoots?: readonly string[]): HostToolBypass | null;
   decide(request: RequestPermissionRequest, context: HostPermissionContext): HostPermissionDecision;
   /**
    * Konteks' final answer to a request `decide` saw (after policy or a

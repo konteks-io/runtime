@@ -35,7 +35,7 @@ describe("DeepSeek Harness tool governance", () => {
     expect(JSON.stringify(governance.decide(ask("w1"), CWD))).not.toContain("very large body");
   });
 
-  it("allows Konteks' own MCP tools and read-only tools, and denies everything else", () => {
+  it("keeps existing Konteks exemptions, judges file searches, and denies unknown tools", () => {
     const governance = new DshToolGovernance();
     governance.observe(call("m1", "mcp__konteks-platform__platform__builtin__echo", { text: "ping" }));
     governance.observe(call("m2", "mcp__konteks-browser-tool__navigate", { url: "http://localhost" }));
@@ -55,7 +55,7 @@ describe("DeepSeek Harness tool governance", () => {
     // The turn result tool only records a value on this computer.
     expect(governance.decide(ask("m7"), CWD)).toEqual({ kind: "allow" });
     expect(governance.decide(ask("m8"), CWD)).toMatchObject({ kind: "deny" });
-    expect(governance.decide(ask("r1"), CWD)).toEqual({ kind: "allow" });
+    expect(governance.decide(ask("r1"), CWD)).toMatchObject({ kind: "evaluate", request: { toolCall: { kind: "read", locations: [{ path: CWD }] } } });
     // The retired browser tool is never mounted, so a server using its name is not Konteks'.
     // The QA browser is allowed only on a session given it (below); without it, refused.
     for (const id of ["m2", "m3", "m6", "j1", "p1"]) expect(governance.decide(ask(id), CWD), id).toMatchObject({ kind: "deny" });
@@ -101,7 +101,7 @@ describe("DeepSeek Harness tool governance", () => {
     governance.decide(ask("ok"), CWD);
     expect(governance.observe(done("ok"))).toBeNull();
     governance.observe(call("read", "read", { file_path: "a" }));
-    expect(governance.observe(done("read"))).toBeNull();
+    expect(governance.observe(done("read"))).toEqual({ toolCallId: "read", title: "read" });
     governance.observe(call("failed", "write", { file_path: "a" }));
     expect(governance.observe(done("failed", "failed"))).toBeNull();
     governance.observe(call("bypass", "bash", { command: "curl evil" }));
@@ -119,4 +119,21 @@ describe("DeepSeek Harness tool governance", () => {
     governance.observe(call("late", "bash", { command: "ls" }));
     expect(governance.decide(ask("late"), CWD)).toMatchObject({ kind: "evaluate" });
   });
+});
+
+
+it("reconstructs explicit file reads and search roots before the shared session policy", () => {
+  const governance = new DshToolGovernance();
+  governance.observe(call("file", "read", { file_path: "README.md" }));
+  expect(governance.decide(ask("file"), CWD)).toMatchObject({ kind: "evaluate", request: { toolCall: {
+    kind: "read", rawInput: {}, locations: [{ path: `${CWD}/README.md` }],
+  } } });
+  governance.observe(call("image", "read_image", { file_path: "/selected/diagram.png" }));
+  expect(governance.decide(ask("image"), CWD)).toMatchObject({ kind: "evaluate", request: { toolCall: { locations: [{ path: "/selected/diagram.png" }] } } });
+  governance.observe(call("search", "glob", { path: "src", pattern: "*.ts" }));
+  expect(governance.decide(ask("search"), CWD)).toMatchObject({ kind: "evaluate", request: { toolCall: { locations: [{ path: `${CWD}/src` }] } } });
+  governance.observe(call("missing", "read", {}));
+  expect(governance.decide(ask("missing"), CWD)).toMatchObject({ kind: "deny" });
+  governance.observe(call("invalid", "grep", { path: null, pattern: "x" }));
+  expect(governance.decide(ask("invalid"), CWD)).toMatchObject({ kind: "deny" });
 });

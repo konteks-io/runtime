@@ -233,3 +233,20 @@ describe("Google Antigravity tool governance", () => {
     });
   });
 });
+
+
+it("uses the same selected read roots for asked and observed Antigravity reads", () => {
+  const governance = new AntigravityToolGovernance();
+  const skill = "/rt/selected-skills/review", file = `${skill}/SKILL.md`;
+  const requested = { toolCallId: "asked-skill", title: "Run view_file?", kind: "read", rawInput: { AbsolutePath: file } };
+  governance.observe(toolCall(requested), WC, [skill]);
+  expect(governance.decide(request(requested), { ...context, readOnlyRoots: [skill] })).toMatchObject({ kind: "evaluate" });
+  const observed = { toolCallId: "unasked-skill", title: "Running view_file", kind: "read", rawInput: { file_path: file } };
+  governance.observe(toolCall(observed, "in_progress"), WC, [skill]);
+  expect(governance.observe(done("unasked-skill"), WC, [skill])).toBeNull();
+  governance.observe(toolCall({ ...observed, toolCallId: "peer", rawInput: { file_path: "/rt/other-session/private.txt" } }, "in_progress"), WC, [skill]);
+  expect(governance.observe(done("peer"), WC, [skill])).toEqual({ toolCallId: "peer", title: "view_file" });
+  const unnamed = { toolCallId: "unnamed", title: "Run view_file?", kind: "read", rawInput: {} };
+  governance.observe(toolCall(unnamed), WC, [skill]);
+  expect(governance.decide(request(unnamed), { ...context, readOnlyRoots: [skill] })).toMatchObject({ kind: "deny" });
+});

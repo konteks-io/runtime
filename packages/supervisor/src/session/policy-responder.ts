@@ -2,7 +2,7 @@ import type { CreateElicitationRequest, RequestPermissionRequest } from "@agentc
 import type { PolicyEvaluator } from "@konteks/agent-core";
 import { BROWSER_MCP_SERVER_NAME, browserToolFromTitle, isDeniedBrowserTool } from "@konteks/remote-agent-runner";
 import { permissionToolIdentity, type McpToolCallLedger, type PermissionToolIdentity } from "./permission-tool-identity.js";
-import type { PolicyRefusal, WorkspaceToolPolicyEvaluation } from "./workspace-tool-policy.js";
+import type { PolicyRefusal, WorkspaceToolPolicyContext, WorkspaceToolPolicyEvaluation } from "./workspace-tool-policy.js";
 
 /**
  * The ACP policy responder: a permission request or elicitation
@@ -43,6 +43,8 @@ export interface PermissionContext {
   agentId: string;
   workspaceRoot: string;
   cwd?: string;
+  /** Local preparation authority; never read from tool arguments. */
+  readOnlyRoots?: readonly string[];
   browserTools?: boolean;
   sessionServers?: ReadonlySet<string>;
   ledger?: McpToolCallLedger;
@@ -161,14 +163,16 @@ export class EvaluatorPolicyResponder implements PolicyResponder {
    */
   private async evaluated(evaluator: PolicyEvaluator, request: RequestPermissionRequest, context: PermissionContext, options: AnswerOptions): Promise<PolicyDecision> {
     const toolCall = request.toolCall as PolicyToolCall;
-    const evaluation: WorkspaceToolPolicyEvaluation = await evaluator.evaluateToolUse({
+    const policyContext: WorkspaceToolPolicyContext = {
       toolName: toolCall.kind ?? toolCall.title ?? request.toolCall.toolCallId,
       input: policyInput(toolCall),
       repoPath: context.cwd ?? context.workspaceRoot,
       workspaceRoot: context.workspaceRoot,
+      readOnlyRoots: context.readOnlyRoots ?? [],
       agentId: context.agentId,
       toolUseId: request.toolCall.toolCallId,
-    });
+    };
+    const evaluation: WorkspaceToolPolicyEvaluation = await evaluator.evaluateToolUse(policyContext);
     if (evaluation.allowed && options.allow !== null) return { kind: "allow", optionId: options.allow };
     if (!evaluation.allowed) return deniedBy(evaluation, options.deny);
     return this.deferOrDeny(options.deny);

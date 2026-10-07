@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import { createServer, request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
@@ -15,7 +16,8 @@ import { createWorkspaceToolPolicy } from "../session/workspace-tool-policy.js";
 import { RelayedSession, type RelayedSessionDeps } from "../session/relayed-session.js";
 import { renderStructuredOutputContract } from "@konteks/agent-core";
 import type { RunnerPort } from "../runner-port.js";
-import type { TransportManager } from "../transport/relay-transport.js";
+import { TransportManager } from "../transport/relay-transport.js";
+import type { PreviewStatus } from "../preview/process-manager.js";
 import type { OutboundMessage } from "../transport/transport.js";
 import { RunnerEventBus } from "../../../agent-runner/src/events.js";
 import { InMemorySessionRefStore, SessionManager } from "../../../agent-runner/src/sessions/manager.js";
@@ -264,7 +266,7 @@ describe("relayed session", () => {
 
   describe("preview tools (native preview)", () => {
     function previewAccess() {
-      const status = (sessionId: string, state: "running" | "stopped") => ({ sessionId, state, phase: null, url: null, port: null, command: null, install: null, prepare: null, source: null, explanation: null, notes: [], message: state, startedAt: null, readyAt: null, idleStopMinutes: 30, logTail: [] });
+      const status = (sessionId: string, state: "running" | "stopped"): PreviewStatus => ({ sessionId, state, phase: null, url: null, port: null, command: null, install: null, prepare: null, source: null, explanation: null, notes: [], message: state, startedAt: null, readyAt: null, idleStopMinutes: 30, logTail: [], startedBy: null });
       return { start: vi.fn(async (sessionId: string) => status(sessionId, "running")), stop: vi.fn(async (sessionId: string) => status(sessionId, "stopped")), status: vi.fn((sessionId: string) => status(sessionId, "running")), touch: vi.fn(), permit: vi.fn(), forget: vi.fn() };
     }
 
@@ -385,7 +387,7 @@ describe("relayed session", () => {
           f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId, params: { sessionId: "acp-1", toolCall: { toolCallId, kind, title, rawInput }, options } });
         const answer = (requestId: string) => (vi.mocked(f.runner.answer).mock.calls.find(call => call[1] === requestId)?.[2] as { outcome: { optionId?: string } } | undefined)?.outcome.optionId ?? "none";
         if (agentId === "dsh") {
-          for (const [id, tool] of [["n", "browser_navigate"], ["u", "browser_run_code_unsafe"]]) {
+          for (const [id, tool] of [["n", "browser_navigate"], ["u", "browser_run_code_unsafe"]] as const) {
             await update({ sessionUpdate: "tool_call", toolCallId: id, title: `mcp__konteks-browser__${tool}`, kind: "other", status: "in_progress", rawInput: { url: origin } });
             await ask(`p-${id}`, id, "other", `mcp__konteks-browser__${tool}`, {});
           }
@@ -394,7 +396,7 @@ describe("relayed session", () => {
           await f.session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p1", params: { sessionId: "acp-1", prompt: [{ type: "text", text: "Check the page." }] } });
           const forwarded = (vi.mocked(f.runner.prompt).mock.calls[0]![2] as { prompt: Array<{ text: string }> }).prompt;
           expect(forwarded[0]!.text).toContain("`konteks-browser`");
-          for (const [id, tool] of [["n", "browser_navigate"], ["u", "browser_run_code_unsafe"]]) {
+          for (const [id, tool] of [["n", "browser_navigate"], ["u", "browser_run_code_unsafe"]] as const) {
             const code = `const page = await tools["konteks-browser"].${tool}({ url: "${origin}/" });\nreturn page;`;
             await update({ sessionUpdate: "tool_call", toolCallId: id, title: "execute", kind: "other", status: "pending", locations: [], rawInput: {} });
             await update({ sessionUpdate: "tool_call_update", toolCallId: id, status: "in_progress", rawInput: { code } });
@@ -616,6 +618,35 @@ describe("relayed session", () => {
         ordinary: "allow", deleteOther: "reject", moveOther: "reject", mixed: "reject" };
       expect(await decide(directWork)).toEqual(expected);
       expect(await decide({ ...assignment, agentRoute: { ...assignment.agentRoute, mcpCapabilityTokenRef: undefined } } as RemoteWorkAssignment)).toEqual(expected);
+    });
+
+    it("snapshots prepared skill read roots without granting peer reads or skill writes", async () => {
+      const own = join(dir, "read-own"), other = join(dir, "read-peer"), skill = join(dir, "selected-skill");
+      await mkdir(own); await mkdir(other); await mkdir(skill);
+      const readOnlyRoots = [skill];
+      const work: RemoteWorkAssignment = { ...assignment, agentRoute: { requiredRole: "assistant", agentId: "codex" } };
+      const f = await build({ workspaceRoot: dir,
+        prepareInputs: async target => ({ binding: { workspaceId: target.workspaceId, sessionId: "s", assignmentId: target.id,
+          instanceId: target.instanceId, attempt: target.attempt }, cwd: own, readOnlyRoots, skillInstructions: "", beforePrompt: async () => undefined }),
+        policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => false),
+      }, work);
+      try {
+        await f.session.bootstrap();
+        readOnlyRoots.push(other);
+        const ask = (id: string, kind: "read" | "edit", path: string) => {
+          const params: RequestPermissionRequest = { sessionId: "acp-1", toolCall: { toolCallId: id, kind, rawInput: { file_path: path } },
+            options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" }] };
+          return f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: id, params });
+        };
+        await ask("read-own", "read", "README.md");
+        await ask("read-skill", "read", join(skill, "SKILL.md"));
+        await ask("read-peer", "read", join(other, "private.txt"));
+        await ask("write-skill", "edit", join(skill, "SKILL.md"));
+        expect(f.runner.answer).toHaveBeenCalledWith("acp-1", "read-own", { outcome: { outcome: "selected", optionId: "allow" } });
+        expect(f.runner.answer).toHaveBeenCalledWith("acp-1", "read-skill", { outcome: { outcome: "selected", optionId: "allow" } });
+        expect(f.runner.answer).toHaveBeenCalledWith("acp-1", "read-peer", { outcome: { outcome: "selected", optionId: "reject" } });
+        expect(f.runner.answer).toHaveBeenCalledWith("acp-1", "write-skill", { outcome: { outcome: "selected", optionId: "reject" } });
+      } finally { await f.session.close("cancelled"); }
     });
 
     // A Codex "Edit files" call named four paths, one written
@@ -1248,8 +1279,12 @@ describe("relayed session", () => {
     const key = generateInstanceKey();
     const mux = new ChannelMux({ recoveryAuthority: () => "accepted-test-generation", clock, key: () => key, ackIntervalSeconds: 5, ackEveryFrames: 3, replayBufferBytes: 16_384, replayBufferAgeMs: 60_000,
       emit: frame => { emitted.push(frame); return true; }, onFrame: () => undefined, onStall: () => undefined, onReset: () => undefined, persistCursors: async () => undefined });
-    const transport = { openChannel: (id: string) => mux.openChannel(id, "session"), closeChannel: (id: string) => mux.closeChannel(id),
-      send: (message: OutboundMessage) => mux.send(message.channelId, message.channel, message.body, message.signature) } as TransportManager;
+    const transport = new TransportManager(null, { kind: "https", available: true,
+      send: () => undefined, onInbound: () => undefined, openChannel: () => undefined, closeChannel: () => undefined,
+      start: () => undefined, stop: () => undefined });
+    vi.spyOn(transport, "openChannel").mockImplementation((id: string) => mux.openChannel(id, "session"));
+    vi.spyOn(transport, "closeChannel").mockImplementation((id: string) => mux.closeChannel(id));
+    vi.spyOn(transport, "send").mockImplementation((message: OutboundMessage) => mux.send(message.channelId, message.channel, message.body, message.signature));
     for (const attempt of [1, 2]) {
       const work = { ...assignment, id: `asg-${attempt}`, attempt };
       const { session } = await build({ transport,
@@ -1260,7 +1295,7 @@ describe("relayed session", () => {
     }
     expect(emitted).toEqual([]);
     mux.applyHandshake({ connectionEpoch: 7, resume: { "session:s": { to_core: 0, to_runtime: 0 } }, reset: [] });
-    expect(emitted.map(frame => "seq" in frame ? [frame.channelId, frame.seq, frame.body.kind] : null)).toEqual([
+    expect(emitted.map(frame => "seq" in frame && frame.channel === "session" ? [frame.channelId, frame.seq, frame.body.kind] : null)).toEqual([
       ["session:s", 1, "session_ready"], ["session:s", 2, "session_closed"],
       ["session:s", 3, "session_ready"], ["session:s", 4, "session_closed"],
     ]);
@@ -1464,7 +1499,7 @@ describe("relayed session", () => {
     await session.bootstrap();
     expect(prepareInputs).toHaveBeenCalledWith(assignment);
     expect(sent[0]?.body).toMatchObject({ kind: 'session_ready', attempt: 1, recoveryEpoch: 0, readyRevision: 1 });
-    expect(runner.createSession.mock.calls[0]?.[0]).toMatchObject({ cwd: "/private/native/checkout" });
+    expect(vi.mocked(runner.createSession).mock.calls[0]?.[0]).toMatchObject({ cwd: "/private/native/checkout" });
     await expect(session.onToRuntime({ kind: "acp", method: "session/prompt", id: "prepared-1", params: { sessionId: "acp-1", prompt: [{ type: "text", text: "do the work" }] } })).rejects.toMatchObject({ code: "execution_authority_unavailable" });
     expect(beforePrompt).not.toHaveBeenCalled();
     expect(runner.prompt).not.toHaveBeenCalled();

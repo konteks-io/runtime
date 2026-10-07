@@ -218,3 +218,20 @@ describe("Code Mode parser", () => {
     expect(parseKonteksCodeModeBlock('import x from "y"; await tools["konteks-result"].submit_result({});', SERVERS)).toMatchObject({ ok: false });
   });
 });
+
+
+it("uses the same selected read roots for asked and observed OpenCode reads", () => {
+  const governance = new OpenCodeToolGovernance();
+  const skill = "/rt/selected-skills/review", file = `${skill}/SKILL.md`;
+  governance.observe(call("asked-skill", "read"), WC, [skill]);
+  governance.observe(input("asked-skill", { filePath: file }), WC, [skill]);
+  expect(governance.decide(ask("asked-skill", "read", "Read skill", { filePath: file }), { ...context, readOnlyRoots: [skill] })).toMatchObject({ kind: "evaluate" });
+  governance.observe(call("unasked-skill", "read"), WC, [skill]);
+  governance.observe(input("unasked-skill", { filePath: file }), WC, [skill]);
+  expect(governance.observe(done("unasked-skill"), WC, [skill])).toBeNull();
+  governance.observe(call("peer", "read"), WC, [skill]);
+  governance.observe(input("peer", { filePath: "/rt/other-session/private.txt" }), WC, [skill]);
+  expect(governance.observe(done("peer"), WC, [skill])).toEqual({ toolCallId: "peer", title: "read" });
+  governance.observe(call("unnamed", "read"), WC, [skill]);
+  expect(governance.decide(ask("unnamed", "read", "Read", {}), { ...context, readOnlyRoots: [skill] })).toMatchObject({ kind: "deny" });
+});

@@ -7,6 +7,8 @@ import { stageOrganizationSkills, type StageOrganizationSkillsOptions, type Stag
 export interface PreparedSessionInputs {
   binding: RemoteTransferBinding;
   cwd: string;
+  /** Verified selected organization-skill directories; read authority only, local to this session. */
+  readOnlyRoots?: readonly string[];
   skillInstructions: string;
   beforePrompt: () => Promise<void>;
   /** Delivery-only terminal barrier. Public ACP completion waits for its durable cloud receipt. */
@@ -68,6 +70,7 @@ export async function prepareOrganizationSkillSession(options: StageOrganization
     const staged = await stageOrganizationSkills(snapshot);
     return {
       binding: { ...snapshot.authority.binding }, cwd,
+      readOnlyRoots: Object.freeze(staged.skills.map(skill => skill.directory)),
       skillInstructions: organizationSkillInstructions(staged),
       beforePrompt: async () => {
         try {

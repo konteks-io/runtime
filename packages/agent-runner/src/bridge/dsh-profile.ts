@@ -24,9 +24,10 @@ import { posix, win32 } from "node:path";
  * supervisor keeps a tripwire for a gated call that never asked.
  */
 
-/** Tools that never change anything; every other tool asks first. */
+/** Existing exemptions; named file reads and searches must reach session policy.
+ * The vendor skill loader and other in-process reads still require separate confinement. */
 export const DSH_READ_ONLY_TOOLS: readonly string[] = Object.freeze([
-  "read", "read_image", "grep", "glob", "todo_write", "skill", "web_fetch", "web_search",
+  "todo_write", "skill", "web_fetch", "web_search",
   "list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource", "list_subagent_models", "job_list", "job_output",
 ]);
 

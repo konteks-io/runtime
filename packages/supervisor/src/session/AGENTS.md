@@ -54,8 +54,15 @@ whole permission path.
   `quarantineMessageFor` names the Gemini Enterprise "Terminal
   auto-execution: Require review" setting when that credential is in use.
 - File changes are judged against each session's verified working copy
-  (`policyRoot()`), including non-direct assignments. This ACP permission
-  check does not confine reads or shell execution.
+  (`policyRoot()`), including non-direct assignments. The general policy judges
+  recognized structured read/search calls against that copy plus the selected
+  organization-skill directories verified by input preparation. Roots are local
+  typed context, never tool arguments; a judged read must name a path. dsh
+  read/read_image/grep/glob calls ask through its hook and reach this policy.
+  OpenCode/Antigravity use the same roots for asked and observed named reads,
+  retaining their provider controls and tripwires. Vendor-internal skill loads,
+  opaque unasked reads and shell execution still require separate controls.
+  These ACP permission checks do not provide process/OS confinement.
 
 ## Gotchas
 

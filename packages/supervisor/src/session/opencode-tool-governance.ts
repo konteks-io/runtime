@@ -1,6 +1,6 @@
 import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import { isDeniedBrowserTool } from "@konteks/remote-agent-runner";
-import { isWithinWorkspace } from "./workspace-tool-policy.js";
+import { isWithinReadRoots, isWithinWorkspace } from "./workspace-tool-policy.js";
 import { rebuiltRequest, refusal, resolveIn } from "./host-decisions.js";
 import { CODE_MODE_ACCEPTED_FORM, parseKonteksCodeModeBlock, type CodeModeCall } from "./opencode-code-mode.js";
 import type { HostPermissionContext, HostPermissionDecision, HostToolBypass, HostToolGovernance } from "./host-tool-governance.js";
@@ -167,11 +167,11 @@ function privateEnvFile(path: string): boolean {
   return ENV_FILE.test(path) && !ENV_EXAMPLE.test(path);
 }
 
-/** An allowed read or search that reached a `.env` file or left the working copy should have asked or been refused. */
-function ungatedOverreach(toolCallId: string, observed: ObservedCall, cwd: string): HostToolBypass | null {
+/** A named read/search beyond the verified roots, or a `.env` read, should have asked or been refused. */
+function ungatedOverreach(toolCallId: string, observed: ObservedCall, cwd: string, readOnlyRoots: readonly string[]): HostToolBypass | null {
   for (const path of namedPaths(observed.rawInput)) {
     const absolute = resolveIn(cwd, path);
-    if ((observed.tool === "read" && privateEnvFile(absolute)) || !isWithinWorkspace(absolute, cwd)) return { toolCallId, title: observed.tool };
+    if ((observed.tool === "read" && privateEnvFile(absolute)) || !isWithinReadRoots(absolute, cwd, readOnlyRoots)) return { toolCallId, title: observed.tool };
   }
   return null;
 }
@@ -215,7 +215,8 @@ function editDecision(r: AskedRequest, tool: string): HostPermissionDecision {
 
 function searchDecision(r: AskedRequest, tool: string): HostPermissionDecision {
   const paths = namedAbsolutePaths(r);
-  if (paths.some(path => !isWithinWorkspace(path, r.context.cwd))) return refusal("a path outside the working copy");
+  if (paths.length === 0) return refusal("the read or search call names no path; provide an explicit path");
+  if (paths.some(path => !isWithinReadRoots(path, r.context.cwd, r.context.readOnlyRoots))) return refusal("a path outside the working copy and selected skill folders");
   if (tool === "read" && paths.some(privateEnvFile)) return refusal("reading a .env file is not allowed");
   return rebuiltRequest(r.request, r.toolCallId, { kind: "read", title: tool, rawInput: {}, locations: paths.map(path => ({ path })) });
 }
@@ -242,14 +243,14 @@ export class OpenCodeToolGovernance implements HostToolGovernance {
 
   constructor(private readonly limit = 512) {}
 
-  observe(update: unknown, cwd: string): HostToolBypass | null {
+  observe(update: unknown, cwd: string, readOnlyRoots: readonly string[] = []): HostToolBypass | null {
     const value = record(update);
     const toolCallId = typeof value.toolCallId === "string" ? value.toolCallId : undefined;
     if (toolCallId === undefined) return null;
     const input = record(value.rawInput);
     if (value.sessionUpdate === "tool_call" || (value.sessionUpdate === "tool_call_update" && !this.terminal(value.status))) return this.observeRunning(toolCallId, value, input);
     if (value.sessionUpdate !== "tool_call_update") return null;
-    return this.observeEnd(toolCallId, value, input, cwd);
+    return this.observeEnd(toolCallId, value, input, cwd, readOnlyRoots);
   }
 
   private observeRunning(toolCallId: string, value: Record<string, unknown>, input: Record<string, unknown>): null {
@@ -270,7 +271,7 @@ export class OpenCodeToolGovernance implements HostToolGovernance {
     return null;
   }
 
-  private observeEnd(toolCallId: string, value: Record<string, unknown>, input: Record<string, unknown>, cwd: string): HostToolBypass | null {
+  private observeEnd(toolCallId: string, value: Record<string, unknown>, input: Record<string, unknown>, cwd: string, readOnlyRoots: readonly string[]): HostToolBypass | null {
     const status = value.status;
     const observed = this.calls.get(toolCallId);
     const block: BlockDecision = { askedFirst: this.asked.has(toolCallId), approved: this.approved.get(toolCallId), refusedBlock: this.refused.has(toolCallId) };
@@ -281,7 +282,7 @@ export class OpenCodeToolGovernance implements HostToolGovernance {
     // Only a call that ran to completion did something.
     if (status !== "completed" || block.askedFirst) return null;
     if (!UNGATED.has(observed.tool)) return { toolCallId, title: observed.tool };
-    return ungatedOverreach(toolCallId, observed, cwd);
+    return ungatedOverreach(toolCallId, observed, cwd, readOnlyRoots);
   }
 
   decide(request: RequestPermissionRequest, context: HostPermissionContext): HostPermissionDecision {

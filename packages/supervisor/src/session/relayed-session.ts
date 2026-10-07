@@ -223,6 +223,7 @@ export class RelayedSession {
   private toolFormTold = false;
   private readonly logger: Logger;
   private preparedInputs: PreparedSessionInputs | null = null;
+  private readOnlyRoots: readonly string[] = Object.freeze([]);
   private readonly executionGate: NativeExecutionGate | null;
   /** Durable key of the last prompt admitted on this session (see promptBusy). */
   private promptReservation: string | null = null;
@@ -361,7 +362,9 @@ export class RelayedSession {
     catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
     this.deps.assertExecutionOwned?.();
     const binding = this.verifiedBinding(prepared);
+    const readOnlyRoots = Object.freeze([...(prepared.readOnlyRoots ?? [])]);
     this.preparedInputs = prepared;
+    this.readOnlyRoots = readOnlyRoots;
     // Input preparation verifies Core's claim-bound selection. Use its logical
     // session identity, never a bridge ref or an assignment-local random ID.
     this.boundChannelId = `session:${binding.sessionId}`;
@@ -1264,7 +1267,7 @@ export class RelayedSession {
     if (this.previewSessionId !== null) this.deps.preview?.touch(this.previewSessionId);
     this.observeStructuredText(update);
     this.mcpCalls?.observe(update);
-    const bypass = this.toolGovernance?.observe(update, this.sessionCwd()) ?? null;
+    const bypass = this.toolGovernance?.observe(update, this.sessionCwd(), this.readOnlyRoots) ?? null;
     await this.sendToCore({ kind: "acp", method: "session/update", params: event.params as never });
     if (bypass) await this.onToolGovernanceBypass(bypass);
   }
@@ -1502,7 +1505,7 @@ export class RelayedSession {
   private async governPermission(ref: string, requestId: string, params: RequestPermissionRequest, governance: HostToolGovernance): Promise<RequestPermissionRequest | null> {
     const request = { ...params, options: params.options.filter(option => option.kind !== "allow_always") };
     this.governedPermissions.set(requestId, { toolCallId: request.toolCall.toolCallId, options: request.options });
-    const verdict = governance.decide(request, { cwd: this.sessionCwd(), servers: this.sessionServers, browserTools: this.browserGateway !== null });
+    const verdict = governance.decide(request, { cwd: this.sessionCwd(), readOnlyRoots: this.readOnlyRoots, servers: this.sessionServers, browserTools: this.browserGateway !== null });
     if (verdict.kind === "evaluate") return verdict.request;
     if (this.closed) return null;
     this.deps.assertExecutionOwned?.();
@@ -1522,7 +1525,7 @@ export class RelayedSession {
 
   private permissionContext(): Parameters<PolicyResponder["evaluatePermission"]>[1] {
     return { assignmentId: this.assignment.id, agentId: this.assignment.agentRoute.agentId, workspaceRoot: this.policyRoot(),
-      cwd: this.sessionCwd(), browserTools: this.browserGateway !== null, sessionServers: this.sessionServers, ...(this.mcpCalls ? { ledger: this.mcpCalls } : {}),
+      cwd: this.sessionCwd(), readOnlyRoots: this.readOnlyRoots, browserTools: this.browserGateway !== null, sessionServers: this.sessionServers, ...(this.mcpCalls ? { ledger: this.mcpCalls } : {}),
       admittedMcpTools: this.deps.admittedMcpTools?.(this.assignment) ?? [] };
   }
 
@@ -1546,8 +1549,11 @@ export class RelayedSession {
    * the agent when it continues the stopped turn.
    */
   private async denyByPolicy(ref: string, requestId: string, request: RequestPermissionRequest, decision: Extract<PolicyDecision, { kind: "deny" }>): Promise<void> {
-    if (decision.message && decision.refusal?.reason === "outside_workspace") {
-      await this.noteRefusedToolCall(ref, request.toolCall.toolCallId, decision.message);
+    if (decision.message) {
+      const reason = decision.refusal?.reason;
+      if (reason === "outside_workspace" || reason === "outside_read_roots" || reason === "unresolved_read") {
+        await this.noteRefusedToolCall(ref, request.toolCall.toolCallId, decision.message);
+      }
     }
     await this.answerPermission(ref, requestId, decision.optionId === null ? cancelledPermission() : selectedOption(decision.optionId));
   }

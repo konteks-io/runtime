@@ -8,11 +8,11 @@ const folders: string[] = [];
 afterEach(async () => { for (const folder of folders.splice(0)) await rm(folder, { recursive: true, force: true }); });
 
 describe("Konteks patch set for DeepSeek Harness", () => {
-  it("asks before every tool outside the read-only allowlist", () => {
+  it("asks before file reads and searches and every tool outside the existing exemptions", () => {
     const hooks = JSON.parse(renderDshKonteksProfile("/konteks/dsh", "darwin").files.find(file => file.name === "konteks-hooks.json")!.content);
     const matcher = new RegExp(hooks.hooks.PreToolUse[0].matcher);
     for (const tool of DSH_READ_ONLY_TOOLS) expect(matcher.test(tool), tool).toBe(false);
-    for (const tool of ["bash", "pwsh", "write", "edit", "str_replace_editor", "run_code", "plugin_manager", "subagent", "mcp__konteks-platform__platform__builtin__echo", "reader", "readx"]) {
+    for (const tool of ["read", "read_image", "glob", "grep", "bash", "pwsh", "write", "edit", "str_replace_editor", "run_code", "plugin_manager", "subagent", "mcp__konteks-platform__platform__builtin__echo", "reader", "readx"]) {
       expect(matcher.test(tool), tool).toBe(true);
     }
   });
