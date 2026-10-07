@@ -296,11 +296,12 @@ describe.runIf(process.platform === "win32")("on a real Windows", () => {
     const executable = join(base, "connector.cmd");
     await writeFile(executable, [
       "@echo off", "set run=0", 'if exist "%~dp0runs.txt" set /p run=<"%~dp0runs.txt"',
-      "set /a run+=1", 'echo %run%>"%~dp0runs.txt"', "echo launch=%run%",
+      "set /a run+=1", '>"%~dp0runs.txt" echo %run%', "echo launch=%run%",
       "if %run% LSS 3 exit /b 7", "exit /b 0", "",
     ].join("\r\n"));
     const service = nativeServiceDefinition({ os: "windows", home: base, root: base, executable, userId: "S-1-5-21-1-2-3-1001" });
     const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(hostScript(service), "utf16le").toString("base64")], { encoding: "utf8", windowsHide: true, timeout: 30_000 });
+    expect(result.error, result.stderr).toBeUndefined();
     expect(result.status).toBe(0);
     expect((await readFile(join(base, "runs.txt"), "utf8")).trim()).toBe("3");
     expect(await readFile(join(base, "logs", "connector.log"), "utf8")).toMatch(/launch=1[\s\S]*launch=2[\s\S]*launch=3/);
