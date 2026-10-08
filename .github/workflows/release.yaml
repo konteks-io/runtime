@@ -121,7 +121,7 @@ jobs:
           if [ -n "$DEB_SIGNING_PUBLIC_KEY" ]; then printf '%s\n' "$DEB_SIGNING_PUBLIC_KEY" > dist/release/deb-signing.asc; fi
           cp bootstrap/install.ps1 bootstrap/onboarding.md bootstrap/connect.md dist/release/
           node scripts/release-assets.mjs commands --tag "${{ github.ref_name }}" --out dist/release/commands.json
-          node scripts/bake-bootstrap.mjs --sums dist/release/SHA256SUMS --pub dist/release/release-signing.pub --in bootstrap/install.sh --out dist/release/install.sh
+          node scripts/bake-bootstrap.mjs --sums dist/release/SHA256SUMS --pub dist/release/release-signing.pub --in bootstrap/install.sh --out dist/release/install.sh --tag "${{ github.ref_name }}"
           sh -n dist/release/install.sh
           node scripts/release-assets.mjs verify --manifest dist/release/native-manifest.json --dir dist/release
       - name: Publish the GitHub Release (assets are immutable per tag; latest is the stable channel)

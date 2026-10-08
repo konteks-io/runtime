@@ -17,7 +17,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 const args = Object.fromEntries(process.argv.slice(2).map((value, index, all) => (value.startsWith("--") ? [value.slice(2), all[index + 1]] : [])).filter(pair => pair.length === 2));
-for (const key of ["sums", "pub", "in", "out"]) if (!args[key]) throw new Error("usage: bake-bootstrap.mjs --sums SHA256SUMS --pub release-signing.pub --in bootstrap/install.sh --out dist/release/install.sh");
+for (const key of ["sums", "pub", "in", "out", "tag"]) if (!args[key]) throw new Error("usage: bake-bootstrap.mjs --sums SHA256SUMS --pub release-signing.pub --in bootstrap/install.sh --out dist/release/install.sh --tag vX.Y.Z");
 
 const EXECUTABLE = /^konteks-remote-(?:macos|debian|windows)-(?:amd64|arm64)(?:\.exe)?$/;
 // The Graft package is baked too: on macOS the bootstrap cannot verify the
@@ -39,7 +39,12 @@ const pinned = {
 };
 for (const [name, key] of Object.entries(pinned)) if (key !== releaseKey) throw new Error(`${name} pins ${key ?? "no release key"}, but this release is signed by ${releaseKey}; update the pinned key in both bootstraps`);
 
+if (!/^v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?$/.test(args.tag)) throw new Error("invalid release tag");
 let script = readFileSync(args.in, "utf8");
+// Bind artifact downloads to the same immutable release as the baked digests.
+const releaseBase = 'RELEASE_BASE="${KONTEKS_RELEASE_BASE:-https://github.com/konteks-io/runtime/releases/latest/download}"';
+if (!script.includes(releaseBase)) throw new Error("bootstrap is missing the release base placeholder");
+script = script.replace(releaseBase, `RELEASE_BASE="\${KONTEKS_RELEASE_BASE:-https://github.com/konteks-io/runtime/releases/download/${args.tag}}"`);
 const marker = { sums: 'BAKED_EXECUTABLE_SUMS=""', pub: 'BAKED_RELEASE_PUBKEY_SHA256=""' };
 for (const value of Object.values(marker)) if (!script.includes(value)) throw new Error(`bootstrap is missing the ${value} placeholder`);
 script = script.replace(marker.sums, `BAKED_EXECUTABLE_SUMS="${lines.map(([digest, name]) => `${digest}  ${name}`).join("\\n")}"`);
