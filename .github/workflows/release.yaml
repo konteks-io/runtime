@@ -38,9 +38,9 @@ jobs:
         shell: bash
         run: |
           node scripts/ci-vendored-contracts.mjs
-          npm install --package-lock-only --ignore-scripts --legacy-peer-deps --no-audit --no-fund
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
       - name: Install (shared contracts are vendored under vendor/)
-        run: npm ci --ignore-scripts --legacy-peer-deps
+        run: npm ci --ignore-scripts
       - name: Build the connector executable and its installer package
         shell: bash
         env:
@@ -88,9 +88,9 @@ jobs:
         shell: bash
         run: |
           node scripts/ci-vendored-contracts.mjs
-          npm install --package-lock-only --ignore-scripts --legacy-peer-deps --no-audit --no-fund
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
       - name: Install (shared contracts are vendored under vendor/)
-        run: npm ci --ignore-scripts --legacy-peer-deps
+        run: npm ci --ignore-scripts
       - name: Build the release tooling (it shares the connector's verification code)
         run: npm run build
       - uses: actions/download-artifact@v4

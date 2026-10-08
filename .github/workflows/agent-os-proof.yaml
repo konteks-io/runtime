@@ -61,9 +61,9 @@ jobs:
         shell: bash
         run: |
           node scripts/ci-vendored-contracts.mjs
-          npm install --package-lock-only --ignore-scripts --legacy-peer-deps --no-audit --no-fund
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
       - name: Install the runtime
-        run: npm ci --ignore-scripts --legacy-peer-deps
+        run: npm ci --ignore-scripts
       - name: Build the runtime
         run: npm run build
       - name: Platform
