@@ -47,7 +47,7 @@ export type LoginFailureReason = "no_license";
 
 const URL_PATTERN = /https?:\/\/[^\s<>"')\]]+/g;
 const USER_CODE_PATTERN = /\b([A-Z0-9]{4,5}-[A-Z0-9]{4,5})\b/;
-const PROMPT_PATTERN = /(?:paste|enter|input|type)[^\n]*(?:code|token|key|url)[^\n]*[:?]\s*$/i;
+const PROMPT_PATTERN = /(?:paste|enter|input|type)[^\n]*(?:code|token|key|url)[^\n]*[:?>]\s*$/i;
 // Codex colours its device link and one-time code. Left in, the escape after
 // the link became part of the URL Konteks showed, and the one before the code
 // hid it from USER_CODE_PATTERN's word boundary.

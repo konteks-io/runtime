@@ -17,13 +17,13 @@ function fixture() {
   const flow = startLoginFlow({ config: RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "claude-code" }), family: findAgentBridge("claude-code")!, env: {}, events, timeoutMs: 1000 });
   return { child, seen, flow };
 }
-it("relays a split authorization prompt without a trailing newline", async () => {
+it.each(["Paste the authorization code here: ", "Paste code here if prompted > "])("relays a split prompt without a trailing newline: %s", async prompt => {
   vi.useFakeTimers();
   const f = fixture();
-  f.child.stdout.write("Paste the authoriz");
-  f.child.stdout.write("ation code here: ");
+  f.child.stdout.write(prompt.slice(0, 10));
+  f.child.stdout.write(prompt.slice(10));
   await vi.advanceTimersByTimeAsync(200);
-  expect(f.seen).toContainEqual(expect.objectContaining({ event: { type: "prompt", label: "Paste the authorization code here:", secret: false } }));
+  expect(f.seen).toContainEqual(expect.objectContaining({ event: { type: "prompt", label: prompt.trim(), secret: false } }));
   f.child.emit("close", 0);
   await f.flow.done;
 });
