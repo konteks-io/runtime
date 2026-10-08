@@ -874,7 +874,7 @@ describe("relayed session", () => {
         cwd: own, readOnlyRoots, skillInstructions: "", beforePrompt: async () => undefined,
       }) });
       try {
-        expect(f.runner.createSession).toHaveBeenCalledWith(expect.objectContaining({ cwd: own, readOnlyRoots }));
+        expect(f.runner.createSession).toHaveBeenCalledWith(expect.objectContaining({ cwd: own, readOnlyRoots }), undefined);
         const read = async (id: string, tool: string, input: Record<string, unknown>) => {
           await f.toolCall(id, tool, input);
           await f.ask(`p-${id}`, id, tool === "read" ? "read" : "search", tool, input);

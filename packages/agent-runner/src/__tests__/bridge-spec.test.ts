@@ -205,6 +205,7 @@ describe("bridge spawn spec", () => {
       "/usr/lib/node_modules/@deepseek-ai/dsh/lib/bin.js", "--profile", "acp",
       "--patch", join("/rt/credentials/dsh", "konteks-dsh", "konteks-dsh.patch.yml"),
       "--patch", join("/rt/credentials/dsh", "konteks-dsh", "konteks-dsh-ask.patch.yml"),
+      "--patch", join("/rt/credentials/dsh", ".dsh", "profiles", "konteks-control-policy", "read-fence.patch.yml"),
     ]);
     expect(spec.cwd).toBe("/rt/workspaces/dsh");
     expect(spec.env).toMatchObject({
