@@ -129,7 +129,7 @@ characterization suite needs installed agents or Linux:
 konteks-remote status          # connection, lease, agents
 konteks-remote agents          # each agent and whether it is ready
 konteks-remote auth status
-konteks-remote auth login <agent>   # claude-code, codex, dsh, opencode, antigravity
+konteks-remote auth login <agent>   # claude-code (or claude), codex, dsh, opencode, antigravity
 konteks-remote auth logout <agent>
 konteks-remote agent add <agent>
 konteks-remote doctor
