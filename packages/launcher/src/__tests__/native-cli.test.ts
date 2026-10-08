@@ -11,6 +11,11 @@ function fixture() {
 }
 
 describe("native customer entry point", () => {
+  it("accepts claude as the Claude Code sign-in alias", async () => {
+    const { program, actions } = fixture();
+    await program.parseAsync(["auth", "login", "claude"], { from: "user" });
+    expect(actions.control).toHaveBeenCalledWith(expect.objectContaining({ operation: "auth.login", agent: "claude-code" }));
+  });
   it("exposes native lifecycle without a BYOK or appliance command", () => {
     const { program } = fixture();
     expect(program.commands.map(command => command.name())).toEqual(expect.arrayContaining(["install", "serve", "start", "stop", "status", "agents", "auth"]));

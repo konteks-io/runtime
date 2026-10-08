@@ -65,8 +65,9 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     return value;
   };
   const agent = (value: string): NativeAgentId => {
+    if (value === "claude") return "claude-code";
     if (isRetiredAgentId(value)) throw new InvalidArgumentError(retiredAgentMessage(value));
-    if (!(NATIVE_AGENT_IDS as readonly string[]).includes(value)) throw new InvalidArgumentError("unsupported agent family");
+    if (!(NATIVE_AGENT_IDS as readonly string[]).includes(value)) throw new InvalidArgumentError("unsupported agent family; choose claude-code (or claude), codex, dsh, opencode or antigravity");
     return value as NativeAgentId;
   };
   const project = (value: string): string => {
