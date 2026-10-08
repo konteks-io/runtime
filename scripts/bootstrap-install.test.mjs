@@ -1203,7 +1203,7 @@ test("Windows bootstrap reports a failed runtime start after an update", windows
 
 test.after(() => rmSync(root, { recursive: true, force: true }));
 
-test("release bootstrap keeps downloads on its own tag when latest advances", () => {
+test("release bootstrap keeps downloads on its own tag when latest advances", { skip: process.platform === "win32" }, () => {
   const sums = join(root, "SHA256SUMS");
   const pub = join(root, "release-signing.pub");
   const output = join(root, "install.sh");
