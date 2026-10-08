@@ -1,6 +1,6 @@
 import { lstat, realpath } from "node:fs/promises";
 import { isAbsolute } from "node:path";
-import { RemoteInstanceError, RemoteSkillCatalogSchema, type RemoteDeliveryAcceptanceReceipt, type RemoteTransferBinding, type SessionToCoreMessage } from "@konteks/remote-common";
+import { RemoteInstanceError, RemoteSkillCatalogSchema, skillFreshnessFailure, type SkillFreshnessEvidence, type RemoteDeliveryAcceptanceReceipt, type RemoteTransferBinding, type SessionToCoreMessage } from "@konteks/remote-common";
 import { stageOrganizationSkills, type StageOrganizationSkillsOptions, type StagedOrganizationSkills } from "./staging.js";
 
 /** Local-only preparation result: paths/instructions never enter relay frames. */
@@ -59,7 +59,7 @@ export async function prepareDirectSessionInputs(options: { cwd: string; binding
 }
 
 /** Caller resolves the approved source checkout and authoritative skill selection. */
-export async function prepareOrganizationSkillSession(options: StageOrganizationSkillsOptions & { cwd: string }): Promise<PreparedSessionInputs> {
+export async function prepareOrganizationSkillSession(options: StageOrganizationSkillsOptions & { cwd: string; skillFreshness?: (skillId: string) => Promise<SkillFreshnessEvidence> }): Promise<PreparedSessionInputs> {
   try {
     const cwd = await checkedDirectory(options.cwd);
     const snapshot = {
@@ -75,10 +75,22 @@ export async function prepareOrganizationSkillSession(options: StageOrganization
       beforePrompt: async () => {
         try {
           if (await checkedDirectory(options.cwd) !== cwd) throw new Error("source moved");
+          await assertScopedSkillFreshness(snapshot.catalog, options.skillFreshness);
           const verified = await stageOrganizationSkills(snapshot);
           if (verified.root !== staged.root) throw new Error("skill root moved");
         } catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
       },
     };
   } catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
+}
+
+/** Scope-aware catalogs require fresh, agent-bound evidence before every turn. */
+async function assertScopedSkillFreshness(catalog: ReturnType<typeof RemoteSkillCatalogSchema.parse>, evidence?: (skillId: string) => Promise<SkillFreshnessEvidence>): Promise<void> {
+  for (const skill of catalog.skills) {
+    if (!skill.scope) continue;
+    const proof = await evidence?.(skill.skillId);
+    if (skillFreshnessFailure(proof) !== null || proof?.desiredDigest !== skill.transfer.treeDigest || proof?.desiredVersion !== skill.version) {
+      throw new RemoteInstanceError("capability_unavailable", "Required Skill freshness has not been verified for this coding agent.");
+    }
+  }
 }

@@ -7,7 +7,8 @@ import {
   RemoteFileTreeSchema, RemoteSkillCatalogSchema, RemoteTransferBindingSchema,
   REMOTE_FILE_TREE_LIMITS, RemoteInstanceError, computeRemoteFileTreeDigest,
   computeRemoteTransferManifestDigest, validateRemoteTransfer, sha256Hex,
-  canonicalize, isFsErrorWithCode,
+  canonicalize, isFsErrorWithCode, skillScopeAllows,
+  type SkillExecutionContext,
   type RemoteTransferBinding, type RemoteTransferManifest, type RemoteSkillCatalog,
   type RemoteFileEntry, type RemoteFileTree,
 } from "@konteks/remote-common";
@@ -26,6 +27,8 @@ import { readFully } from "../read-fully.js";
  */
 export interface StageOrganizationSkillsOptions {
   scratchRoot: string;
+  /** Core-resolved execution identity, never inferred from local paths or Skill content. */
+  executionContext?: SkillExecutionContext;
   catalog: unknown;
   /** Obtained from the current authorized assignment, not a received catalog. */
   authority: { binding: RemoteTransferBinding; catalogDigest: string };
@@ -187,6 +190,9 @@ function authorizedCatalog(options: StageOrganizationSkillsOptions): AuthorizedC
   const authority = RemoteTransferBindingSchema.safeParse(options.authority.binding);
   if (!parsed.success || !authority.success || canonicalize(parsed.data.binding) !== canonicalize(authority.data) || parsed.data.catalogDigest !== options.authority.catalogDigest) {
     throw new RemoteInstanceError("workspace_binding_invalid", "Organization skill selection does not match the authorized assignment.");
+  }
+  if (parsed.data.skills.some(skill => skill.scope && !skillScopeAllows(skill.scope, options.executionContext))) {
+    throw new RemoteInstanceError("workspace_binding_invalid", "A required Skill is outside this execution scope.");
   }
   return { catalog: parsed.data, binding: authority.data };
 }
