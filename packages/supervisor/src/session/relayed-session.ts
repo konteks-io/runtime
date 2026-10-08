@@ -32,7 +32,7 @@ import type { PendingRequest, SupervisorJournal } from "../state/journal.js";
 import type { TransportManager } from "../transport/relay-transport.js";
 import { deferredPermissionBody, PermissionBroker, registerDeferral, sanitizeElicitationRequest, sanitizePermissionRequest, type PendingHumanRequest, type SanitizedElicitation, type SanitizedPermission } from "./permissions.js";
 import type { CapabilityTokenIssue, DeferredPermissionBody } from "../core/client.js";
-import type { AdmittedMcpTool, PolicyDecision, PolicyResponder } from "./policy-responder.js";
+import { deferredPermissionRequest, type AdmittedMcpTool, type PolicyDecision, type PolicyResponder } from "./policy-responder.js";
 import type { PreparedSessionInputs } from "../skills/session-inputs.js";
 import { McpCapabilityFacade, type McpLocalTransportIdentity } from "../mcp/capability-facade.js";
 import { PREVIEW_WORK_KINDS, PreviewMcpServer, type SessionPreviewAccess } from "../preview/mcp-server.js";
@@ -1562,7 +1562,7 @@ export class RelayedSession {
   /** Ask a person through Konteks, when the assignment allows it; an integration gate's question is answered once, never "always". */
   private async deferPermission(ref: string, requestId: string, request: RequestPermissionRequest, decision: Extract<PolicyDecision, { kind: "defer" }>): Promise<void> {
     if (!this.assignment.policy.humanDeferralAllowed) return void (await this.answerPermission(ref, requestId, cancelledPermission()));
-    const asked = decision.allowOnceOnly ? { ...request, options: request.options.filter(option => option.kind !== "allow_always") } : request;
+    const asked = deferredPermissionRequest(request, decision);
     const sanitized = sanitizePermissionRequest(asked);
     const pending = await this.deferToHuman(ref, requestId, "session/request_permission", sanitized);
     if (!pending) return void (await this.answerPermission(ref, requestId, cancelledPermission()));

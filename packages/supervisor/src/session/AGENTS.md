@@ -29,6 +29,14 @@ whole permission path.
 - **`allow_once` only.** Every policy allow is `allow_once`; `allow_always` is
   never offered to policy or a person (OpenCode would store it and stop
   asking; Antigravity's offer is stripped before anything sees it).
+- **Explicit native escalation asks a person.** Codex command permission bundles,
+  standalone filesystem/network permission grants, network approvals and command
+  paths/cwd outside trusted roots are never automatically approved. Claude's
+  structured `SandboxNetworkAccess` and blocked shell paths also defer. If human
+  deferral or the exact safe options are unavailable, refuse. Codex's manual
+  standalone grant is turn-scoped; session grants and strict automatic review
+  are excluded from the broker and Core view. Ordinary same-authority commands
+  retain the command policy; these checks do not attest OS confinement.
 - **Only the session's own MCP servers.** A tool whose server is not in the
   session's `sessionServers` is refused without asking. `konteks-browser` is
   allowed only on a session given the browser, and never a hidden browser tool.
