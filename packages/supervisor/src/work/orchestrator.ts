@@ -133,7 +133,7 @@ interface OrchestratorDeps {
   /** Present when this connector runs integration tasks; absent, `integration` work is refused. */
   integrationCarrier?: IntegrationWorkCarrier;
   /** An idle completed session was released and no other session holds its channel (its preview may go). */
-  onSessionReleased?: (sessionId: string) => void;
+  onSessionReleased?: (sessionId: string) => Promise<void>;
   logger?: Logger;
 }
 
@@ -1695,10 +1695,11 @@ export class WorkOrchestrator {
     const log = { assignmentId: owner.assignment.id, attempt: owner.assignment.attempt, stage: "idle_reaper" };
     try {
       assertCurrent();
+      if (channelId.startsWith("session:")) await this.deps.onSessionReleased?.(channelId.slice("session:".length));
+      assertCurrent();
       await this.stopCompletedOwner(prior, ref, processOwner, assertCurrent);
       owner.releaseCompletedChannel();
       if (this.sessions.get(key) === owner) this.sessions.delete(key);
-      if (!this.channelOwners.has(channelId) && channelId.startsWith("session:")) this.deps.onSessionReleased?.(channelId.slice("session:".length));
       this.logger.info({ ...log, outcome: "released", idleMs: now - idle.settledAt }, "released an idle completed session");
       return true;
     } catch (error) {

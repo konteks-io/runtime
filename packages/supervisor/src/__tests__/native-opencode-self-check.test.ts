@@ -12,7 +12,22 @@ const CAPTURED = readFileSync(new URL("./fixtures/opencode-2.0.18-debug-agents.j
 /** The same from OpenCode 2.0.21 (live; extra fields and system prompts dropped): every agent now ends with OpenCode's own `browser * deny`. */
 const CAPTURED_2_0_21 = readFileSync(new URL("./fixtures/opencode-2.0.21-debug-agents.json", import.meta.url), "utf8");
 type Agent = { id: string; permissions: Array<{ action: string; resource: string; effect: string }> };
-const agents = (): Agent[] => JSON.parse(CAPTURED) as Agent[];
+/** Expected rule effects for this candidate, projected from preserved historical schema captures.
+ * These are fixture inputs, not fresh output from either installed provider. */
+function expectedFileApprovalListing(capture: string): string {
+  const list = JSON.parse(capture) as Agent[];
+  for (const agent of list) {
+    const start = agent.permissions.findIndex(rule => rule.action === "*" && rule.resource === "*" && rule.effect === "ask");
+    if (start < 0) throw new Error("historical Konteks rule block missing");
+    for (const rule of agent.permissions.slice(start)) {
+      if (["read", "list", "glob", "grep"].includes(rule.action) && rule.effect === "allow") rule.effect = "ask";
+    }
+  }
+  return JSON.stringify(list);
+}
+const EXPECTED = expectedFileApprovalListing(CAPTURED);
+const EXPECTED_2_0_21 = expectedFileApprovalListing(CAPTURED_2_0_21);
+const agents = (): Agent[] => JSON.parse(EXPECTED) as Agent[];
 
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
@@ -40,8 +55,8 @@ async function fixture(outputs: string[]) {
 }
 
 describe("the OpenCode start self-check", () => {
-  it("passes on OpenCode 2.0.18's resolved rules, in the private home with the Konteks environment, and leaves no service running", async () => {
-    const f = await fixture([CAPTURED]);
+  it("accepts the expected configured 2.0.18 listing in the private home and leaves no service running", async () => {
+    const f = await fixture([EXPECTED]);
     await expect(f.check()).resolves.toBeUndefined();
     const debug = f.calls.find(call => call.args[0] === "debug")!;
     expect(debug.args).toEqual(["debug", "agents"]);
@@ -61,13 +76,13 @@ describe("the OpenCode start self-check", () => {
     // The live 2.0.18 timeline: [] at 0.3 s, defaults (plan and title, none of our rules) until 1.5 s, then ours.
     const defaults = agents().map(agent => ({ ...agent, permissions: agent.permissions.slice(0, -OPENCODE_KONTEKS_PERMISSIONS.length) }));
     defaults.push({ id: "plan", permissions: [] }, { id: "title", permissions: [] });
-    const f = await fixture(["[]\n", JSON.stringify(defaults), JSON.stringify(defaults), CAPTURED]);
+    const f = await fixture(["[]\n", JSON.stringify(defaults), JSON.stringify(defaults), EXPECTED]);
     await f.check();
     expect(f.calls.filter(call => call.args[0] === "debug")).toHaveLength(4);
   });
 
   it("remembers a pass per binary, version and file, and checks again when the file changes", async () => {
-    const f = await fixture([CAPTURED]);
+    const f = await fixture([EXPECTED]);
     const cache = new Map<string, true>();
     await f.check(cache);
     await f.check(cache);
@@ -81,7 +96,7 @@ describe("the OpenCode start self-check", () => {
   it.each([
     ["a rule after ours", drifted(list => list[0]!.permissions.push({ action: "bash", resource: "*", effect: "allow" })), /build: the Konteks rules are not last.*shell command is allow/],
     ["our catch-all ask missing", drifted(list => { for (const agent of list) agent.permissions = agent.permissions.filter((rule, index, all) => !(index === all.length - 12 && rule.action === "*")); }), /the Konteks rules are not last.*shell command is allow/],
-    [".env no longer gated", drifted(list => { for (const agent of list) agent.permissions = agent.permissions.filter(rule => !(rule.resource === "*.env" && rule.effect === "ask")); }), /reading \.env is allow/],
+    [".env no longer gated", drifted(list => { for (const agent of list) agent.permissions.push({ action: "read", resource: "*.env", effect: "allow" }); }), /reading \.env is allow/],
     ["outside folders not denied", drifted(list => { for (const agent of list) agent.permissions.push({ action: "external_directory", resource: "*", effect: "allow" }); }), /folder outside the working copy is allow/],
     ["the built-in browser back", drifted(list => { for (const agent of list) agent.permissions.push({ action: "browser", resource: "*", effect: "allow" }); }), /built-in browser is allow/],
     ["OpenCode's own Code Mode tools back", drifted(list => { for (const agent of list) agent.permissions.push({ action: "opencode_session_move", resource: "*", effect: "ask" }); }), /own Code Mode tools is ask/],
@@ -106,28 +121,34 @@ describe("the OpenCode start self-check", () => {
   });
 
   it("reads a debug command that failed to run as not ready yet, and still stops the service", async () => {
-    const f = await fixture([CAPTURED]);
+    const f = await fixture([EXPECTED]);
     f.run.mockImplementation(async (_binary, args) => { f.events.push(args.join(" ")); return args[0] === "debug" ? { code: null, stdout: "", stderr: "timed out" } : { code: 0, stdout: "", stderr: "" }; });
     await expect(f.check()).rejects.toMatchObject({ code: "agent_unavailable", diagnostic: "opencode_self_check_failed", retryable: true });
     expect(f.events.slice(-2)).toEqual(["service stop", "scan"]);
   });
 
-  it("names every drift on the captured listing as none", () => {
+  it.each([CAPTURED, CAPTURED_2_0_21])("refuses a preserved historical listing whose named file operations still run unasked", capture => {
+    expect(openCodeAgentsDrift(JSON.parse(capture))).toContain("agent build: reading a file is allow, expected ask");
+    expect(openCodeAgentsDrift(JSON.parse(capture))).toContain("agent build: searching file names is allow, expected ask");
+    expect(openCodeAgentsDrift(JSON.parse(capture))).toContain("agent build: searching file contents is allow, expected ask");
+  });
+
+  it("names every drift on the projected configured listing as none", () => {
     expect(openCodeAgentsDrift(agents())).toEqual([]);
   });
 
-  it("passes on OpenCode 2.0.21, which appends its own `browser * deny` after the Konteks rules", async () => {
-    const list = JSON.parse(CAPTURED_2_0_21) as Agent[];
+  it("accepts the expected configured 2.0.21 listing with its existing final `browser * deny`", async () => {
+    const list = JSON.parse(EXPECTED_2_0_21) as Agent[];
     for (const agent of list) expect(agent.permissions.at(-1)).toEqual({ action: "browser", resource: "*", effect: "deny" });
     expect(openCodeAgentsDrift(list)).toEqual([]);
-    const f = await fixture([CAPTURED_2_0_21]);
+    const f = await fixture([EXPECTED_2_0_21]);
     await expect(f.check()).resolves.toBeUndefined();
   });
 
-  const after21 = (rules: Agent["permissions"]) => { const list = JSON.parse(CAPTURED_2_0_21) as Agent[]; for (const agent of list) agent.permissions.push(...rules); return list; };
+  const after21 = (rules: Agent["permissions"]) => { const list = JSON.parse(EXPECTED_2_0_21) as Agent[]; for (const agent of list) agent.permissions.push(...rules); return list; };
   it("accepts any further deny after the Konteks rules, but the probes still pin every decision", () => {
     expect(openCodeAgentsDrift(after21([{ action: "websearch", resource: "*", effect: "deny" }]))).toEqual([]);
-    expect(openCodeAgentsDrift(after21([{ action: "*", resource: "*", effect: "deny" }]))).toContain("agent build: reading a file is deny, expected allow");
+    expect(openCodeAgentsDrift(after21([{ action: "*", resource: "*", effect: "deny" }]))).toContain("agent build: reading a file is deny, expected ask");
   });
 
   it.each([

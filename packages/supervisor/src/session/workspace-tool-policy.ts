@@ -1,21 +1,15 @@
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync } from "node:fs";
+import { isFsErrorWithCode } from "@konteks/remote-common";
 import { dirname, isAbsolute, join, parse, relative, resolve } from "node:path";
 import type { PolicyEvaluator, ToolPolicyContext, ToolPolicyEvaluation } from "@konteks/agent-core";
 
 /**
- * The native connector's tool policy.
- *
- * Hosted runs answer every ACP permission request by policy: the deployment
- * bash blocklist, then a workspace-boundary check for file changes, and allow
- * otherwise (`ai-agent-harness` `createHarnessToolPolicyEvaluator`, and the
- * Claude adapter's fallback in `@konteks/agent-adapters`). A connector with no
- * evaluator deferred every request to a human, so an ordinary Claude Code
- * tool call waited on a relay deferral Core never recorded. bb likewise maps
- * its runtime policy onto the agent's own permission mode instead of asking
- * for each call.
+ * Native general tool policy. File changes are session-local; structured
+ * reads additionally admit the selected skill directories verified by input
+ * preparation. These permission checks are not process/OS confinement.
  *
  * Keep DEFAULT_BASH_BLOCKLIST in sync with `@konteks/agent-adapters`
- * (`shared/bash-blocklist.ts`); the native package does not ship adapters.
+ * (`shared/bash-blocklist.ts`); it remains supplemental command policy.
  */
 export const DEFAULT_BASH_BLOCKLIST: readonly string[] = [
   "nc ", "netcat", "ssh ", "telnet", "nslookup", "dig ", "sudo ", "su ", "mkfs", "dd if=", "/dev/",
@@ -56,27 +50,43 @@ export function blockedCommandPattern(command: string, blocklist: readonly strin
   return null;
 }
 
-/** Resolve symlinks of the longest existing prefix, so a link cannot escape the boundary. */
-function realPrefix(path: string): string {
+/** Distinguish a missing entry from an unreadable one, including dangling symlinks. */
+function existingEntry(path: string): boolean | null {
+  try { lstatSync(path); return true; }
+  catch (error) { return isFsErrorWithCode(error, "ENOENT") ? false : null; }
+}
+
+/** Resolve the longest existing prefix; an observation failure grants no path authority. */
+function realPrefix(path: string): string | null {
   let current = path;
   const missing: string[] = [];
-  while (!existsSync(current)) {
+  let exists = existingEntry(current);
+  while (exists === false) {
     const parent = dirname(current);
-    if (parent === current) return path;
+    if (parent === current) return null;
     missing.unshift(current.slice(parent.length).replace(/^[/\\]/, ""));
     current = parent;
+    exists = existingEntry(current);
   }
-  try {
-    return join(realpathSync(current), ...missing);
-  } catch {
-    return path;
-  }
+  if (exists === null) return null;
+  try { return join(realpathSync(current), ...missing); }
+  catch { return null; }
+}
+
+function withinResolvedRoot(target: string | null, root: string | null): boolean {
+  if (target === null || root === null) return false;
+  const rel = relative(root, target);
+  return !rel.startsWith("..") && !isAbsolute(rel);
 }
 
 export function isWithinWorkspace(rawPath: string, workspaceRoot: string): boolean {
-  const target = realPrefix(resolve(workspaceRoot, rawPath));
-  const rel = relative(realPrefix(resolve(workspaceRoot)), target);
-  return !rel.startsWith("..") && !isAbsolute(rel);
+  return withinResolvedRoot(realPrefix(resolve(workspaceRoot, rawPath)), realPrefix(resolve(workspaceRoot)));
+}
+
+/** Relative paths are always session-relative, including a read of a selected skill. */
+export function isWithinReadRoots(rawPath: string, cwd: string, readOnlyRoots: readonly string[] = []): boolean {
+  const target = realPrefix(resolve(cwd, rawPath));
+  return [cwd, ...readOnlyRoots].some(root => withinResolvedRoot(target, realPrefix(resolve(root))));
 }
 
 /**
@@ -98,7 +108,7 @@ export interface RefusedPath {
 
 /** Why a tool call was refused: what the connector logs (no secrets, no host paths). */
 export interface PolicyRefusal {
-  reason: "outside_workspace" | "bash_blocklist";
+  reason: "outside_workspace" | "outside_read_roots" | "unresolved_read" | "unresolved_write" | "bash_blocklist";
   /** File changes: how many paths the call named, and the ones outside. */
   pathCount?: number;
   outside?: RefusedPath[];
@@ -175,36 +185,70 @@ function nonBlankString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+/** Local authority extends the public evaluator input without trusting tool arguments. */
+export interface WorkspaceToolPolicyContext extends ToolPolicyContext {
+  readOnlyRoots?: readonly string[];
+}
+
+function readEvaluation(context: WorkspaceToolPolicyContext): WorkspaceToolPolicyEvaluation {
+  const paths = changedPaths(context.input);
+  const cwd = context.repoPath || context.workspaceRoot;
+  if (paths.length === 0) return {
+    allowed: false,
+    denyMessage: `${POLICY_REFUSAL_PREFIX} file read: the call names no path to judge. Name an explicit path inside the working copy or a required organization skill folder and try again.`,
+    refusal: { reason: "unresolved_read", pathCount: 0 },
+  };
+  const outside = paths.filter(path => !isWithinReadRoots(path, cwd, context.readOnlyRoots)).map(path => ({
+    path: bounded((isAbsolute(path) ? relative(cwd, path) : path).split("\\").join("/")), rootAnchored: false,
+  }));
+  if (outside.length === 0) return { allowed: true };
+  return {
+    allowed: false,
+    denyMessage: `${POLICY_REFUSAL_PREFIX} file read: a named path is outside this session's working copy and required organization skill folders. Use an explicitly authorized path and try again.`,
+    refusal: { reason: "outside_read_roots", pathCount: paths.length, outside: outside.slice(0, MAX_SHOWN_PATHS) },
+  };
+}
+
+/** Command blocklist evaluation is separate from filesystem authority. */
+function executeEvaluation(context: ToolPolicyContext, blocklist: readonly string[]): WorkspaceToolPolicyEvaluation {
+  const command = typeof context.input.command === "string" ? context.input.command : "";
+  const hit = blockedCommandPattern(command, blocklist);
+  return hit
+    ? { allowed: false, denyMessage: `bash_blocklist: "${hit.trim()}" is not allowed on this connector`,
+        refusal: { reason: "bash_blocklist", pattern: hit.trim() } }
+    : { allowed: true };
+}
+
+/** A recognized file change needs positive path authority before it can be allowed. */
+function writeEvaluation(context: ToolPolicyContext): WorkspaceToolPolicyEvaluation {
+  const paths = changedPaths(context.input);
+  if (paths.length === 0) return {
+    allowed: false,
+    denyMessage: `${POLICY_REFUSAL_PREFIX} file change: the call names no path to judge. Name every affected path inside the working copy and try again.`,
+    refusal: { reason: "unresolved_write", pathCount: 0 },
+  };
+  // One call can name several paths (an "Edit files" patch). Judge it as a whole.
+  const cwd = context.repoPath || context.workspaceRoot;
+  const outside = paths
+    .filter(path => !isWithinWorkspace(path, context.workspaceRoot))
+    .map(path => describeRefusedPath(path, context.workspaceRoot, cwd));
+  if (outside.length === 0) return { allowed: true };
+  return {
+    allowed: false,
+    denyMessage: outsideWorkspaceMessage(outside, paths.length, cwd),
+    refusal: { reason: "outside_workspace", pathCount: paths.length, outside: outside.slice(0, MAX_SHOWN_PATHS) },
+  };
+}
+
 export function createWorkspaceToolPolicy(options: { bashBlocklist?: readonly string[] } = {}): PolicyEvaluator {
   const blocklist = options.bashBlocklist ?? DEFAULT_BASH_BLOCKLIST;
   return {
-    evaluateToolUse(context: ToolPolicyContext): WorkspaceToolPolicyEvaluation {
+    evaluateToolUse(context: WorkspaceToolPolicyContext): WorkspaceToolPolicyEvaluation {
+      if (context.toolName === "read" || context.toolName === "search") return readEvaluation(context);
       if (context.toolName === "execute") {
-        const command = typeof context.input.command === "string" ? context.input.command : "";
-        const hit = blockedCommandPattern(command, blocklist);
-        return hit
-          ? { allowed: false, denyMessage: `bash_blocklist: "${hit.trim()}" is not allowed on this connector`,
-              refusal: { reason: "bash_blocklist", pattern: hit.trim() } }
-          : { allowed: true };
+        return executeEvaluation(context, blocklist);
       }
-      if (FILE_CHANGE_KINDS.has(context.toolName)) {
-        // One call can name several paths (an "Edit files" patch). It is
-        // allowed or refused as a whole, so name every path that is outside,
-        // and the working copy, so the agent can retry correctly.
-        const paths = changedPaths(context.input);
-        // `repoPath` is the session's working copy; the boundary may be wider.
-        const cwd = context.repoPath || context.workspaceRoot;
-        const outside = paths
-          .filter(path => !isWithinWorkspace(path, context.workspaceRoot))
-          .map(path => describeRefusedPath(path, context.workspaceRoot, cwd));
-        if (outside.length > 0) {
-          return {
-            allowed: false,
-            denyMessage: outsideWorkspaceMessage(outside, paths.length, cwd),
-            refusal: { reason: "outside_workspace", pathCount: paths.length, outside: outside.slice(0, MAX_SHOWN_PATHS) },
-          };
-        }
-      }
+      if (FILE_CHANGE_KINDS.has(context.toolName)) return writeEvaluation(context);
       return { allowed: true };
     },
   };

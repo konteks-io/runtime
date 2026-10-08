@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import { createServer, request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
@@ -15,7 +16,8 @@ import { createWorkspaceToolPolicy } from "../session/workspace-tool-policy.js";
 import { RelayedSession, type RelayedSessionDeps } from "../session/relayed-session.js";
 import { renderStructuredOutputContract } from "@konteks/agent-core";
 import type { RunnerPort } from "../runner-port.js";
-import type { TransportManager } from "../transport/relay-transport.js";
+import { TransportManager } from "../transport/relay-transport.js";
+import type { PreviewStatus } from "../preview/process-manager.js";
 import type { OutboundMessage } from "../transport/transport.js";
 import { RunnerEventBus } from "../../../agent-runner/src/events.js";
 import { InMemorySessionRefStore, SessionManager } from "../../../agent-runner/src/sessions/manager.js";
@@ -264,7 +266,7 @@ describe("relayed session", () => {
 
   describe("preview tools (native preview)", () => {
     function previewAccess() {
-      const status = (sessionId: string, state: "running" | "stopped") => ({ sessionId, state, phase: null, url: null, port: null, command: null, install: null, prepare: null, source: null, explanation: null, notes: [], message: state, startedAt: null, readyAt: null, idleStopMinutes: 30, logTail: [] });
+      const status = (sessionId: string, state: "running" | "stopped"): PreviewStatus => ({ sessionId, state, phase: null, url: null, port: null, command: null, install: null, prepare: null, source: null, explanation: null, notes: [], message: state, startedAt: null, readyAt: null, idleStopMinutes: 30, logTail: [], startedBy: null });
       return { start: vi.fn(async (sessionId: string) => status(sessionId, "running")), stop: vi.fn(async (sessionId: string) => status(sessionId, "stopped")), status: vi.fn((sessionId: string) => status(sessionId, "running")), touch: vi.fn(), permit: vi.fn(), forget: vi.fn() };
     }
 
@@ -385,7 +387,7 @@ describe("relayed session", () => {
           f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId, params: { sessionId: "acp-1", toolCall: { toolCallId, kind, title, rawInput }, options } });
         const answer = (requestId: string) => (vi.mocked(f.runner.answer).mock.calls.find(call => call[1] === requestId)?.[2] as { outcome: { optionId?: string } } | undefined)?.outcome.optionId ?? "none";
         if (agentId === "dsh") {
-          for (const [id, tool] of [["n", "browser_navigate"], ["u", "browser_run_code_unsafe"]]) {
+          for (const [id, tool] of [["n", "browser_navigate"], ["u", "browser_run_code_unsafe"]] as const) {
             await update({ sessionUpdate: "tool_call", toolCallId: id, title: `mcp__konteks-browser__${tool}`, kind: "other", status: "in_progress", rawInput: { url: origin } });
             await ask(`p-${id}`, id, "other", `mcp__konteks-browser__${tool}`, {});
           }
@@ -394,7 +396,7 @@ describe("relayed session", () => {
           await f.session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p1", params: { sessionId: "acp-1", prompt: [{ type: "text", text: "Check the page." }] } });
           const forwarded = (vi.mocked(f.runner.prompt).mock.calls[0]![2] as { prompt: Array<{ text: string }> }).prompt;
           expect(forwarded[0]!.text).toContain("`konteks-browser`");
-          for (const [id, tool] of [["n", "browser_navigate"], ["u", "browser_run_code_unsafe"]]) {
+          for (const [id, tool] of [["n", "browser_navigate"], ["u", "browser_run_code_unsafe"]] as const) {
             const code = `const page = await tools["konteks-browser"].${tool}({ url: "${origin}/" });\nreturn page;`;
             await update({ sessionUpdate: "tool_call", toolCallId: id, title: "execute", kind: "other", status: "pending", locations: [], rawInput: {} });
             await update({ sessionUpdate: "tool_call_update", toolCallId: id, status: "in_progress", rawInput: { code } });
@@ -603,13 +605,60 @@ describe("relayed session", () => {
           await ask("relative", { kind: "edit", title: "Write notes", rawInput: { file_path: "notes.txt" } });
           await ask("other", { kind: "edit", title: "Write elsewhere", rawInput: { file_path: join(other, "x.txt") } });
           await ask("push", { kind: "execute", title: "git push", rawInput: { command: "git push origin main" } });
+          await ask("ordinary", { kind: "execute", title: "npm run build", rawInput: { command: "npm run build" } });
+          await ask("delete-other", { kind: "delete", locations: [{ path: join(other, "x.txt") }] });
+          await ask("move-other", { kind: "move", rawInput: { file_path: join(own, "notes.txt"), destination: join(other, "notes.txt") } });
+          await ask("mixed", { kind: "edit", locations: [{ path: join(own, "notes.txt") }, { path: join(other, "x.txt") }] });
           const answer = (id: string) => (vi.mocked(f.runner.answer).mock.calls.find(call => call[1] === id)?.[2] as { outcome: { optionId?: string } } | undefined)?.outcome.optionId;
-          return { inside: answer("inside"), relative: answer("relative"), other: answer("other"), push: answer("push") };
+          return { inside: answer("inside"), relative: answer("relative"), other: answer("other"), push: answer("push"),
+            ordinary: answer("ordinary"), deleteOther: answer("delete-other"), moveOther: answer("move-other"), mixed: answer("mixed") };
         } finally { await f.session.close("cancelled"); }
       };
-      expect(await decide(directWork)).toEqual({ inside: "allow", relative: "allow", other: "reject", push: "reject" });
-      // Konteks's own conversations keep the workspace root (unchanged here).
-      expect((await decide({ ...assignment, agentRoute: { ...assignment.agentRoute, mcpCapabilityTokenRef: undefined } } as RemoteWorkAssignment)).other).toBe("allow");
+      const expected = { inside: "allow", relative: "allow", other: "reject", push: "reject",
+        ordinary: "allow", deleteOther: "reject", moveOther: "reject", mixed: "reject" };
+      expect(await decide(directWork)).toEqual(expected);
+      expect(await decide({ ...assignment, agentRoute: { ...assignment.agentRoute, mcpCapabilityTokenRef: undefined } } as RemoteWorkAssignment)).toEqual(expected);
+    });
+
+    it("snapshots prepared skill read roots without granting peer reads or skill writes", async () => {
+      const own = join(dir, "read-own"), other = join(dir, "read-peer"), skill = join(dir, "selected-skill");
+      await mkdir(own); await mkdir(other); await mkdir(skill);
+      const readOnlyRoots = [skill];
+      const work: RemoteWorkAssignment = { ...assignment, agentRoute: { requiredRole: "assistant", agentId: "codex" } };
+      const f = await build({ workspaceRoot: dir,
+        prepareInputs: async target => ({ binding: { workspaceId: target.workspaceId, sessionId: "s", assignmentId: target.id,
+          instanceId: target.instanceId, attempt: target.attempt }, cwd: own, readOnlyRoots, skillInstructions: "", beforePrompt: async () => undefined }),
+        policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => false),
+      }, work);
+      try {
+        await f.session.bootstrap();
+        const request = vi.mocked(f.runner.createSession).mock.calls[0]![0];
+        expect(request).toMatchObject({ cwd: own, readOnlyRoots: [skill] });
+        expect(request.readOnlyRoots).not.toBe(readOnlyRoots);
+        expect(Object.isFrozen(request.readOnlyRoots)).toBe(true);
+        readOnlyRoots.push(other);
+        expect(request.readOnlyRoots).toEqual([skill]);
+        const ask = (id: string, kind: "read" | "edit", path: string) => {
+          const params: RequestPermissionRequest = { sessionId: "acp-1", toolCall: { toolCallId: id, kind, rawInput: { file_path: path } },
+            options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" }] };
+          return f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: id, params });
+        };
+        await ask("read-own", "read", "README.md");
+        await ask("read-skill", "read", join(skill, "SKILL.md"));
+        await ask("read-peer", "read", join(other, "private.txt"));
+        await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: "widen-peer", params: {
+          sessionId: "acp-1", toolCall: { toolCallId: "widen-peer", kind: "read", rawInput: {
+            file_path: join(other, "private.txt"), readOnlyRoots: [other],
+          } }, options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" }],
+        } });
+        await ask("write-skill", "edit", join(skill, "SKILL.md"));
+        expect(f.runner.answer).toHaveBeenCalledWith("acp-1", "read-own", { outcome: { outcome: "selected", optionId: "allow" } });
+        expect(f.runner.answer).toHaveBeenCalledWith("acp-1", "read-skill", { outcome: { outcome: "selected", optionId: "allow" } });
+        expect(f.runner.answer).toHaveBeenCalledWith("acp-1", "read-peer", { outcome: { outcome: "selected", optionId: "reject" } });
+        expect(f.runner.answer).toHaveBeenCalledWith("acp-1", "widen-peer", { outcome: { outcome: "selected", optionId: "reject" } });
+        expect(request.readOnlyRoots).toEqual([skill]);
+        expect(f.runner.answer).toHaveBeenCalledWith("acp-1", "write-skill", { outcome: { outcome: "selected", optionId: "reject" } });
+      } finally { await f.session.close("cancelled"); }
     });
 
     // A Codex "Edit files" call named four paths, one written
@@ -650,6 +699,38 @@ describe("relayed session", () => {
         }), "tool permission not allowed by policy");
         expect(JSON.stringify(warn.mock.calls)).not.toContain(dir);
         expect(JSON.stringify(f.sent)).not.toContain(dir);
+      } finally { await f.session.close("cancelled"); }
+    });
+
+    it.each(["edit", "delete", "move"] as const)("notes why an unresolved %s call is refused before answering, without human deferral", async kind => {
+      const own = join(dir, "unresolved-write");
+      await mkdir(own);
+      const registerDeferral = vi.fn(async () => { throw new Error("An unresolved file change must not be deferred"); });
+      const f = await build({ workspaceRoot: dir, registerDeferral,
+        prepareInputs: async target => ({ binding: { workspaceId: target.workspaceId, sessionId: "s", assignmentId: target.id,
+          instanceId: target.instanceId, attempt: target.attempt }, cwd: own, skillInstructions: "", beforePrompt: async () => undefined }),
+        policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true),
+      });
+      try {
+        await f.session.bootstrap();
+        const sequence: string[] = [];
+        const send = f.transport.send.bind(f.transport);
+        vi.spyOn(f.transport, "send").mockImplementation(message => {
+          if ("kind" in message.body && message.body.kind === "acp" && message.body.method === "session/update") sequence.push("note");
+          send(message);
+        });
+        const answer = vi.spyOn(f.runner, "answer").mockImplementation(async () => { sequence.push("answer"); return { delivered: true }; });
+        const params: RequestPermissionRequest = { sessionId: "acp-1", toolCall: { toolCallId: "unresolved-write", kind, rawInput: { opaque_patch: "change source" } },
+          options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" }] };
+        const sentBefore = f.sent.length;
+        await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: "unresolved-write", params });
+        expect(answer).toHaveBeenCalledWith("acp-1", "unresolved-write", { outcome: { outcome: "selected", optionId: "reject" } });
+        expect(registerDeferral).not.toHaveBeenCalled();
+        expect(sequence).toEqual(["note", "answer"]);
+        expect(f.sent.slice(sentBefore)).toContainEqual(expect.objectContaining({ body: expect.objectContaining({ kind: "acp", method: "session/update",
+          params: expect.objectContaining({ update: { sessionUpdate: "tool_call_update", toolCallId: "unresolved-write", content: [{ type: "content", content: { type: "text",
+            text: "Konteks refused this file change: the call names no path to judge. Name every affected path inside the working copy and try again." } }] } }),
+        }) }));
       } finally { await f.session.close("cancelled"); }
     });
 
@@ -710,7 +791,7 @@ describe("relayed session", () => {
     it("stops the turn and takes dsh out of service when a gated tool ran without asking", async () => {
       const f = await dshSession();
       await f.toolCall("t-ok", "bash", { command: "ls" }); await f.ask("p-ok", "t-ok"); await f.finished("t-ok");
-      await f.toolCall("t-read", "read", { file_path: "a" }); await f.finished("t-read");
+      await f.toolCall("t-read", "read", { file_path: "a" }); await f.ask("p-read", "t-read"); await f.finished("t-read");
       expect(f.quarantine).not.toHaveBeenCalled();
       await f.toolCall("t-bypass", "bash", { command: "curl https://example.com" }); await f.finished("t-bypass");
       expect(f.runner.cancel).toHaveBeenCalledWith("acp-1");
@@ -724,13 +805,14 @@ describe("relayed session", () => {
     // OpenCode 2 always offers once / always / reject; Konteks never picks "always".
     const options = [{ optionId: "once", name: "Allow once", kind: "allow_once" }, { optionId: "always", name: "Always allow", kind: "allow_always" }, { optionId: "reject", name: "Reject", kind: "reject_once" }];
     const CWD = "/private/native/checkout";
-    const KINDS: Record<string, string> = { shell: "execute", write: "edit", edit: "edit", execute: "other", subagent: "think", read: "read" };
-    async function openCodeSession(work: RemoteWorkAssignment = openCodeWork) {
+    const KINDS: Record<string, string> = { shell: "execute", write: "edit", edit: "edit", execute: "other", subagent: "think", read: "read", grep: "search", glob: "search" };
+    async function openCodeSession(work: RemoteWorkAssignment = openCodeWork, overrides: Partial<RelayedSessionDeps> = {}) {
       const quarantine = vi.fn(async () => undefined);
       const f = await build({
         policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true),
         // The platform facade under the name Core gives it (core/client.ts).
         redeemCapabilityToken: async () => ({ mcpServer: { name: "konteks-platform", url: "https://mcp.example", headers: [{ name: "authorization", value: "Bearer cap-token" }] }, expiresAt: "2026-09-07T00:00:00Z" }),
+        ...overrides,
       }, work);
       (f.runner as unknown as { quarantine: typeof quarantine }).quarantine = quarantine;
       await f.session.bootstrap();
@@ -780,6 +862,49 @@ describe("relayed session", () => {
       await f.session.close("cancelled");
     });
 
+    it.each(["assistant_execution", "direct"] as const)("judges OpenCode file approvals in the real %s session path", async kind => {
+      const own = join(dir, "opencode-own"), skill = join(dir, "opencode-selected"), peer = join(dir, "opencode-peer");
+      await mkdir(own); await mkdir(skill); await mkdir(peer);
+      const work: RemoteWorkAssignment = kind === "direct" ? { ...openCodeWork, kind,
+        source: { kind: "direct_session", portability: "instance_bound", ownerInstanceId: "inst", sessionId: "s", turnRef: "turn-direct" },
+      } : openCodeWork;
+      const readOnlyRoots = kind === "direct" ? [] : [skill];
+      const f = await openCodeSession(work, { workspaceRoot: dir, prepareInputs: async target => ({
+        binding: { workspaceId: target.workspaceId, sessionId: "s", assignmentId: target.id, instanceId: target.instanceId, attempt: target.attempt },
+        cwd: own, readOnlyRoots, skillInstructions: "", beforePrompt: async () => undefined,
+      }) });
+      try {
+        expect(f.runner.createSession).toHaveBeenCalledWith(expect.objectContaining({ cwd: own, readOnlyRoots }), undefined);
+        const read = async (id: string, tool: string, input: Record<string, unknown>) => {
+          await f.toolCall(id, tool, input);
+          await f.ask(`p-${id}`, id, tool === "read" ? "read" : "search", tool, input);
+        };
+        await read("inside", "read", { path: "README.md" });
+        await read("directory", "read", { path: "." });
+        await read("glob", "glob", { pattern: "**/*.ts" });
+        await read("grep", "grep", { pattern: "TODO" });
+        await read("skill", "read", { path: join(skill, "SKILL.md") });
+        await read("peer", "read", { path: join(peer, "private.txt") });
+        await read("env", "read", { path: ".env" });
+        await read("example", "read", { path: ".env.example" });
+        await read("unnamed", "read", {});
+        expect(["inside", "directory", "glob", "grep", "example"].map(id => f.answer(`p-${id}`))).toEqual(["once", "once", "once", "once", "once"]);
+        expect(f.answer("p-skill")).toBe(kind === "direct" ? "reject" : "once");
+        expect(["peer", "env", "unnamed"].map(id => f.answer(`p-${id}`))).toEqual(["reject", "reject", "reject"]);
+        expect(JSON.stringify(vi.mocked(f.runner.answer).mock.calls.map(call => call[2]))).not.toContain('"always"');
+        await f.finished("inside");
+        expect(f.quarantine).not.toHaveBeenCalled();
+      } finally { await f.session.close("cancelled"); }
+    });
+
+    it("quarantines an unasked OpenCode read even when no path was reported", async () => {
+      const f = await openCodeSession();
+      await f.toolCall("unasked", "read", {}); await f.finished("unasked");
+      expect(f.runner.cancel).toHaveBeenCalledWith("acp-1");
+      expect(f.quarantine).toHaveBeenCalledWith("OpenCode ran a tool without Konteks' approval. Update or reinstall OpenCode, then restart the connector.");
+      expect(f.closed).toEqual(["agent_exited"]);
+    });
+
     it("names OpenCode's tools in plain words, and a Code Mode block as the Konteks tool it calls", async () => {
       const f = await openCodeSession();
       await f.toolCall("t-1", "shell", { command: "ls" });
@@ -796,7 +921,7 @@ describe("relayed session", () => {
     it("stops the turn and takes OpenCode out of service when a gated tool ran without asking", async () => {
       const f = await openCodeSession();
       await f.toolCall("t-ok", "shell", { command: "ls" }); await f.ask("p-ok", "t-ok", "execute", "ls", { command: "ls", cwd: CWD }); await f.finished("t-ok");
-      await f.toolCall("t-read", "read", { filePath: `${CWD}/a.ts` }); await f.finished("t-read");
+      await f.toolCall("t-read", "read", { path: `${CWD}/a.ts` }); await f.ask("p-read", "t-read", "read", "a.ts", { path: `${CWD}/a.ts` }); await f.finished("t-read");
       expect(f.quarantine).not.toHaveBeenCalled();
       await f.toolCall("t-bypass", "shell", { command: "curl https://example.com" }); await f.finished("t-bypass");
       expect(f.runner.cancel).toHaveBeenCalledWith("acp-1");
@@ -1242,8 +1367,12 @@ describe("relayed session", () => {
     const key = generateInstanceKey();
     const mux = new ChannelMux({ recoveryAuthority: () => "accepted-test-generation", clock, key: () => key, ackIntervalSeconds: 5, ackEveryFrames: 3, replayBufferBytes: 16_384, replayBufferAgeMs: 60_000,
       emit: frame => { emitted.push(frame); return true; }, onFrame: () => undefined, onStall: () => undefined, onReset: () => undefined, persistCursors: async () => undefined });
-    const transport = { openChannel: (id: string) => mux.openChannel(id, "session"), closeChannel: (id: string) => mux.closeChannel(id),
-      send: (message: OutboundMessage) => mux.send(message.channelId, message.channel, message.body, message.signature) } as TransportManager;
+    const transport = new TransportManager(null, { kind: "https", available: true,
+      send: () => undefined, onInbound: () => undefined, openChannel: () => undefined, closeChannel: () => undefined,
+      start: () => undefined, stop: () => undefined });
+    vi.spyOn(transport, "openChannel").mockImplementation((id: string) => mux.openChannel(id, "session"));
+    vi.spyOn(transport, "closeChannel").mockImplementation((id: string) => mux.closeChannel(id));
+    vi.spyOn(transport, "send").mockImplementation((message: OutboundMessage) => mux.send(message.channelId, message.channel, message.body, message.signature));
     for (const attempt of [1, 2]) {
       const work = { ...assignment, id: `asg-${attempt}`, attempt };
       const { session } = await build({ transport,
@@ -1254,7 +1383,7 @@ describe("relayed session", () => {
     }
     expect(emitted).toEqual([]);
     mux.applyHandshake({ connectionEpoch: 7, resume: { "session:s": { to_core: 0, to_runtime: 0 } }, reset: [] });
-    expect(emitted.map(frame => "seq" in frame ? [frame.channelId, frame.seq, frame.body.kind] : null)).toEqual([
+    expect(emitted.map(frame => "seq" in frame && frame.channel === "session" ? [frame.channelId, frame.seq, frame.body.kind] : null)).toEqual([
       ["session:s", 1, "session_ready"], ["session:s", 2, "session_closed"],
       ["session:s", 3, "session_ready"], ["session:s", 4, "session_closed"],
     ]);
@@ -1458,7 +1587,7 @@ describe("relayed session", () => {
     await session.bootstrap();
     expect(prepareInputs).toHaveBeenCalledWith(assignment);
     expect(sent[0]?.body).toMatchObject({ kind: 'session_ready', attempt: 1, recoveryEpoch: 0, readyRevision: 1 });
-    expect(runner.createSession.mock.calls[0]?.[0]).toMatchObject({ cwd: "/private/native/checkout" });
+    expect(vi.mocked(runner.createSession).mock.calls[0]?.[0]).toMatchObject({ cwd: "/private/native/checkout" });
     await expect(session.onToRuntime({ kind: "acp", method: "session/prompt", id: "prepared-1", params: { sessionId: "acp-1", prompt: [{ type: "text", text: "do the work" }] } })).rejects.toMatchObject({ code: "execution_authority_unavailable" });
     expect(beforePrompt).not.toHaveBeenCalled();
     expect(runner.prompt).not.toHaveBeenCalled();

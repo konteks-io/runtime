@@ -1,11 +1,11 @@
-import { mkdtempSync, mkdirSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { McpToolCallLedger } from "../session/permission-tool-identity.js";
 import { EvaluatorPolicyResponder } from "../session/policy-responder.js";
-import { DEFAULT_BASH_BLOCKLIST, POLICY_REFUSAL_PREFIX, blockedCommandPattern, createWorkspaceToolPolicy, describeRefusedPath, isWithinWorkspace, type WorkspaceToolPolicyEvaluation } from "../session/workspace-tool-policy.js";
+import { DEFAULT_BASH_BLOCKLIST, POLICY_REFUSAL_PREFIX, blockedCommandPattern, createWorkspaceToolPolicy, describeRefusedPath, isWithinWorkspace, type WorkspaceToolPolicyEvaluation, type WorkspaceToolPolicyContext } from "../session/workspace-tool-policy.js";
 
 const options = [
   { optionId: "allow", name: "Allow", kind: "allow_once" },
@@ -18,6 +18,7 @@ function request(toolCall: Record<string, unknown>): RequestPermissionRequest {
 
 describe("native workspace tool policy", () => {
   const root = mkdtempSync(join(tmpdir(), "ws-policy-"));
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
   mkdirSync(join(root, "src"));
   const context = { assignmentId: "a", agentId: "claude-code", workspaceRoot: root };
   const responder = new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true);
@@ -32,6 +33,29 @@ describe("native workspace tool policy", () => {
       .resolves.toEqual({ kind: "allow", optionId: "allow" });
     await expect(responder.evaluatePermission(request({ kind: "edit", title: "Write", rawInput: { file_path: join(root, "src", "a.ts") } }), context))
       .resolves.toEqual({ kind: "allow", optionId: "allow" });
+  });
+
+  it.each(["edit", "delete", "move"])("refuses a %s call with no recognized path instead of auto-approving it", async kind => {
+    const missingCarriers = [{}, { file_path: " " }, { file_path: null }, { opaque_path: join(root, "src", "a.ts") }, { locations: [{ line: 1 }] }];
+    for (const rawInput of missingCarriers) {
+      await expect(responder.evaluatePermission(request({ kind, rawInput }), context)).resolves.toMatchObject({
+        kind: "deny", optionId: "reject", refusal: { reason: "unresolved_write", pathCount: 0 },
+      });
+    }
+    await expect(responder.evaluatePermission(request({ kind, title: "Change src/a.ts", locations: [] }), context)).resolves.toMatchObject({
+      kind: "deny", optionId: "reject", message: `${POLICY_REFUSAL_PREFIX} file change: the call names no path to judge. Name every affected path inside the working copy and try again.`,
+    });
+  });
+
+  it.each(["edit", "delete", "move"])("retains every existing recognized %s path carrier and refuses mixed outside paths", async kind => {
+    for (const key of ["file_path", "filePath", "path", "notebook_path", "target_file", "destination"]) {
+      await expect(responder.evaluatePermission(request({ kind, rawInput: { [key]: join(root, "src", "a.ts") } }), context))
+        .resolves.toEqual({ kind: "allow", optionId: "allow" });
+    }
+    await expect(responder.evaluatePermission(request({ kind, locations: [{ path: join(root, "src", "a.ts") }] }), context))
+      .resolves.toEqual({ kind: "allow", optionId: "allow" });
+    await expect(responder.evaluatePermission(request({ kind, rawInput: { file_path: join(root, "src", "a.ts"), destination: join(root, "..", "peer.ts") } }), context))
+      .resolves.toMatchObject({ kind: "deny", optionId: "reject", refusal: { reason: "outside_workspace", pathCount: 2 } });
   });
 
   it("allows the QA browser's tools only on a session given the browser, and never the unsafe ones", async () => {
@@ -80,6 +104,7 @@ describe("native workspace tool policy", () => {
 // the agent learned which path or why.
 describe("a refused file change names what is outside and how to fix it", () => {
   const root = mkdtempSync(join(tmpdir(), "ws-refusal-"));
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
   const cwd = join(root, "session-1");
   mkdirSync(join(cwd, "storefront", "lib"), { recursive: true });
   const policy = createWorkspaceToolPolicy();
@@ -142,3 +167,36 @@ describe("the connector's command blocklist", () => {
   });
 });
 
+describe("session reads with verified organization skill roots", () => {
+  const runner = mkdtempSync(join(tmpdir(), "read-policy-"));
+  afterAll(() => rmSync(runner, { recursive: true, force: true }));
+  const cwd = join(runner, "own"), peer = join(runner, "peer"), skill = join(runner, "skills", "selected");
+  mkdirSync(cwd); mkdirSync(peer); mkdirSync(skill, { recursive: true });
+  const policy = createWorkspaceToolPolicy();
+  const judge = (toolName: string, input: Record<string, unknown>) => {
+    const context: WorkspaceToolPolicyContext = { toolName, input, repoPath: cwd, workspaceRoot: cwd,
+      readOnlyRoots: [skill], agentId: "claude-code", toolUseId: "read" };
+    return Promise.resolve(policy.evaluateToolUse(context));
+  };
+
+  it("allows session-relative reads and selected skill reads, but never gives those skills write authority", async () => {
+    expect((await judge("read", { file_path: "README.md" })).allowed).toBe(true);
+    expect((await judge("read", { file_path: join(skill, "SKILL.md") })).allowed).toBe(true);
+    expect((await judge("search", { path: skill })).allowed).toBe(true);
+    expect((await judge("edit", { file_path: join(skill, "SKILL.md") })).allowed).toBe(false);
+  });
+
+  it("denies peer, unnamed and mixed reads, and cannot be widened by tool arguments", async () => {
+    expect((await judge("read", { file_path: join(peer, "private.txt") })).allowed).toBe(false);
+    expect((await judge("search", { pattern: "*" })).allowed).toBe(false);
+    expect((await judge("read", { file_path: join(peer, "private.txt"), readOnlyRoots: [peer] })).allowed).toBe(false);
+    expect((await judge("read", { locations: [{ path: join(cwd, "README.md") }, { path: join(peer, "private.txt") }] })).allowed).toBe(false);
+  });
+
+  it("rejects a skill symlink escaping its declared directory and a dangling-link observation", async () => {
+    symlinkSync(peer, join(skill, "escape"));
+    expect((await judge("read", { file_path: join(skill, "escape", "private.txt") })).allowed).toBe(false);
+    symlinkSync(join(peer, "missing-directory"), join(cwd, "dangling"));
+    expect((await judge("read", { file_path: join(cwd, "dangling", "private.txt") })).allowed).toBe(false);
+  });
+});

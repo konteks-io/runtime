@@ -148,19 +148,19 @@ describe("OpenCode tool governance", () => {
     expect(governance.decide(ask("r2", "read", ".env.example", { filePath: `${WC}/.env.example` }), context)).toMatchObject({ kind: "evaluate" });
   });
 
-  it("trips when a gated tool completes without asking, and not for what never asks", () => {
+  it("trips when a gated tool completes without asking, including named file tools", () => {
     const { governance, shell } = governed();
     shell("ok", "ls");
     expect(governance.observe(done("ok"), WC)).toBeNull();
     governance.observe(call("rd", "read"), WC);
     governance.observe(input("rd", { filePath: `${WC}/src/a.ts` }), WC);
-    expect(governance.observe(done("rd"), WC)).toBeNull();
+    expect(governance.observe(done("rd"), WC)).toEqual({ toolCallId: "rd", title: "read" });
     governance.observe(call("fl", "shell"), WC);
     expect(governance.observe(done("fl", "failed"), WC)).toBeNull();
     governance.observe(call("by", "shell"), WC);
     governance.observe(input("by", { command: "curl https://example.com" }), WC);
     expect(governance.observe(done("by"), WC)).toEqual({ toolCallId: "by", title: "shell" });
-    // A read that reached .env or left the working copy should have asked or been refused.
+    // Every named file tool must ask, even when its path appears inside the working copy.
     governance.observe(call("env", "read"), WC);
     governance.observe(input("env", { filePath: `${WC}/.env` }), WC);
     expect(governance.observe(done("env"), WC)).toEqual({ toolCallId: "env", title: "read" });
@@ -217,4 +217,67 @@ describe("Code Mode parser", () => {
     expect(parseKonteksCodeModeBlock('await tools["konteks-result"].submit_result(/x/);', SERVERS)).toMatchObject({ ok: false });
     expect(parseKonteksCodeModeBlock('import x from "y"; await tools["konteks-result"].submit_result({});', SERVERS)).toMatchObject({ ok: false });
   });
+});
+
+
+it("uses selected read roots for asked OpenCode reads and trips on unasked reads", () => {
+  const governance = new OpenCodeToolGovernance();
+  const skill = "/rt/selected-skills/review", file = `${skill}/SKILL.md`;
+  governance.observe(call("asked-skill", "read"), WC, [skill]);
+  governance.observe(input("asked-skill", { filePath: file }), WC, [skill]);
+  expect(governance.decide(ask("asked-skill", "read", "Read skill", { filePath: file }), { ...context, readOnlyRoots: [skill] })).toMatchObject({ kind: "evaluate" });
+  governance.observe(call("unasked-skill", "read"), WC, [skill]);
+  governance.observe(input("unasked-skill", { filePath: file }), WC, [skill]);
+  expect(governance.observe(done("unasked-skill"), WC, [skill])).toEqual({ toolCallId: "unasked-skill", title: "read" });
+  governance.observe(call("peer", "read"), WC, [skill]);
+  governance.observe(input("peer", { filePath: "/rt/other-session/private.txt" }), WC, [skill]);
+  expect(governance.observe(done("peer"), WC, [skill])).toEqual({ toolCallId: "peer", title: "read" });
+  governance.observe(call("unnamed", "read"), WC, [skill]);
+  expect(governance.decide(ask("unnamed", "read", "Read", {}), { ...context, readOnlyRoots: [skill] })).toMatchObject({ kind: "deny" });
+});
+
+
+it.each(["read", "grep", "glob", "list"])("requires an approval for an unasked %s with no recognized path", tool => {
+  const governance = new OpenCodeToolGovernance();
+  governance.observe(call("opaque", tool), WC);
+  governance.observe(input("opaque", { pattern: "x" }), WC);
+  expect(governance.observe(done("opaque"), WC)).toEqual({ toolCallId: "opaque", title: tool });
+});
+
+it.each(["grep", "glob"])("preserves the pinned provider's omitted %s path default without treating invalid paths as authority", tool => {
+  const governance = new OpenCodeToolGovernance();
+  governance.observe(call("default", tool), WC);
+  governance.observe(input("default", { pattern: "*.ts" }), WC);
+  expect(governance.decide(ask("default", "search", "*.ts", { pattern: "*.ts", path: undefined }), context))
+    .toMatchObject({ kind: "evaluate", request: { toolCall: { kind: "read", locations: [{ path: WC }] } } });
+  expect(governance.observe(done("default"), WC)).toBeNull();
+  for (const path of [null, "", " "]) {
+    const id = `invalid-${String(path)}`;
+    governance.observe(call(id, tool), WC);
+    governance.observe(input(id, { pattern: "*.ts", path }), WC);
+    expect(governance.decide(ask(id, "search", "*.ts", { pattern: "*.ts", path }), context)).toMatchObject({ kind: "deny" });
+  }
+});
+
+it.each(["undefined", "null"])("uses the actual glob-only %s sentinel at cwd while preserving grep's literal path", path => {
+  const governance = new OpenCodeToolGovernance();
+  for (const tool of ["glob", "grep"]) {
+    governance.observe(call(tool, tool), WC);
+    governance.observe(input(tool, { pattern: "x", path }), WC);
+    expect(governance.decide(ask(tool, "search", "x", { pattern: "x", path }), context))
+      .toMatchObject({ kind: "evaluate", request: { toolCall: { locations: [{ path: tool === "glob" ? WC : `${WC}/${path}` }] } } });
+  }
+});
+
+it.each(["read", "grep", "glob", "list"])("carries every explicit %s path through the maintained read reconstruction", tool => {
+  const governance = new OpenCodeToolGovernance();
+  const kind = tool === "read" ? "read" : "search";
+  governance.observe(call("named", tool), WC);
+  governance.observe(input("named", { path: "src", pattern: "x" }), WC);
+  expect(governance.decide(ask("named", kind, "src", { path: "src", pattern: "x" }), context))
+    .toMatchObject({ kind: "evaluate", request: { toolCall: { kind: "read", locations: [{ path: `${WC}/src` }] } } });
+  expect(governance.observe(done("named"), WC)).toBeNull();
+  governance.observe(call("outside", tool), WC);
+  governance.observe(input("outside", { path: "/other-session/private", pattern: "x" }), WC);
+  expect(governance.decide(ask("outside", kind, "outside", { path: "/other-session/private", pattern: "x" }), context)).toMatchObject({ kind: "deny" });
 });

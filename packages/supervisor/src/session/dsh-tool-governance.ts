@@ -26,6 +26,7 @@ interface ObservedCall { title: string; rawInput: Record<string, unknown> }
 
 const EXECUTE = new Set(["bash", "pwsh"]);
 const EDIT = new Set(["write", "edit", "str_replace_editor"]);
+const FILE_READ = new Set(["read", "read_image", "grep", "glob"]);
 const READ_ONLY = new Set(DSH_READ_ONLY_TOOLS);
 /**
  * The only MCP servers the runtime gives a session: Konteks' own — the
@@ -57,16 +58,33 @@ function widerSandbox(escalation: unknown): boolean {
   return escalation !== undefined && !(typeof escalation === "string" && SANDBOX_WITHIN_WORKSPACE.has(escalation));
 }
 
-/** Read-only and Konteks tools are allowed; the browser only where given; shell and edits go to policy with what they would touch. */
-function toolDecision(request: RequestPermissionRequest, observed: ObservedCall, cwd: string, browserTools: boolean): DshPermissionDecision {
-  const { title, rawInput } = observed;
-  const toolCallId = request.toolCall.toolCallId;
+/** Non-file exemptions and browser admission retain their separate trusted gates. */
+function exemptDecision(title: string, browserTools: boolean): DshPermissionDecision | null {
   if (READ_ONLY.has(title) || KONTEKS_MCP.test(title)) return { kind: "allow" };
   const browserTool = BROWSER_MCP.exec(title)?.[1];
   if (browserTool !== undefined) return browserDecision(browserTool, browserTools);
+  return null;
+}
+
+/** Existing exemptions and Konteks tools stay allowed; named file reads, searches, shell and edits reach policy. */
+function toolDecision(request: RequestPermissionRequest, observed: ObservedCall, cwd: string, browserTools: boolean): DshPermissionDecision {
+  const { title, rawInput } = observed;
+  const toolCallId = request.toolCall.toolCallId;
+  if (FILE_READ.has(title)) return readDecision(request, toolCallId, title, rawInput, cwd);
+  const exempt = exemptDecision(title, browserTools);
+  if (exempt !== null) return exempt;
   if (EXECUTE.has(title)) return executeDecision(request, toolCallId, title, rawInput.command);
   if (EDIT.has(title)) return editDecision(request, toolCallId, title, editPath(rawInput), cwd);
   return { kind: "deny", reason: `${title || "an unnamed tool"} is not a tool Konteks allows DeepSeek Harness to use` };
+}
+
+/** File reads require their mandatory file_path; searches default to the session cwd. */
+function readDecision(request: RequestPermissionRequest, toolCallId: string, title: string, rawInput: Record<string, unknown>, cwd: string): DshPermissionDecision {
+  const search = title === "grep" || title === "glob";
+  const path = search ? (rawInput.path === undefined ? cwd : rawInput.path) : rawInput.file_path;
+  if (typeof path !== "string" || path.trim().length === 0) return { kind: "deny", reason: `${title} call has no path to judge` };
+  const absolute = resolveIn(cwd, path);
+  return { kind: "evaluate", request: { ...request, toolCall: { toolCallId, kind: "read", title, rawInput: {}, locations: [{ path: absolute }] } } };
 }
 
 function browserDecision(browserTool: string, browserTools: boolean): DshPermissionDecision {

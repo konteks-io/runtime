@@ -111,7 +111,7 @@ describe("native background service definitions", () => {
     // The task exists (registered for the previous release) but is stopped.
     const calls: NativeServiceCommand[] = [];
     const execute = vi.fn(async (command: NativeServiceCommand) => { calls.push(command); return command === next.status ? 1 : 0; });
-    const write = vi.fn(async () => undefined);
+    const write = vi.fn(async (_path: string, _contents: string | Uint8Array) => undefined);
     await expect(startNativeServiceDefinition(next, { execute, write })).resolves.toBe('started');
     expect(write).toHaveBeenCalledWith(next.supportFiles![0]!.path, next.supportFiles![0]!.contents);
     const bytes = write.mock.calls[1]?.[1];

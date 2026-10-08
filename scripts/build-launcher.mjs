@@ -58,7 +58,7 @@ execFileSync(npx, [
   "--define:import.meta.url=__filename",
   `--outfile=${join(work, "launcher.bundle.cjs")}`,
 ], { stdio: "inherit", shell });
-writeFileSync(join(work, "sea-config.json"), JSON.stringify({ main: join(work, "launcher.bundle.cjs"), output: join(work, "launcher.blob"), disableExperimentalSEAWarning: true }));
+writeFileSync(join(work, "sea-config.json"), JSON.stringify({ main: join(work, "launcher.bundle.cjs"), output: join(work, "launcher.blob"), disableExperimentalSEAWarning: true, assets: { "konteks-dsh-filesystem-backend": "packages/agent-runner/dist/bridge/dsh-filesystem-backend.js" } }));
 execFileSync(process.execPath, ["--experimental-sea-config", join(work, "sea-config.json")], { stdio: "inherit" });
 const executable = join(work, os === "windows" ? "konteks-remote.exe" : "konteks-remote");
 copyFileSync(process.execPath, executable);

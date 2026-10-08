@@ -233,3 +233,88 @@ describe("Google Antigravity tool governance", () => {
     });
   });
 });
+
+
+it("uses the same selected read roots for asked and observed Antigravity reads", () => {
+  const governance = new AntigravityToolGovernance();
+  const skill = "/rt/selected-skills/review", file = `${skill}/SKILL.md`;
+  const requested = { toolCallId: "asked-skill", title: "Run view_file?", kind: "read", rawInput: { AbsolutePath: file } };
+  governance.observe(toolCall(requested), WC, [skill]);
+  expect(governance.decide(request(requested), { ...context, readOnlyRoots: [skill] })).toMatchObject({ kind: "evaluate" });
+  const observed = { toolCallId: "unasked-skill", title: "Running view_file", kind: "read", rawInput: { file_path: file } };
+  governance.observe(toolCall(observed, "in_progress"), WC, [skill]);
+  expect(governance.observe(done("unasked-skill"), WC, [skill])).toBeNull();
+  governance.observe(toolCall({ ...observed, toolCallId: "peer", rawInput: { file_path: "/rt/other-session/private.txt" } }, "in_progress"), WC, [skill]);
+  expect(governance.observe(done("peer"), WC, [skill])).toEqual({ toolCallId: "peer", title: "view_file" });
+  const unnamed = { toolCallId: "unnamed", title: "Run view_file?", kind: "read", rawInput: {} };
+  governance.observe(toolCall(unnamed), WC, [skill]);
+  expect(governance.decide(request(unnamed), { ...context, readOnlyRoots: [skill] })).toMatchObject({ kind: "deny" });
+});
+
+
+describe("Antigravity unasked read path authority", () => {
+  it.each([
+    ["view_file", "read"],
+    ["list_directory", "search"],
+    ["list_dir", "search"],
+    ["search_directory", "search"],
+    ["find_file", "search"],
+    ["find_by_name", "search"],
+    ["grep_search", "search"],
+  ])("trips when completed %s has no extractable path", (tool, kind) => {
+    const inputs: unknown[] = [{}, { opaque_path: `${WC}/README.md` }, { AbsolutePath: " ", path: null }, "{not-json", "{}", []];
+    for (const [index, rawInput] of inputs.entries()) {
+      const governance = new AntigravityToolGovernance();
+      const toolCallId = `opaque-${tool}-${index}`;
+      expect(governance.observe({ sessionUpdate: "tool_call", toolCallId, title: `Running ${tool}`, kind, status: "in_progress", rawInput, locations: [{ opaque_path: WC }] }, WC)).toBeNull();
+      expect(governance.observe(done(toolCallId), WC)).toEqual({ toolCallId, title: tool });
+    }
+  });
+
+  it.each([
+    "AbsolutePath", "absolute_path", "DirectoryPath", "directory_path", "SearchPath",
+    "search_path", "SearchDirectory", "file_path", "FilePath", "path",
+  ])("keeps the supported %s input carrier inside the working copy", key => {
+    const governance = new AntigravityToolGovernance();
+    const toolCallId = `carrier-${key}`;
+    governance.observe(toolCall({ toolCallId, title: "Running view_file", kind: "read", rawInput: { [key]: "README.md" } }, "in_progress"), WC);
+    expect(governance.observe(done(toolCallId), WC)).toBeNull();
+  });
+
+  it.each([
+    { tool: "view_file", kind: "read", rawInput: { AbsolutePath: `${WC}/README.md`, search_path: "/rt/other-session/private.txt" }, locations: [{ path: "/rt/selected-skills/review/SKILL.md" }] },
+    { tool: "grep_search", kind: "search", rawInput: { AbsolutePath: `${WC}/README.md`, search_path: "/rt/other-session/private.txt" }, locations: [{ path: "/rt/selected-skills/review/SKILL.md" }] },
+    { tool: "view_file", kind: "read", rawInput: { AbsolutePath: `${WC}/README.md`, search_path: "/rt/selected-skills/review/SKILL.md" }, locations: [{ path: "/rt/other-session/private.txt" }] },
+    { tool: "grep_search", kind: "search", rawInput: { AbsolutePath: `${WC}/README.md`, search_path: "/rt/selected-skills/review/SKILL.md" }, locations: [{ path: "/rt/other-session/private.txt" }] },
+  ])("trips on mixed allowed and outside paths in completed $tool", ({ tool, kind, rawInput, locations }) => {
+    const governance = new AntigravityToolGovernance();
+    const skill = "/rt/selected-skills/review";
+    const toolCallId = `mixed-${tool}`;
+    governance.observe(toolCall({ toolCallId, title: `Running ${tool}`, kind, rawInput, locations }, "in_progress"), WC, [skill]);
+    expect(governance.observe(done(toolCallId), WC, [skill])).toEqual({ toolCallId, title: tool });
+  });
+
+  it("keeps location-only and replayed JSON carriers in selected read roots", () => {
+    const governance = new AntigravityToolGovernance();
+    const skill = "/rt/selected-skills/review", file = `${skill}/SKILL.md`;
+    governance.observe(toolCall({ toolCallId: "location-only", title: "Running list_directory", kind: "search", rawInput: {}, locations: [{ path: skill }] }, "in_progress"), WC, [skill]);
+    expect(governance.observe(done("location-only"), WC, [skill])).toBeNull();
+    governance.observe({ sessionUpdate: "tool_call", toolCallId: "replay-json", title: "Running view_file", status: "in_progress", rawInput: JSON.stringify({ file_path: file }) }, WC, [skill]);
+    expect(governance.observe(done("replay-json"), WC, [skill])).toBeNull();
+  });
+
+  it("judges paths filled by progress or the completion input", () => {
+    const governance = new AntigravityToolGovernance();
+    governance.observe(toolCall({ toolCallId: "progress-path", title: "Running grep_search", kind: "search", rawInput: {} }, "in_progress"), WC);
+    expect(governance.observe({ sessionUpdate: "tool_call_update", toolCallId: "progress-path", status: "in_progress", locations: [{ path: WC }] }, WC)).toBeNull();
+    expect(governance.observe(done("progress-path"), WC)).toBeNull();
+    governance.observe(toolCall({ toolCallId: "completion-path", title: "Running view_file", kind: "read", rawInput: {} }, "in_progress"), WC);
+    expect(governance.observe(done("completion-path", "completed", { rawInput: { AbsolutePath: `${WC}/README.md` } }), WC)).toBeNull();
+  });
+
+  it.each(["failed", "cancelled"] as const)("does not trip on a pathless read that %s", status => {
+    const governance = new AntigravityToolGovernance();
+    governance.observe(toolCall({ toolCallId: status, title: "Running view_file", kind: "read", rawInput: {} }, "in_progress"), WC);
+    expect(governance.observe(done(status, status), WC)).toBeNull();
+  });
+});

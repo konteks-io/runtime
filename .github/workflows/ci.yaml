@@ -20,9 +20,9 @@ jobs:
         shell: bash
         run: |
           node scripts/ci-vendored-contracts.mjs
-          npm install --package-lock-only --ignore-scripts --legacy-peer-deps --no-audit --no-fund
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
       - name: Install (shared contracts are vendored under vendor/)
-        run: npm ci --ignore-scripts --legacy-peer-deps
+        run: npm ci --ignore-scripts
       - name: Verify the Codex patch against the reviewed upstream source
         shell: bash
         env:
@@ -109,9 +109,9 @@ jobs:
         shell: bash
         run: |
           node scripts/ci-vendored-contracts.mjs
-          npm install --package-lock-only --ignore-scripts --legacy-peer-deps --no-audit --no-fund
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
       - name: Install (shared contracts are vendored under vendor/)
-        run: npm ci --ignore-scripts --legacy-peer-deps
+        run: npm ci --ignore-scripts
       - name: Build workspace packages
         run: npm run build
       - name: Verify Mac binary compatibility decisions and produced native metadata

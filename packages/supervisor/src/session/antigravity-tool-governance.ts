@@ -1,6 +1,6 @@
 import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import { BROWSER_MCP_SERVER_NAME, isDeniedBrowserTool } from "@konteks/remote-agent-runner";
-import { isWithinWorkspace } from "./workspace-tool-policy.js";
+import { isWithinReadRoots, isWithinWorkspace } from "./workspace-tool-policy.js";
 import { rebuiltRequest, refusal, resolveIn } from "./host-decisions.js";
 import type { HostPermissionContext, HostPermissionDecision, HostToolBypass, HostToolGovernance } from "./host-tool-governance.js";
 
@@ -299,10 +299,10 @@ function fetchDecision(r: AskedRequest, tool: string): HostPermissionDecision {
   return rebuiltRequest(r.request, r.toolCallId, { kind: "fetch", title: tool, rawInput: { url: target } });
 }
 
-/** Asked only when the organisation's outside-file setting says "Always ask": inside the working copy or not at all. */
+/** Asked only when the organisation's outside-file setting says "Always ask": verified read roots only. */
 function readDecision(r: AskedRequest, tool: string): HostPermissionDecision {
   const paths = [...new Set([...readPaths({ rawInput: r.input, locations: r.asked.locations }, r.context.cwd), ...readPaths(r.observed, r.context.cwd)])];
-  if (paths.length === 0 || paths.some(path => !isWithinWorkspace(path, r.context.cwd))) return refusal("a path outside the working copy");
+  if (paths.length === 0 || paths.some(path => !isWithinReadRoots(path, r.context.cwd, r.context.readOnlyRoots))) return refusal("a path outside the working copy and selected skill folders");
   return rebuiltRequest(r.request, r.toolCallId, { kind: "read", title: tool, rawInput: {}, locations: paths.map(path => ({ path })) });
 }
 
@@ -329,13 +329,13 @@ export class AntigravityToolGovernance implements HostToolGovernance {
     return bypass.unaskedCommand === true && credentialMethod === ANTIGRAVITY_ENTERPRISE_METHOD ? ANTIGRAVITY_ENTERPRISE_QUARANTINE_MESSAGE : ANTIGRAVITY_QUARANTINE_MESSAGE;
   }
 
-  observe(update: unknown, cwd: string): HostToolBypass | null {
+  observe(update: unknown, cwd: string, readOnlyRoots: readonly string[] = []): HostToolBypass | null {
     const value = record(update);
     const toolCallId = typeof value.toolCallId === "string" ? value.toolCallId : undefined;
     if (toolCallId === undefined) return null;
     if (value.sessionUpdate === "tool_call") return this.observeCall(toolCallId, value);
     if (value.sessionUpdate !== "tool_call_update") return null;
-    return this.observeUpdate(toolCallId, value, cwd);
+    return this.observeUpdate(toolCallId, value, cwd, readOnlyRoots);
   }
 
   private observeCall(toolCallId: string, value: Record<string, unknown>): HostToolBypass | null {
@@ -353,7 +353,7 @@ export class AntigravityToolGovernance implements HostToolGovernance {
     return null;
   }
 
-  private observeUpdate(toolCallId: string, value: Record<string, unknown>, cwd: string): HostToolBypass | null {
+  private observeUpdate(toolCallId: string, value: Record<string, unknown>, cwd: string, readOnlyRoots: readonly string[]): HostToolBypass | null {
     const observed = this.calls.get(toolCallId);
     const status = value.status;
     if (status !== "completed" && status !== "failed" && status !== "cancelled") {
@@ -367,19 +367,24 @@ export class AntigravityToolGovernance implements HostToolGovernance {
     // Only a call that ran to completion did something.
     if (!observed || status !== "completed") return null;
     refreshInput(observed, value);
-    return this.completedBypass(toolCallId, observed, askedFirst ? { answer } : undefined, cwd);
+    return this.completedBypass(toolCallId, observed, askedFirst ? { answer } : undefined, cwd, readOnlyRoots);
   }
 
-  private completedBypass(toolCallId: string, observed: ObservedCall, asked: { answer: boolean | undefined } | undefined, cwd: string): HostToolBypass | null {
+  private completedBypass(toolCallId: string, observed: ObservedCall, asked: { answer: boolean | undefined } | undefined, cwd: string, readOnlyRoots: readonly string[]): HostToolBypass | null {
     // The trust question "completes" once answered; it is never work.
     if (observed.tool === "workspace_trust") return null;
     if (asked) return this.askedOutcome(toolCallId, observed, asked.answer, cwd);
     if (INERT_TOOLS.has(observed.tool) || UNASKED_AT_PARITY.has(observed.tool)) return null;
     if (READ_TOOLS.has(observed.tool) && readKind(observed.kind)) {
-      // Reads run unasked inside the working copy; one that left it should have been refused.
-      return readPaths(observed, cwd).some(path => !isWithinWorkspace(path, cwd)) ? { toolCallId, title: observed.tool } : null;
+      return this.unaskedReadBypass(toolCallId, observed, cwd, readOnlyRoots);
     }
     return this.unaskedWork(toolCallId, observed, cwd);
+  }
+
+  private unaskedReadBypass(toolCallId: string, observed: ObservedCall, cwd: string, readOnlyRoots: readonly string[]): HostToolBypass | null {
+    // An unasked read must positively name paths inside the same verified roots.
+    const paths = readPaths(observed, cwd);
+    return paths.length === 0 || paths.some(path => !isWithinReadRoots(path, cwd, readOnlyRoots)) ? { toolCallId, title: observed.tool } : null;
   }
 
   private askedOutcome(toolCallId: string, observed: ObservedCall, answer: boolean | undefined, cwd: string): HostToolBypass | null {

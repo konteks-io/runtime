@@ -32,7 +32,7 @@ import type { PendingRequest, SupervisorJournal } from "../state/journal.js";
 import type { TransportManager } from "../transport/relay-transport.js";
 import { deferredPermissionBody, PermissionBroker, registerDeferral, sanitizeElicitationRequest, sanitizePermissionRequest, type PendingHumanRequest, type SanitizedElicitation, type SanitizedPermission } from "./permissions.js";
 import type { CapabilityTokenIssue, DeferredPermissionBody } from "../core/client.js";
-import type { AdmittedMcpTool, PolicyDecision, PolicyResponder } from "./policy-responder.js";
+import { deferredPermissionRequest, type AdmittedMcpTool, type PolicyDecision, type PolicyResponder } from "./policy-responder.js";
 import type { PreparedSessionInputs } from "../skills/session-inputs.js";
 import { McpCapabilityFacade, type McpLocalTransportIdentity } from "../mcp/capability-facade.js";
 import { PREVIEW_WORK_KINDS, PreviewMcpServer, type SessionPreviewAccess } from "../preview/mcp-server.js";
@@ -223,6 +223,7 @@ export class RelayedSession {
   private toolFormTold = false;
   private readonly logger: Logger;
   private preparedInputs: PreparedSessionInputs | null = null;
+  private readOnlyRoots: readonly string[] = Object.freeze([]);
   private readonly executionGate: NativeExecutionGate | null;
   /** Durable key of the last prompt admitted on this session (see promptBusy). */
   private promptReservation: string | null = null;
@@ -361,7 +362,9 @@ export class RelayedSession {
     catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
     this.deps.assertExecutionOwned?.();
     const binding = this.verifiedBinding(prepared);
+    const readOnlyRoots = Object.freeze([...(prepared.readOnlyRoots ?? [])]);
     this.preparedInputs = prepared;
+    this.readOnlyRoots = readOnlyRoots;
     // Input preparation verifies Core's claim-bound selection. Use its logical
     // session identity, never a bridge ref or an assignment-local random ID.
     this.boundChannelId = `session:${binding.sessionId}`;
@@ -596,6 +599,7 @@ export class RelayedSession {
       context: { instanceId: this.deps.instanceId, assignmentId: this.assignment.id, attempt: this.assignment.attempt, agentId: this.assignment.agentRoute.agentId },
       readinessDeadlineAt: new Date(Date.now() + Math.max(0, Date.parse(this.assignment.expiresAt) - this.deps.clock.coreNow())).toISOString(),
       cwd,
+      readOnlyRoots: this.readOnlyRoots,
       mcpServers,
       ...(this.assignment.agentRoute.sessionConfig ? { sessionConfig: this.assignment.agentRoute.sessionConfig } : {}),
       ...this.directModelOptions(),
@@ -1264,7 +1268,7 @@ export class RelayedSession {
     if (this.previewSessionId !== null) this.deps.preview?.touch(this.previewSessionId);
     this.observeStructuredText(update);
     this.mcpCalls?.observe(update);
-    const bypass = this.toolGovernance?.observe(update, this.sessionCwd()) ?? null;
+    const bypass = this.toolGovernance?.observe(update, this.sessionCwd(), this.readOnlyRoots) ?? null;
     await this.sendToCore({ kind: "acp", method: "session/update", params: event.params as never });
     if (bypass) await this.onToolGovernanceBypass(bypass);
   }
@@ -1502,7 +1506,7 @@ export class RelayedSession {
   private async governPermission(ref: string, requestId: string, params: RequestPermissionRequest, governance: HostToolGovernance): Promise<RequestPermissionRequest | null> {
     const request = { ...params, options: params.options.filter(option => option.kind !== "allow_always") };
     this.governedPermissions.set(requestId, { toolCallId: request.toolCall.toolCallId, options: request.options });
-    const verdict = governance.decide(request, { cwd: this.sessionCwd(), servers: this.sessionServers, browserTools: this.browserGateway !== null });
+    const verdict = governance.decide(request, { cwd: this.sessionCwd(), readOnlyRoots: this.readOnlyRoots, servers: this.sessionServers, browserTools: this.browserGateway !== null });
     if (verdict.kind === "evaluate") return verdict.request;
     if (this.closed) return null;
     this.deps.assertExecutionOwned?.();
@@ -1522,7 +1526,7 @@ export class RelayedSession {
 
   private permissionContext(): Parameters<PolicyResponder["evaluatePermission"]>[1] {
     return { assignmentId: this.assignment.id, agentId: this.assignment.agentRoute.agentId, workspaceRoot: this.policyRoot(),
-      cwd: this.sessionCwd(), browserTools: this.browserGateway !== null, sessionServers: this.sessionServers, ...(this.mcpCalls ? { ledger: this.mcpCalls } : {}),
+      cwd: this.sessionCwd(), readOnlyRoots: this.readOnlyRoots, browserTools: this.browserGateway !== null, sessionServers: this.sessionServers, ...(this.mcpCalls ? { ledger: this.mcpCalls } : {}),
       admittedMcpTools: this.deps.admittedMcpTools?.(this.assignment) ?? [] };
   }
 
@@ -1546,8 +1550,11 @@ export class RelayedSession {
    * the agent when it continues the stopped turn.
    */
   private async denyByPolicy(ref: string, requestId: string, request: RequestPermissionRequest, decision: Extract<PolicyDecision, { kind: "deny" }>): Promise<void> {
-    if (decision.message && decision.refusal?.reason === "outside_workspace") {
-      await this.noteRefusedToolCall(ref, request.toolCall.toolCallId, decision.message);
+    if (decision.message) {
+      const reason = decision.refusal?.reason;
+      if (reason === "outside_workspace" || reason === "outside_read_roots" || reason === "unresolved_read" || reason === "unresolved_write") {
+        await this.noteRefusedToolCall(ref, request.toolCall.toolCallId, decision.message);
+      }
     }
     await this.answerPermission(ref, requestId, decision.optionId === null ? cancelledPermission() : selectedOption(decision.optionId));
   }
@@ -1555,7 +1562,7 @@ export class RelayedSession {
   /** Ask a person through Konteks, when the assignment allows it; an integration gate's question is answered once, never "always". */
   private async deferPermission(ref: string, requestId: string, request: RequestPermissionRequest, decision: Extract<PolicyDecision, { kind: "defer" }>): Promise<void> {
     if (!this.assignment.policy.humanDeferralAllowed) return void (await this.answerPermission(ref, requestId, cancelledPermission()));
-    const asked = decision.allowOnceOnly ? { ...request, options: request.options.filter(option => option.kind !== "allow_always") } : request;
+    const asked = deferredPermissionRequest(request, decision);
     const sanitized = sanitizePermissionRequest(asked);
     const pending = await this.deferToHuman(ref, requestId, "session/request_permission", sanitized);
     if (!pending) return void (await this.answerPermission(ref, requestId, cancelledPermission()));
@@ -1586,14 +1593,9 @@ export class RelayedSession {
     this.toolGovernance?.answered?.(governed.toolCallId, option?.kind === "allow_once");
   }
 
-  /**
-   * The folder the tool policy judges file changes against: the runner's
-   * workspace, except for a direct session, whose agent may change files only
-   * in its own private session folder, never another session's. Kept to direct sessions: Konteks's own kinds are proven against the
-   * workspace root today, and their tighter root is a change of its own.
-   */
+  /** The tool policy judges file changes against this session's verified working copy. */
   private policyRoot(): string {
-    return isDirectAssignment(this.assignment) ? this.sessionCwd() : this.deps.workspaceRoot;
+    return this.sessionCwd();
   }
 
   /** What goes in front of the person's text: the staged skills line; nothing for a direct session, so a leading `/command` stays first. */
@@ -1731,7 +1733,8 @@ export class RelayedSession {
     this.fenceForRecovery();
     this.recoveryStopTask = (async () => {
       await this.closeMcpFacade();
-      this.stopPreview("claim_lost");
+      const previewStop = this.stopPreview("claim_lost");
+      void previewStop.catch(() => undefined);
       const initialRef = this.creationReturned ? this.acpSessionRef : null;
       const stop = async (ref: string): Promise<void> => {
         const stopRunner = this.deps.runner.stopForRecovery;
@@ -1751,9 +1754,11 @@ export class RelayedSession {
       // below; that failure alone is neither stop evidence nor a permanent
       // veto on recovery's separately journaled ACP-settlement stage.
       if (this.closeTask) await Promise.allSettled([this.closeTask]);
-      if (initialStop) await initialStop;
-      else if (this.acpSessionRef !== null) await stop(this.acpSessionRef);
-      else throw new RemoteInstanceError("recovery_required", "Bridge session creation has an unknown outcome; recovery stop is unproven.");
+      const runnerStop = initialStop ?? (this.acpSessionRef !== null ? stop(this.acpSessionRef) :
+        Promise.reject(new RemoteInstanceError("recovery_required", "Bridge session creation has an unknown outcome; recovery stop is unproven.")));
+      const stops = await Promise.allSettled([runnerStop, previewStop]);
+      const failure = stops.find((result): result is PromiseRejectedResult => result.status === "rejected");
+      if (failure) throw failure.reason;
       // The execution is already `stopping` under this session's own recovery
       // fence; only admission ownership can still be current here.
       this.assertRecoveryOwned();
@@ -1900,7 +1905,7 @@ export class RelayedSession {
    */
   private async afterClose(reason: SessionClosedReason, nativeCompletion: boolean): Promise<void> {
     await this.closeMcpFacade();
-    if (!nativeCompletion) this.stopPreview(reason);
+    if (!nativeCompletion) await this.stopPreview(reason);
     this.completedSettlementInProgress = false;
     if (!nativeCompletion) this.releaseUnlessRecovering();
   }
@@ -1922,11 +1927,11 @@ export class RelayedSession {
   }
 
   /** The session's preview goes with the session (not with a completed turn). */
-  private stopPreview(reason: string): void {
+  private async stopPreview(reason: string): Promise<void> {
     const sessionId = this.previewSessionId;
     if (sessionId === null || !this.deps.preview) return;
     this.deps.preview.forget?.(sessionId);
-    void this.deps.preview.stop(sessionId, reason).catch(error => this.logger.warn({ event: "preview.stop_failed", assignmentId: this.assignment.id, err: error }, "session preview could not be stopped"));
+    await this.deps.preview.stop(sessionId, reason);
   }
 
   get isClosed(): boolean {

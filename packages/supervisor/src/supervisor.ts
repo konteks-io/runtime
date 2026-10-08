@@ -346,6 +346,7 @@ export class Supervisor {
       idleMs: config.SUPERVISOR_PREVIEW_IDLE_MINUTES * 60_000,
       maxRunning: config.SUPERVISOR_PREVIEW_MAX_RUNNING,
       registry: this.previewRegistry,
+      onUnavailable: sessionId => this.previewChannel?.previewUnavailable(sessionId),
       onStopped: sessionId => this.previewChannel?.previewStopped(sessionId),
       logger: this.logger,
     });
@@ -392,7 +393,7 @@ export class Supervisor {
     } });
     await this.store.init();
     // A restart never adopts a preview: kill what a crashed process left running.
-    await this.previewRegistry.sweep().catch(error => this.logger.warn({ err: error }, "leftover preview processes could not be checked"));
+    await this.previewRegistry.sweep();
     await this.journal.load();
     await this.outbox.load();
     await this.beginUpdateProbation();
@@ -970,11 +971,11 @@ export class Supervisor {
     this.broker = new PermissionBroker({ clock: this.clock, deadlineSeconds: () => this.configuration.permissionResponderDeadlineSeconds, onTimeout: async (request) => this.work.onPermissionTimeout(request) });
     this.work = new WorkOrchestrator({
       verifyCancellation: directive => verifier.verify(directive, directive.signature),
-      onSessionReleased: sessionId => {
+      onSessionReleased: async sessionId => {
         // The dev server stops with the session; its worktree stays openable
         // by a viewer while it exists (a delivery's preview after the delivery).
         this.previewViewerStarts.delete(sessionId);
-        void this.previews.stop(sessionId, "session_released");
+        await this.previews.stop(sessionId, "session_released");
       },
       ...(this.assignmentSender ? { assignmentSender: this.assignmentSender } : {}),
       runnerIncarnation: () => this.runnerIncarnation,
@@ -1895,9 +1896,12 @@ export class Supervisor {
   private startLeaseLossCleanup(): void {
     if (this.leaseLossCleanup) return;
     this.leaseLossCleanupFailed = false;
-    void this.previews.stopAll("lease_lost");
-    this.leaseLossCleanup = Promise.resolve().then(() => this.work.drainSessions("lease_lost"))
-      .catch(() => { this.leaseLossCleanupFailed = true; this.logger.error("lease-loss session cleanup failed; work remains drained"); })
+    this.leaseLossCleanup = Promise.resolve().then(async () => {
+      const results = await Promise.allSettled([this.previews.stopAll("lease_lost"), this.work.drainSessions("lease_lost")]);
+      const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+      if (failure) throw failure.reason;
+    })
+      .catch(() => { this.leaseLossCleanupFailed = true; this.logger.error("lease-loss session or preview cleanup failed; work remains drained"); })
       .finally(() => { this.leaseLossCleanup = null; this.restoreLeaseDrain(); });
   }
 
@@ -2019,7 +2023,7 @@ export class Supervisor {
           this.drainTimer.unref();
         } else {
           this.drainTimer = null;
-          void this.work.drainSessions("drain").catch(() => this.logger.error("drain deadline session cleanup failed"));
+          void this.stopAtDrainDeadline().catch(() => this.logger.error("drain deadline session or preview cleanup failed; work remains drained"));
         }
       };
       expire();
@@ -2027,9 +2031,18 @@ export class Supervisor {
     // Previews of sessions still working stop with those sessions; the rest
     // (a finished turn's preview left open) stop now.
     const live = this.work.liveSessionIds();
-    for (const preview of this.previews.list()) if (!live.has(preview.sessionId)) void this.previews.stop(preview.sessionId, "drain");
+    const previews = this.previews.list().filter(preview => !live.has(preview.sessionId));
+    const stopped = await Promise.allSettled(previews.map(preview => this.previews.stop(preview.sessionId, "drain")));
+    const failures = stopped.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failures.length) throw new AggregateError(failures.map(result => result.reason), "Detached preview cleanup remains unconfirmed; work remains drained.");
     this.logger.info({ reason, active }, "draining: no new claims");
     return active;
+  }
+
+  private async stopAtDrainDeadline(): Promise<void> {
+    const stopped = await Promise.allSettled([this.work.drainSessions("drain"), this.previews.stopAll("drain")]);
+    const failure = stopped.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failure) throw failure.reason;
   }
 
   private cancelDrainTimer(): void {
@@ -2991,8 +3004,7 @@ export class Supervisor {
     await this.noteShutdown("supervisor_prelude", "completed");
     await this.drainForShutdown();
     await this.noteShutdown("preview_close", "entered");
-    await this.previews.close();
-    await this.noteShutdown("preview_close", "completed");
+    const previewFailure = await this.closePreviewsForShutdown();
     this.previewChannel?.dispose();
     const { runnerFailure, codexFailure } = await this.stopAgentsForShutdown();
     for (const runner of this.runners.values()) runner.stopEvents();
@@ -3000,8 +3012,20 @@ export class Supervisor {
     await this.noteShutdown("state_close", "entered");
     await this.stateMutations.close();
     this.nativeOwnership?.release();
+    if (previewFailure) throw previewFailure.reason;
     if (runnerFailure) throw runnerFailure.reason;
     if (codexFailure) throw codexFailure.reason;
+  }
+
+  private async closePreviewsForShutdown(): Promise<{ reason: unknown } | null> {
+    try {
+      await this.previews.close();
+      await this.noteShutdown("preview_close", "completed");
+      return null;
+    } catch (reason) {
+      this.logger.error("preview shutdown remains unconfirmed; retained owners fence restart");
+      return { reason };
+    }
   }
 
   /** Diagnostics must never prevent cleanup or change the shutdown receipt. */

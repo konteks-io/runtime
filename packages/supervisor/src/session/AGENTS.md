@@ -29,6 +29,14 @@ whole permission path.
 - **`allow_once` only.** Every policy allow is `allow_once`; `allow_always` is
   never offered to policy or a person (OpenCode would store it and stop
   asking; Antigravity's offer is stripped before anything sees it).
+- **Explicit native escalation asks a person.** Codex command permission bundles,
+  standalone filesystem/network permission grants, network approvals and command
+  paths/cwd outside trusted roots are never automatically approved. Claude's
+  structured `SandboxNetworkAccess` and blocked shell paths also defer. If human
+  deferral or the exact safe options are unavailable, refuse. Codex's manual
+  standalone grant is turn-scoped; session grants and strict automatic review
+  are excluded from the broker and Core view. Ordinary same-authority commands
+  retain the command policy; these checks do not attest OS confinement.
 - **Only the session's own MCP servers.** A tool whose server is not in the
   session's `sessionServers` is refused without asking. `konteks-browser` is
   allowed only on a session given the browser, and never a hidden browser tool.
@@ -53,8 +61,19 @@ whole permission path.
   quarantines that agent on this connector (other agents keep running).
   `quarantineMessageFor` names the Gemini Enterprise "Terminal
   auto-execution: Require review" setting when that credential is in use.
-- File changes are judged against the workspace root, or the session's own
-  folder for a direct session (`policyRoot()`).
+- File changes are judged against each session's verified working copy
+  (`policyRoot()`), including non-direct assignments. The general policy judges
+  recognized structured read/search calls against that copy plus the selected
+  organization-skill directories verified by input preparation. Roots are local
+  typed context, never tool arguments; a judged read must name a path. dsh
+  read/read_image/grep/glob calls ask through its hook and reach this policy.
+  OpenCode named read/search tools ask before these roots are judged; an
+  unasked completion trips even without a named path. Its omitted grep/glob
+  path uses the pinned provider's session cwd default. Antigravity uses the
+  same roots for asked and observed named reads. Provider controls and
+  tripwires remain. Vendor-internal skill loads,
+  opaque unasked reads and shell execution still require separate controls.
+  These ACP permission checks do not provide process/OS confinement.
 
 ## Gotchas
 

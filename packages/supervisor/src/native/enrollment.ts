@@ -300,10 +300,15 @@ export class NativeEnrollment {
     return client.request({
       method: "POST",
       path,
-      bodyFactory: () => ({
-        ...body,
-        proof: signInstanceProof(key as never, { method, audience: CORE_AUDIENCE, subject, body }),
-      }),
+      bodyFactory: () => {
+        const signedBody = method === "enrollment_token"
+          ? { ...body, issuedAt: Math.floor(this.options.clock.coreNow() / 1000) }
+          : body;
+        return {
+          ...signedBody,
+          proof: signInstanceProof(key as never, { method, audience: CORE_AUDIENCE, subject, body: signedBody }),
+        };
+      },
       schema: schema as never,
     }) as Promise<T>;
   }

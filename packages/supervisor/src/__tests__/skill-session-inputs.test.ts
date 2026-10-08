@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { computeRemoteFileTreeDigest, computeRemoteSkillCatalogDigest } from "../../../common/src/contracts.js";
 import { prepareOrganizationSkillSession } from "../skills/session-inputs.js";
@@ -26,6 +26,10 @@ describe("native skill-to-ACP input preparation", () => {
     expect(prepared.skillInstructions).toContain("do not grant tool permissions");
     expect(prepared.skillInstructions).not.toContain("</skills>");
     expect(prepared.cwd).toContain("checkout");
+    expect(prepared.readOnlyRoots).toEqual([dirname(file)]);
+    expect(Object.isFrozen(prepared.readOnlyRoots)).toBe(true);
+    expect(prepared.readOnlyRoots).not.toContain(root);
+    expect(prepared.readOnlyRoots).not.toContain(join(root, "private"));
     await prepared.beforePrompt();
     await writeFile(file, "changed");
     await expect(prepared.beforePrompt()).rejects.toMatchObject({ code: "capability_unavailable" });

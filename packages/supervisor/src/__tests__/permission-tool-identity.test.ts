@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import { describe, expect, it } from "vitest";
 import { McpToolCallLedger, permissionToolIdentity } from "../session/permission-tool-identity.js";
@@ -85,9 +86,18 @@ describe("browser allow keyed on structured identity", () => {
   });
 
   it("answers every policy allow with allow_once, and never falls back to allow_always", async () => {
-    await expect(responder.evaluatePermission(claude("Read", { kind: "read" }), context)).resolves.toEqual({ kind: "allow", optionId: "allow" });
-    const onlyAlways = { ...claude("Read", { kind: "read" }), options: options.filter(option => option.kind !== "allow_once") } as RequestPermissionRequest;
-    await expect(responder.evaluatePermission(onlyAlways, context)).resolves.toEqual({ kind: "deny", optionId: "reject" });
+    const cwd = fileURLToPath(new URL(".", import.meta.url));
+    const readContext = { ...context, cwd, workspaceRoot: cwd };
+    const ownedRead = claude("Read", { kind: "read", rawInput: { file_path: fileURLToPath(import.meta.url) } });
+    await expect(responder.evaluatePermission(ownedRead, readContext)).resolves.toEqual({ kind: "allow", optionId: "allow" });
+    const onlyAlways = { ...ownedRead, options: options.filter(option => option.kind !== "allow_once") } as RequestPermissionRequest;
+    await expect(responder.evaluatePermission(onlyAlways, readContext)).resolves.toEqual({ kind: "deny", optionId: "reject" });
+  });
+
+  it("refuses a read with no path even when a one-time approval is available", async () => {
+    const cwd = fileURLToPath(new URL(".", import.meta.url));
+    await expect(responder.evaluatePermission(claude("Read", { kind: "read" }), { ...context, cwd, workspaceRoot: cwd }))
+      .resolves.toMatchObject({ kind: "deny", optionId: "reject", refusal: { reason: "unresolved_read", pathCount: 0 } });
   });
 });
 

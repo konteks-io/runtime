@@ -7,6 +7,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CONVERSATION_HAS_NO_APP, inferPreviewPlan, parsePreviewYaml, resolvePreviewPlan, frameworkFlags, substitutePreviewVariables, type PreviewPlanResult } from "../preview/config.js";
 import { buildPreviewEnv, PreviewProcessManager, PreviewProcessRegistry, allocatePreviewPort, type PreviewChild } from "../preview/process-manager.js";
 import { resolvePreviewPath } from "../preview/user-path.js";
+import type { PreviewProcessOwner } from "../preview/process-owner.js";
+
+function fixtureOwner(pid: number | undefined): PreviewProcessOwner {
+  const process = { version: 1 as const, platform: "linux" as const, pid: pid!, processGroupId: pid!, startToken: `boot:${pid}`, commandDigest: "fixture" };
+  return { version: 2, id: `owner:${pid}`, pid: pid ?? null, platform: "linux", process };
+}
 
 class FakeChild extends EventEmitter implements PreviewChild {
   readonly stdout = new PassThrough();
@@ -128,7 +134,8 @@ describe("supervised preview process manager", () => {
     const stopped: string[] = [];
     const instance = new PreviewProcessManager({
       spawn: ({ command, env, cwd }) => { const child = new FakeChild(1000 + children.length, command, env, cwd); children.push(child); return child; },
-      terminate: async child => { terminated.push(child as FakeChild); if ((child as FakeChild).exitCode === null) (child as FakeChild).exit(null, "SIGTERM"); },
+      captureOwner: fixtureOwner,
+      stopOwner: async owner => { const child = children.find(value => value.pid === owner.pid)!; terminated.push(child); if (child.exitCode === null) child.exit(null, "SIGTERM"); },
       resolvePlan: async () => plan,
       probe: async () => up,
       allocatePort: async inUse => { let port = 43_100; while (inUse.has(port)) port += 1; return port; },
@@ -265,29 +272,104 @@ describe("supervised preview process manager", () => {
     await f.instance.waitForSettled("s", 2_000);
     f.children[0]!.exit(1);
     expect(f.instance.status("s")).toMatchObject({ state: "failed", message: expect.stringContaining("stopped unexpectedly") });
-    expect(f.stopped).toEqual(["s"]);
+    await vi.waitFor(() => expect(f.stopped).toEqual(["s"]));
+  });
+
+  it("retains a failed stop, withdraws forwarding, keeps the cap and permits an explicit retry", async () => {
+    let confirmed = false;
+    const unavailable: string[] = [];
+    const f = manager({ maxRunning: 1, onUnavailable: id => void unavailable.push(id), stopOwner: async () => {
+      if (!confirmed) throw new Error("tree observation failed");
+    } });
+    f.setUp(true);
+    await f.instance.start("s", "/w");
+    await f.instance.waitForSettled("s", 2_000);
+    await expect(f.instance.stop("s", "agent")).rejects.toThrow("tree observation failed");
+    expect(f.instance.status("s")).toMatchObject({ state: "failed", url: null, message: expect.stringContaining("unconfirmed") });
+    expect(f.instance.originFor("s")).toBeNull();
+    expect(f.stopped).toEqual([]);
+    expect(unavailable).toContain("s");
+    expect(await f.instance.start("other", "/other")).toMatchObject({ state: "failed", message: expect.stringContaining("limit is 1") });
+    await expect(f.instance.start("s", "/w")).rejects.toThrow("tree observation failed");
+    expect(f.children).toHaveLength(1);
+    confirmed = true;
+    expect(await f.instance.stop("s", "agent")).toMatchObject({ state: "stopped" });
+    expect(await f.instance.start("other", "/other")).toMatchObject({ state: "starting" });
+    await f.instance.close();
+  });
+
+  it("does not turn a leader exit into confirmed group exit or forget its capacity", async () => {
+    const f = manager({ maxRunning: 1, stopOwner: async () => { throw new Error("group survives its leader"); } });
+    f.setUp(true);
+    await f.instance.start("s", "/w");
+    await f.instance.waitForSettled("s", 2_000);
+    f.children[0]!.exit(0);
+    await vi.waitFor(() => expect(f.instance.status("s").message).toContain("unconfirmed"));
+    expect(f.stopped).toEqual([]);
+    expect(await f.instance.start("other", "/other")).toMatchObject({ state: "failed" });
+    expect(f.children).toHaveLength(1);
+    await expect(f.instance.close()).rejects.toThrow("cleanup remains unconfirmed");
+  });
+
+  it("does not advance from setup while the exited setup group remains unconfirmed", async () => {
+    const f = manager({ stopOwner: async () => { throw new Error("setup descendants survive"); } },
+      { ok: true, plan: { command: "npm run dev", install: "npm install", healthPath: "/", env: {}, source: "inferred", explanation: "x", notes: [] } });
+    await f.instance.start("s", "/w");
+    await vi.waitFor(() => expect(f.children).toHaveLength(1));
+    f.children[0]!.exit(0);
+    await vi.waitFor(() => expect(f.instance.status("s").message).toContain("unconfirmed"));
+    expect(f.children).toHaveLength(1);
+    expect(f.stopped).toEqual([]);
+    await expect(f.instance.close()).rejects.toThrow("cleanup remains unconfirmed");
+  });
+
+  it("never reports running after failed identity capture and retains the unknown reservation", async () => {
+    const f = manager({ maxRunning: 1, captureOwner: pid => ({ ...fixtureOwner(pid), process: null }),
+      stopOwner: async () => { throw new Error("original identity unknown"); } });
+    f.setUp(true);
+    await f.instance.start("s", "/w");
+    await vi.waitFor(() => expect(f.instance.status("s").message).toContain("unconfirmed"));
+    expect(f.instance.originFor("s")).toBeNull();
+    expect(f.stopped).toEqual([]);
+    expect(await f.instance.start("other", "/other")).toMatchObject({ state: "failed" });
+    await expect(f.instance.close()).rejects.toThrow("cleanup remains unconfirmed");
+  });
+
+  it("stopAll attempts every owner and reports failure after the other owner stopped", async () => {
+    const calls: number[] = [];
+    const f = manager({ stopOwner: async owner => { calls.push(owner.pid!); if (owner.pid === 1000) throw new Error("first survives"); } });
+    f.setUp(true);
+    await f.instance.start("a", "/a");
+    await f.instance.start("b", "/b");
+    await f.instance.waitForSettled("b", 2_000);
+    await expect(f.instance.stopAll("lease_lost")).rejects.toThrow("cleanup remains unconfirmed");
+    expect(calls).toEqual([1000, 1001]);
+    expect(f.instance.status("b")).toMatchObject({ state: "stopped" });
+    expect(f.instance.status("a")).toMatchObject({ state: "failed" });
+    expect(f.stopped).toEqual(["b"]);
   });
 });
 
 describe("preview process registry (restart never adopts)", () => {
-  it("kills only recorded process groups whose start identity still matches, then forgets them", async () => {
+  it("retires confirmed owners but preserves a failed owner for restart recovery", async () => {
     const file = join(dir, "preview-processes.json");
-    const identities = new Map<number, string>([[501, "start-a"], [502, "start-b"]]);
-    const registry = new PreviewProcessRegistry(file, pid => identities.get(pid) ?? null);
-    await registry.record(501);
-    await registry.record(502);
-    expect(JSON.parse(await readFile(file, "utf8"))).toEqual([{ pid: 501, token: "start-a" }, { pid: 502, token: "start-b" }]);
-    identities.set(502, "reused-pid");
+    const registry = new PreviewProcessRegistry(file);
+    const first = fixtureOwner(501), second = fixtureOwner(502);
+    await registry.retain(first);
+    await registry.retain(second);
     const signalled: number[] = [];
-    const next = new PreviewProcessRegistry(file, pid => identities.get(pid) ?? null);
-    expect(await next.sweep(pid => void signalled.push(pid))).toBe(1);
+    const next = new PreviewProcessRegistry(file, { stop: async owner => {
+      if (owner.pid === 502) throw new Error("identity changed");
+      signalled.push(owner.pid!);
+    } });
+    await expect(next.sweep()).rejects.toThrow("startup is fenced");
     expect(signalled).toEqual([501]);
-    expect(JSON.parse(await readFile(file, "utf8"))).toEqual([]);
+    expect(JSON.parse(await readFile(file, "utf8"))).toEqual([second]);
   });
 
   it("does nothing on a clean start", async () => {
     await writeFile(join(dir, "other"), "");
-    const registry = new PreviewProcessRegistry(join(dir, "preview-processes.json"), () => "x");
-    expect(await registry.sweep(() => { throw new Error("never"); })).toBe(0);
+    const registry = new PreviewProcessRegistry(join(dir, "preview-processes.json"), { stop: async () => { throw new Error("never"); } });
+    expect(await registry.sweep()).toBe(0);
   });
 });

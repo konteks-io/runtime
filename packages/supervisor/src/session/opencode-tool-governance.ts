@@ -1,6 +1,6 @@
 import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import { isDeniedBrowserTool } from "@konteks/remote-agent-runner";
-import { isWithinWorkspace } from "./workspace-tool-policy.js";
+import { isWithinReadRoots, isWithinWorkspace } from "./workspace-tool-policy.js";
 import { rebuiltRequest, refusal, resolveIn } from "./host-decisions.js";
 import { CODE_MODE_ACCEPTED_FORM, parseKonteksCodeModeBlock, type CodeModeCall } from "./opencode-code-mode.js";
 import type { HostPermissionContext, HostPermissionDecision, HostToolBypass, HostToolGovernance } from "./host-tool-governance.js";
@@ -8,10 +8,10 @@ import type { HostPermissionContext, HostPermissionDecision, HostToolBypass, Hos
 /**
  * Permission parity for OpenCode 2.
  *
- * OpenCode runs with the locked Konteks configuration (`* ask` first, reads
- * and searches allowed, `external_directory` and the built-in browser denied;
- * agent-runner `host/opencode.ts`), so every other tool asks through ACP
- * `session/request_permission` before it runs. This judges each request by
+ * OpenCode runs with the locked Konteks configuration (`* ask` first, named
+ * reads and searches asking, `external_directory` and the built-in browser
+ * denied; agent-runner `host/opencode.ts`), so these tools ask through ACP
+ * `session/request_permission` before they run. This judges each request by
  * what the tool call really is, never by the request's own title:
  * - the tool is the name OpenCode gives the call's FIRST `tool_call` (`shell`,
  *   `edit`, `execute`, …), recorded as calls are seen; a subagent's calls
@@ -24,7 +24,8 @@ import type { HostPermissionContext, HostPermissionDecision, HostToolBypass, Hos
  *   refused; edit/write/patch → every file, resolved against the working copy,
  *   all inside it, then the policy's workspace check; Code Mode (`execute`)
  *   → approved only in the accepted form (opencode-code-mode.ts) and only for
- *   this session's own Konteks servers; a `.env` read → refused; a subagent,
+ *   this session's own Konteks servers; read/search → every named path inside
+ *   the working copy or selected skill folders; a `.env` read → refused; a subagent,
  *   todo list or web fetch → as for the other agents;
  * - an uncorrelated request, an unknown tool or a mismatch → refused. Never
  *   `allow_always` (OpenCode would store it in its database and stop asking).
@@ -33,7 +34,7 @@ import type { HostPermissionContext, HostPermissionDecision, HostToolBypass, Hos
  * stop honouring, so `observe` is the tripwire (as for DeepSeek Harness): a
  * gated tool that completes without having asked, a Code Mode block whose
  * `rawOutput.metadata.toolCalls` lists a call Konteks did not approve, or a
- * read of `.env` or outside the working copy that ran unasked, all report a
+ * named file tool that ran unasked, all report a
  * bypass and the session quarantines OpenCode on this connector.
  *
  * What 2.0.18 does NOT let Konteks judge beforehand: Code Mode
@@ -58,8 +59,8 @@ export const OPENCODE_TOOL_KINDS: Readonly<Record<string, string>> = Object.free
 const SHELL = new Set(["shell", "bash"]);
 const EDIT = new Set(["write", "edit", "patch", "apply_patch"]);
 const SEARCH = new Set(["read", "grep", "glob", "list"]);
-/** Tools the locked configuration lets run without asking (`read` of a `.env` file excepted). */
-const UNGATED = new Set(["read", "grep", "glob", "list", "todowrite", "todoread"]);
+/** Inert todo tools may run without asking; named filesystem tools must ask. */
+const UNGATED = new Set(["todowrite", "todoread"]);
 /** The Code Mode catalogue lookup (`tools.search`): it runs without asking and calls nothing. */
 const CATALOGUE_LOOKUPS = new Set(["search", "tools.search"]);
 /**
@@ -167,15 +168,6 @@ function privateEnvFile(path: string): boolean {
   return ENV_FILE.test(path) && !ENV_EXAMPLE.test(path);
 }
 
-/** An allowed read or search that reached a `.env` file or left the working copy should have asked or been refused. */
-function ungatedOverreach(toolCallId: string, observed: ObservedCall, cwd: string): HostToolBypass | null {
-  for (const path of namedPaths(observed.rawInput)) {
-    const absolute = resolveIn(cwd, path);
-    if ((observed.tool === "read" && privateEnvFile(absolute)) || !isWithinWorkspace(absolute, cwd)) return { toolCallId, title: observed.tool };
-  }
-  return null;
-}
-
 /** A permission request next to the input its call reported. */
 interface AskedRequest {
   request: RequestPermissionRequest;
@@ -213,9 +205,25 @@ function editDecision(r: AskedRequest, tool: string): HostPermissionDecision {
   return rebuiltRequest(r.request, r.toolCallId, { kind: "edit", title: tool, rawInput: { file_path: paths[0] }, locations: paths.map(path => ({ path })) });
 }
 
+/** The pinned glob provider treats these string sentinels as an omitted path. */
+function searchInput(input: Record<string, unknown>, tool: string): Record<string, unknown> {
+  return tool === "glob" && (input.path === "undefined" || input.path === "null") ? { ...input, path: undefined } : input;
+}
+
+/** OpenCode 2.0.18 defaults an omitted grep/glob path to the session Location. */
+function searchPaths(r: AskedRequest, tool: string): string[] {
+  const lookup = { ...r, asked: searchInput(r.asked, tool), seen: searchInput(r.seen, tool) };
+  const paths = namedAbsolutePaths(lookup);
+  if (paths.length > 0) return paths;
+  if (tool !== "grep" && tool !== "glob") return [];
+  if (lookup.asked.path !== undefined || lookup.seen.path !== undefined) return [];
+  return [r.context.cwd];
+}
+
 function searchDecision(r: AskedRequest, tool: string): HostPermissionDecision {
-  const paths = namedAbsolutePaths(r);
-  if (paths.some(path => !isWithinWorkspace(path, r.context.cwd))) return refusal("a path outside the working copy");
+  const paths = searchPaths(r, tool);
+  if (paths.length === 0) return refusal("the read or search call names no path; provide an explicit path");
+  if (paths.some(path => !isWithinReadRoots(path, r.context.cwd, r.context.readOnlyRoots))) return refusal("a path outside the working copy and selected skill folders");
   if (tool === "read" && paths.some(privateEnvFile)) return refusal("reading a .env file is not allowed");
   return rebuiltRequest(r.request, r.toolCallId, { kind: "read", title: tool, rawInput: {}, locations: paths.map(path => ({ path })) });
 }
@@ -242,14 +250,14 @@ export class OpenCodeToolGovernance implements HostToolGovernance {
 
   constructor(private readonly limit = 512) {}
 
-  observe(update: unknown, cwd: string): HostToolBypass | null {
+  observe(update: unknown, _cwd: string, _readOnlyRoots: readonly string[] = []): HostToolBypass | null {
     const value = record(update);
     const toolCallId = typeof value.toolCallId === "string" ? value.toolCallId : undefined;
     if (toolCallId === undefined) return null;
     const input = record(value.rawInput);
     if (value.sessionUpdate === "tool_call" || (value.sessionUpdate === "tool_call_update" && !this.terminal(value.status))) return this.observeRunning(toolCallId, value, input);
     if (value.sessionUpdate !== "tool_call_update") return null;
-    return this.observeEnd(toolCallId, value, input, cwd);
+    return this.observeEnd(toolCallId, value);
   }
 
   private observeRunning(toolCallId: string, value: Record<string, unknown>, input: Record<string, unknown>): null {
@@ -270,18 +278,16 @@ export class OpenCodeToolGovernance implements HostToolGovernance {
     return null;
   }
 
-  private observeEnd(toolCallId: string, value: Record<string, unknown>, input: Record<string, unknown>, cwd: string): HostToolBypass | null {
+  private observeEnd(toolCallId: string, value: Record<string, unknown>): HostToolBypass | null {
     const status = value.status;
     const observed = this.calls.get(toolCallId);
     const block: BlockDecision = { askedFirst: this.asked.has(toolCallId), approved: this.approved.get(toolCallId), refusedBlock: this.refused.has(toolCallId) };
     this.forget(toolCallId);
     if (!observed || status === "cancelled") return null;
-    if (Object.keys(input).length > 0) observed.rawInput = input;
     if (observed.tool === "execute") return unapprovedCodeModeCall(toolCallId, value.rawOutput, block);
     // Only a call that ran to completion did something.
     if (status !== "completed" || block.askedFirst) return null;
-    if (!UNGATED.has(observed.tool)) return { toolCallId, title: observed.tool };
-    return ungatedOverreach(toolCallId, observed, cwd);
+    return UNGATED.has(observed.tool) ? null : { toolCallId, title: observed.tool };
   }
 
   decide(request: RequestPermissionRequest, context: HostPermissionContext): HostPermissionDecision {

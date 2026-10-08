@@ -1,12 +1,12 @@
 import { mkdir, readFile } from "node:fs/promises";
 import type { InitializeResponse } from "@agentclientprotocol/sdk";
-import { join } from "node:path";
-import { RemoteInstanceError, createLogger, withoutUndefined, writeSecretFile, type AgentLoginOptionId, type ConnectedAgentCredential, type ConnectedAgentView, type Logger, type RetainedProcessOwner } from "@konteks/remote-common";
+import { join, resolve } from "node:path";
+import { RemoteInstanceError, createLogger, stopRetainedProcessOwner, withoutUndefined, writeSecretFile, type AgentLoginOptionId, type ConnectedAgentCredential, type ConnectedAgentView, type Logger, type RetainedProcessOwner } from "@konteks/remote-common";
 import type { AgentBridgeFamily } from "@konteks/remote-release";
 import { fallbackLoginIdentity, probeIdentity, type IdentityProbe } from "./auth/identity.js";
 import { runLogout, startLoginFlow, type LoginFailureReason, type LoginFlow } from "./auth/login-flow.js";
 import { hostAgentRunnerAdapter } from "./host/registry.js";
-import { DEFAULT_HOST_AGENT_SETTINGS, type HostAgentRunnerAdapter, type HostAgentSettings, type HostLoginRequest, type HostSpawn, type HostWorkingCopyBinding } from "./host/host-agent.js";
+import { DEFAULT_HOST_AGENT_SETTINGS, type HostAgentRunnerAdapter, type HostAgentSettings, type HostLoginRequest, type HostSpawn, type HostFileAuthority, type HostWorkingCopyBinding } from "./host/host-agent.js";
 import { AgentScopeStore, applyIdentityObservation, type AgentScopeState } from "./auth/scope-store.js";
 import { classifyBridgeError, spawnBridge, type BridgeClientHandlers, type BridgeProcess, type BridgeStopOwner, type SpawnBridgeOptions } from "./bridge/process.js";
 import { MODEL_DISCOVERY_MIN_SESSION_TIMEOUT_MS, definiteModelDiscoveryFailure, discoverBridgeModelCapability, offerableModelCapability, type DiscoveredBridgeModelCapability } from "./bridge/model-capability.js";
@@ -256,6 +256,43 @@ function bootstrapLifecycle(lifecycle: SessionLifecycle | undefined, owners: { d
   };
 }
 
+/** The same local authority may be represented by reordered or duplicate roots. */
+function sameFileAuthority(authority: HostFileAuthority, cwd: string, readOnlyRoots: readonly string[]): boolean {
+  const roots = (values: readonly string[]) => [...new Set(values.map(value => resolve(value)))].sort();
+  return resolve(authority.cwd) === resolve(cwd) && JSON.stringify(roots(authority.readOnlyRoots)) === JSON.stringify(roots(readOnlyRoots));
+}
+
+/** Windows tree stop precedes leader cleanup; POSIX group stop gets an independent absence check. */
+async function stopBoundProcess(owner: BridgeStopOwner, stop: () => Promise<void>): Promise<void> {
+  const retained = owner.retainedProcessOwner;
+  if (!retained) throw new RemoteInstanceError("recovery_required", "Bound execution process ownership is unavailable.");
+  if (process.platform === "win32") await stopRetainedProcessOwner(retained);
+  await stop();
+  if (process.platform !== "win32") await stopRetainedProcessOwner(retained);
+}
+
+/** Profile ownership outlives a leader exit: release only after exact group stop. */
+function boundStopOwner(process: BridgeStopOwner, binding: HostWorkingCopyBinding | null): BridgeStopOwner {
+  if (!binding?.authority) return process;
+  const stop = process.stop.bind(process);
+  let stopping: Promise<void> | undefined;
+  let stopConfirmed = false;
+  return {
+    get exited() { return process.exited; },
+    ...(process.retainedProcessOwner ? { retainedProcessOwner: process.retainedProcessOwner } : {}),
+    stop: () => {
+      if (stopping) return stopping;
+      const attempt = Promise.resolve().then(async () => {
+        if (!stopConfirmed) { await stopBoundProcess(process, stop); stopConfirmed = true; }
+        await binding.release();
+      });
+      stopping = attempt;
+      void attempt.catch(() => { if (stopping === attempt) stopping = undefined; });
+      return attempt;
+    },
+  };
+}
+
 export class AgentRuntime {
   readonly events: RunnerEventBus;
   readonly sessions: SessionManager;
@@ -287,9 +324,9 @@ export class AgentRuntime {
   private quarantined: string | null = null;
   /** A host-installed agent's adapter (DeepSeek Harness, OpenCode); null for a bundled agent. */
   private readonly host: HostAgentRunnerAdapter | null;
-  /** Each execution process of this agent serves one working copy and is never reused by another session (OpenCode). */
+  /** Each execution child serves one working copy or fixed read authority; another session never reuses it. */
   private readonly perWorkingCopy: boolean;
-  /** What each such process holds on its working copy, released when it exits. */
+  /** Process-local preparations; fixed read authority lasts through qualified owned group/tree cleanup. */
   private readonly workingCopyBindings = new WeakMap<BridgeProcess, HostWorkingCopyBinding>();
   /** Core's settings for host agents on this computer (free models, route billing). */
   private hostSettings: HostAgentSettings = DEFAULT_HOST_AGENT_SETTINGS;
@@ -352,11 +389,12 @@ export class AgentRuntime {
   }
 
   /** With execution processes, every session gets one of its own (and a fresh one when bootstrap must retry). */
-  private executionBridgeHooks(): Pick<SessionManagerOptions, "createBridge" | "replaceBridge"> {
+  private executionBridgeHooks(): Pick<SessionManagerOptions, "createBridge" | "replaceBridge" | "rebindBridge"> {
     if (!this.options.executionBridgeLimit) return {};
     return {
-      createBridge: (ref, lifecycle, cwd) => this.acquireBootstrapExecutionBridge(ref, 1, undefined, lifecycle, cwd),
-      replaceBridge: (ref, previous, bootstrapAttempt, lifecycle, cwd) => this.replaceBootstrapExecutionBridge(ref, previous, bootstrapAttempt, lifecycle, cwd),
+      createBridge: (ref, lifecycle, cwd, roots) => this.acquireBootstrapExecutionBridge(ref, 1, undefined, lifecycle, cwd, roots),
+      replaceBridge: (ref, previous, bootstrapAttempt, lifecycle, cwd, roots) => this.replaceBootstrapExecutionBridge(ref, previous, bootstrapAttempt, lifecycle, cwd, roots),
+      ...(this.perWorkingCopy ? { rebindBridge: (ref: string, previous: BridgeProcess, lifecycle: SessionLifecycle | undefined, cwd: string, roots: readonly string[], retirePrevious: () => Promise<void>) => this.rebindExecutionBridge(ref, previous, lifecycle, cwd, roots, retirePrevious) } : {}),
     };
   }
 
@@ -454,9 +492,9 @@ export class AgentRuntime {
     return held;
   }
 
-  private createExecutionBridge(ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string): Promise<BridgeProcess> {
+  private createExecutionBridge(ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string, readOnlyRoots: readonly string[] = []): Promise<BridgeProcess> {
     const queueMs = this.host?.processLimits?.queueMs;
-    return queueMs === undefined ? this.reserveExecutionBridge(ref, lifecycle, cwd) : this.queueForExecutionBridge(ref, Date.now() + queueMs, lifecycle, cwd);
+    return queueMs === undefined ? this.reserveExecutionBridge(ref, lifecycle, cwd, readOnlyRoots) : this.queueForExecutionBridge(ref, Date.now() + queueMs, lifecycle, cwd, readOnlyRoots);
   }
 
   /**
@@ -465,10 +503,10 @@ export class AgentRuntime {
    * or its resident process being taken frees one. Past the wait it is
    * refused plainly; nothing was reserved.
    */
-  private async queueForExecutionBridge(ref: string, until: number, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string): Promise<BridgeProcess> {
+  private async queueForExecutionBridge(ref: string, until: number, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string, readOnlyRoots: readonly string[] = []): Promise<BridgeProcess> {
     for (let logged = false; ; logged = true) {
       const limit = this.executionLimit();
-      if (!this.waitsForCapacity(ref, limit)) return this.reserveExecutionBridge(ref, lifecycle, cwd);
+      if (!this.waitsForCapacity(ref, limit)) return this.reserveExecutionBridge(ref, lifecycle, cwd, readOnlyRoots);
       if (Date.now() >= until) {
         throw new RemoteInstanceError("temporarily_unavailable", `${this.family.displayName} is already running ${limit} sessions on this computer. Try again when one of them finishes.`, { diagnostic: "execution_processes_busy" });
       }
@@ -506,7 +544,7 @@ export class AgentRuntime {
     );
   }
 
-  private reserveExecutionBridge(ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string): Promise<BridgeProcess> {
+  private reserveExecutionBridge(ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string, readOnlyRoots: readonly string[] = []): Promise<BridgeProcess> {
     const refusal = this.reservationRefusal(ref);
     if (refusal) return Promise.reject(refusal);
     const bridge = Promise.resolve().then(async () => {
@@ -516,7 +554,7 @@ export class AgentRuntime {
       // A resident process costs this reference one `session/new`; only when
       // none is idle does it pay the spawn plus ACP `initialize`.
       const idle = this.perWorkingCopy ? null : this.takeIdleExecutionBridge();
-      return idle ? this.adoptIdleExecutionBridge(ref, idle, lifecycle) : this.spawnExecutionBridge(ref, lifecycle, cwd);
+      return idle ? this.adoptIdleExecutionBridge(ref, idle, lifecycle) : this.spawnExecutionBridge(ref, lifecycle, cwd, readOnlyRoots);
     });
     // Reserve the bounded owner before any executable await. Even a rejected
     // bootstrap retains its slot; no missing handle is interpreted as stopped.
@@ -525,52 +563,70 @@ export class AgentRuntime {
   }
 
   /**
-   * The spawn spec of one execution process: the runtime's own, or for an
-   * agent whose process serves one working copy (OpenCode), the environment
-   * its adapter prepared for exactly `cwd`, held until that process exits.
+   * The spawn spec of one execution process: the runtime's own, or the
+   * adapter's immutable working-copy profile, arguments, environment and cwd.
+   * Fixed read authority is held until qualified process-group/tree cleanup.
    */
-  private async executionSpec(cwd: string | undefined): Promise<{ spec: BridgeSpawnSpec; binding: HostWorkingCopyBinding | null }> {
+  private async executionSpec(cwd: string | undefined, readOnlyRoots: readonly string[]): Promise<{ spec: BridgeSpawnSpec; binding: HostWorkingCopyBinding | null }> {
     if (!this.perWorkingCopy) return { spec: this.spec, binding: null };
     if (cwd === undefined) throw new RemoteInstanceError("agent_unavailable", `${this.family.displayName} needs the session's working copy before it starts.`);
-    const binding = await this.host!.bindWorkingCopy!(this.options.config, this.family, cwd);
-    return { spec: { ...this.spec, env: binding.env }, binding };
+    const binding = await this.host!.bindWorkingCopy!(this.options.config, this.family, cwd, readOnlyRoots, this.spec.env);
+    return { spec: { ...this.spec, env: binding.env, args: binding.args === undefined ? this.spec.args : [...binding.args], cwd: binding.cwd ?? this.spec.cwd }, binding };
   }
 
   private releaseWorkingCopy(binding: HostWorkingCopyBinding | null): void {
     if (binding) void binding.release().catch(error => this.logger.warn({ agentId: this.family.agentId, err: error }, "working copy preparation could not be removed"));
   }
 
-  private async spawnExecutionBridge(ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string): Promise<BridgeProcess> {
+  private async spawnExecutionBridge(ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string, readOnlyRoots: readonly string[] = []): Promise<BridgeProcess> {
     const record = this.executionBridges.get(ref)!;
-    const start: { owner: BridgeProcess | null; exitedDuringStart: boolean; ownerPersistence: Promise<void> } = { owner: null, exitedDuringStart: false, ownerPersistence: Promise.resolve() };
-    const { spec, binding } = await this.executionSpec(cwd);
+    const start: { owner: BridgeProcess | null; processOwner?: BridgeStopOwner; exitedDuringStart: boolean; ownerPersistence: Promise<void> } = { owner: null, exitedDuringStart: false, ownerPersistence: Promise.resolve() };
+    const { spec, binding } = await this.executionSpec(cwd, readOnlyRoots);
     const candidate = await this.spawnProcess({
       spec, initializeTimeoutMs: this.options.config.RUNNER_INITIALIZE_TIMEOUT_MS,
       clientVersion: this.options.config.RUNNER_BRIDGE_VERSION, logger: this.logger,
       onProcessOwner: process => {
-        record.process = process;
-        record.durable = process;
-        start.ownerPersistence = this.persistProcessOwner(process, lifecycle);
+        const owned = boundStopOwner(process, binding);
+        start.processOwner = owned;
+        record.process = owned;
+        record.durable = owned;
+        start.ownerPersistence = this.persistProcessOwner(owned, lifecycle);
         return start.ownerPersistence;
       },
       ...this.executionSpawnHooks(),
-      handlers: this.executionHandlers(start, binding),
-    }).catch((error: unknown) => {
-      // A process that never started never exits: undo its preparation here.
-      this.releaseWorkingCopy(binding);
+      handlers: this.executionHandlers(start, binding, record),
+    }).catch(async (error: unknown) => {
+      await this.releaseFailedPreparation(record, binding);
       throw error;
     });
+    if (start.processOwner) candidate.stop = start.processOwner.stop;
     if (binding) this.workingCopyBindings.set(candidate, binding);
     await start.ownerPersistence;
     start.owner = candidate;
+    return this.finishExecutionStart(record, candidate, start.exitedDuringStart);
+  }
+
+  /** Install the initialized owner and reject any exit or stop seen during startup. */
+  private async finishExecutionStart(record: ExecutionOwner, candidate: BridgeProcess, exitedDuringStart: boolean): Promise<BridgeProcess> {
     record.process = candidate;
     record.live = candidate;
     record.durable ??= candidate;
-    if (this.stopping || record.stopping || start.exitedDuringStart || candidate.exited) {
+    if (this.stopping || record.stopping || exitedDuringStart || candidate.exited) {
       await candidate.stop();
       throw new RemoteInstanceError("agent_unavailable", "Execution bridge exited during initialization.");
     }
     return candidate;
+  }
+
+  private async releaseFailedPreparation(record: ExecutionOwner, binding: HostWorkingCopyBinding | null): Promise<void> {
+    if (!binding?.authority) { this.releaseWorkingCopy(binding); return; }
+    try {
+      if (record.process) return await record.process.stop();
+      throw new RemoteInstanceError("recovery_required", "Execution process ownership is uncertain.", { diagnostic: "execution_process_owner_unconfirmed" });
+    } catch (stopError) {
+      record.stopping = true;
+      throw new RemoteInstanceError("recovery_required", "Execution preparation is retained until owned cleanup is confirmed.", { cause: stopError, diagnostic: "execution_preparation_stop_unconfirmed" });
+    }
   }
 
   private executionSpawnHooks(): Pick<SpawnBridgeOptions, "spawnProcess" | "stderrFailure"> {
@@ -585,13 +641,18 @@ export class AgentRuntime {
    * reference reuses as-is: the session manager resolves every update,
    * permission, elicitation and exit to the sessions bound to exactly it.
    */
-  private executionHandlers(start: { owner: BridgeProcess | null; exitedDuringStart: boolean }, binding: HostWorkingCopyBinding | null): BridgeClientHandlers {
+  private executionHandlers(start: { owner: BridgeProcess | null; processOwner?: BridgeStopOwner; exitedDuringStart: boolean }, binding: HostWorkingCopyBinding | null, record: ExecutionOwner): BridgeClientHandlers {
     return {
       onSessionUpdate: params => this.sessions.onSessionUpdate(params, start.owner),
       onRequestPermission: params => this.sessions.onRequestPermission(params, start.owner),
       onCreateElicitation: params => this.sessions.onCreateElicitation(params, start.owner),
       onExit: () => {
-        this.releaseWorkingCopy(binding);
+        if (binding?.authority) {
+          void start.processOwner?.stop().catch(error => {
+            record.stopping = true;
+            this.logger.warn({ agentId: this.family.agentId, err: error }, "exited execution group cleanup remains unconfirmed");
+          });
+        } else this.releaseWorkingCopy(binding);
         if (!start.owner) { start.exitedDuringStart = true; return; }
         this.sessions.closeAll("agent_exited", start.owner);
         this.observeExecutionExit(start.owner);
@@ -613,8 +674,9 @@ export class AgentRuntime {
     bootstrapAttempt: number,
     lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"],
     cwd?: string,
+    readOnlyRoots: readonly string[] = [],
   ): Promise<{ bridge: BridgeProcess; bootstrapAttempt: number }> {
-    return this.acquireBootstrapExecutionBridge(ref, bootstrapAttempt, previous, lifecycle, cwd);
+    return this.acquireBootstrapExecutionBridge(ref, bootstrapAttempt, previous, lifecycle, cwd, readOnlyRoots);
   }
 
   /** Spawn/initialize belongs to the same four-attempt bootstrap budget as the
@@ -626,14 +688,57 @@ export class AgentRuntime {
     previous: BridgeProcess | undefined,
     lifecycle?: SessionLifecycle,
     cwd?: string,
+    readOnlyRoots: readonly string[] = [],
   ): Promise<{ bridge: BridgeProcess; bootstrapAttempt: number }> {
     const owners: { durablePrevious: RetainedProcessOwner | undefined } = { durablePrevious: previous ? this.retireBootstrapOwner(ref, previous, lifecycle) : undefined };
+    return this.acquireOwnedBootstrapBridge(ref, firstAttempt, owners, lifecycle, cwd, readOnlyRoots);
+  }
+
+  private async acquireOwnedBootstrapBridge(ref: string, firstAttempt: number, owners: { durablePrevious: RetainedProcessOwner | undefined }, lifecycle: SessionLifecycle | undefined, cwd: string | undefined, readOnlyRoots: readonly string[]): Promise<{ bridge: BridgeProcess; bootstrapAttempt: number }> {
     for (let bootstrapAttempt = firstAttempt; bootstrapAttempt <= 4; bootstrapAttempt += 1) {
-      const bridge = await this.bootstrapAttempt(ref, bootstrapAttempt, owners, lifecycle, cwd);
+      const bridge = await this.bootstrapAttempt(ref, bootstrapAttempt, owners, lifecycle, cwd, readOnlyRoots);
       if (bridge) return { bridge, bootstrapAttempt };
       await this.bootstrapPause(ref, bootstrapAttempt);
     }
     throw new RemoteInstanceError("agent_unavailable", "Bootstrap bridge retry budget exhausted.", { retryable: true });
+  }
+
+  /** Fixed-authority children are replaced before the provider resumes with new roots. */
+  private async rebindExecutionBridge(ref: string, previous: BridgeProcess, lifecycle: SessionLifecycle | undefined, cwd: string, readOnlyRoots: readonly string[], retirePrevious: () => Promise<void>): Promise<BridgeProcess> {
+    const authority = this.workingCopyBindings.get(previous)?.authority;
+    if (!authority) return previous;
+    if (sameFileAuthority(authority, cwd, readOnlyRoots)) return previous;
+    const owner = this.continuationOwner(ref, previous);
+    const durablePrevious = this.continuationProcessOwner(owner, lifecycle);
+    owner.stopping = true;
+    try {
+      try { await retirePrevious(); }
+      finally { await previous.stop(); }
+    }
+    catch (error) {
+      throw new RemoteInstanceError("recovery_required", "Previous file-authority process stop is unconfirmed.", { cause: error, diagnostic: "file_authority_rebind_stop_unconfirmed" });
+    }
+    lifecycle?.assertCurrent();
+    owner.finalized = true;
+    this.executionBridges.delete(ref);
+    const replacement = await this.acquireOwnedBootstrapBridge(ref, 1, { durablePrevious }, lifecycle, cwd, readOnlyRoots);
+    return replacement.bridge;
+  }
+
+  private continuationOwner(ref: string, previous: BridgeProcess): ExecutionOwner {
+    const owner = this.executionBridges.get(ref);
+    if (!owner || owner.live !== previous || owner.stopping || owner.finalized) {
+      throw new RemoteInstanceError("recovery_required", "Continuation has no matching execution process owner.");
+    }
+    return owner;
+  }
+
+  private continuationProcessOwner(owner: ExecutionOwner, lifecycle: SessionLifecycle | undefined): RetainedProcessOwner {
+    const durablePrevious = owner.durable?.retainedProcessOwner;
+    if (!durablePrevious || !lifecycle?.replaceProcessOwner) {
+      throw new RemoteInstanceError("recovery_required", "Durable continuation process-owner replacement is unavailable.");
+    }
+    return durablePrevious;
   }
 
   /** The confirmed-stopped pre-ready owner a replacement takes over; its durable owner is what the next candidate replaces. */
@@ -662,11 +767,11 @@ export class AgentRuntime {
   }
 
   /** The initialized candidate, or null when this attempt failed in a way worth a fresh one (its process already stopped). */
-  private async bootstrapAttempt(ref: string, bootstrapAttempt: number, owners: { durablePrevious: RetainedProcessOwner | undefined }, lifecycle: SessionLifecycle | undefined, cwd: string | undefined): Promise<BridgeProcess | null> {
+  private async bootstrapAttempt(ref: string, bootstrapAttempt: number, owners: { durablePrevious: RetainedProcessOwner | undefined }, lifecycle: SessionLifecycle | undefined, cwd: string | undefined, readOnlyRoots: readonly string[]): Promise<BridgeProcess | null> {
     const persisted: { candidate?: RetainedProcessOwner } = {};
     const initializeStartedAt = Date.now();
     try {
-      const bridge = await this.createExecutionBridge(ref, bootstrapLifecycle(lifecycle, owners, persisted), cwd);
+      const bridge = await this.createExecutionBridge(ref, bootstrapLifecycle(lifecycle, owners, persisted), cwd, readOnlyRoots);
       this.logger.info({
         agentId: this.family.agentId,
         acpSessionRef: ref,
@@ -865,8 +970,8 @@ export class AgentRuntime {
   private parkIdle(bridge: BridgeProcess, durable: BridgeStopOwner): boolean {
     // A later reference must record this process's durable owner; without a
     // captured identity there is nothing to record, so the process stops.
-    // A process serving one working copy (OpenCode) keeps that copy's
-    // instructions and its sessions' MCP servers, so no other session reuses it.
+    // A process bound to one working copy or fixed read authority keeps that
+    // profile for its lifetime, so no other session reuses it.
     if (this.perWorkingCopy) return false;
     if (this.stopping || bridge.exited || durable.retainedProcessOwner === undefined || this.idleExecutionBridge !== null || this.sessions.sessionsBoundTo(bridge) !== 0) return false;
     const entry: IdleExecutionBridge = { bridge, durable, authEpoch: this.authEpoch, expiry: setTimeout(() => void this.expireIdleExecutionBridge(entry), this.idleExecutionBridgeTtlMs()) };

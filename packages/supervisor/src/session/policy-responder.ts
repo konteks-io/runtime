@@ -1,8 +1,9 @@
 import type { CreateElicitationRequest, RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import type { PolicyEvaluator } from "@konteks/agent-core";
+import { nativePermissionEscalation, type NativeEscalationDecision } from "./native-permission-escalation.js";
 import { BROWSER_MCP_SERVER_NAME, browserToolFromTitle, isDeniedBrowserTool } from "@konteks/remote-agent-runner";
 import { permissionToolIdentity, type McpToolCallLedger, type PermissionToolIdentity } from "./permission-tool-identity.js";
-import type { PolicyRefusal, WorkspaceToolPolicyEvaluation } from "./workspace-tool-policy.js";
+import type { PolicyRefusal, WorkspaceToolPolicyContext, WorkspaceToolPolicyEvaluation } from "./workspace-tool-policy.js";
 
 /**
  * The ACP policy responder: a permission request or elicitation
@@ -16,12 +17,14 @@ import type { PolicyRefusal, WorkspaceToolPolicyEvaluation } from "./workspace-t
  * A deny carries why (two "Edit files" refusals once ended a repair turn
  * and nothing said which path was wrong): `message` is the note for the
  * agent and Konteks, `refusal` the detail the connector logs.
- * `allowOnceOnly`: whoever answers a deferred request may allow it once, never always (an integration gate's call).
+ * `allowOnceOnly` excludes persistent choices; `optionIds` also excludes
+ * native automatic-review choices. A Codex standalone manual grant is for the
+ * turn, which its deferred title states; it is not a per-call grant.
  */
 export type PolicyDecision =
   | { kind: "allow"; optionId: string }
   | { kind: "deny"; optionId: string | null; message?: string; refusal?: PolicyRefusal }
-  | { kind: "defer"; allowOnceOnly?: true };
+  | { kind: "defer"; allowOnceOnly?: true; optionIds?: readonly string[]; title?: string };
 
 /**
  * An MCP server and tools an integration binding admitted into this session
@@ -43,6 +46,8 @@ export interface PermissionContext {
   agentId: string;
   workspaceRoot: string;
   cwd?: string;
+  /** Local preparation authority; never read from tool arguments. */
+  readOnlyRoots?: readonly string[];
   browserTools?: boolean;
   sessionServers?: ReadonlySet<string>;
   ledger?: McpToolCallLedger;
@@ -61,6 +66,31 @@ function preferredOption(request: RequestPermissionRequest, kinds: readonly stri
     if (option) return option.optionId;
   }
   return null;
+}
+
+/** Apply the same finite choices before broker registration, digesting and
+ * relay display, so a withheld native option can never be selected later. */
+export function deferredPermissionRequest(request: RequestPermissionRequest, decision: Extract<PolicyDecision, { kind: "defer" }>): RequestPermissionRequest {
+  const options = request.options.filter(option => {
+    if (decision.allowOnceOnly && option.kind === "allow_always") return false;
+    return decision.optionIds?.includes(option.optionId) ?? true;
+  });
+  return { ...request, options, toolCall: { ...request.toolCall, ...(decision.title ? { title: decision.title } : {}) } };
+}
+
+function answerOptions(request: RequestPermissionRequest, escalation: NativeEscalationDecision | null): AnswerOptions {
+  const allow = preferredOption(request, ["allow_once"]);
+  if (escalation?.kind === "deny") return { allow, deny: escalation.optionId };
+  const eligible = escalation === null ? request : deferredPermissionRequest(request, escalation);
+  return { allow, deny: preferredOption(eligible, ["reject_once", "reject_always"]) };
+}
+
+/** The pinned Claude bridge presents PowerShell as kind=other. Its patched
+ * native identity still makes it an execution request subject to the blocklist. */
+function policyToolName(request: RequestPermissionRequest, context: PermissionContext, identity: PermissionToolIdentity): string {
+  const nativeShell = context.agentId === "claude-code" && identity.kind === "native" && (identity.tool === "Bash" || identity.tool === "PowerShell");
+  if (nativeShell) return "execute";
+  return request.toolCall.kind ?? request.toolCall.title ?? request.toolCall.toolCallId;
 }
 
 export function isSignInElicitation(request: CreateElicitationRequest): boolean {
@@ -120,6 +150,8 @@ function deniedBy(evaluation: WorkspaceToolPolicyEvaluation, deny: string | null
  * one-time allow is not allowed by policy); one it denies is answered
  * `reject_once`. With no evaluator the responder defers (when deferral is
  * allowed) so the governance loop's human path decides — never a silent allow.
+ * Explicit native authority escalation instead requires the finite human choice,
+ * or refusal when that choice is unavailable.
  *
  * Tool identity comes from structured fields only (`permission-tool-identity.ts`):
  * a display title may refuse a call, never allow one.
@@ -128,12 +160,13 @@ export class EvaluatorPolicyResponder implements PolicyResponder {
   constructor(private readonly evaluator: PolicyEvaluator | null, private readonly humanDeferralAllowed: () => boolean) {}
 
   async evaluatePermission(request: RequestPermissionRequest, context: PermissionContext): Promise<PolicyDecision> {
-    const options = { allow: preferredOption(request, ["allow_once"]), deny: preferredOption(request, ["reject_once", "reject_always"]) };
     const identity = context.toolIdentity ?? identityOf(request, context);
+    const escalation = nativePermissionEscalation(request, context, identity, this.humanDeferralAllowed);
+    const options = answerOptions(request, escalation);
     const ruled = browserRule(identity, request, context, options) ?? this.mcpRule(identity, context, options.deny);
     if (ruled) return ruled;
-    if (this.evaluator === null) return this.deferOrDeny(options.deny);
-    return this.evaluated(this.evaluator, request, context, options);
+    if (this.evaluator === null) return escalation ?? this.deferOrDeny(options.deny);
+    return this.evaluated(this.evaluator, request, context, options, identity, escalation);
   }
 
   /**
@@ -154,23 +187,26 @@ export class EvaluatorPolicyResponder implements PolicyResponder {
   }
 
   /**
-   * Policy judges the ACP tool kind (execute/edit/read/...), not a display
-   * title; a shell call without structured input is judged by its title.
+   * Policy judges the ACP kind, with the pinned Claude native shell identity
+   * normalized to execute. A shell lacking structured input uses its title.
    * `updatedInput` is never applied: an ACP answer can only allow or refuse
    * the call the agent named, never rewrite it.
    */
-  private async evaluated(evaluator: PolicyEvaluator, request: RequestPermissionRequest, context: PermissionContext, options: AnswerOptions): Promise<PolicyDecision> {
+  private async evaluated(evaluator: PolicyEvaluator, request: RequestPermissionRequest, context: PermissionContext, options: AnswerOptions, identity: PermissionToolIdentity, escalation: NativeEscalationDecision | null): Promise<PolicyDecision> {
     const toolCall = request.toolCall as PolicyToolCall;
-    const evaluation: WorkspaceToolPolicyEvaluation = await evaluator.evaluateToolUse({
-      toolName: toolCall.kind ?? toolCall.title ?? request.toolCall.toolCallId,
+    const policyContext: WorkspaceToolPolicyContext = {
+      toolName: policyToolName(request, context, identity),
       input: policyInput(toolCall),
       repoPath: context.cwd ?? context.workspaceRoot,
       workspaceRoot: context.workspaceRoot,
+      readOnlyRoots: context.readOnlyRoots ?? [],
       agentId: context.agentId,
       toolUseId: request.toolCall.toolCallId,
-    });
-    if (evaluation.allowed && options.allow !== null) return { kind: "allow", optionId: options.allow };
+    };
+    const evaluation: WorkspaceToolPolicyEvaluation = await evaluator.evaluateToolUse(policyContext);
     if (!evaluation.allowed) return deniedBy(evaluation, options.deny);
+    if (escalation !== null) return escalation;
+    if (options.allow !== null) return { kind: "allow", optionId: options.allow };
     return this.deferOrDeny(options.deny);
   }
 

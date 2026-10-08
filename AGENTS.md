@@ -99,6 +99,11 @@ Node 22 (`.nvmrc`; CI and releases use 22.23.2). From the repo root:
   (`packages/supervisor/src/control/handlers.ts`, `native/update.ts`). Raising
   the minimum together with the target cuts off every live older runtime; the
   two-step pin is in `ci-cd/RELEASE_PROCEDURE.md` (Stage 4, step 7).
+- **Retained Windows stop evidence.** Default identity and descendant queries
+  require successful structured observations. Query failure, timeout, malformed
+  output or unstable identity is `recovery_required`, never proof of absence.
+  Keep the exact durable owner and existing capacity/quiescence fences on an
+  unknown outcome; no elapsed timer certifies physical exit.
 - **Relay lease rotation.** Core holds a runtime's relay connection to the
   lease it handshook with (15 min), so `RelayClient.armLeaseRotation`
   re-handshakes with the current heartbeat lease 60 s before that one expires
