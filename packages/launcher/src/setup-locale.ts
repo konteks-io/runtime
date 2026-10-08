@@ -7,6 +7,9 @@ type ErrorValues = Values | ((locale: SetupLocale) => Values);
 
 /** Foreground setup copy only. Technical values and provider output are never translated. */
 const COPY = {
+  claudeLoginConnecting: ["Connecting to the local connector for Claude Code sign-in…", "Menghubungkan ke konektor lokal untuk masuk ke Claude Code…"],
+  claudeLoginSteps: ["Claude Code will open a browser link. Finish sign-in there; if it asks for an authorization code, paste it at the prompt below. Keep this terminal open; press Ctrl+C to cancel.", "Claude Code akan membuka tautan peramban. Selesaikan proses masuk di sana; jika diminta kode otorisasi, tempelkan pada perintah di bawah. Biarkan terminal ini terbuka; tekan Ctrl+C untuk membatalkan."],
+  claudeLoginRecovery: ["If no link appears, run `claude auth login` in a separate terminal to check Claude Code, and `konteks-remote doctor` to check the connector.", "Jika tautan tidak muncul, jalankan `claude auth login` di terminal lain untuk memeriksa Claude Code, dan `konteks-remote doctor` untuk memeriksa konektor."],
   foregroundInstall: ["Runtime setup", "Pemasangan runtime"],
   foregroundUpdate: ["Runtime update", "Pembaruan runtime"],
   phaseDownload: ["Downloading and verifying", "Mengunduh dan memverifikasi"],

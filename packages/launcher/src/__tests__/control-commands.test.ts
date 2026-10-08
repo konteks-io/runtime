@@ -81,6 +81,23 @@ function fake(options: { json?: boolean; confirm?: boolean; loginFailure?: boole
 }
 
 describe("native control commands", () => {
+  it("shows Claude sign-in guidance in the selected Indonesian locale", async () => {
+    const f = fake();
+    f.context.output = { ...f.context.output, setupLocale: "id" };
+    await authLogin(f.context, "claude-code", false);
+    expect(f.text()).toContain("Menghubungkan ke konektor lokal");
+    expect(f.text()).toContain("tekan Ctrl+C untuk membatalkan");
+    expect(f.text()).toContain("konteks-remote doctor");
+  });
+  it("explains Claude login before waiting for the connector", async () => {
+    const f = fake();
+    f.context.control.call = (async (_request: unknown, schema: { parse: (value: unknown) => unknown }) => {
+      expect(f.text()).toContain("Connecting to the local connector for Claude Code sign-in");
+      expect(f.text()).toContain("claude auth login");
+      return schema.parse({ loginId: "l1" });
+    }) as typeof f.context.control.call;
+    await authLogin(f.context, "claude-code", false);
+  });
   it("fails the command when the supervisor reports a failed login", async () => {
     const f = fake({ loginFailure: true });
     await expect(authLogin(f.context, "dsh", false)).rejects.toMatchObject({ code: "agent_auth_required", message: "the DeepSeek API key was not saved" });

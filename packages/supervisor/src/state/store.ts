@@ -115,10 +115,20 @@ const CursorsSchema = z.record(z.string(), z.object({ to_core: z.number().int().
   allocated: z.number().int().nonnegative().optional() }).strict());
 type Cursors = z.infer<typeof CursorsSchema>;
 
+// Epoch zero means queued before this process's first handshake. It is a
+// local replay record, never a wire frame: ChannelMux stamps the accepted
+// epoch on transmission. Keep every other shared frame constraint intact.
+const retainedEpoch = { connectionEpoch: z.number().int().nonnegative() };
+const [firstToCoreFrame, ...otherToCoreFrames] = ToCoreRelayFrameSchema.options;
+const RetainedToCoreRelayFrameSchema = z.discriminatedUnion("channel", [
+  firstToCoreFrame.extend(retainedEpoch),
+  ...otherToCoreFrames.map(frame => frame.extend(retainedEpoch)),
+]);
+
 const RelayDurableStateSchema = z.object({
   cursors: CursorsSchema,
   outbound: z.record(z.string(), z.array(z.object({
-    frame: ToCoreRelayFrameSchema,
+    frame: RetainedToCoreRelayFrameSchema,
     bytes: z.number().int().nonnegative(),
     enqueuedAt: z.number().int().nonnegative(),
   }).strict())),

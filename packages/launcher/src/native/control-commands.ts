@@ -139,6 +139,11 @@ export async function authLogin(context: ControlContext, agentId: string, organi
     const ok = await prompts.ask(setupWords(context.output, "organizationAttestation", { agent: agentId }));
     if (!ok) throw setupError("ownership_promotion_denied", "organizationDeclined");
   }
+  if (agentId === "claude-code") {
+    setupLine(context.output, "claudeLoginConnecting");
+    setupLine(context.output, "claudeLoginSteps");
+    setupLine(context.output, "claudeLoginRecovery");
+  }
   const relay = new LoginRelay(context, prompts, agentName(agentId), organization);
   try {
     await context.control.call({ op: "auth.login", agentId, organization, ...which }, z.object({ loginId: z.string() }), { onEvent: event => relay.onEvent(event), signal: relay.interrupted.signal, timeoutMs: 20 * 60_000 });

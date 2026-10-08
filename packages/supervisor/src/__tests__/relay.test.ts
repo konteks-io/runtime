@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
-import { createLogger, FixedClock, generateInstanceKey, logicalAssignmentRequestDigest, logicalAssignmentResponseDigest, verifyBody, type AssignmentReplyFrame, type AssignmentRequestFrame, type LogicalAssignmentRequestFrame, type RelayAck, type ToCoreRelayFrame, type ToRuntimeRelayFrame } from "@konteks/remote-common";
+import { createLogger, FixedClock, generateInstanceKey, logicalAssignmentRequestDigest, logicalAssignmentResponseDigest, ToCoreRelayFrameSchema, verifyBody, type AssignmentReplyFrame, type AssignmentRequestFrame, type LogicalAssignmentRequestFrame, type RelayAck, type ToCoreRelayFrame, type ToRuntimeRelayFrame } from "@konteks/remote-common";
 import { CHANNEL_LIVENESS_MS, ChannelMux } from "../relay/channel-mux.js";
 import type { MuxOptions } from "../relay/channel-mux.js";
 import { ReplayBuffer } from "../relay/replay-buffer.js";
@@ -705,22 +705,39 @@ describe("channel mux", () => {
 });
 
 
-it('persists a terminal session frame during fallback and replays it after process restart', async () => {
+it.each(['reconnect', 'restart'])('persists an offline terminal frame and replays it after %s', async recovery => {
   const { RelayTransport, TransportManager } = await import('../transport/relay-transport.js');
-  let durable: import('../relay/channel-mux.js').RelayDurableState | undefined;
-  const first = buildMux({ persistRelayState: async state => { durable = structuredClone(state); } });
-  const relay = new RelayTransport({ connected: false } as never, first.mux, { setHandler: () => {} });
-  const https = { kind: 'https', start: vi.fn(), send: vi.fn() };
-  const manager = new TransportManager(relay, https as never, 3, () => ({ connected: false, consecutiveFailures: 3 }));
-  manager.evaluate();
-  manager.send({ channel: 'session', channelId: 'session:s', body: { kind: 'acp_error', id: 'request', method: 'session/prompt', error: { code: -32000, message: 'Stopped' } } } as never);
-  await vi.waitFor(() => expect(durable?.outbound['session:s']).toHaveLength(1));
-  expect(https.send).not.toHaveBeenCalled(); expect(first.emitted).toHaveLength(0);
-  const restarted = buildMux();
-  restarted.mux.restoreDurableState(durable!, () => 'session');
-  await restarted.mux.applyHandshake({ connectionEpoch: 2, resume: { 'session:s': { to_core: 0, to_runtime: 0 } }, reset: [] });
-  expect(restarted.emitted).toHaveLength(1);
-  expect(restarted.emitted[0]).toMatchObject({ channelId: 'session:s', seq: 1, body: { kind: 'acp_error', id: 'request' } });
-  await restarted.mux.receive({ kind: 'ack', channelId: 'session:s', connectionEpoch: 2, cumulativeSeq: 1, issuedAt: restarted.clock.nowIso(), dataDirection: 'to_core', origin: 'grant_holder', grantId: 'grant' });
-  expect(restarted.mux.snapshot()[0]?.unacked).toBe(0);
+  const dir = await mkdtemp(join(tmpdir(), 'kr-relay-offline-'));
+  try {
+    const store = new SupervisorStore(dir);
+    let durable: import('../relay/channel-mux.js').RelayDurableState | undefined;
+    const first = buildMux({ persistRelayState: async state => {
+      await store.saveRelayState(state);
+      durable = await new SupervisorStore(dir).relayState() ?? undefined;
+    } });
+    const relay = new RelayTransport({ connected: false } as never, first.mux, { setHandler: () => {} });
+    const https = { kind: 'https', start: vi.fn(), send: vi.fn() };
+    const manager = new TransportManager(relay, https as never, 3, () => ({ connected: false, consecutiveFailures: 3 }));
+    manager.evaluate();
+    const terminal = { kind: 'acp_error' as const, id: 'request', method: 'session/prompt' as const, error: { code: -32000, message: 'Stopped', class: 'cancelled' as const, retryable: false } };
+    expect(ToCoreRelayFrameSchema.safeParse({ channel: 'session', direction: 'to_core', channelId: 'session:s', connectionEpoch: 2, seq: 1, issuedAt: first.clock.nowIso(), body: terminal }).success).toBe(true);
+    manager.send({ channel: 'session', channelId: 'session:s', body: terminal });
+    await vi.waitFor(() => expect(durable?.outbound['session:s']).toHaveLength(1));
+    const pending = durable!.outbound['session:s']![0]!.frame;
+    expect(pending.connectionEpoch).toBe(0);
+    expect(ToCoreRelayFrameSchema.safeParse(pending).success).toBe(false);
+    expect(() => store.saveRelayState({ ...durable!, outbound: { 'session:s': [{ ...durable!.outbound['session:s']![0]!, frame: { ...pending, connectionEpoch: -1 } }] } })).toThrow();
+    expect(() => store.saveRelayState({ ...durable!, outbound: { 'session:s': [{ ...durable!.outbound['session:s']![0]!, frame: { ...pending, body: { kind: 'unknown' } } as never }] } })).toThrow();
+    expect(https.send).not.toHaveBeenCalled(); expect(first.emitted).toHaveLength(0);
+    const recovered = recovery === 'restart' ? buildMux() : first;
+    if (recovery === 'restart') recovered.mux.restoreDurableState(durable!, () => 'session');
+    await recovered.mux.applyHandshake({ connectionEpoch: 2, resume: { 'session:s': { to_core: 0, to_runtime: 0 } }, reset: [] });
+    expect(recovered.emitted).toHaveLength(1);
+    expect(recovered.emitted[0]).toMatchObject({ channelId: 'session:s', seq: 1, connectionEpoch: 2, body: { kind: 'acp_error', id: 'request' } });
+    expect(ToCoreRelayFrameSchema.safeParse(recovered.emitted[0]).success).toBe(true);
+    await recovered.mux.receive({ kind: 'ack', channelId: 'session:s', connectionEpoch: 2, cumulativeSeq: 1, issuedAt: recovered.clock.nowIso(), dataDirection: 'to_core', origin: 'grant_holder', grantId: 'grant' });
+    expect(recovered.mux.snapshot()[0]?.unacked).toBe(0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
