@@ -1202,3 +1202,20 @@ test("Windows bootstrap reports a failed runtime start after an update", windows
 });
 
 test.after(() => rmSync(root, { recursive: true, force: true }));
+
+test("release bootstrap keeps downloads on its own tag when latest advances", { skip: process.platform === "win32" }, () => {
+  const sums = join(root, "SHA256SUMS");
+  const pub = join(root, "release-signing.pub");
+  const output = join(root, "install.sh");
+  const names = ["debian-amd64", "debian-arm64", "macos-amd64", "macos-arm64", "windows-amd64.exe"];
+  writeFileSync(sums, names.map(name => `${"a".repeat(64)}  konteks-remote-${name}`).join("\n") + "\n");
+  const source = readFileSync("bootstrap/install.sh", "utf8");
+  const key = source.match(/^PINNED_RELEASE_PUBKEY="([^"]+)"$/m)[1];
+  writeFileSync(pub, `-----BEGIN PUBLIC KEY-----\n${key}\n-----END PUBLIC KEY-----\n`);
+  execFileSync(process.execPath, ["scripts/bake-bootstrap.mjs", "--sums", sums, "--pub", pub, "--in", "bootstrap/install.sh", "--out", output, "--tag", "v0.12.8"]);
+  const baked = readFileSync(output, "utf8");
+  const assignment = baked.split("\n").find(line => line.startsWith("RELEASE_BASE="));
+  const resolve = override => execFileSync("sh", ["-c", `${assignment}\nprintf '%s' "$RELEASE_BASE"`], {encoding: "utf8", env: {...process.env, KONTEKS_RELEASE_BASE: override}});
+  assert.equal(resolve(""), "https://github.com/konteks-io/runtime/releases/download/v0.12.8");
+  assert.equal(resolve("https://example.test/release"), "https://example.test/release");
+});
