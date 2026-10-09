@@ -38,6 +38,7 @@ import { McpCapabilityFacade, type McpLocalTransportIdentity } from "../mcp/capa
 import { PREVIEW_WORK_KINDS, PreviewMcpServer, type SessionPreviewAccess } from "../preview/mcp-server.js";
 import { PreviewBrowserGateway } from "../preview/browser-gateway.js";
 import {
+  boundPublicToolTitle,
   canonicalizeAcpToolActivity,
   chunkOptions,
   contractIssue,
@@ -842,7 +843,7 @@ export class RelayedSession {
       toolCallId === undefined ? undefined : this.toolActivityIdentity.get(toolCallId),
     ) as Record<string, unknown>;
     return {
-      canonicalMessage: { ...message, params: { ...message.params, update: omitPrivateAcpToolPayload(canonicalUpdate) } },
+      canonicalMessage: { ...message, params: { ...message.params, update: boundPublicToolTitle(omitPrivateAcpToolPayload(canonicalUpdate)) } },
       canonicalIdentity: toolCallId === undefined ? undefined : toolIdentity(toolCallId, canonicalUpdate),
     };
   }

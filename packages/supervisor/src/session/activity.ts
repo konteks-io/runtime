@@ -37,6 +37,23 @@ export function omitPrivateAcpToolPayload(value: unknown): unknown {
     key !== "rawInput" && key !== "rawOutput" && key !== "_meta"));
 }
 
+/** Longer than a person reads on one tool line, well inside the relay's 2048. */
+export const PUBLIC_TOOL_TITLE_MAX = 600;
+
+/**
+ * Claude Code titles a shell call with its whole command, and a heredoc runs
+ * past the relay contract's 2048 characters: the update was refused whole, so
+ * the tool's own end never reached the page (10-09). Cut the public title
+ * instead; the call keeps its identity and status.
+ */
+export function boundPublicToolTitle(value: unknown): unknown {
+  const update = plainRecord(value);
+  if (update?.sessionUpdate !== "tool_call" && update?.sessionUpdate !== "tool_call_update") return value;
+  const title = update.title;
+  if (typeof title !== "string" || title.length <= PUBLIC_TOOL_TITLE_MAX) return value;
+  return { ...update, title: `${[...title].slice(0, PUBLIC_TOOL_TITLE_MAX - 1).join("").trimEnd()}…` };
+}
+
 type ToolCanonicalizer = (candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined) => unknown;
 
 /**

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { SessionToCoreMessageSchema } from "@konteks/remote-common";
 import {
+  boundPublicToolTitle,
   canonicalizeAcpToolActivity,
   chunkOptions,
   contractIssue,
@@ -183,5 +184,20 @@ describe("a Codex file search that finds nothing", () => {
     expect(canonicalizeAcpToolActivity(failed(1, "rg: notes: No such file"), "codex", { kind: "read", title: "List files" }))
       .toMatchObject({ status: "failed" });
     expect(canonicalizeAcpToolActivity(failed(1), "codex", { kind: "execute", title: "Run command" })).toMatchObject({ status: "failed" });
+  });
+});
+
+describe("a tool whose title is a long command", () => {
+  it("keeps its update, with the title cut to one readable line", () => {
+    // 10-09 03:14Z: Claude Code titled a heredoc command past 2048 characters; both updates were refused (`too_big`).
+    const title = `cat > notes.md <<'EOF'\n${"word ".repeat(600)}\nEOF`;
+    const message = (update: unknown) => ({ kind: "acp", method: "session/update", params: { sessionId: "acp-1", update } });
+    const update = { sessionUpdate: "tool_call_update", toolCallId: "toolu-1", title, status: "completed" };
+    expect(SessionToCoreMessageSchema.safeParse(message(update)).success).toBe(false);
+    const bounded = boundPublicToolTitle(update) as { title: string; status: string };
+    expect(SessionToCoreMessageSchema.safeParse(message(bounded)).success).toBe(true);
+    expect(bounded).toMatchObject({ status: "completed", title: expect.stringMatching(/^cat > notes\.md <<'EOF'.*…$/s) });
+    expect(bounded.title.length).toBeLessThanOrEqual(600);
+    expect(boundPublicToolTitle({ ...update, title: "ls" })).toEqual({ ...update, title: "ls" });
   });
 });
