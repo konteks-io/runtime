@@ -1,13 +1,16 @@
+import { openCodeSkillContent } from "./opencode-skill-content.js";
 import { randomBytes } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { RemoteInstanceError } from "@konteks/remote-common";
 
-const source = `export default {
+const source = `import { readFile } from "node:fs/promises";
+export default {
   id: "konteks-managed-skills-activation",
   async setup(context) {
     const { endpoint, token } = context.options;
+    const expectedContent = JSON.parse(await readFile(new URL("./skills.json", import.meta.url), "utf8"));
     const send = async action => {
       const response = await fetch(endpoint.replace(/ready$/, action), {
         method: "POST", headers: { authorization: "Bearer " + token },
@@ -46,6 +49,10 @@ const source = `export default {
       }
       const messages = input.messages.filter(message => message.id === selectedMessage.messageID && message.role === "user");
       if (messages.length !== 1) throw new Error("Konteks managed Skill load admission has no current native message");
+      const parts = messages[0].content;
+      if (!Array.isArray(parts) || expectedContent.some((text, index) => parts[index]?.type !== "text" || parts[index].text !== text)) {
+        throw new Error("Konteks managed Skill content verification failed");
+      }
       await deny();
     };
     const dispose = () => Promise.all(registrations.map(registration => registration.dispose()));
@@ -86,6 +93,7 @@ function close(server: Server): Promise<void> {
 
 /** Startup activation only. This acknowledgement never certifies a Skill load. */
 export async function createOpenCodeActivation(configHome: string, skillRoots: readonly string[] = []) {
+  const expectedContent = await openCodeSkillContent(skillRoots);
   await mkdir(configHome, { recursive: true, mode: 0o700 });
   const directory = await mkdtemp(join(configHome, ".managed-plugin-"));
   const token = randomBytes(32).toString("hex");
@@ -109,6 +117,7 @@ export async function createOpenCodeActivation(configHome: string, skillRoots: r
   server.headersTimeout = 5000;
   try {
     await writeFile(join(directory, "package.json"), JSON.stringify({ private: true, type: "module", main: "server.js" }), { mode: 0o600, flag: "wx" });
+    await writeFile(join(directory, "skills.json"), JSON.stringify(expectedContent), { mode: 0o600, flag: "wx" });
     await writeFile(join(directory, "server.js"), source, { mode: 0o600, flag: "wx" });
     const port = await listen(server);
     server.unref();

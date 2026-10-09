@@ -407,6 +407,8 @@ it("refuses unsupported native hook registrations without acknowledging readines
 it("selects native Skill attachments only from the exact authorized source files", async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "opencode-selection-"))); roots.push(root);
   const skillRoot = join(root, "review");
+  await mkdir(skillRoot, { mode: 0o700 });
+  await writeFile(join(skillRoot, "SKILL.md"), "---\nname: Review\n---\nOriginal content", { mode: 0o600 });
   const activation = await createOpenCodeActivation(root, [skillRoot]);
   type NativePrompt = { sessionID: string; messageID: string; prompt: { text?: string; skills?: { id: string }[] } };
   const callbacks = new Map<string, (input: NativePrompt) => Promise<void>>();
@@ -426,7 +428,9 @@ it("selects native Skill attachments only from the exact authorized source files
     const verify = callbacks.get("context")! as unknown as (input: unknown) => Promise<void>;
     await expect(verify({ sessionID: "other", messages: [{ id: "native-message", role: "user" }] })).rejects.toThrow(/current native message/);
     await expect(verify({ sessionID: "native-session", messages: [{ id: "old-message", role: "user" }] })).rejects.toThrow(/current native message/);
-    await expect(verify({ sessionID: "native-session", messages: [{ id: "native-message", role: "user" }] })).rejects.toThrow(/load admission is unavailable/);
+    const expectedContent = JSON.parse(await readFile(join(activation.plugin.package, "skills.json"), "utf8")) as string[];
+    await expect(verify({ sessionID: "native-session", messages: [{ id: "native-message", role: "user", content: [{ type: "text", text: "tampered" }] }] })).rejects.toThrow(/content verification failed/);
+    await expect(verify({ sessionID: "native-session", messages: [{ id: "native-message", role: "user", content: expectedContent.map(text => ({ type: "text", text })) }] })).rejects.toThrow(/load admission is unavailable/);
     await expect(select({ ...input, prompt: { skills: [{ id: "personal" }] } })).rejects.toThrow(/unauthorized/);
     await expect(verify({ sessionID: "native-session", messages: [{ id: "native-message", role: "user" }] })).rejects.toThrow(/current native message/);
     inventory.push({ id: "duplicate", path: join(skillRoot, "SKILL.md") });
