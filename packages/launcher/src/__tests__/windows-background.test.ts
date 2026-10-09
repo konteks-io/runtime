@@ -23,7 +23,6 @@ describe("Windows login background process", () => {
 describe.runIf(process.platform === "win32")("legacy Windows helper migration", () => {
   const root = "C:\\Users\\Ada\\AppData\\Local\\konteks-remote";
   const sid = "S-1-5-21-1-2-3-1001";
-  const program = win32.join(process.env.SystemRoot!, "System32", "wscript.exe");
   const argumentsFor = (root: string, quoted: boolean) => `//B //NoLogo //E:JScript ${quoted ? '"' : ""}${root}\\service.js${quoted ? '"' : ""}`;
   const cases = [
     { name: "historically generated unquoted helper", root, args: argumentsFor(root, false), accepted: true },
@@ -39,6 +38,7 @@ describe.runIf(process.platform === "win32")("legacy Windows helper migration", 
   ];
 
   it.each(cases)("checks $name against the actual generated migration predicate", testCase => {
+    const program = win32.join(process.env.SystemRoot!, "System32", "wscript.exe");
     const service = nativeServiceDefinition({ os: "windows", home: "C:\\Users\\Ada", root: testCase.root, executable: `${testCase.root}\\releases\\next\\konteks-connector.exe`, userId: sid });
     const context = Buffer.from(service.status.args.at(-1)!, "base64").toString("utf16le");
     // Replace only metadata presence and Task Scheduler I/O. The generated
