@@ -131,8 +131,8 @@ export class NativeExecutionGate {
     this.options.assertOwned();
     const { key, prior, replay } = this.priorAdmission(envelope);
     const claims = this.verifiedClaims(envelope, keys, prior, replay);
-    // A fresh Core-signed delivery permit may carry the turn's renewed lifetime.
-    if (!replay && delivery(claims)) await this.followCoreHorizon(Date.parse(claims.expiresAt));
+    // A fresh Core-signed permit may carry the turn's renewed lifetime.
+    if (!replay) await this.followCoreHorizon(Date.parse(claims.expiresAt));
     const authority = this.localAuthority(claims, replay);
     if (replay) return this.replayed({ key, envelope, authority }, prior!, claims);
     return this.consumeAndAdmit({ key, envelope, authority }, claims, keys);
@@ -460,13 +460,17 @@ export class NativeExecutionGate {
   /**
    * The check lease's verified claims. A genuine check that a slow Core
    * answered after its own expiry says nothing about the execution: it is
-   * asked again rather than stopping the agent.
+   * asked again rather than stopping the agent. Delivery, direct and
+   * Assistant turns alike are verified against the renewed view, so a lease
+   * Core renewed is adopted (10-09: a direct turn was fenced one hour after
+   * the session's first prompt).
    */
   private verifiedCheck(authority: Authority, lease: string, keys: ReadonlyMap<string, KeyObject>): CheckClaims {
     const checkInput = { lease, trustedKeys: keys, nowSeconds: Math.floor(this.options.clock.coreNow() / 1000), issuedAtToleranceSeconds: 1 };
     try {
-      return delivery(authority) ? verifyRemoteDeliveryCheckLease({ ...checkInput, currentAuthority: renewedView(authority, lease) })
-        : verifyRemoteExecutionCheckLease({ ...checkInput, currentAuthority: authority });
+      const currentAuthority = renewedView(authority, lease);
+      return delivery(currentAuthority) ? verifyRemoteDeliveryCheckLease({ ...checkInput, currentAuthority })
+        : verifyRemoteExecutionCheckLease({ ...checkInput, currentAuthority });
     } catch (error) {
       const reason = verificationReason(error);
       this.logger.warn({ event: "execution.check_refused", assignmentId: authority.assignmentId, attempt: authority.attempt,
@@ -477,9 +481,13 @@ export class NativeExecutionGate {
     }
   }
 
-  /** Core renewed this turn: the verified answer is the same authority with a later lifetime, held from now on. */
+  /**
+   * Core renewed this turn (a delivery, direct or Assistant turn): the
+   * verified answer is the same authority with a later lifetime, held from
+   * now on.
+   */
   private async followRenewedTurn(authority: Authority, claims: CheckClaims): Promise<void> {
-    if (!delivery(authority) || !(Date.parse(claims.expiresAt) > Date.parse(authority.expiresAt))) return;
+    if (!(Date.parse(claims.expiresAt) > Date.parse(authority.expiresAt))) return;
     await this.followCoreHorizon(Date.parse(claims.expiresAt));
     if (this.authority === authority) this.authority = { ...authority, expiresAt: claims.expiresAt };
   }
@@ -550,7 +558,7 @@ export class NativeExecutionGate {
   /**
    * The latest instant this assignment is known to be live: its own expiry,
    * or later where Core's verified checks have carried the local record
-   * (Core renews a live delivery turn past its issued hour).
+   * (Core renews a live delivery, direct or Assistant turn past its issued hour).
    */
   liveUntil(): number {
     const assignment = this.options.assignment;
@@ -711,7 +719,7 @@ function verificationReason(error: unknown): string {
 }
 
 /**
- * The authority a delivery check lease is verified against: the one held,
+ * The authority a check lease is verified against: the one held,
  * or, when Core's lease names a later `expiresAt`, the same authority with
  * that lifetime (Core renews a live turn). The lease is still verified
  * in full against it, signature and every other field, so nothing but the
