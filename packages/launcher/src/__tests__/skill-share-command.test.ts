@@ -33,6 +33,21 @@ function fixture(tty = false, json = false) {
 }
 
 describe("Skill sharing CLI", () => {
+  it("shows every selected audience and initiative before accepting ongoing publication", async () => {
+    const { context, call } = fixture(true);
+    vi.mocked(context.confirm!).mockResolvedValue(false);
+    await expect(
+      shareSkill(context, {
+        skill: "example",
+        systems: ["system-a", "system-b"],
+        initiatives: ["initiative-a", "initiative-b"],
+      }),
+    ).rejects.toThrow("cancelled");
+    const message = vi.mocked(context.confirm!).mock.calls[0]![0];
+    for (const scope of ["system-a", "system-b", "initiative-a", "initiative-b"])
+      expect(message).toContain(scope);
+    expect(call).toHaveBeenCalledTimes(1);
+  });
   it("preserves repeated system and initiative options", async () => {
     const control = vi.fn();
     const program = createNativeProgram({ control } as never);

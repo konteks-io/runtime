@@ -75,11 +75,13 @@ async function sharingConsent(
   context: ControlContext,
   options: SkillShareOptions,
   name: string,
+  selection: ReturnType<typeof RuntimeSkillShareRequestSchema.parse>,
 ): Promise<void> {
   const id = outputLocale(context.output) === "id";
+  const scopes = sharingScopeSummary(selection, id);
   const message = id
-    ? `Bagikan seluruh folder Skill ${name} dan izinkan publikasi otomatis perubahan berikutnya? Menghapus sumber lokal tidak membatalkan berbagi.`
-    : `Share the complete Skill folder ${name} and authorize automatic publication of subsequent edits? Deleting the local source does not unshare it.`;
+    ? `Bagikan seluruh folder Skill ${name} dan izinkan publikasi otomatis perubahan berikutnya? ${scopes} Menghapus sumber lokal tidak membatalkan berbagi.`
+    : `Share the complete Skill folder ${name} and authorize automatic publication of subsequent edits? ${scopes} Deleting the local source does not unshare it.`;
   if (options.confirmOngoingPublication) return;
   if (!interactive(context))
     throw new RemoteInstanceError(
@@ -98,6 +100,25 @@ async function sharingConsent(
       "prerequisite_missing",
       id ? "Berbagi Skill dibatalkan." : "Skill sharing cancelled.",
     );
+}
+
+function sharingScopeSummary(
+  selection: ReturnType<typeof RuntimeSkillShareRequestSchema.parse>,
+  id: boolean,
+): string {
+  const audience =
+    selection.audience.kind === "organization"
+      ? id
+        ? "Organisasi"
+        : "Organization"
+      : `${id ? "Sistem" : "Systems"}: ${selection.audience.systemRefs.join(", ")}`;
+  const context =
+    selection.context.kind === "initiatives"
+      ? `${id ? "Hanya inisiatif" : "Initiatives only"}: ${selection.context.initiativeRefs.join(", ")}`
+      : id
+        ? "Semua konteks yang diizinkan"
+        : "All authorized contexts";
+  return `${audience}. ${context}.`;
 }
 
 export async function shareSkill(
@@ -123,7 +144,7 @@ export async function shareSkill(
     context: contextScope,
     confirmation: { ongoingPublication: true },
   });
-  await sharingConsent(context, options, selected.name);
+  await sharingConsent(context, options, selected.name, selection);
   const publication = await context.control.call(
     {
       op: "skills.share",
