@@ -21,7 +21,9 @@ const source = `export default {
     const dispose = () => Promise.all(registrations.map(registration => registration.dispose()));
     try {
       for (const name of ["context", "http.request", "experimental.ws.send"]) {
-        registrations.push(await context.session.hook(name, deny));
+        const registration = await context.session.hook(name, deny);
+        if (typeof registration?.dispose !== "function") throw new Error("OpenCode native Skill hooks are unsupported");
+        registrations.push(registration);
       }
       await send("ready");
     } catch (error) {

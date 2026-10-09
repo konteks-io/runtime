@@ -384,3 +384,19 @@ it("registers provider-independent native request guards before activation", asy
     expect(dispose).toHaveBeenCalledTimes(3);
   } finally { await activation.release(); }
 });
+
+
+it("refuses unsupported native hook registrations without acknowledging readiness", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "opencode-unsupported-"))); roots.push(root);
+  const activation = await createOpenCodeActivation(root);
+  const dispose = vi.fn(async () => {});
+  const hook = vi.fn().mockResolvedValueOnce({ dispose }).mockResolvedValueOnce(undefined);
+  try {
+    const module = await import(pathToFileURL(join(activation.plugin.package, "server.js")).href);
+    await expect(module.default.setup({ options: activation.plugin.options, session: { hook } })).rejects.toThrow(/unsupported/);
+    expect(dispose).toHaveBeenCalledTimes(1);
+    const waiting = expect(activation.wait()).rejects.toMatchObject({ code: "agent_unavailable" });
+    await activation.release();
+    await waiting;
+  } finally { await activation.release(); }
+});
