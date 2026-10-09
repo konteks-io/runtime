@@ -1767,6 +1767,7 @@ export class Supervisor {
       this.validateRelayHandshake(result);
       this.transport.resumeAfterRecovery();
       await this.work.reports.flushAll();
+      this.requestAutomaticSkillSync();
       void this.ensureRuntimeUpdates()?.recover().catch(() => {
         this.logger.warn({ event: "runtime.update_report_pending" }, "runtime update outcome will be retried");
       });
