@@ -234,7 +234,7 @@ export class Reconciliation {
       const assertLease = this.deps.captureLeaseFence?.() ?? (() => undefined);
       assertCurrent = () => { assertApplication(); assertLease(); this.deps.assertOwned(); };
       return this.establish(assertCurrent);
-    });
+    }, "reconnect");
     // Recovery may touch an agent or a large journal. It never holds the
     // lease-acquisition lane needed for periodic authority renewal.
     await this.deps.afterEstablishment?.(assertCurrent);

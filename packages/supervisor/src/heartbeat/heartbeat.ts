@@ -181,7 +181,7 @@ export class HeartbeatPublisher {
         if (!this.stopped && (pending || this.running)) await this.options.onFailure(error);
         throw error;
       }
-    });
+    }, pending ? "pending heartbeat" : "heartbeat");
     flight.catch(() => undefined);
     // A flight that never settled once held the recovery cycle, shutdown and
     // the lease lane hostage: the process stayed alive with no timers and no
