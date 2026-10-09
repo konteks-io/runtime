@@ -494,6 +494,21 @@ describe("relayed session", () => {
       },
     } as RemoteWorkAssignment;
 
+    it("resumes a direct Codex thread on every turn: it has no MCP transport for the legacy check to protect", async () => {
+      // 10-09: a direct Codex session took the one-time legacy-thread load on
+      // its second turn and was refused on every turn after ("This message
+      // did not reach the agent"): a direct session never starts the
+      // capability facade, so it never records a local MCP transport.
+      const assertLegacyCodexThreadUnloaded = vi.fn(async () => false);
+      const codexDirect = { ...directWork, agentRoute: { ...directWork.agentRoute, agentId: "codex" } } as RemoteWorkAssignment;
+      const f = await build({ restoreReference: "acp-0", assertLegacyCodexThreadUnloaded }, codexDirect);
+      try {
+        await f.session.bootstrap();
+        expect(f.runner.createSession).toHaveBeenCalledWith(expect.objectContaining({ restoreAcpSessionRef: "acp-0" }), undefined);
+        expect(assertLegacyCodexThreadUnloaded).not.toHaveBeenCalled();
+      } finally { await f.session.close("cancelled"); }
+    });
+
     it("refuses new model policy before preparation and provider effects unless signed Core 7.4 is accepted", async () => {
       const prepareInputs = vi.fn();
       const f = await build(

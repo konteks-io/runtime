@@ -552,10 +552,16 @@ export class RelayedSession {
       { diagnostic: "legacy_mcp_thread_loaded_or_unverified" });
   }
 
+  /**
+   * A Codex thread whose platform MCP transport predates the retained one.
+   * Never a direct session's: it starts no capability facade, so it has no
+   * transport to refresh, and treating it as legacy spent the one-time
+   * legacy load on its second turn and refused every turn after.
+   */
   private legacyCodexTransport(reference: string | undefined): boolean {
     return (
       this.assignment.agentRoute.agentId === "codex" && Boolean(this.assignment.agentRoute.mcpCapabilityTokenRef) &&
-      Boolean(reference) && !this.deps.mcpLocalTransport
+      Boolean(reference) && !this.deps.mcpLocalTransport && !isDirectAssignment(this.assignment)
     );
   }
 
