@@ -177,9 +177,7 @@ async function fixture(sourceFiles: Record<string, string> = { "src/app.txt": "o
   };
 }
 
-// Each case stages real files and runs Git; the suite takes ~4.6 s on an idle
-// runner, so one case preparing twice can pass 5 s on a busy one (10-09).
-describe("native authorized input composition", { timeout: 20_000 }, () => {
+describe("native authorized input composition", () => {
   it("initializes Git for a repository source and preserves its baseline and edits on restart", async () => {
     const f = await fixture(),
       git = await testGitTool();
