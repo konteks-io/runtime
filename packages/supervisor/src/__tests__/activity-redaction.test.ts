@@ -170,8 +170,9 @@ describe("streamed activity redaction", () => {
     expect(redactStream(["I edited `", "/Users/oth", "er/app/x.ts` now"])).toBe("I edited `[local-path]` now");
     // A quoted root-anchored slip that is not a host path stays readable: a refusal quotes it back.
     expect(redactStream(["`/storefront/app/page.tsx` starts at the root"])).toBe("`/storefront/app/page.tsx` starts at the root");
-    // Globs and HTML are not paths.
+    // Globs and HTML are not paths, even with a closing tag split across chunks.
     expect(redactStream(["rg -g '!**/.DS_Store' and </p>"])).toBe("rg -g '!**/.DS_Store' and </p>");
+    expect(redactStream(["renders as <h2>Title</", "h2>. Added a test."])).toBe("renders as <h2>Title</h2>. Added a test.");
   });
 
   it("keeps Application Support inside a path when a chunk ends at its space", () => {

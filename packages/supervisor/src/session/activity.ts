@@ -447,7 +447,9 @@ export function endsInsidePath(text: string, previousEndedInPath: boolean, start
     if (TOKEN_DELIMITER.test(text[index]!)) { start = index; break; }
   }
   if (start === -1) return previousEndedInPath || (startsAtBoundary && PATH_TOKEN_START.test(text));
-  return PATH_TOKEN_START.test(text.slice(start + 1));
+  // After `<` it is a tag: a chunk ending "</" made the next chunk's "h2>" a
+  // path's continuation ("<h2>Title</[local-path]>", 10-09).
+  return text[start] !== "<" && PATH_TOKEN_START.test(text.slice(start + 1));
 }
 
 /** What follows an "Application" path end when the path is macOS's app-data folder. */
