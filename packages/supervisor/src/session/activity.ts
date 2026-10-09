@@ -403,6 +403,8 @@ interface ActivityTextOptions {
    * not a new word.
    */
   continuesApplication?: boolean;
+  /** The previous chunk ended on a backtick or `[`: a host path may open this one. */
+  afterQuote?: boolean;
 }
 
 const PATH_MASK = "[local-path]";
@@ -462,41 +464,73 @@ export interface ChunkTrail {
 
 /** How the next streamed chunk reads, given the stream's last one. */
 export function chunkOptions(previous: ChunkTrail | undefined): Required<ActivityTextOptions> {
-  const continuesPath = previous?.inPath ?? false;
-  const continuesApplication = previous?.endsOnApplication ?? false;
+  return trailOptions(previous ?? { text: "", inPath: false, output: "" }, previous === undefined);
+}
+
+function trailOptions(previous: ChunkTrail, first: boolean): Required<ActivityTextOptions> {
+  const continuesApplication = previous.endsOnApplication === true;
   return {
-    startsAtBoundary: continuesAtBoundary(previous?.text),
-    continuesPath,
+    startsAtBoundary: first || continuesAtBoundary(previous.text),
+    continuesPath: previous.inPath,
     // The space after "Application" may already have gone out after the mask.
-    afterMaskedPath: (continuesPath || continuesApplication) && /\[local-path\] ?$/.test(previous?.output ?? ""),
+    afterMaskedPath: (previous.inPath || continuesApplication) && /\[local-path\] ?$/.test(previous.output),
     continuesApplication,
+    afterQuote: /[`[]$/.test(previous.text),
   };
 }
 
 /** The trail after a chunk. One that was all continuation leaves the previous mask the one to continue. */
 export function nextTrail(previous: ChunkTrail | undefined, text: string, options: Required<ActivityTextOptions>, output: string): ChunkTrail {
-  // A chunk that is all "Support/…" after an "Application" end is still inside that path.
-  const inPath = (options.continuesApplication && APPLICATION_SUPPORT_TAIL.test(text) && !/[\s"'<>`)\]}=(]/.test(text.replace(/^ /, "")))
-    || endsInsidePath(text, options.continuesPath, options.startsAtBoundary);
-  const head = text.match(/^(.*\/Application) ?$/s)?.[1];
-  const endsOnApplication = head !== undefined && endsInsidePath(head, options.continuesPath, options.startsAtBoundary);
+  // A path that opens right after a backtick or bracket is a token start too.
+  const atBoundary = options.startsAtBoundary || options.afterQuote;
+  const inPath = allApplicationSupport(text, options) || endsInsidePath(text, options.continuesPath, atBoundary);
+  const endsOnApplication = endsOnApplicationPath(text, options.continuesPath, atBoundary);
   return { text, inPath, output: output || (previous?.output ?? ""), ...(endsOnApplication ? { endsOnApplication } : {}) };
+}
+
+/** A chunk that is all "Support/…" after an "Application" end is still inside that path. */
+function allApplicationSupport(text: string, options: Required<ActivityTextOptions>): boolean {
+  return options.continuesApplication && APPLICATION_SUPPORT_TAIL.test(text) && !TOKEN_DELIMITER.test(text.replace(/^ /, ""));
+}
+
+/** Whether a chunk's path ends on "/Application", maybe with the space after it. */
+function endsOnApplicationPath(text: string, continuesPath: boolean, atBoundary: boolean): boolean {
+  const head = text.match(/^(.*\/Application) ?$/s)?.[1];
+  return head !== undefined && endsInsidePath(head, continuesPath, atBoundary);
 }
 
 
 /** Whether text following `previous` starts a new token for path detection. */
 export function continuesAtBoundary(previous: string | undefined): boolean {
-  return previous === undefined || previous.length === 0 || /[\s"'=(`[]$/.test(previous);
+  return previous === undefined || previous.length === 0 || /[\s"'=(]$/.test(previous);
+}
+
+/** The chunk's opening continuation of the previous chunk's path, masked once. */
+function continuedText(text: string, options: ActivityTextOptions): string {
+  if (options.continuesApplication && APPLICATION_SUPPORT_TAIL.test(text)) {
+    return text.replace(/^ ?Support[\\/][^\s"'<>`)\]}*]*/, options.afterMaskedPath ? "" : PATH_MASK);
+  }
+  if (options.continuesPath) return text.replace(/^(?=[\w.~\\/-])[^\s"'<>`)\]}*]+/, options.afterMaskedPath ? "" : PATH_MASK);
+  return text;
+}
+
+/** Where on this computer a quoted absolute path is surely private: under a home or system root. */
+const HOST_ROOT = "(?:Users|home|root|private|var|tmp|opt|etc|Volumes|mnt|Library)/";
+
+/**
+ * A path an agent quotes in Markdown code or a link went out whole, user name
+ * included (`/Users/…`, [/Users/…], 10-09). A quoted path under a host root
+ * is masked; one that is not (`/storefront/app/…`, an agent's root-anchored
+ * slip that a refusal quotes back to it) stays readable.
+ */
+function maskQuotedHostPaths(text: string, afterQuote: boolean): string {
+  const quoted = new RegExp(`(${afterQuote ? "^|" : ""}[\`[])\\/(?=${HOST_ROOT})[^\\s"'<>\`)\\]}*]+`, "g");
+  return text.replace(quoted, "$1[local-path]");
 }
 
 function publicText(value: string, workspaceRoot: string, options: ActivityTextOptions): string {
   const startsAtBoundary = options.startsAtBoundary ?? true;
-  let text = redactText(value);
-  if (options.continuesApplication && APPLICATION_SUPPORT_TAIL.test(text)) {
-    text = text.replace(/^ ?Support[\\/][^\s"'<>`)\]}*]*/, options.afterMaskedPath ? "" : PATH_MASK);
-  } else if (options.continuesPath) {
-    text = text.replace(/^(?=[\w.~\\/-])[^\s"'<>`)\]}*]+/, options.afterMaskedPath ? "" : PATH_MASK);
-  }
+  let text = continuedText(redactText(value), options);
   // A chunk opening `:/…` or `:\…` continues a drive path whose letter was
   // emitted in the previous chunk. `://` is excluded because that is a URL
   // scheme, and a chunk ending exactly at the separator defers rather than
@@ -516,10 +550,7 @@ function publicText(value: string, workspaceRoot: string, options: ActivityTextO
     .replace(/\\\\[^\s"'<>`)\]}]+/g, "[local-path]")
     // A path starts with a path character after the slash, and `*` is never
     // part of one: `sudo ls /**` (a root slash and Markdown bold) is not a
-    // private path, and redacting it broke the bold. A path in Markdown code
-    // or a link (`/Users/…`, [/Users/…]) is a path too: agents quote theirs in
-    // backticks, and those went out whole (10-09). Not after `*` (a glob's
-    // `**/x`) or `<` (HTML's `</p>`).
-    .replace(/(^|[\s"'=(`[])\/(?!\/)(?=[\w.~-])[^\s"'<>`)\]}*]+/g, "$1[local-path]");
-  return releaseHeldSpaces(startsAtBoundary ? out : out.slice(1));
+    // private path, and redacting it broke the bold.
+    .replace(/(^|[\s"'=(])\/(?!\/)(?=[\w.~-])[^\s"'<>`)\]}*]+/g, "$1[local-path]");
+  return maskQuotedHostPaths(releaseHeldSpaces(startsAtBoundary ? out : out.slice(1)), options.afterQuote ?? false);
 }
