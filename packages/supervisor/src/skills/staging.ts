@@ -278,13 +278,14 @@ export async function stageMachineOrganizationSkills(options: {
   const envelope = RuntimeSkillSyncEnvelopeSchema.parse(structuredClone(options.envelope));
   const catalog = envelope.catalog;
   verifyMachineOwner(catalog.binding, options.owner);
+  verifyGeneralDiscoveryScopes(catalog.skills);
   const current = async () => {
     await options.assertAuthorized(); const now = options.now();
     if (!Number.isFinite(now) || Date.parse(envelope.issuedAt) > now + 1000 || Date.parse(envelope.expiresAt) <= now) throw unavailable();
   };
-  const contentIdentity = (value: typeof catalog) => sha256Hex(canonicalize({
+  const contentIdentity = (value: typeof catalog) => sha256Hex(canonicalize(JSON.parse(JSON.stringify({
     workspaceId: value.binding.workspaceId, instanceId: value.binding.instanceId, skills: value.skills,
-  }));
+  }))));
   const receiptSchema = z.object({ catalog: RuntimeSkillSyncCatalogSchema,
     modes: z.record(z.string(), z.record(z.string(), z.union([z.literal(0o600), z.literal(0o700)]))),
   }).strict();
@@ -364,4 +365,8 @@ export async function retainStagedSkill(skill: StagedOrganizationSkills["skills"
     return destination;
   } catch { throw unavailable(); }
   finally { if (temporary) await rm(temporary, { recursive: true, force: true }).catch(() => undefined); }
+}
+
+function verifyGeneralDiscoveryScopes(skills: readonly RuntimeSkillSyncItem[]): void {
+  if (skills.some(skill => skill.scope !== undefined && (skill.scope.audience.kind !== "organization" || skill.scope.context.kind !== "global"))) throw unavailable();
 }
