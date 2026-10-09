@@ -165,6 +165,8 @@ export class WorkOrchestrator {
   /** Single-flight retirements of unfinished executions, by execution generation. */
   private readonly executionRetirements = new Map<string, Promise<boolean>>();
   private readonly recoveryFences = new Set<string>();
+  /** Per logical session channel: the fenced reference whose runner record was released, so the restore that follows names its source. */
+  private readonly releasedFencedReferences = new Map<string, string>();
   private recoveryEvidenceRetry: Promise<void> | null = null;
   private recoveryEvidenceRetryRequested = false;
   private readonly logger: Logger;
@@ -1109,20 +1111,49 @@ export class WorkOrchestrator {
       record.evidence.attempt === prior.attempt && record.evidence.claimId === prior.claimId);
   }
 
-  /** Hand a settled fenced owner's channel to the next turn; false keeps the gate. */
+  /**
+   * Hand a settled fenced owner's channel to the next turn; false keeps the
+   * gate. The runner first drops its fenced record, which still holds the
+   * agent's own session id: kept, it refused every restore of the person's
+   * conversation until the connector restarted. The fenced reference itself
+   * is never reused; the next turn restores under a new one.
+   */
   private releaseRecoveredPredecessor(channelId: string, predecessor: RelayedSession, prior: LocalAdmission | undefined,
     successor: RemoteWorkAssignment): boolean {
     if (!prior || !this.recoveredExecutionSettled(prior)) return false;
+    const fencedReference = this.forgetRecoveredSession(prior);
+    if (fencedReference === false) return false;
     try { predecessor.releaseRecoveredChannel(); }
     catch { return false; }
     const key = `${prior.assignmentId}:${prior.attempt}`;
     if (this.channelOwners.get(channelId) === predecessor) this.channelOwners.delete(channelId);
     if (this.sessions.get(key) === predecessor) this.sessions.delete(key);
+    if (fencedReference) this.releasedFencedReferences.set(channelId, fencedReference);
     this.logger.info({ event: "execution.recovered_predecessor_released", assignmentId: successor.id, attempt: successor.attempt,
       predecessorAssignmentId: prior.assignmentId, predecessorAttempt: prior.attempt, predecessorClaimId: prior.claimId,
-      stage: "channel_handoff", outcome: "fresh_session" },
-    "the previous execution was stopped and Core settled it; starting a fresh ACP session");
+      stage: "channel_handoff", outcome: "predecessor_released", runnerRecordReleased: fencedReference !== undefined },
+    "the previous execution was stopped and Core settled it; the next turn opens a new ACP session");
     return true;
+  }
+
+  /**
+   * The runner's release of a settled fenced record: its reference, undefined
+   * when there is nothing to release (no reference, or a runner without
+   * one), false when the runner refused (the gate stays).
+   */
+  private forgetRecoveredSession(prior: LocalAdmission): string | undefined | false {
+    const reference = this.deps.journal.execution.execution(prior)?.acpSessionRef;
+    const runner = this.deps.runners.get(prior.agentId);
+    if (!reference || !runner?.forgetRecoveredSession) return undefined;
+    try {
+      runner.forgetRecoveredSession(reference);
+      return reference;
+    } catch (error) {
+      this.logger.warn({ predecessorAssignmentId: prior.assignmentId, predecessorAttempt: prior.attempt, stage: "channel_handoff",
+        diagnostic: error instanceof RemoteInstanceError ? error.diagnostic : undefined },
+      "the runner still holds the previous execution's session; keeping this session blocked");
+      return false;
+    }
   }
 
   /** The fenced executions a turn of this logical session would wait on. */
@@ -1197,11 +1228,25 @@ export class WorkOrchestrator {
    * with agent_session_lost if either the mapping or provider state is gone.
    */
   private async takeOverWithoutLiveOwner(assignment: RemoteWorkAssignment, admission: LocalAdmission, sessionId: string, assertCurrent: () => void): Promise<Takeover | undefined> {
-    const continued = continuedSession(assignment.source);
-    if (continued && continued.acpSessionRef !== undefined) this.logger.info({ assignmentId: assignment.id, attempt: assignment.attempt, stage: "channel_handoff", outcome: "restore_session" },
-      "the conversation's previous session is not live here; restoring it from the durable ACP reference");
-    if (!harnessDelivery(assignment)) return undefined;
-    return this.takeOverHarnessHead(assignment, admission, sessionId, assertCurrent);
+    if (harnessDelivery(assignment)) return this.takeOverHarnessHead(assignment, admission, sessionId, assertCurrent);
+    this.logRestoreSource(assignment, `session:${sessionId}`);
+    return undefined;
+  }
+
+  /**
+   * What a conversation or direct turn without a live owner opens: the
+   * agent's transcript restored under a new reference, from Core's durable
+   * reference or from a fenced one whose runner record was just released, or
+   * a fresh session when Core names none.
+   */
+  private logRestoreSource(assignment: RemoteWorkAssignment, channelId: string): void {
+    const reference = continuedSession(assignment.source)?.acpSessionRef;
+    const released = this.releasedFencedReferences.get(channelId);
+    this.releasedFencedReferences.delete(channelId);
+    const log = { assignmentId: assignment.id, attempt: assignment.attempt, stage: "channel_handoff" };
+    if (reference === undefined) return void this.logger.info({ ...log, outcome: "fresh_session" }, "the conversation names no previous session; starting a new ACP session");
+    this.logger.info({ ...log, outcome: "restore_session", sourceReference: released === reference ? "fenced_released" : "durable" },
+      "the conversation's previous session is not live here; restoring it under a new ACP reference");
   }
 
   /** A repository role's head: restore or continue its retained session, or start fresh when the journal proves that is safe. */

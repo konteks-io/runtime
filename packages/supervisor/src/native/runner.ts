@@ -36,6 +36,7 @@ const inputSchema = z.object({
   acpSessionRef: z.string().min(1).max(256).optional(),
   restoreAcpSessionRef: z.string().min(1).max(256).optional(),
   freshProviderSessionOnRestore: z.boolean().optional(),
+  freshSessionWhenRestoreLost: z.boolean().optional(),
   sessionLabel: RemoteSessionLabelSchema.optional(),
   agentTitled: z.literal(true).optional(),
   browser: z.object({
@@ -244,7 +245,7 @@ export class NativeRunner implements RunnerPort {
     const { context, readinessDeadlineAt, cwd, readOnlyRoots, sessionConfig,
       modelSelectionPolicy,
       modelSelection,
-      acpSessionRef, freshProviderSessionOnRestore, sessionLabel, agentTitled, browser, integration,
+      acpSessionRef, freshProviderSessionOnRestore, freshSessionWhenRestoreLost, sessionLabel, agentTitled, browser, integration,
     } = data;
     // The session's browser is a stdio MCP server the agent launches (its own
     // package's, or the connector's for an agent without one); composed here,
@@ -256,7 +257,7 @@ export class NativeRunner implements RunnerPort {
       ...withoutUndefined({ sessionConfig,
         modelSelectionPolicy,
         modelSelection,
-        acpSessionRef, freshProviderSessionOnRestore, sessionLabel,
+        acpSessionRef, freshProviderSessionOnRestore, freshSessionWhenRestoreLost, sessionLabel,
       }),
       ...(agentTitled ? { agentTitled } : {}),
       ...withoutUndefined({ integration }),
@@ -347,6 +348,17 @@ export class NativeRunner implements RunnerPort {
       // establish qualified quiescence; both ownership records stay retained.
       await this.runtime.stopExecutionBridge(ref);
     }
+  }
+
+  /**
+   * After Core settled a force-stopped turn and its process is proven gone:
+   * drop the fenced session record (refused unless it is one) and return its
+   * process slot, so the conversation can be restored under a new reference.
+   */
+  forgetRecoveredSession(ref: string): void {
+    this.requireStarted();
+    this.runtime.sessions.forgetRecovered(ref);
+    this.runtime.finalizeRecoveredExecution(ref);
   }
 
   async stopRetainedExecution(owner: RetainedProcessOwner): Promise<void> {

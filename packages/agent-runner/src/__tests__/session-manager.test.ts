@@ -925,3 +925,92 @@ describe("integration sessions", () => {
       .rejects.toMatchObject({ code: "schema_invalid" });
   });
 });
+
+// 10-09: Core fenced a direct Claude Code turn; the connector stopped it for
+// recovery and kept the fenced record, which still held the agent's own
+// session id. Every later turn's restore was refused until a restart.
+describe("restoring a conversation after its turn was stopped for recovery", () => {
+  const lifecycle = { beforeCreate: async () => undefined, recordProcessOwner: async () => undefined, assertCurrent: () => undefined };
+  const successor = { ...context, assignmentId: "asg-2", agentId: "claude-code" };
+
+  async function fencedSession(overrides: Partial<Record<keyof ClientSideConnection, unknown>> = {}) {
+    const store = new InMemorySessionRefStore();
+    const first = fakeBridge(overrides);
+    let current = first.bridge;
+    const manager = new SessionManager({ bridge: () => current, events: new RunnerEventBus(), refStore: store });
+    const { acpSessionRef } = await manager.create({ context: { ...context, agentId: "claude-code" }, cwd: "/w", mcpServers: [] });
+    const next = fakeBridge();
+    return { store, manager, first, next, acpSessionRef, useNext: () => { current = next.bridge; } };
+  }
+
+  async function stoppedAndExited() {
+    const f = await fencedSession();
+    await f.manager.stopForRecovery(f.acpSessionRef);
+    Object.assign(f.first.bridge, { exited: true });
+    f.manager.closeAll("agent_exited", f.first.bridge);
+    f.useNext();
+    return f;
+  }
+
+  it("refuses the restore while the fenced owner still holds the agent's session, and says why", async () => {
+    const f = await stoppedAndExited();
+    await expect(f.manager.restore({ context: successor, cwd: "/w", mcpServers: [], lifecycle }, f.acpSessionRef))
+      .rejects.toMatchObject({ code: "recovery_required", diagnostic: "bridge_session_owned" });
+    expect(f.next.calls.loadSession).toBeUndefined();
+    expect(f.manager.activeSessions).toBe(1);
+  });
+
+  it("resumes the same agent session under a new reference once the fenced owner is forgotten", async () => {
+    const f = await stoppedAndExited();
+    f.manager.forgetRecovered(f.acpSessionRef);
+    expect(f.manager.activeSessions).toBe(0);
+    const restored = await f.manager.restore({ context: successor, cwd: "/w", mcpServers: [], lifecycle }, f.acpSessionRef);
+    expect(restored).toMatchObject({ resumed: true });
+    expect(restored.acpSessionRef).not.toBe(f.acpSessionRef);
+    expect(f.next.calls.loadSession?.[0]).toMatchObject({ sessionId: "bridge-s1" });
+    expect(await f.store.get(restored.acpSessionRef)).toBe("bridge-s1");
+    // An unknown reference has nothing left to forget.
+    expect(() => f.manager.forgetRecovered(f.acpSessionRef)).not.toThrow();
+  });
+
+  it("refuses to forget a live session, or one whose process or recovery stop is still running", async () => {
+    const live = await fencedSession();
+    expect(() => live.manager.forgetRecovered(live.acpSessionRef)).toThrow(expect.objectContaining({ diagnostic: "forget_not_recovered" }));
+    await live.manager.stopForRecovery(live.acpSessionRef);
+    expect(() => live.manager.forgetRecovered(live.acpSessionRef)).toThrow(expect.objectContaining({ diagnostic: "forget_not_recovered" }));
+    expect(live.manager.activeSessions).toBe(1);
+
+    const stopping = await fencedSession({ cancel: vi.fn(() => new Promise(() => undefined)) });
+    void stopping.manager.stopForRecovery(stopping.acpSessionRef).catch(() => undefined);
+    Object.assign(stopping.first.bridge, { exited: true });
+    expect(() => stopping.manager.forgetRecovered(stopping.acpSessionRef)).toThrow(expect.objectContaining({ diagnostic: "forget_not_recovered" }));
+    expect(stopping.manager.activeSessions).toBe(1);
+  });
+
+  it("opens one new session for a person's turn when the agent cannot reopen its transcript", async () => {
+    const store = new InMemorySessionRefStore();
+    await store.put("acp-prior", "bridge-old");
+    await store.put("acp-other", "bridge-other");
+    let created = 0;
+    const newSession = vi.fn(async () => ({ sessionId: `bridge-new-${++created}` }));
+    const loadSession = vi.fn(async () => { throw new RequestError(-32602, "no such session"); });
+    const { bridge } = fakeBridge({ loadSession, newSession });
+    const beforeCreate = vi.fn(async () => undefined);
+    const manager = new SessionManager({ bridge: () => bridge, events: new RunnerEventBus(), refStore: store });
+    // Without the person's-turn flag a lost transcript still fails closed.
+    await expect(manager.restore({ context: successor, cwd: "/w", mcpServers: [], lifecycle }, "acp-prior")).rejects.toMatchObject({ diagnostic: "agent_session_lost" });
+    expect(newSession).not.toHaveBeenCalled();
+    // No mapping at all: one new session under the reference already reserved.
+    const unmapped = await manager.restore({ context: successor, cwd: "/w", mcpServers: [], freshSessionWhenRestoreLost: true,
+      lifecycle: { ...lifecycle, beforeCreate } }, "acp-unknown");
+    expect(unmapped).toMatchObject({ resumed: false });
+    expect(beforeCreate).toHaveBeenCalledOnce();
+    expect(beforeCreate).toHaveBeenCalledWith(unmapped.acpSessionRef);
+    expect(await store.get(unmapped.acpSessionRef)).toBe("bridge-new-1");
+    // The agent refuses the load: the same.
+    const refused = await manager.restore({ context: successor, cwd: "/w", mcpServers: [], freshSessionWhenRestoreLost: true, lifecycle }, "acp-other");
+    expect(refused).toMatchObject({ resumed: false });
+    expect(loadSession).toHaveBeenCalledTimes(2);
+    expect(await store.get(refused.acpSessionRef)).toBe("bridge-new-2");
+  });
+});
