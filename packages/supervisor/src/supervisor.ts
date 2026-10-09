@@ -2363,15 +2363,15 @@ export class Supervisor {
     this.skillSync ??= new SkillSyncCoordinator(async signal => {
       this.assertSkillSyncReady();
       const client = this.machineSkillSyncClient();
-      try { await exchangeLocalSkills({ client, homes, now: () => this.clock.coreNow(), assertReady: () => this.assertSkillSyncReady() }, signal); }
-      catch { this.logger.warn({ event: "skills.local_inventory_unavailable" }, "Runtime Skill inventory or signed export could not be delivered."); }
-      this.assertSkillSyncReady();
       return runRequestedSkillSync(client, () => refreshMachineSkills({
       client, homes, unavailableAgentIds,
       scratchRoot: join(this.config.SUPERVISOR_DATA_DIR, "machine-skills"),
       owner: { workspaceId: this.workspaceId ?? "", instanceId: this.instanceId ?? "" },
       now: () => this.clock.coreNow(),
-    }, signal), signal);
+    }, signal), signal, async () => {
+        await exchangeLocalSkills({ client, homes, now: () => this.clock.coreNow(), assertReady: () => this.assertSkillSyncReady() }, signal);
+        this.assertSkillSyncReady();
+      });
     });
     this.skillSync.startPeriodic(() => this.skillSyncReady(), () => this.logSkillSyncFailure());
     try { return { ...await this.skillSync.sync(), complete: true, loaded: "unknown" as const }; }

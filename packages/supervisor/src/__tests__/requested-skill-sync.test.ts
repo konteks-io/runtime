@@ -40,3 +40,37 @@ it("does not report sync success when the completion acknowledgement is refused"
   client.receipt.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
   await expect(runRequestedSkillSync(client as never, async () => "installed", signal)).rejects.toThrow("completion");
 });
+
+it("reports a failed local exchange and does not claim synchronization success", async () => {
+  const { client, signal } = fixture();
+  const failure = new Error("inventory delivery failed");
+  const refresh = vi.fn(async () => "installed");
+  await expect(runRequestedSkillSync(client as never, refresh, signal,
+    async () => { throw failure; })).rejects.toBe(failure);
+  expect(refresh).not.toHaveBeenCalled();
+  expect(client.receipt).toHaveBeenLastCalledWith({ requestId: "request-a", state: "failed" }, signal);
+});
+it("requires local exchange even without a site sync request", async () => {
+  const { client, signal } = fixture();
+  client.pendingRequest.mockResolvedValueOnce(null as never);
+  const failure = new Error("export delivery failed");
+  const refresh = vi.fn();
+  await expect(runRequestedSkillSync(client as never, refresh, signal,
+    async () => { throw failure; })).rejects.toBe(failure);
+  expect(refresh).not.toHaveBeenCalled();
+});
+
+it("exchanges local sources after request acceptance and before agent refresh", async () => {
+  const { client, signal } = fixture();
+  const phases: string[] = [];
+  const exchange = async () => {
+    expect(client.receipt).toHaveBeenLastCalledWith({ requestId: "request-a", state: "accepted" }, signal);
+    phases.push("exchange");
+  };
+  await expect(runRequestedSkillSync(client as never, async () => {
+    phases.push("refresh");
+    return "installed";
+  }, signal, exchange)).resolves.toBe("installed");
+  expect(phases).toEqual(["exchange", "refresh"]);
+  expect(client.receipt).toHaveBeenLastCalledWith({ requestId: "request-a", state: "succeeded" }, signal);
+});
