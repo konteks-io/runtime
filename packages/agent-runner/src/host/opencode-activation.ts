@@ -17,7 +17,11 @@ const source = `export default {
       await response.body?.cancel();
     };
     const registrations = [];
+    let selectedMessage;
+    const nativeID = value => typeof value === "string" && value.length > 0 && value.length <= 256;
     const select = async input => {
+      selectedMessage = undefined;
+      if (!nativeID(input.sessionID) || !nativeID(input.messageID)) throw new Error("OpenCode native Skill prompt identity is unavailable");
       const result = await context.skill.list();
       if (!Array.isArray(result.data)) throw new Error("OpenCode Skill inventory is unavailable");
       const selected = context.options.skillFiles.map(path => {
@@ -33,11 +37,20 @@ const source = `export default {
         throw new Error("OpenCode requested an unauthorized Skill attachment");
       }
       input.prompt.skills = selected;
+      selectedMessage = { sessionID: input.sessionID, messageID: input.messageID };
     };
     const deny = async () => { throw new Error("Konteks managed Skill load admission is unavailable"); };
+    const verify = async input => {
+      if (!selectedMessage || input?.sessionID !== selectedMessage.sessionID) {
+        throw new Error("Konteks managed Skill load admission has no current native message");
+      }
+      const messages = input.messages.filter(message => message.id === selectedMessage.messageID && message.role === "user");
+      if (messages.length !== 1) throw new Error("Konteks managed Skill load admission has no current native message");
+      await deny();
+    };
     const dispose = () => Promise.all(registrations.map(registration => registration.dispose()));
     try {
-      for (const [name, callback] of [["prompt", select], ["context", deny], ["http.request", deny], ["experimental.ws.send", deny]]) {
+      for (const [name, callback] of [["prompt", select], ["context", verify], ["http.request", deny], ["experimental.ws.send", deny]]) {
         const registration = await context.session.hook(name, callback);
         if (typeof registration?.dispose !== "function") throw new Error("OpenCode native Skill hooks are unsupported");
         registrations.push(registration);

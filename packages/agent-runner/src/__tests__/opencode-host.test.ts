@@ -408,7 +408,7 @@ it("selects native Skill attachments only from the exact authorized source files
   const root = await realpath(await mkdtemp(join(tmpdir(), "opencode-selection-"))); roots.push(root);
   const skillRoot = join(root, "review");
   const activation = await createOpenCodeActivation(root, [skillRoot]);
-  type NativePrompt = { prompt: { text?: string; skills?: { id: string }[] } };
+  type NativePrompt = { sessionID: string; messageID: string; prompt: { text?: string; skills?: { id: string }[] } };
   const callbacks = new Map<string, (input: NativePrompt) => Promise<void>>();
   const inventory = [{ id: "approved", path: join(skillRoot, "SKILL.md") }, { id: "personal", path: join(root, "personal", "SKILL.md") }];
   try {
@@ -419,15 +419,20 @@ it("selects native Skill attachments only from the exact authorized source files
         callbacks.set(name, callback); return { dispose: async () => {} };
       } } });
     const select = callbacks.get("prompt")!;
-    const input = { prompt: { text: "Work", skills: [] } };
+    const input = { sessionID: "native-session", messageID: "native-message", prompt: { text: "Work", skills: [] } };
     expect(select).toBeTypeOf("function");
     await select(input);
     expect(input.prompt.skills).toEqual([{ id: "approved" }]);
-    await expect(select({ prompt: { skills: [{ id: "personal" }] } })).rejects.toThrow(/unauthorized/);
+    const verify = callbacks.get("context")! as unknown as (input: unknown) => Promise<void>;
+    await expect(verify({ sessionID: "other", messages: [{ id: "native-message", role: "user" }] })).rejects.toThrow(/current native message/);
+    await expect(verify({ sessionID: "native-session", messages: [{ id: "old-message", role: "user" }] })).rejects.toThrow(/current native message/);
+    await expect(verify({ sessionID: "native-session", messages: [{ id: "native-message", role: "user" }] })).rejects.toThrow(/load admission is unavailable/);
+    await expect(select({ ...input, prompt: { skills: [{ id: "personal" }] } })).rejects.toThrow(/unauthorized/);
+    await expect(verify({ sessionID: "native-session", messages: [{ id: "native-message", role: "user" }] })).rejects.toThrow(/current native message/);
     inventory.push({ id: "duplicate", path: join(skillRoot, "SKILL.md") });
-    await expect(select({ prompt: {} })).rejects.toThrow(/ambiguous/);
+    await expect(select({ ...input, prompt: {} })).rejects.toThrow(/ambiguous/);
     inventory.splice(0);
-    await expect(select({ prompt: {} })).rejects.toThrow(/ambiguous/);
+    await expect(select({ ...input, prompt: {} })).rejects.toThrow(/ambiguous/);
     await cleanup();
   } finally { await activation.release(); }
 });
