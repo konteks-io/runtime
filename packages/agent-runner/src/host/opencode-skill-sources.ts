@@ -33,12 +33,10 @@ async function closedSnapshot(parent: string, roots: readonly string[]): Promise
 }
 async function selectedSkillOnly(root: string): Promise<void> {
   const entries = await readdir(root, { recursive: true, withFileTypes: true });
-  if (
-    entries.some(
-      (entry) => entry.isSymbolicLink() || (entry.name === "SKILL.md" && entry.parentPath !== root),
-    )
-  )
-    throw unavailable();
+  for (const entry of entries) {
+    if (entry.name === "SKILL.md" && entry.parentPath !== root) throw unavailable();
+    owned(await lstat(join(entry.parentPath, entry.name)), entry.isDirectory());
+  }
 }
 function canonicalRoot(root: string): void {
   if (!isAbsolute(root) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(root) || resolve(root) !== root)

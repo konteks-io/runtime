@@ -1,8 +1,24 @@
 import { expect, it } from "vitest";
-import { mkdtemp, mkdir, writeFile, realpath, rm, symlink } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, realpath, rm, symlink, link } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openCodeSkillSources } from "../host/opencode-skill-sources.js";
+it.skipIf(process.platform === "win32")("rejects supporting files linked to mutable external content", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "opencode-linked-support-")));
+  const external = await realpath(await mkdtemp(join(tmpdir(), "opencode-external-support-")));
+  try {
+    const skill = join(root, "review");
+    await mkdir(skill, { mode: 0o700 });
+    await writeFile(join(root, ".catalog.json"), "{}", { mode: 0o600 });
+    await writeFile(join(skill, "SKILL.md"), "# Review", { mode: 0o600 });
+    await writeFile(join(external, "guide.md"), "Mutable support", { mode: 0o600 });
+    await link(join(external, "guide.md"), join(skill, "guide.md"));
+    await expect(openCodeSkillSources([skill])).rejects.toThrow();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(external, { recursive: true, force: true });
+  }
+});
 it("exposes only closed selected Skill snapshots and rejects unexpected sibling Skills", async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "opencode-skill-source-")));
   try {
