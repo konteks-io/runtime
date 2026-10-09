@@ -1,4 +1,5 @@
 import { redactText } from "@konteks/remote-common";
+import { commandOutputText } from "./command-output.js";
 
 /**
  * `konteks-remote --verbose` (or `KONTEKS_REMOTE_VERBOSE=1`): every service
@@ -28,7 +29,7 @@ export function verbose(text: string, stream: NodeJS.WritableStream = process.st
 const OUTPUT_LIMIT = 2_000;
 
 function bounded(text: string): string {
-  const trimmed = text.trim();
+  const trimmed = commandOutputText(text);
   return trimmed.length > OUTPUT_LIMIT ? `${trimmed.slice(0, OUTPUT_LIMIT)}… (${trimmed.length - OUTPUT_LIMIT} more characters)` : trimmed;
 }
 

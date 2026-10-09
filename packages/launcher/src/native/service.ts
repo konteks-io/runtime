@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { posix, win32 } from "node:path";
 import { setupText, type SetupCopyKey, type SetupLocale } from "../setup-locale.js";
+import { commandOutputText } from "../command-output.js";
 import { windowsBackgroundDefinition } from "./windows-background.js";
 
 /** The connector's own log in `<root>/logs`, where the OS keeps none (macOS); the supervisor keeps it small. */
@@ -135,7 +136,7 @@ const EXCERPT_LIMIT = 300;
 
 /** The service manager's own words, bounded: stderr first, stdout when stderr is empty. */
 function serviceOutputExcerpt(run: NativeServiceRun): string {
-  const text = (run.stderr?.trim() || run.stdout?.trim() || "").replace(/\s+/g, " ");
+  const text = (commandOutputText(run.stderr ?? "") || commandOutputText(run.stdout ?? "")).replace(/\s+/g, " ");
   return text.length > EXCERPT_LIMIT ? `${text.slice(0, EXCERPT_LIMIT - 1)}…` : text;
 }
 

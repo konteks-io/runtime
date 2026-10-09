@@ -1,8 +1,8 @@
 import { mkdtemp, readFile, rm, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { describeServiceFailure, encodeServiceDefinition, nativeServiceDefinition, NativeServiceCommandError, startNativeServiceDefinition, type NativeServiceCommand } from "../native/service.js";
 import { keepServiceOnOwnDefinition, type OwnServiceDefinitionDeps } from "../native/commands.js";
@@ -282,6 +282,88 @@ describe.runIf(process.platform === "win32")("on a real Windows", () => {
     expect(result.stderr).toBe("");
     expect(result.status).toBe(0);
   }, 20_000);
+
+  it("Windows PowerShell 5.1 parses every generated lifecycle command without executing it", () => {
+    const service = nativeServiceDefinition({ os: "windows", home: "C:\\Users\\Ada & O'Brien", root: "C:\\Users\\Ada & O'Brien\\remote\\", executable: "C:\\Users\\Ada & O'Brien\\remote\\releases\\next\\konteks-connector.exe", userId: "S-1-5-21-1-2-3-1001" });
+    const commands = [...service.install, service.start, service.stop, ...service.remove, service.status, service.registered!, service.handoff!(123)];
+    const encoded = commands.map(command => command.args.at(-1)!);
+    encoded.push(Buffer.from(hostScript(service), "utf16le").toString("base64"));
+    const check = "$failed=$false; foreach ($encoded in [Console]::In.ReadToEnd().Split([char]10)) { $errors=$null; $text=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encoded.Trim())); [void][System.Management.Automation.Language.Parser]::ParseInput($text,[ref]$null,[ref]$errors); if ($errors) { $failed=$true; foreach ($error in $errors) { [Console]::Error.WriteLine($error.ToString()) } } }; if ($failed) { exit 1 }";
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", check], { input: encoded.join("\n"), encoding: "utf8", windowsHide: true, timeout: 15_000 });
+    expect(result.error).toBeUndefined();
+    expect(result.stderr).toBe("");
+    expect(result.status).toBe(0);
+  }, 20_000);
+
+  it("starts through actual WScript and JScript, then honors login startup and clean connector exit", async () => {
+    const base = await mkdtemp(join(tmpdir(), "konteks full chain & O'Brien ")); dirs.push(base);
+    const executable = join(base, "connector.cmd");
+    const fixture = join(base, "fixture-child.cjs");
+    const release = join(base, "fixture-child-release");
+    await writeFile(fixture, `const fs = require('node:fs'); const root = process.argv[2]; fs.writeFileSync(root + '/fixture-child-ready', 'ready');\nconst deadline = setTimeout(() => process.exit(9), 15000); const poll = setInterval(() => { if (fs.existsSync(root + '/fixture-child-release')) { clearTimeout(deadline); clearInterval(poll); process.exit(0); } }, 25);\n`);
+    await writeFile(executable, `@echo full-chain: %*\r\n@"${process.execPath}" "${fixture}" "${base}"\r\n@exit /b %errorlevel%\r\n`);
+    const service = nativeServiceDefinition({ os: "windows", home: base, root: base, executable, userId: "S-1-5-21-1-2-3-1001" });
+    const run = (command: NativeServiceCommand) => spawnSync(command.command, command.args, { encoding: "utf8", windowsHide: true, timeout: 25_000 });
+    const state = join(base, "supervisor", "background-host.json");
+    const stop = join(base, "supervisor", "background-stop");
+    const present = (path: string) => readFile(path).then(() => true, error => { if (error.code === "ENOENT") return false; throw error; });
+    const waitFor = async (condition: () => Promise<boolean>, limit: number) => {
+      const deadline = Date.now() + limit;
+      while (!(await condition()) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
+    };
+    const waitForExit = async () => {
+      await waitFor(async () => !(await present(state)), 10_000);
+      expect(await present(state), "Disposable background host must finish its finite connector").toBe(false);
+    };
+    let parentExited = false;
+    let outputClosed = false;
+    const runStart = () => new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+      const child = spawn(service.start.command, service.start.args, { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "", stderr = "";
+      child.stdout.on("data", chunk => { stdout = (stdout + String(chunk)).slice(0, 256 * 1024); });
+      child.stderr.on("data", chunk => { stderr = (stderr + String(chunk)).slice(0, 256 * 1024); });
+      child.once("error", reject);
+      child.once("exit", () => { parentExited = true; });
+      child.once("close", code => { outputClosed = true; resolve({ code, stdout, stderr }); });
+    });
+    const started = startNativeServiceDefinition(service, {
+      execute: async command => { if (command === service.start) return runStart(); const result = run(command); return { code: result.status, stdout: result.stdout, stderr: result.stderr }; },
+      write: async (path, contents) => { await mkdir(dirname(path), { recursive: true }); await writeFile(path, contents); },
+    });
+    void started.catch(() => undefined);
+    try {
+      await waitFor(() => present(join(base, "fixture-child-ready")), 10_000);
+      expect(await present(join(base, "fixture-child-ready"))).toBe(true);
+      await waitFor(async () => parentExited, 5_000);
+      expect(parentExited, "Starting PowerShell must exit while the fixture connector is alive").toBe(true);
+      await waitFor(async () => outputClosed, 1_000);
+      expect(outputClosed, "An exited start command must not leave output pipes inherited by its background tree").toBe(true);
+      await expect(started).resolves.toBe("started");
+      const owner = JSON.parse(await readFile(state, "utf8"));
+      expect(owner).toEqual({ pid: expect.any(Number), started: expect.stringMatching(/^\d+$/) });
+      expect(run(service.status).status).toBe(0);
+      expect(run(service.registered!).status).toBe(0);
+      await writeFile(release, "release");
+      await waitForExit();
+      expect(run(service.status).status).toBe(1);
+      await writeFile(stop, "stop");
+      const login = spawnSync(join(process.env.SystemRoot!, "System32", "wscript.exe"), ["//B", "//NoLogo", "//E:JScript", service.supportFiles![0]!.path, "--login"], { encoding: "utf8", windowsHide: true, timeout: 15_000 });
+      expect(login.error).toBeUndefined();
+      expect(login.status, login.stderr).toBe(0);
+      await expect(readFile(stop)).rejects.toMatchObject({ code: "ENOENT" });
+      await waitForExit();
+      const log = await readFile(join(base, "logs", "connector.log"), "utf8");
+      expect(log.split(/\r?\n/).filter(line => line === `full-chain: serve --root "${base}"`)).toHaveLength(2);
+    } finally {
+      await writeFile(release, "release");
+      try { await started; }
+      finally {
+        run(service.stop);
+        await waitForExit();
+        expect(run(service.remove[0]!).status).toBe(0);
+      }
+    }
+  }, 45_000);
 
   it("runs the connector with a path full of cmd and PowerShell metacharacters, appends its output to the log and stops after clean exit", async () => {
     const base = await mkdtemp(join(tmpdir(), "konteks host %PATH% & O'Brien ")); dirs.push(base);
