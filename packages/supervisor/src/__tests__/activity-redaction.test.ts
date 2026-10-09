@@ -204,6 +204,18 @@ describe("a Codex file search that finds nothing", () => {
       .toMatchObject({ status: "completed" });
   });
 
+  it("is shown as done when a longer command ends in a search that found nothing", () => {
+    // 10-09: `cat …; cat …; rg --files -g AGENTS.md …` read "Failed" though every step worked.
+    const title = "\"cat tests/test_cli.py; cat pytest.ini; rg --files --hidden -g AGENTS.md -g '!.venv/**'\"";
+    expect(canonicalizeAcpToolActivity({ ...failed(1, "[pytest]\ntestpaths = tests"), title }, "codex", undefined))
+      .toMatchObject({ status: "completed" });
+    expect(canonicalizeAcpToolActivity({ ...failed(1, "x"), title: "git log | grep fixme" }, "codex", undefined))
+      .toMatchObject({ status: "completed" });
+    // A search that broke (2), or a command that ends in something else, still failed.
+    expect(canonicalizeAcpToolActivity({ ...failed(2, "rg: bad flag"), title }, "codex", undefined)).toMatchObject({ status: "failed" });
+    expect(canonicalizeAcpToolActivity({ ...failed(1, "x"), title: "rg -n foo src; pytest -q" }, "codex", undefined)).toMatchObject({ status: "failed" });
+  });
+
   it("still fails when the command broke or was not a search", () => {
     expect(canonicalizeAcpToolActivity(failed(2), "codex", { kind: "read", title: "List files" })).toMatchObject({ status: "failed" });
     expect(canonicalizeAcpToolActivity(failed(1, "rg: notes: No such file"), "codex", { kind: "read", title: "List files" }))

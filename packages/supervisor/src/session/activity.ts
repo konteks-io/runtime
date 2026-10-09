@@ -292,7 +292,22 @@ const CODEX_FINDING_TITLE = /^(?:List files|Search files|Search for |Search in |
  */
 function codexCanonicalizer(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): unknown {
   if (candidate.sessionUpdate !== "tool_call_update" || candidate.status !== "failed") return candidate;
-  return codexFinds(candidate, prior) && foundNothing(candidate.rawOutput) ? { ...candidate, status: "completed" } : candidate;
+  const nothingFound = (codexFinds(candidate, prior) && foundNothing(candidate.rawOutput)) || lastSearchFoundNothing(candidate, prior);
+  return nothingFound ? { ...candidate, status: "completed" } : candidate;
+}
+
+/** A command whose last step is a search: `cat a; rg --files -g AGENTS.md`, or `… | grep x`. */
+const ENDS_IN_SEARCH = /(?:^|[;|&]\s*)(?:rg|grep|egrep|fgrep)\s[^;|&]*$/;
+
+/**
+ * The same AGENTS.md lookup at the end of a longer command (`cat …; cat …;
+ * rg --files -g AGENTS.md …`) read "Failed" although every step worked
+ * (10-09): rg and grep exit 1 only when nothing matched (2 on an error), and
+ * the command's exit is its last step's.
+ */
+function lastSearchFoundNothing(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): boolean {
+  const title = (nonBlank(candidate.title) ?? prior?.title)?.replace(/^["']|["']$/g, "");
+  return title !== undefined && ENDS_IN_SEARCH.test(title) && plainRecord(candidate.rawOutput)?.exit_code === 1;
 }
 
 function codexFinds(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): boolean {
