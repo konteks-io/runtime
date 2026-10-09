@@ -1,4 +1,5 @@
 import type { HostPromptTurn } from "./host-agent.js";
+import { openCodeTurnAdmission } from "./opencode-turn-admission.js";
 import { openCodeSkillContent } from "./opencode-skill-content.js";
 import { randomBytes } from "node:crypto";
 import { createServer, type Server, type ServerResponse } from "node:http";
@@ -7,17 +8,19 @@ import { join } from "node:path";
 import { RemoteInstanceError } from "@konteks/remote-common";
 
 const source = `import { readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 export default {
   id: "konteks-managed-skills-activation",
   async setup(context) {
     const { endpoint, token } = context.options;
     const expectedContent = JSON.parse(await readFile(new URL("./skills.json", import.meta.url), "utf8"));
-    const send = async action => {
+    const send = async (action, value) => {
       const response = await fetch(endpoint.replace(/ready$/, action), {
         method: "POST", headers: { authorization: "Bearer " + token },
+        ...(value ? { body: JSON.stringify(value) } : {}),
         redirect: "error", signal: AbortSignal.timeout(5000)
       });
-      if (!response.ok) throw new Error("Konteks plugin activation was refused");
+      if (!response.ok) throw new Error("Konteks plugin activation was refused; managed Skill load admission is unavailable");
       if (action === "turn") return response.json();
       await response.body?.cancel();
     };
@@ -44,9 +47,14 @@ export default {
         throw new Error("OpenCode requested an unauthorized Skill attachment");
       }
       input.prompt.skills = selected;
-      selectedMessage = { sessionID: input.sessionID, messageID: input.messageID };
+      selectedMessage = { sessionID: input.sessionID, messageID: input.messageID, turn };
     };
-    const deny = async () => { throw new Error("Konteks managed Skill load admission is unavailable"); };
+    const permit = async input => {
+      if (!selectedMessage || input?.sessionID !== selectedMessage.sessionID || input.kind !== "primary") {
+        throw new Error("Konteks managed Skill load admission is unavailable");
+      }
+      await send("permit", selectedMessage.turn);
+    };
     const verify = async input => {
       if (!selectedMessage || input?.sessionID !== selectedMessage.sessionID) {
         throw new Error("Konteks managed Skill load admission has no current native message");
@@ -57,11 +65,12 @@ export default {
       if (!Array.isArray(parts) || expectedContent.some((text, index) => parts[index]?.type !== "text" || parts[index].text !== text)) {
         throw new Error("Konteks managed Skill content verification failed");
       }
-      await deny();
+      const digests = expectedContent.map(text => createHash("sha256").update(text).digest("hex"));
+      await send("load", { ...selectedMessage.turn, digests });
     };
     const dispose = () => Promise.all(registrations.map(registration => registration.dispose()));
     try {
-      for (const [name, callback] of [["prompt", select], ["context", verify], ["http.request", deny], ["experimental.ws.send", deny]]) {
+      for (const [name, callback] of [["prompt", select], ["context", verify], ["http.request", permit], ["experimental.ws.send", permit]]) {
         const registration = await context.session.hook(name, callback);
         if (typeof registration?.dispose !== "function") throw new Error("OpenCode native Skill hooks are unsupported");
         registrations.push(registration);
@@ -95,33 +104,41 @@ function close(server: Server): Promise<void> {
   return new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
 }
 
-/** Startup activation only. This acknowledgement never certifies a Skill load. */
+/** Native startup and turn-bound admission. Startup readiness alone never certifies a Skill load. */
 export async function createOpenCodeActivation(configHome: string, skillRoots: readonly string[] = []) {
   const expectedContent = await openCodeSkillContent(skillRoots);
   await mkdir(configHome, { recursive: true, mode: 0o700 });
   const directory = await mkdtemp(join(configHome, ".managed-plugin-"));
   const token = randomBytes(32).toString("hex");
   let active = false, closed = false, stopped = false;
-  let turn: HostPromptTurn | undefined;
+  const admission = openCodeTurnAdmission(skillRoots, expectedContent);
   let resolveReady!: () => void;
   const ready = new Promise<void>(resolve => { resolveReady = resolve; });
   const takeTurn = (response: ServerResponse) => {
-    const current = turn;
-    turn = undefined;
-    if (!active || !current) { response.writeHead(403).end(); return; }
-    response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(current));
+    try {
+      if (!active) throw unavailable();
+      const value = JSON.stringify(admission.take());
+      response.writeHead(200, { "content-type": "application/json" }).end(value);
+    } catch { response.writeHead(403).end(); }
   };
+  const authenticated = (request: import("node:http").IncomingMessage) => !closed && !stopped && request.method === "POST" && request.headers.authorization === `Bearer ${token}`;
+  const loadRoutes = new Set(["/load", "/permit"]);
   const server = createServer((request, response) => {
-    request.resume();
-    if (closed || stopped || request.method !== "POST" || request.headers.authorization !== `Bearer ${token}`) {
-      response.writeHead(403).end(); return;
+    if (!authenticated(request)) {
+      request.resume(); response.writeHead(403).end(); return;
     }
+    if (active && loadRoutes.has(request.url!)) {
+      void admission.handle(request).then(() => response.writeHead(204).end()).catch(() => { request.resume(); response.writeHead(403).end(); });
+      return;
+    }
+    request.resume();
     if (request.url === "/turn") { takeTurn(response); return; }
     if (request.url !== "/ready" && request.url !== "/closed") {
       response.writeHead(404).end(); return;
     }
     active = request.url === "/ready";
     stopped = !active;
+    if (stopped) admission.clear();
     resolveReady();
     response.writeHead(204).end();
   });
@@ -137,10 +154,10 @@ export async function createOpenCodeActivation(configHome: string, skillRoots: r
       plugin: { package: directory, options: { endpoint: `http://127.0.0.1:${port}/ready`, token, skillFiles: skillRoots.map(root => join(root, "SKILL.md")) } },
       prepareTurn: (value?: HostPromptTurn) => {
         if (closed || !active) throw unavailable();
-        turn = value ? Object.freeze({ ...value }) : undefined;
+        admission.prepare(value);
       },
       finishTurn: (value: HostPromptTurn) => {
-        if (turn?.acpSessionRef === value.acpSessionRef && turn.requestId === value.requestId) turn = undefined;
+        admission.finish(value);
       },
       wait: async () => {
         let timer: ReturnType<typeof setTimeout> | undefined;
@@ -153,7 +170,7 @@ export async function createOpenCodeActivation(configHome: string, skillRoots: r
       },
       release: async () => {
         if (closed) return;
-        closed = true; active = false; turn = undefined; resolveReady();
+        closed = true; active = false; admission.clear(); resolveReady();
         try { await close(server); } finally { await rm(directory, { recursive: true, force: true }); }
       },
     };

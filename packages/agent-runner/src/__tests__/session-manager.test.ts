@@ -51,6 +51,27 @@ async function nextEvent(bus: RunnerEventBus, kind: RunnerEvent["kind"]): Promis
 }
 
 describe("session manager bootstrap", () => {
+  it("binds native Skill admission to the current owner and invalidates it after settlement", async () => {
+    const { bridge } = fakeBridge();
+    const events = new RunnerEventBus();
+    const admitSkillLoad = vi.fn(async () => {});
+    let turnAdmission: ((roots: readonly string[]) => Promise<void>) | undefined;
+    const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore(),
+      beforePrompt: async (_bridge, turn) => {
+        turnAdmission = turn.admitSkillLoad;
+        await turnAdmission!(["/verified/skill"]);
+      } });
+    const { acpSessionRef } = await manager.create({ context, cwd: "/w", mcpServers: [],
+      lifecycle: { beforeCreate: async () => {}, recordProcessOwner: async () => {}, assertCurrent: () => {}, admitSkillLoad } });
+    const completed = nextEvent(events, "prompt_result");
+    manager.prompt(acpSessionRef, "native-turn", { prompt: [] });
+    await completed;
+    await manager.sealCompletedTurn(acpSessionRef);
+    expect(admitSkillLoad).toHaveBeenCalledExactlyOnceWith({ acpSessionRef, requestId: "native-turn", readOnlyRoots: ["/verified/skill"] });
+    await expect(turnAdmission!(["/verified/skill"])).rejects.toThrow(/settled/);
+    expect(admitSkillLoad).toHaveBeenCalledTimes(1);
+  });
+
   it("applies the governed session baseline to create and live continuation", async () => {
     const { bridge, calls } = fakeBridge({}, { agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {} } } });
     const events = new RunnerEventBus();

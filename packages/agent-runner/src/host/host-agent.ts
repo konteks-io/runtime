@@ -179,6 +179,8 @@ export interface HostPromptTurn {
   readonly acpSessionRef: string;
   readonly bridgeSessionId: string;
   readonly requestId: string;
+  /** Local authority callback; functions never enter plugin JSON. */
+  readonly admitSkillLoad?: (roots: readonly string[]) => Promise<void>;
 }
 
 export interface HostWorkingCopyBinding {

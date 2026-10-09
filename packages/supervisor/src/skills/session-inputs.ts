@@ -11,6 +11,10 @@ export interface PreparedSessionInputs {
   readOnlyRoots?: readonly string[];
   skillInstructions: string;
   beforePrompt: () => Promise<void>;
+  /** Staging only: native model transport still requires admitNativeLoad. */
+  prepareNativeLoad?: () => Promise<void>;
+  /** Host-verified content roots, never model-supplied paths. */
+  admitNativeLoad?: (roots: readonly string[]) => Promise<void>;
   /** Delivery-only terminal barrier. Public ACP completion waits for its durable cloud receipt. */
   acceptDeliveryOutput?: (authority: { claimId: string; invocationRef: string; completion: SessionToCoreMessage }) => Promise<RemoteDeliveryAcceptanceReceipt>;
   /** Restart/reconnect path: never captures new bytes without the original runner completion. */
@@ -70,17 +74,26 @@ export async function prepareOrganizationSkillSession(options: StageOrganization
       authority: { binding: { ...options.authority.binding }, catalogDigest: options.authority.catalogDigest },
     };
     const staged = await stageOrganizationSkills(snapshot);
+    const roots = Object.freeze(staged.skills.map(skill => skill.directory));
+    const verify = async () => {
+      try {
+        if (await checkedDirectory(options.cwd) !== cwd) throw new Error("source moved");
+        const verified = await stageOrganizationSkills(snapshot);
+        if (verified.root !== staged.root) throw new Error("skill root moved");
+      } catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
+    };
     return {
       binding: { ...snapshot.authority.binding }, cwd,
-      readOnlyRoots: Object.freeze(staged.skills.map(skill => skill.directory)),
+      readOnlyRoots: roots,
       skillInstructions: organizationSkillInstructions(staged),
       beforePrompt: async () => {
         await assertRequiredSkillFreshness(snapshot.catalog, options.skillFreshness);
-        try {
-          if (await checkedDirectory(options.cwd) !== cwd) throw new Error("source moved");
-          const verified = await stageOrganizationSkills(snapshot);
-          if (verified.root !== staged.root) throw new Error("skill root moved");
-        } catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
+        await verify();
+      },
+      prepareNativeLoad: verify,
+      admitNativeLoad: async observed => {
+        if (observed.length !== roots.length || roots.some((root, index) => observed[index] !== root)) throw freshnessError("failed");
+        await verify();
       },
     };
   } catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }

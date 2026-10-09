@@ -195,6 +195,38 @@ describe("relayed session", () => {
     await session.close("cancelled");
   });
 
+  it("stages OpenCode inputs before dispatch and rechecks native loads under the live execution owner", async () => {
+    const beforePrompt = vi.fn(async () => { throw new Error("No external load proof"); });
+    const prepareNativeLoad = vi.fn(async () => {});
+    const admitNativeLoad = vi.fn(async () => {});
+    let owned = true;
+    const work = { ...assignment, agentRoute: { ...assignment.agentRoute, agentId: "opencode" } };
+    const f = await build({
+      reserveExecutionReference: async () => {},
+      assertExecutionOwned: () => { if (!owned) throw new Error("fenced"); },
+      prepareInputs: async target => ({ binding: { workspaceId: target.workspaceId, sessionId: "s", assignmentId: target.id, instanceId: target.instanceId, attempt: target.attempt },
+        cwd: "/private/native/checkout", readOnlyRoots: ["/verified/skill"], skillInstructions: "", beforePrompt, prepareNativeLoad, admitNativeLoad }),
+    }, work);
+    vi.mocked(f.runner.createSession).mockImplementation(async (_input, lifecycle) => {
+      await lifecycle?.beforeCreate("acp-1");
+      return { acpSessionRef: "acp-1", resumed: false, capabilities: { forkSession: false, sessionResume: true } };
+    });
+    try {
+      await f.session.bootstrap();
+      await (f.session as unknown as { runBeforePrompt(): Promise<void> }).runBeforePrompt();
+      expect(prepareNativeLoad).toHaveBeenCalledTimes(1);
+      expect(beforePrompt).not.toHaveBeenCalled();
+      const lifecycle = vi.mocked(f.runner.createSession).mock.calls[0]![1]!;
+      const authority = { acpSessionRef: "acp-1", requestId: "native-turn", readOnlyRoots: ["/verified/skill"] };
+      await lifecycle.admitSkillLoad!(authority);
+      expect(admitNativeLoad).toHaveBeenCalledExactlyOnceWith(["/verified/skill"]);
+      await expect(lifecycle.admitSkillLoad!({ ...authority, acpSessionRef: "foreign" })).rejects.toThrow();
+      owned = false;
+      await expect(lifecycle.admitSkillLoad!(authority)).rejects.toThrow(/fenced/);
+      expect(admitNativeLoad).toHaveBeenCalledTimes(1);
+    } finally { owned = true; await f.session.close("cancelled"); }
+  });
+
   it.each(["live", "restored"] as const)("keeps a %s Codex thread's MCP transport bound to only the current fenced turn", async continuation => {
     const seen: string[] = [];
     let holdNext = false;

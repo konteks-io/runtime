@@ -453,3 +453,66 @@ it("selects native Skill attachments only from the exact authorized source files
     await cleanup();
   } finally { await activation.release(); }
 });
+
+it("admits only verified native primary requests in the live governed turn", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "opencode-admission-"))); roots.push(root);
+  const skillRoot = join(root, "review");
+  await mkdir(skillRoot);
+  await writeFile(join(skillRoot, "SKILL.md"), "---\nname: Review\n---\nReview carefully.");
+  const activation = await createOpenCodeActivation(root, [skillRoot]);
+  const callbacks = new Map<string, (input: unknown) => Promise<void>>();
+  const admitSkillLoad = vi.fn(async () => {});
+  const turn = { acpSessionRef: "opaque", bridgeSessionId: "native", requestId: "turn", admitSkillLoad };
+  try {
+    const module = await import(pathToFileURL(join(activation.plugin.package, "server.js")).href);
+    const cleanup = await module.default.setup({ options: activation.plugin.options,
+      skill: { list: async () => ({ data: [{ id: "skill", path: join(skillRoot, "SKILL.md") }] }) },
+      session: { hook: async (name: string, callback: (input: unknown) => Promise<void>) => {
+        callbacks.set(name, callback); return { dispose: async () => {} };
+      } } });
+    activation.prepareTurn(turn);
+    await callbacks.get("prompt")!({ sessionID: "native", messageID: "message", prompt: {} });
+    const scope = { sessionID: "native", kind: "primary" };
+    await expect(callbacks.get("http.request")!(scope)).rejects.toThrow(/refused/);
+    const content = JSON.parse(await readFile(join(activation.plugin.package, "skills.json"), "utf8")) as string[];
+    const context = { sessionID: "native", messages: [{ id: "message", role: "user", content: content.map(text => ({ type: "text", text })) }] };
+    await callbacks.get("context")!(context);
+    expect(admitSkillLoad).toHaveBeenCalledExactlyOnceWith([skillRoot]);
+    await callbacks.get("context")!(context);
+    expect(admitSkillLoad).toHaveBeenCalledTimes(1);
+    await callbacks.get("http.request")!(scope);
+    await callbacks.get("experimental.ws.send")!(scope);
+    await expect(callbacks.get("http.request")!({ ...scope, kind: "title" })).rejects.toThrow(/admission/);
+    await expect(callbacks.get("http.request")!({ ...scope, sessionID: "other" })).rejects.toThrow(/admission/);
+    activation.finishTurn(turn);
+    await expect(callbacks.get("http.request")!(scope)).rejects.toThrow(/refused/);
+    await cleanup();
+  } finally { await activation.release(); }
+});
+
+it.each(["changed plugin snapshot", "authority refusal"])("keeps native transport blocked after %s", async failure => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "opencode-refusal-"))); roots.push(root);
+  const skillRoot = join(root, "review");
+  await mkdir(skillRoot);
+  await writeFile(join(skillRoot, "SKILL.md"), "---\nname: Review\n---\nOriginal content.");
+  const activation = await createOpenCodeActivation(root, [skillRoot]);
+  const callbacks = new Map<string, (input: unknown) => Promise<void>>();
+  const admitSkillLoad = vi.fn(async () => { throw new Error("private authority error"); });
+  try {
+    const file = join(activation.plugin.package, "skills.json");
+    if (failure === "changed plugin snapshot") await writeFile(file, JSON.stringify(["Changed content."]));
+    const content = JSON.parse(await readFile(file, "utf8")) as string[];
+    const module = await import(pathToFileURL(join(activation.plugin.package, "server.js")).href);
+    const cleanup = await module.default.setup({ options: activation.plugin.options,
+      skill: { list: async () => ({ data: [{ id: "skill", path: join(skillRoot, "SKILL.md") }] }) },
+      session: { hook: async (name: string, callback: (input: unknown) => Promise<void>) => {
+        callbacks.set(name, callback); return { dispose: async () => {} };
+      } } });
+    activation.prepareTurn({ acpSessionRef: "opaque", bridgeSessionId: "native", requestId: "turn", admitSkillLoad });
+    await callbacks.get("prompt")!({ sessionID: "native", messageID: "message", prompt: {} });
+    await expect(callbacks.get("context")!({ sessionID: "native", messages: [{ id: "message", role: "user", content: content.map(text => ({ type: "text", text })) }] })).rejects.toThrow(/activation was refused/);
+    expect(admitSkillLoad).toHaveBeenCalledTimes(failure === "changed plugin snapshot" ? 0 : 1);
+    await expect(callbacks.get("http.request")!({ sessionID: "native", kind: "primary" })).rejects.toThrow(/activation was refused/);
+    await cleanup();
+  } finally { await activation.release(); }
+});

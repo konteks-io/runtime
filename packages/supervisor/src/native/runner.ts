@@ -274,6 +274,7 @@ export class NativeRunner implements RunnerPort {
         await lifecycle.replaceProcessOwner(previous, replacement);
       },
       assertCurrent: () => { this.requireReady(); lifecycle?.assertCurrent(); },
+      ...(lifecycle?.admitSkillLoad ? { admitSkillLoad: lifecycle.admitSkillLoad } : {}),
     };
   }
 

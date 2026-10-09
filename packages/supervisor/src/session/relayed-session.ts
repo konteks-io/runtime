@@ -590,6 +590,7 @@ export class RelayedSession {
         await this.deps.replaceExecutionProcessOwner(previous, replacement);
       },
       assertCurrent: () => this.assertLifecycleCurrent(),
+      admitSkillLoad: authority => this.admitNativeSkillLoad(authority),
     };
   }
 
@@ -1068,8 +1069,25 @@ export class RelayedSession {
     await this.promptRunner(ref, request.id, this.withInstructions(request.params as PromptParams));
   }
 
+  private async admitNativeSkillLoad(authority: { acpSessionRef: string; requestId: string; readOnlyRoots: readonly string[] }): Promise<void> {
+    this.assertLifecycleCurrent();
+    this.deps.assertPromptAllowed?.();
+    if (authority.acpSessionRef !== this.acpSessionRef || !this.nativeSkillLoadAvailable()) throw sessionClosed();
+    await this.preparedInputs!.admitNativeLoad!(authority.readOnlyRoots);
+    this.assertLifecycleCurrent();
+    this.deps.assertPromptAllowed?.();
+  }
+
+  private nativeSkillLoadAvailable(): boolean {
+    return this.assignment.agentRoute.agentId === "opencode" && Boolean(this.deps.reserveExecutionReference) &&
+      Boolean(this.preparedInputs?.prepareNativeLoad && this.preparedInputs.admitNativeLoad);
+  }
+
   private async runBeforePrompt(): Promise<void> {
-    try { await this.preparedInputs?.beforePrompt(); }
+    try {
+      if (this.nativeSkillLoadAvailable()) await this.preparedInputs!.prepareNativeLoad!();
+      else await this.preparedInputs?.beforePrompt();
+    }
     catch (error) { throw safeSkillFreshnessRejection(error) ?? new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
   }
 
