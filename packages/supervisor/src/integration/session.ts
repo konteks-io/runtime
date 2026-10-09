@@ -155,6 +155,18 @@ function boundedUtf8(text: string, maxBytes: number): { content: string; truncat
  * that completes without ever reaching the gate stops the session: that
  * route is not governed, so the task reports it instead of a result.
  */
+/** How long a finished read waits for its last events and its session close before it reports anyway. */
+const SETTLE_GRACE_MS = 15_000;
+
+/** Whether `work` settled within `ms`; it keeps running either way. */
+async function settledWithin(work: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), ms); timer.unref(); });
+  const done = await Promise.race([work.then(() => true, () => true), timeout]);
+  clearTimeout(timer);
+  return done;
+}
+
 export class IntegrationSession {
   private readonly logger: Logger;
   private readonly ledger = new McpToolCallLedger();
@@ -190,6 +202,12 @@ export class IntegrationSession {
     await chmod(cwd, 0o700);
     const resultTools = new StructuredResultToolServer({ logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt } });
     let created = false;
+    // Where a read's time goes, one line per task (a read takes ~45 s and
+    // nothing said which part was slow).
+    const startedAt = now();
+    const phasesMs: Record<string, number> = {};
+    let mark = startedAt;
+    const lap = (phase: string) => { const at = now(); phasesMs[phase] = at - mark; mark = at; };
     try {
       const resultServer = await resultTools.start();
       const mcpServers: RunnerSessionInput["mcpServers"] = [{ type: "http", ...resultServer }];
@@ -210,13 +228,18 @@ export class IntegrationSession {
         integration: integrationAdmission(source, fixture),
       });
       created = true;
+      lap("session");
       this.acpSessionRef = session.acpSessionRef;
       assertCurrent();
       const definition = await resultTools.bind(schema);
       const end = await this.promptTurn(session.acpSessionRef, () => buildIntegrationPrompt(spec, definition), deadlineAt, now);
+      lap("turn");
       return this.result(end, resultTools.result()?.value);
     } finally {
       await this.cleanUp(created, resultTools, cwd);
+      lap("cleanup");
+      this.logger.info({ event: "integration.task.timing", assignmentId: this.assignment.id, phase: spec.phase,
+        agentId: spec.agentId, totalMs: now() - startedAt, phasesMs }, "integration task timing");
     }
   }
 
@@ -239,14 +262,19 @@ export class IntegrationSession {
       await Promise.race([turn, new Promise(resolve => setTimeout(resolve, this.deps.cancelGraceMs ?? 2_000).unref())]);
     }
     this.ended = end;
-    await Promise.allSettled([...this.pending]);
+    // Bounded like every other step of a read: one handler that never
+    // settles must not hold the task (and its terminal report) open.
+    await settledWithin(Promise.allSettled([...this.pending]), SETTLE_GRACE_MS);
     return this.ended;
   }
 
   private async cleanUp(created: boolean, resultTools: StructuredResultToolServer, cwd: string): Promise<void> {
     this.ended ??= { kind: "exited" };
     this.endTurn = null;
-    if (created && this.acpSessionRef) await this.deps.runner.closeSession(this.acpSessionRef).catch(error => this.logger.warn({ err: error }, "integration session close failed"));
+    if (created && this.acpSessionRef) {
+      const closing = this.deps.runner.closeSession(this.acpSessionRef).catch(error => this.logger.warn({ err: error }, "integration session close failed"));
+      if (!(await settledWithin(closing, SETTLE_GRACE_MS))) this.logger.warn({ assignmentId: this.assignment.id }, "integration session close still running; reporting without waiting for it");
+    }
     await resultTools.close().catch(() => undefined);
     await rm(cwd, { recursive: true, force: true }).catch(() => undefined);
   }

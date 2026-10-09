@@ -212,7 +212,9 @@ export class ReportSender {
     assertSubmittable(entry, args.draft, key);
     const reportSequence = entry.reports.nextSequence;
     const reportId = randomUUID();
+    const startedAt = Date.now();
     const report = await this.mintReport(entry, args, reportId, reportSequence);
+    const mintedAt = Date.now();
     await this.journalReport(entry, report, reportSequence);
     const group = reportGroup(args.assignmentId, args.attempt, args.claimId);
     await this.options.outbox.enqueue({
@@ -224,7 +226,15 @@ export class ReportSender {
       body: report,
       createdAt: report.reportedAt,
     });
+    const queuedAt = Date.now();
     await this.flushGroup(group);
+    const sentAt = Date.now();
+    // Core sees terminal integration reports ~8 s after reportedAt while
+    // other kinds take under a second (10-09); say which step took it.
+    if (sentAt - startedAt >= 1_000) {
+      this.logger.info({ event: "assignment_report.slow_send", assignmentId: args.assignmentId, attempt: args.attempt,
+        terminal: args.draft.terminal, mintMs: mintedAt - startedAt, journalMs: queuedAt - mintedAt, sendMs: sentAt - queuedAt }, "slow assignment report send");
+    }
     return report;
   }
 

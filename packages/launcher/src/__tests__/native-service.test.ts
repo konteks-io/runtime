@@ -99,7 +99,8 @@ describe("native background service definitions", () => {
     const service = nativeServiceDefinition({ os: 'windows', home: 'C:\\Users\\Test User', root, executable: `${root}\\releases\\next\\konteks-connector.exe`, userId: 'S-1-5-21-123-456-789-1001' });
     expect(JSON.parse(service.contents).shortcut).toContain('C:\\Users\\Test User\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\');
     const start = Buffer.from(service.start.args.at(-1)!, 'base64').toString('utf16le');
-    expect(start).toContain('$start.CreateNoWindow = $true');
+    expect(start).toContain('$start.UseShellExecute = $true');
+    expect(start).toContain('$start.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden');
     expect(start).not.toMatch(/RunAs|password/i);
     const status = Buffer.from(service.status.args.at(-1)!, 'base64').toString('utf16le');
     expect(status).toContain('StartTime.ToUniversalTime().Ticks.ToString()');
