@@ -46,6 +46,7 @@ import {
   omitPrivateAcpToolPayload,
   redactActivity,
   redactSessionMessage,
+  toolLifecycleOnly,
   type CanonicalAcpToolIdentity,
   type ChunkTrail,
 } from "./activity.js";
@@ -816,9 +817,9 @@ export class RelayedSession {
     // strict relay schema deliberately discards `_meta`; doing this after its
     // first parse would permanently lose Claude's safe Agent/ToolSearch name.
     const { canonicalMessage, canonicalIdentity } = this.canonicalized(message);
-    const parsed = SessionToCoreMessageSchema.safeParse(canonicalMessage);
-    if (!parsed.success) return this.rejectMalformed(message, canonicalMessage, canonicalIdentity, parsed.error.issues);
-    const body = this.outboundBody(parsed.data, canonicalIdentity);
+    const parsed = await this.parsedOutbound(message, canonicalMessage, canonicalIdentity);
+    if (parsed === null) return;
+    const body = this.outboundBody(parsed, canonicalIdentity);
     if (body === null) return;
     const sourceSequence = await this.deps.beforeSendToCore?.(body);
     this.deps.assertExecutionOwned?.();
@@ -846,6 +847,30 @@ export class RelayedSession {
       canonicalMessage: { ...message, params: { ...message.params, update: boundPublicToolTitle(omitPrivateAcpToolPayload(canonicalUpdate)) } },
       canonicalIdentity: toolCallId === undefined ? undefined : toolIdentity(toolCallId, canonicalUpdate),
     };
+  }
+
+  /**
+   * The message as the relay contract takes it, or null when it was refused.
+   * A tool update refused for its public content still goes out as the
+   * tool's lifecycle, so its end reaches the page.
+   */
+  private async parsedOutbound(message: SessionToCoreMessage, canonicalMessage: unknown, canonicalIdentity: CanonicalIdentity | undefined): Promise<SessionToCoreMessage | null> {
+    const parsed = SessionToCoreMessageSchema.safeParse(canonicalMessage);
+    if (parsed.success) return parsed.data;
+    const lifecycle = SessionToCoreMessageSchema.safeParse(toolLifecycleOnly(canonicalMessage));
+    if (!lifecycle.success) {
+      await this.rejectMalformed(message, canonicalMessage, canonicalIdentity, parsed.error.issues);
+      return null;
+    }
+    this.logger.warn({
+      event: "session.acp_tool_content_dropped",
+      assignmentId: this.assignment.id,
+      acpSessionRef: this.acpSessionRef,
+      toolCallId: canonicalIdentity?.toolCallId,
+      ...sessionUpdateKind(canonicalMessage),
+      ...contractIssue(parsed.error.issues),
+    }, "Native tool update sent without the content the relay contract refused");
+    return lifecycle.data;
   }
 
   /** A bridge payload that fails the vendored ACP schema is converted, never forwarded. */

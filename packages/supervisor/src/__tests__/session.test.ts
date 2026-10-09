@@ -1466,18 +1466,34 @@ describe("relayed session", () => {
     expect(session.counters.malformedResponses).toBe(0);
   });
 
-  it("still rejects invalid public tool fields and oversized public content after private payload normalization", async () => {
+  // 10-09: a heredoc command's title (> 2048) and a large output each dropped the whole update, so the tool never ended on the page.
+  it("sends an oversized tool update as its lifecycle, never its private payload or the refused content", async () => {
     const { session, sent } = await build();
     await session.bootstrap();
     const before = sent.length;
     for (const update of [
-      { sessionUpdate: "tool_call_update", toolCallId: "bad-title", status: "completed", title: "x".repeat(2049), rawOutput: { secret: "hidden" } },
-      { sessionUpdate: "tool_call_update", toolCallId: "bad-content", status: "completed", content: [{ type: "content", content: { type: "text", text: "x".repeat(70_000) } }], rawOutput: { secret: "hidden" } },
+      { sessionUpdate: "tool_call_update", toolCallId: "long-title", status: "completed", title: "x".repeat(2049), rawOutput: { secret: "hidden" } },
+      { sessionUpdate: "tool_call_update", toolCallId: "big-content", status: "completed", content: [{ type: "content", content: { type: "text", text: "x".repeat(70_000) } }], rawOutput: { secret: "hidden" } },
     ]) {
       await session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update } });
     }
+    const updates = sent.slice(before).map(message => (message.body as { params: { update: Record<string, unknown> } }).params.update);
+    expect(updates).toEqual([
+      { sessionUpdate: "tool_call_update", toolCallId: "long-title", status: "completed", title: expect.stringMatching(/^x{599}…$/) },
+      { sessionUpdate: "tool_call_update", toolCallId: "big-content", status: "completed" },
+    ]);
+    expect(JSON.stringify(updates)).not.toContain("hidden");
+    expect(session.counters.malformedResponses).toBe(0);
+  });
+
+  it("still rejects a tool update whose lifecycle itself breaks the contract", async () => {
+    const { session, sent } = await build();
+    await session.bootstrap();
+    const before = sent.length;
+    await session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1",
+      update: { sessionUpdate: "tool_call_update", toolCallId: "bad-status", status: "exploded" } } });
     expect(sent).toHaveLength(before);
-    expect(session.counters.malformedResponses).toBe(2);
+    expect(session.counters.malformedResponses).toBe(1);
   });
 
   it("relays every streamed chunk after one that ends inside a local path", async () => {

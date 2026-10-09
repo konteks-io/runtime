@@ -54,6 +54,22 @@ export function boundPublicToolTitle(value: unknown): unknown {
   return { ...update, title: `${[...title].slice(0, PUBLIC_TOOL_TITLE_MAX - 1).join("").trimEnd()}…` };
 }
 
+/**
+ * A tool update the relay contract refuses for its public content (a 70 kB
+ * output) is still the tool's lifecycle: without it the page shows the tool
+ * working for good. Keep only what names the call and its status.
+ */
+export function toolLifecycleOnly(message: unknown): unknown {
+  const body = plainRecord(message);
+  const params = plainRecord(body?.params);
+  const update = plainRecord(params?.update);
+  if (update?.sessionUpdate !== "tool_call" && update?.sessionUpdate !== "tool_call_update") return undefined;
+  const kept = Object.fromEntries(Object.entries(update).filter(([key]) => TOOL_LIFECYCLE_FIELDS.has(key)));
+  return { ...body, params: { ...params, update: boundPublicToolTitle(kept) } };
+}
+
+const TOOL_LIFECYCLE_FIELDS: ReadonlySet<string> = new Set(["sessionUpdate", "toolCallId", "status", "kind", "name", "title"]);
+
 type ToolCanonicalizer = (candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined) => unknown;
 
 /**
