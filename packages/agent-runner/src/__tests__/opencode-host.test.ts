@@ -1,3 +1,4 @@
+import { createRequire } from "node:module";
 import { createOpenCodeActivation } from "../host/opencode-activation.js";
 import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -217,7 +218,7 @@ describe("one OpenCode process per working copy", () => {
     await expect(first.beforePrompt()).rejects.toMatchObject({ code: "agent_unavailable" });
     expect(await readFile(join(second.env.XDG_CONFIG_HOME!, "opencode", "AGENTS.md"), "utf8")).toBe("rules");
     const plugin = JSON.parse(second.env.OPENCODE_CONFIG_CONTENT!).plugins[0];
-    const module = await import(pathToFileURL(join(plugin.package, "server.mjs")).href);
+    const module = await import(pathToFileURL(join(plugin.package, "server.js")).href);
     const deactivate = await module.default.setup({ options: plugin.options });
     await second.beforePrompt();
     selectedRoots.length = 0;
@@ -318,12 +319,13 @@ describe("one OpenCode process per working copy", () => {
       expect(settings.plugins).toHaveLength(1);
       const plugin = settings.plugins[0];
       expect((await lstat(plugin.package)).isDirectory()).toBe(true);
+      expect(createRequire(import.meta.url).resolve(join(plugin.package, "server"))).toBe(join(plugin.package, "server.js"));
       expect((await fetch(plugin.options.endpoint, { method: "POST" })).status).toBe(403);
       let admitted = false;
       const prompt = binding.beforePrompt().then(() => { admitted = true; });
       await Promise.resolve();
       expect(admitted).toBe(false);
-      const module = await import(pathToFileURL(join(plugin.package, "server.mjs")).href);
+      const module = await import(pathToFileURL(join(plugin.package, "server.js")).href);
       const deactivate = await module.default.setup({ options: plugin.options });
       await prompt;
       expect(admitted).toBe(true);

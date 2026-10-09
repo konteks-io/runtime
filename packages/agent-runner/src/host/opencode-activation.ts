@@ -63,8 +63,8 @@ export async function createOpenCodeActivation(configHome: string) {
   server.requestTimeout = 5000;
   server.headersTimeout = 5000;
   try {
-    await writeFile(join(directory, "package.json"), JSON.stringify({ private: true, type: "module", main: "server.mjs" }), { mode: 0o600, flag: "wx" });
-    await writeFile(join(directory, "server.mjs"), source, { mode: 0o600, flag: "wx" });
+    await writeFile(join(directory, "package.json"), JSON.stringify({ private: true, type: "module", main: "server.js" }), { mode: 0o600, flag: "wx" });
+    await writeFile(join(directory, "server.js"), source, { mode: 0o600, flag: "wx" });
     const port = await listen(server);
     server.unref();
     return {
