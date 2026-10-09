@@ -137,6 +137,15 @@ interface OrchestratorDeps {
   logger?: Logger;
 }
 
+/** Work whose dispatch only returns at its terminal report (integration, onboarding). */
+function runsToCompletionInDispatch(
+  assignment: RemoteWorkAssignment,
+  deps: Pick<OrchestratorDeps, "integrationCarrier" | "onboardCarrier">,
+): boolean {
+  return Boolean(deps.integrationCarrier && isIntegrationWorkAssignment(assignment)) ||
+    Boolean(deps.onboardCarrier && isOnboardWorkAssignment(assignment));
+}
+
 export class WorkOrchestrator {
   readonly reports: ReportSender;
   private readonly sessions = new Map<string, RelayedSession>();
@@ -642,6 +651,19 @@ export class WorkOrchestrator {
     // session channel are established before the hosted controller can
     // acquire prompt authority.
     if (isSearchAssignment(assignment)) await this.acceptSearchClaim(assignment);
+    // A claim reply is handled in the assignment channel's one-at-a-time
+    // lane, and its ack waits for this handler. Integration and onboarding
+    // work run to their terminal report inside dispatch, so awaiting them
+    // here held every later claim, report ack and cancel behind one read
+    // (10-09: three reads claimed at once all finished ~19 min later, as the
+    // planner turn waiting on them expired). Relayed sessions already
+    // bootstrap off-lane; these now do too. `dispatching` keeps them owned
+    // and dispatchImpl reports their failures.
+    if (runsToCompletionInDispatch(assignment, this.deps)) {
+      void this.dispatch(assignment, entry, assertAuthority).catch(error =>
+        this.logger.warn({ err: error, assignmentId: assignment.id, attempt: assignment.attempt }, "off-lane dispatch failed"));
+      return;
+    }
     await this.dispatch(assignment, entry, assertAuthority);
   }
 
