@@ -33,6 +33,7 @@ describe("DSH per-child profile composition", () => {
     expect(JSON.parse(await readFile(join(dirname(patch), "read-policy.json"), "utf8"))).toEqual({ cwd, readOnlyRoots: [selected] });
     expect(await readFile(join(dirname(patch), "filesystem-backend.mjs"))).toEqual(await readFile(new URL("../../dist/bridge/dsh-filesystem-backend.js", import.meta.url)));
     expect(await readFile(patch, "utf8")).toContain("inject: [fs, konteksFileAuthority]");
+    expect(JSON.parse(await readFile(join(dirname(patch), "package.json"), "utf8"))).toMatchObject({ name: "@konteks/dsh-session-filesystem", version: expect.stringMatching(/\S/) });
     expect(await readFile(patch, "utf8")).not.toContain("bundledSkillDir");
     expect(binding.args?.slice(0, 2)).toEqual(["/public/native/dsh/lib/bin.js", "--profile"]);
     expect(binding.args?.slice(3, 5)).toEqual(["--from-default-profile", "acp"]);
@@ -88,6 +89,8 @@ describe("DSH per-child profile composition", () => {
     expect(await readFile(paths.patchPath, "utf8")).toContain(`cwd: ${JSON.stringify(paths.cwd)}`);
     expect(await readFile(paths.patchPath, "utf8")).toContain("- id: agent-loop\n  inject: [fs, konteksFileAuthority]");
     expect(await readFile(paths.patchPath, "utf8")).toContain("- id: fs-sandbox\n  disabled: true");
+    // dsh's plugin package inventory refuses a manifest without a version: every request then failed.
+    expect(JSON.parse(await readFile(join(paths.policyDir, "package.json"), "utf8"))).toMatchObject({ name: "@konteks/dsh-control-filesystem", version: expect.stringMatching(/\S/) });
   });
 
   it("refuses a child environment pointing outside its owned profile resolution tree", async () => {

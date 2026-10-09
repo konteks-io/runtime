@@ -28,6 +28,10 @@ export function nativePermissionEscalation(
   return { kind: "defer", allowOnceOnly: true, optionIds, title: escalation.title };
 }
 
+/** What the person reads on the card, before the agent's own words for the call. */
+const OUTSIDE_FOLDER = "Outside this session's folder";
+const NEEDS_NETWORK = "Needs the network";
+
 /** A recognizable Codex carrier with a missing kind is malformed, not an
  * ordinary auto-approvable tool. Known MCP calls retain their separate gate. */
 function classifiedEscalation(request: RequestPermissionRequest, context: PermissionContext, identity: PermissionToolIdentity): Escalation | null {
@@ -39,10 +43,10 @@ function classifiedEscalation(request: RequestPermissionRequest, context: Permis
 function providerEscalation(request: RequestPermissionRequest, context: PermissionContext, tool: string): Escalation | null {
   if (context.agentId === "codex") return codexEscalation(request, context);
   if (context.agentId !== "claude-code") return null;
-  if (tool === "SandboxNetworkAccess") return { allowOptionId: "allow-once", title: escalationTitle(request, "Additional network authority", "network access") };
+  if (tool === "SandboxNetworkAccess") return { allowOptionId: "allow-once", title: escalationTitle(request, NEEDS_NETWORK, "network access") };
   if (tool !== "Bash" && tool !== "PowerShell") return null;
   return (request.toolCall.locations ?? []).length > 0
-    ? { allowOptionId: "allow-once", title: escalationTitle(request, "Command outside normal session authority", tool) }
+    ? { allowOptionId: "allow-once", title: escalationTitle(request, OUTSIDE_FOLDER, tool) }
     : null;
 }
 
@@ -50,16 +54,16 @@ function codexEscalation(request: RequestPermissionRequest, context: PermissionC
   const input = plainRecord(request.toolCall.rawInput) ?? {};
   if (codexProfileRequest(request, input)) {
     return { allowOptionId: "allow_permissions_turn", valid: codexProfileValid(request, "other", input.permissions),
-      title: "Grant additional Codex filesystem/network authority for this turn?" };
+      title: "Let Codex reach more files or the network for this turn?" };
   }
   if ("additionalPermissions" in input) {
     return { allowOptionId: "allow_once", valid: codexProfileValid(request, "execute", input.additionalPermissions),
-      title: escalationTitle(request, "Additional command authority", "Codex command") };
+      title: escalationTitle(request, "Needs more access", "Codex command") };
   }
-  if (codexNetworkRequest(request, input)) return { allowOptionId: "allow_once", valid: request.toolCall.kind === "execute", title: escalationTitle(request, "Additional network authority", "Codex network access") };
+  if (codexNetworkRequest(request, input)) return { allowOptionId: "allow_once", valid: request.toolCall.kind === "execute", title: escalationTitle(request, NEEDS_NETWORK, "Codex network access") };
   if (request.toolCall.kind !== "execute") return null;
   return outsideCommandAuthority(request, context)
-    ? { allowOptionId: "allow_once", title: escalationTitle(request, "Command outside normal session authority", "Codex command") }
+    ? { allowOptionId: "allow_once", title: escalationTitle(request, OUTSIDE_FOLDER, "Codex command") }
     : null;
 }
 

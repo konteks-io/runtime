@@ -37,6 +37,39 @@ export function omitPrivateAcpToolPayload(value: unknown): unknown {
     key !== "rawInput" && key !== "rawOutput" && key !== "_meta"));
 }
 
+/** Longer than a person reads on one tool line, well inside the relay's 2048. */
+export const PUBLIC_TOOL_TITLE_MAX = 600;
+
+/**
+ * Claude Code titles a shell call with its whole command, and a heredoc runs
+ * past the relay contract's 2048 characters: the update was refused whole, so
+ * the tool's own end never reached the page (10-09). Cut the public title
+ * instead; the call keeps its identity and status.
+ */
+export function boundPublicToolTitle(value: unknown): unknown {
+  const update = plainRecord(value);
+  if (update?.sessionUpdate !== "tool_call" && update?.sessionUpdate !== "tool_call_update") return value;
+  const title = update.title;
+  if (typeof title !== "string" || title.length <= PUBLIC_TOOL_TITLE_MAX) return value;
+  return { ...update, title: `${[...title].slice(0, PUBLIC_TOOL_TITLE_MAX - 1).join("").trimEnd()}…` };
+}
+
+/**
+ * A tool update the relay contract refuses for its public content (a 70 kB
+ * output) is still the tool's lifecycle: without it the page shows the tool
+ * working for good. Keep only what names the call and its status.
+ */
+export function toolLifecycleOnly(message: unknown): unknown {
+  const body = plainRecord(message);
+  const params = plainRecord(body?.params);
+  const update = plainRecord(params?.update);
+  if (update?.sessionUpdate !== "tool_call" && update?.sessionUpdate !== "tool_call_update") return undefined;
+  const kept = Object.fromEntries(Object.entries(update).filter(([key]) => TOOL_LIFECYCLE_FIELDS.has(key)));
+  return { ...body, params: { ...params, update: boundPublicToolTitle(kept) } };
+}
+
+const TOOL_LIFECYCLE_FIELDS: ReadonlySet<string> = new Set(["sessionUpdate", "toolCallId", "status", "kind", "name", "title"]);
+
 type ToolCanonicalizer = (candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined) => unknown;
 
 /**
@@ -248,8 +281,34 @@ function antigravityReplacesTitle(candidate: Record<string, unknown>, { name, ki
   return title !== undefined && (currentTitle === undefined || ANTIGRAVITY_TOOL_TITLE.test(currentTitle) || name === title || name === "workspace_trust" || kind === "other");
 }
 
+/** Codex's titles for a command that only lists or searches files. */
+const CODEX_FINDING_TITLE = /^(?:List files|Search files|Search for |Search in |Search$)/;
+
+/**
+ * A file listing or search that finds nothing exits 1 (`rg --files -g
+ * AGENTS.md`), and codex-acp reports every non-zero exit as failed: Codex
+ * looks for AGENTS.md on most turns, so most turns showed a red "List files ·
+ * Failed" for a search that worked. Exit 1 with no output is "nothing found".
+ */
+function codexCanonicalizer(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): unknown {
+  if (candidate.sessionUpdate !== "tool_call_update" || candidate.status !== "failed") return candidate;
+  return codexFinds(candidate, prior) && foundNothing(candidate.rawOutput) ? { ...candidate, status: "completed" } : candidate;
+}
+
+function codexFinds(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): boolean {
+  if (prior?.kind === "search") return true;
+  const title = nonBlank(candidate.title) ?? prior?.title;
+  return title !== undefined && CODEX_FINDING_TITLE.test(title);
+}
+
+function foundNothing(rawOutput: unknown): boolean {
+  const output = plainRecord(rawOutput);
+  return output?.exit_code === 1 && nonBlank(output.formatted_output) === undefined;
+}
+
 const DIALECT_CANONICALIZERS: ReadonlyMap<string, ToolCanonicalizer> = new Map([
   ["claude-code", claudeCanonicalizer],
+  ["codex", codexCanonicalizer],
   ["dsh", dshCanonicalizer],
   ["opencode", openCodeCanonicalizer],
   ["antigravity", antigravityCanonicalizer],
@@ -262,7 +321,7 @@ const DIALECT_CANONICALIZERS: ReadonlyMap<string, ToolCanonicalizer> = new Map([
  * This is not a proof of arbitrary secret detection or split-chunk scanning.
  */
 export function redactActivity(value: unknown, workspaceRoot: string, options: ActivityTextOptions = {}): unknown {
-  if (typeof value === "string") return publicText(value, workspaceRoot, options.startsAtBoundary ?? true, options.continuesPath ?? false);
+  if (typeof value === "string") return publicText(value, workspaceRoot, options);
   if (Array.isArray(value)) return value.map(item => redactActivity(item, workspaceRoot, options));
   if (value === null || typeof value !== "object") return value;
   return redactedRecord(value, workspaceRoot, options);
@@ -332,6 +391,39 @@ interface ActivityTextOptions {
   startsAtBoundary?: boolean;
   /** The previous chunk ended inside a local path: redact this chunk's leading continuation too. */
   continuesPath?: boolean;
+  /**
+   * That path is already masked at the end of the previous chunk's output, so
+   * its continuation adds nothing: one path reads as one mask, not one per
+   * chunk it streamed in.
+   */
+  afterMaskedPath?: boolean;
+}
+
+const PATH_MASK = "[local-path]";
+
+/** Whether redacted output ends with a masked path that the next chunk may continue. */
+export function endsWithPathMask(output: string): boolean {
+  return output.endsWith(PATH_MASK);
+}
+
+/**
+ * macOS keeps app data under "Application Support", the one common folder
+ * name with a space. A path stopped at it and leaked its tail
+ * ("[local-path] Support/konteks-remote/…"), so the space is held while
+ * paths are matched.
+ */
+const HELD_SPACE = "\uE000";
+const holdApplicationSupport = (text: string) => text.replace(/\/Application Support(?=[\\/])/g, `/Application${HELD_SPACE}Support`);
+const releaseHeldSpaces = (text: string) => text.split(HELD_SPACE).join(" ");
+
+/** The session's own folder, wherever it appears whole, reads as `[workspace]`. */
+function nameWorkspace(text: string, workspaceRoot: string): string {
+  if (workspaceRoot.length <= 1) return text;
+  const root = workspaceRoot.replace(/[\\/]$/, "");
+  // The prefix marker keeps approved source paths relative and recognizable.
+  const relative = text.split(`${root}/`).join("[workspace]/").split(`${root}\\`).join("[workspace]/");
+  const escaped = root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return relative.replace(new RegExp(`${escaped}(?=$|[\\s"'<>\`)\\]},;:!?]|\\.(?:\\s|$))`, "g"), "[workspace]");
 }
 
 const PATH_TOKEN_START = /^(?:\/(?![/*])|[A-Za-z]:(?:[\\/]|$)|\\\\)/;
@@ -350,25 +442,43 @@ export function endsInsidePath(text: string, previousEndedInPath: boolean, start
   return PATH_TOKEN_START.test(text.slice(start + 1));
 }
 
+/** What a stream remembers of its last text chunk: raw text, whether it ended in a path, and what it became. */
+export interface ChunkTrail {
+  text: string;
+  inPath: boolean;
+  output: string;
+}
+
+/** How the next streamed chunk reads, given the stream's last one. */
+export function chunkOptions(previous: ChunkTrail | undefined): Required<ActivityTextOptions> {
+  const continuesPath = previous?.inPath ?? false;
+  return {
+    startsAtBoundary: continuesAtBoundary(previous?.text),
+    continuesPath,
+    afterMaskedPath: continuesPath && endsWithPathMask(previous?.output ?? ""),
+  };
+}
+
+/** The trail after a chunk. One that was all continuation leaves the previous mask the one to continue. */
+export function nextTrail(previous: ChunkTrail | undefined, text: string, options: Required<ActivityTextOptions>, output: string): ChunkTrail {
+  return { text, inPath: endsInsidePath(text, options.continuesPath, options.startsAtBoundary), output: output || (previous?.output ?? "") };
+}
+
 /** Whether text following `previous` starts a new token for path detection. */
 export function continuesAtBoundary(previous: string | undefined): boolean {
   return previous === undefined || previous.length === 0 || /[\s"'=(]$/.test(previous);
 }
 
-function publicText(value: string, workspaceRoot: string, startsAtBoundary: boolean, continuesPath: boolean): string {
+function publicText(value: string, workspaceRoot: string, options: ActivityTextOptions): string {
+  const startsAtBoundary = options.startsAtBoundary ?? true;
   let text = redactText(value);
-  if (continuesPath) text = text.replace(/^(?=[\w.~\\/-])[^\s"'<>`)\]}*]+/, "[local-path]");
+  if (options.continuesPath) text = text.replace(/^(?=[\w.~\\/-])[^\s"'<>`)\]}*]+/, options.afterMaskedPath ? "" : PATH_MASK);
   // A chunk opening `:/…` or `:\…` continues a drive path whose letter was
   // emitted in the previous chunk. `://` is excluded because that is a URL
   // scheme, and a chunk ending exactly at the separator defers rather than
   // guessing: `:/` alone is ambiguous until the next chunk arrives.
   if (!startsAtBoundary) text = text.replace(/^:[\\/](?!\/)[^\s"'<>`)\]}]+/, "[local-path]");
-  if (workspaceRoot.length > 1) {
-    const root = workspaceRoot.replace(/[\\/]$/, "");
-    // The prefix marker keeps approved source paths relative and recognizable.
-    text = text.split(`${root}/`).join("[workspace]/").split(`${root}\\`).join("[workspace]/");
-    if (text === root) text = "[workspace]";
-  }
+  text = holdApplicationSupport(nameWorkspace(text, workspaceRoot));
   // A DIGIT sentinel keeps a mid-token chunk start from matching a path at
   // position 0, and it must not be a letter: `x` before a chunk opening `://…`
   // reads as the drive-letter pattern below, so the sentinel matched as its own
@@ -384,5 +494,5 @@ function publicText(value: string, workspaceRoot: string, startsAtBoundary: bool
     // part of one: `sudo ls /**` (a root slash and Markdown bold) is not a
     // private path, and redacting it broke the bold.
     .replace(/(^|[\s"'=(])\/(?!\/)(?=[\w.~-])[^\s"'<>`)\]}*]+/g, "$1[local-path]");
-  return startsAtBoundary ? out : out.slice(1);
+  return releaseHeldSpaces(startsAtBoundary ? out : out.slice(1));
 }

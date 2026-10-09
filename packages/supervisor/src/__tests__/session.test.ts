@@ -494,6 +494,21 @@ describe("relayed session", () => {
       },
     } as RemoteWorkAssignment;
 
+    it("resumes a direct Codex thread on every turn: it has no MCP transport for the legacy check to protect", async () => {
+      // 10-09: a direct Codex session took the one-time legacy-thread load on
+      // its second turn and was refused on every turn after ("This message
+      // did not reach the agent"): a direct session never starts the
+      // capability facade, so it never records a local MCP transport.
+      const assertLegacyCodexThreadUnloaded = vi.fn(async () => false);
+      const codexDirect = { ...directWork, agentRoute: { ...directWork.agentRoute, agentId: "codex" } } as RemoteWorkAssignment;
+      const f = await build({ restoreReference: "acp-0", assertLegacyCodexThreadUnloaded }, codexDirect);
+      try {
+        await f.session.bootstrap();
+        expect(f.runner.createSession).toHaveBeenCalledWith(expect.objectContaining({ restoreAcpSessionRef: "acp-0" }), undefined);
+        expect(assertLegacyCodexThreadUnloaded).not.toHaveBeenCalled();
+      } finally { await f.session.close("cancelled"); }
+    });
+
     it("refuses new model policy before preparation and provider effects unless signed Core 7.4 is accepted", async () => {
       const prepareInputs = vi.fn();
       const f = await build(
@@ -1451,18 +1466,34 @@ describe("relayed session", () => {
     expect(session.counters.malformedResponses).toBe(0);
   });
 
-  it("still rejects invalid public tool fields and oversized public content after private payload normalization", async () => {
+  // 10-09: a heredoc command's title (> 2048) and a large output each dropped the whole update, so the tool never ended on the page.
+  it("sends an oversized tool update as its lifecycle, never its private payload or the refused content", async () => {
     const { session, sent } = await build();
     await session.bootstrap();
     const before = sent.length;
     for (const update of [
-      { sessionUpdate: "tool_call_update", toolCallId: "bad-title", status: "completed", title: "x".repeat(2049), rawOutput: { secret: "hidden" } },
-      { sessionUpdate: "tool_call_update", toolCallId: "bad-content", status: "completed", content: [{ type: "content", content: { type: "text", text: "x".repeat(70_000) } }], rawOutput: { secret: "hidden" } },
+      { sessionUpdate: "tool_call_update", toolCallId: "long-title", status: "completed", title: "x".repeat(2049), rawOutput: { secret: "hidden" } },
+      { sessionUpdate: "tool_call_update", toolCallId: "big-content", status: "completed", content: [{ type: "content", content: { type: "text", text: "x".repeat(70_000) } }], rawOutput: { secret: "hidden" } },
     ]) {
       await session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update } });
     }
+    const updates = sent.slice(before).map(message => (message.body as { params: { update: Record<string, unknown> } }).params.update);
+    expect(updates).toEqual([
+      { sessionUpdate: "tool_call_update", toolCallId: "long-title", status: "completed", title: expect.stringMatching(/^x{599}…$/) },
+      { sessionUpdate: "tool_call_update", toolCallId: "big-content", status: "completed" },
+    ]);
+    expect(JSON.stringify(updates)).not.toContain("hidden");
+    expect(session.counters.malformedResponses).toBe(0);
+  });
+
+  it("still rejects a tool update whose lifecycle itself breaks the contract", async () => {
+    const { session, sent } = await build();
+    await session.bootstrap();
+    const before = sent.length;
+    await session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1",
+      update: { sessionUpdate: "tool_call_update", toolCallId: "bad-status", status: "exploded" } } });
     expect(sent).toHaveLength(before);
-    expect(session.counters.malformedResponses).toBe(2);
+    expect(session.counters.malformedResponses).toBe(1);
   });
 
   it("relays every streamed chunk after one that ends inside a local path", async () => {
@@ -1490,7 +1521,7 @@ describe("relayed session", () => {
       ["acp", "session/update", "plan"],
     ]);
     const text = bodies.slice(0, 3).map(body => body.params.update.content?.text).join("");
-    expect(text).toBe("Editing [local-path][local-path] now and running the tests.");
+    expect(text).toBe("Editing [local-path] now and running the tests.");
     expect(JSON.stringify(bodies)).not.toContain("private-person");
   });
 

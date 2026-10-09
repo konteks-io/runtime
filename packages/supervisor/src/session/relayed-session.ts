@@ -38,13 +38,17 @@ import { McpCapabilityFacade, type McpLocalTransportIdentity } from "../mcp/capa
 import { PREVIEW_WORK_KINDS, PreviewMcpServer, type SessionPreviewAccess } from "../preview/mcp-server.js";
 import { PreviewBrowserGateway } from "../preview/browser-gateway.js";
 import {
+  boundPublicToolTitle,
   canonicalizeAcpToolActivity,
-  continuesAtBoundary,
+  chunkOptions,
   contractIssue,
-  endsInsidePath,
+  nextTrail,
   omitPrivateAcpToolPayload,
+  redactActivity,
   redactSessionMessage,
+  toolLifecycleOnly,
   type CanonicalAcpToolIdentity,
+  type ChunkTrail,
 } from "./activity.js";
 import { NativeExecutionGate, type NativeExecutionGateOptions } from "../native/execution-gate.js";
 import {
@@ -208,7 +212,7 @@ export class RelayedSession {
   private channelOpened = false;
   private releaseChannel: (() => void) | null = null;
   /** Last streamed text per chunk kind, so redaction can tell a mid-token chunk start. */
-  private readonly lastChunkText = new Map<string, { text: string; inPath: boolean }>();
+  private readonly lastChunkText = new Map<string, ChunkTrail>();
   /** Safe tool identity carried from `tool_call` to sparse terminal updates. */
   private readonly toolActivityIdentity = new Map<string, CanonicalAcpToolIdentity>();
   /** Rebuilds a host agent's permission requests and trips on an unapproved tool (host-tool-governance.ts: DeepSeek Harness, OpenCode). */
@@ -550,10 +554,16 @@ export class RelayedSession {
       { diagnostic: "legacy_mcp_thread_loaded_or_unverified" });
   }
 
+  /**
+   * A Codex thread whose platform MCP transport predates the retained one.
+   * Never a direct session's: it starts no capability facade, so it has no
+   * transport to refresh, and treating it as legacy spent the one-time
+   * legacy load on its second turn and refused every turn after.
+   */
   private legacyCodexTransport(reference: string | undefined): boolean {
     return (
       this.assignment.agentRoute.agentId === "codex" && Boolean(this.assignment.agentRoute.mcpCapabilityTokenRef) &&
-      Boolean(reference) && !this.deps.mcpLocalTransport
+      Boolean(reference) && !this.deps.mcpLocalTransport && !isDirectAssignment(this.assignment)
     );
   }
 
@@ -807,9 +817,9 @@ export class RelayedSession {
     // strict relay schema deliberately discards `_meta`; doing this after its
     // first parse would permanently lose Claude's safe Agent/ToolSearch name.
     const { canonicalMessage, canonicalIdentity } = this.canonicalized(message);
-    const parsed = SessionToCoreMessageSchema.safeParse(canonicalMessage);
-    if (!parsed.success) return this.rejectMalformed(message, canonicalMessage, canonicalIdentity, parsed.error.issues);
-    const body = this.outboundBody(parsed.data, canonicalIdentity);
+    const parsed = await this.parsedOutbound(message, canonicalMessage, canonicalIdentity);
+    if (parsed === null) return;
+    const body = this.outboundBody(parsed, canonicalIdentity);
     if (body === null) return;
     const sourceSequence = await this.deps.beforeSendToCore?.(body);
     this.deps.assertExecutionOwned?.();
@@ -834,9 +844,33 @@ export class RelayedSession {
       toolCallId === undefined ? undefined : this.toolActivityIdentity.get(toolCallId),
     ) as Record<string, unknown>;
     return {
-      canonicalMessage: { ...message, params: { ...message.params, update: omitPrivateAcpToolPayload(canonicalUpdate) } },
+      canonicalMessage: { ...message, params: { ...message.params, update: boundPublicToolTitle(omitPrivateAcpToolPayload(canonicalUpdate)) } },
       canonicalIdentity: toolCallId === undefined ? undefined : toolIdentity(toolCallId, canonicalUpdate),
     };
+  }
+
+  /**
+   * The message as the relay contract takes it, or null when it was refused.
+   * A tool update refused for its public content still goes out as the
+   * tool's lifecycle, so its end reaches the page.
+   */
+  private async parsedOutbound(message: SessionToCoreMessage, canonicalMessage: unknown, canonicalIdentity: CanonicalIdentity | undefined): Promise<SessionToCoreMessage | null> {
+    const parsed = SessionToCoreMessageSchema.safeParse(canonicalMessage);
+    if (parsed.success) return parsed.data;
+    const lifecycle = SessionToCoreMessageSchema.safeParse(toolLifecycleOnly(canonicalMessage));
+    if (!lifecycle.success) {
+      await this.rejectMalformed(message, canonicalMessage, canonicalIdentity, parsed.error.issues);
+      return null;
+    }
+    this.logger.warn({
+      event: "session.acp_tool_content_dropped",
+      assignmentId: this.assignment.id,
+      acpSessionRef: this.acpSessionRef,
+      toolCallId: canonicalIdentity?.toolCallId,
+      ...sessionUpdateKind(canonicalMessage),
+      ...contractIssue(parsed.error.issues),
+    }, "Native tool update sent without the content the relay contract refused");
+    return lifecycle.data;
   }
 
   /** A bridge payload that fails the vendored ACP schema is converted, never forwarded. */
@@ -875,8 +909,12 @@ export class RelayedSession {
 
   private redactedUpdate(body: SessionToCoreMessage, canonicalIdentity: CanonicalIdentity | undefined): SessionToCoreMessage | null {
     const update = (body as { params: { update: { sessionUpdate: string; content?: { type?: string; text?: unknown } } } }).params.update;
-    const chunk = this.chunkContext(update);
-    const safe = SessionToCoreMessageSchema.safeParse(redactSessionMessage(body, this.sessionCwd(), chunk));
+    const chunkText = streamedText(update);
+    const previous = chunkText === undefined ? undefined : this.lastChunkText.get(update.sessionUpdate);
+    const chunk = chunkOptions(previous);
+    const redacted = redactSessionMessage(body, this.sessionCwd(), chunk);
+    this.rememberChunk(update.sessionUpdate, chunkText, previous, chunk, redacted);
+    const safe = SessionToCoreMessageSchema.safeParse(redacted);
     if (safe.success) return safe.data;
     this.counters.malformedResponses += 1;
     this.logger.warn({
@@ -892,17 +930,14 @@ export class RelayedSession {
   }
 
   /**
-   * Streamed text is split at arbitrary points; judge a chunk's first
-   * character against the previous chunk of the same stream.
+   * Streamed text is split at arbitrary points: the next chunk is judged
+   * against what this one was and what it became once redacted.
    */
-  private chunkContext(update: { sessionUpdate: string; content?: { type?: string; text?: unknown } }): { startsAtBoundary: boolean; continuesPath: boolean } {
-    const chunkText = streamedText(update);
-    const previous = chunkText === undefined ? undefined : this.lastChunkText.get(update.sessionUpdate);
-    const startsAtBoundary = continuesAtBoundary(previous?.text);
-    const continuesPath = previous?.inPath ?? false;
-    if (chunkText === undefined) this.lastChunkText.clear();
-    else this.lastChunkText.set(update.sessionUpdate, { text: chunkText, inPath: endsInsidePath(chunkText, continuesPath, startsAtBoundary) });
-    return { startsAtBoundary, continuesPath };
+  private rememberChunk(sessionUpdate: string, chunkText: string | undefined, previous: ChunkTrail | undefined,
+    chunk: ReturnType<typeof chunkOptions>, redacted: unknown): void {
+    if (chunkText === undefined) { this.lastChunkText.clear(); return; }
+    const output = (redacted as { params?: { update?: { content?: { text?: unknown } } } }).params?.update?.content?.text;
+    this.lastChunkText.set(sessionUpdate, nextTrail(previous, chunkText, chunk, typeof output === "string" ? output : ""));
   }
 
   /** Inbound from the grant holder / orchestrator. */
@@ -1285,7 +1320,10 @@ export class RelayedSession {
     if (accepted && event.method === "session/prompt" && isNativeTurn(this.assignment)) {
       // Say why before the close: its SIGTERM on the bridge was the only
       // trace of a Codex sign-in that could not refresh.
-      this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, code: event.code, errorClass: event.class, retryable: event.retryable },
+      // The agent's own words, redacted and bounded: a DeepSeek Harness turn
+      // that failed on every prompt logged only -32603 (10-09).
+      this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, code: event.code, errorClass: event.class, retryable: event.retryable,
+        message: String(redactActivity(String(event.message ?? ""), this.sessionCwd())).slice(0, 240) },
         "native turn failed with a request error; closing the assignment as an agent exit");
       await this.close("agent_exited");
     }
