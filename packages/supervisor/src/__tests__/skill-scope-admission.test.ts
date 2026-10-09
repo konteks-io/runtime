@@ -55,3 +55,22 @@ it("binds scope restrictions to the catalog digest", async () => {
   await expect(prepareOrganizationSkillSession(input)).rejects.toMatchObject({ code: "capability_unavailable" });
   expect(input.fetchTree).not.toHaveBeenCalled();
 });
+
+it("uses execution context covered by the signed catalog without granting agent load freshness", async () => {
+  const input = await fixture();
+  const { catalogDigest: _digest, ...body } = input.catalog;
+  const signedBody = { ...body, executionContext: input.executionContext };
+  const catalog = { ...signedBody, catalogDigest: computeRemoteSkillCatalogDigest(signedBody) };
+  const prepared = await prepareOrganizationSkillSession({ ...input, executionContext: undefined, catalog, authority: { ...input.authority, catalogDigest: catalog.catalogDigest } });
+  expect(input.fetchTree).toHaveBeenCalledTimes(1);
+  await expect(prepared.beforePrompt()).rejects.toMatchObject({ code: "capability_unavailable" });
+});
+
+it("does not let a local context override restrictions in the signed catalog", async () => {
+  const input = await fixture();
+  const { catalogDigest: _digest, ...body } = input.catalog;
+  const signedBody = { ...body, executionContext: { ...input.executionContext, initiativeRef: "other" } };
+  const catalog = { ...signedBody, catalogDigest: computeRemoteSkillCatalogDigest(signedBody) };
+  await expect(prepareOrganizationSkillSession({ ...input, catalog, authority: { ...input.authority, catalogDigest: catalog.catalogDigest } })).rejects.toMatchObject({ code: "capability_unavailable" });
+  expect(input.fetchTree).not.toHaveBeenCalled();
+});

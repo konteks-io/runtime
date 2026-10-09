@@ -62,9 +62,11 @@ export async function prepareDirectSessionInputs(options: { cwd: string; binding
 export async function prepareOrganizationSkillSession(options: StageOrganizationSkillsOptions & { cwd: string; skillFreshness?: (skillId: string) => Promise<SkillFreshnessEvidence> }): Promise<PreparedSessionInputs> {
   try {
     const cwd = await checkedDirectory(options.cwd);
+    const catalog = RemoteSkillCatalogSchema.parse(options.catalog);
     const snapshot = {
       ...options,
-      catalog: RemoteSkillCatalogSchema.parse(options.catalog),
+      ...(catalog.executionContext ? { executionContext: catalog.executionContext } : {}),
+      catalog,
       authority: { binding: { ...options.authority.binding }, catalogDigest: options.authority.catalogDigest },
     };
     const staged = await stageOrganizationSkills(snapshot);
@@ -89,8 +91,12 @@ async function assertScopedSkillFreshness(catalog: ReturnType<typeof RemoteSkill
   for (const skill of catalog.skills) {
     if (!skill.scope) continue;
     const proof = await evidence?.(skill.skillId);
-    if (skillFreshnessFailure(proof) !== null || proof?.desiredDigest !== skill.transfer.treeDigest || proof?.desiredVersion !== skill.version) {
+    if (skillFreshnessFailure(proof) !== null || !matchesDesiredSkill(proof, skill)) {
       throw new RemoteInstanceError("capability_unavailable", "Required Skill freshness has not been verified for this coding agent.");
     }
   }
+}
+
+function matchesDesiredSkill(proof: SkillFreshnessEvidence | undefined, skill: ReturnType<typeof RemoteSkillCatalogSchema.parse>["skills"][number]): boolean {
+  return proof?.desiredDigest === skill.transfer.treeDigest && proof?.desiredVersion === skill.version;
 }
