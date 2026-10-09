@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { computeRemoteFileTreeDigest, computeRemoteSkillCatalogDigest } from "../../../common/src/contracts.js";
+import { stageOrganizationSkills } from "../skills/staging.js";
 import { prepareOrganizationSkillSession } from "../skills/session-inputs.js";
 
 const roots: string[] = [];
@@ -72,5 +73,14 @@ it("does not let a local context override restrictions in the signed catalog", a
   const signedBody = { ...body, executionContext: { ...input.executionContext, initiativeRef: "other" } };
   const catalog = { ...signedBody, catalogDigest: computeRemoteSkillCatalogDigest(signedBody) };
   await expect(prepareOrganizationSkillSession({ ...input, catalog, authority: { ...input.authority, catalogDigest: catalog.catalogDigest } })).rejects.toMatchObject({ code: "capability_unavailable" });
+  expect(input.fetchTree).not.toHaveBeenCalled();
+});
+
+it("enforces signed scope at the staging boundary even without the session wrapper", async () => {
+  const input = await fixture();
+  const { catalogDigest: _digest, ...body } = input.catalog;
+  const signedBody = { ...body, executionContext: { ...input.executionContext, initiativeRef: "other" } };
+  const catalog = { ...signedBody, catalogDigest: computeRemoteSkillCatalogDigest(signedBody) };
+  await expect(stageOrganizationSkills({ ...input, catalog, authority: { ...input.authority, catalogDigest: catalog.catalogDigest } })).rejects.toMatchObject({ code: "workspace_binding_invalid" });
   expect(input.fetchTree).not.toHaveBeenCalled();
 });

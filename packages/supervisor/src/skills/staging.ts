@@ -193,7 +193,7 @@ function authorizedCatalog(options: StageOrganizationSkillsOptions): AuthorizedC
   if (!parsed.success || !authority.success || canonicalize(parsed.data.binding) !== canonicalize(authority.data) || parsed.data.catalogDigest !== options.authority.catalogDigest) {
     throw new RemoteInstanceError("workspace_binding_invalid", "Organization skill selection does not match the authorized assignment.");
   }
-  if (parsed.data.skills.some(skill => skill.scope && !skillScopeAllows(skill.scope, options.executionContext))) {
+  if (parsed.data.skills.some(skill => skill.scope && !skillScopeAllows(skill.scope, parsed.data.executionContext ?? options.executionContext))) {
     throw new RemoteInstanceError("workspace_binding_invalid", "A required Skill is outside this execution scope.");
   }
   return { catalog: parsed.data, binding: authority.data };
