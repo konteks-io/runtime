@@ -24,11 +24,12 @@ it.each([false, true])("verifies installed trees across configured agent homes, 
       }
     }) };
     const onVerified = vi.fn();
-    const outcome = refreshMachineSkills({ onVerified, client, scratchRoot: join(root, "cache"), homes, owner: { workspaceId: "tenant-a", instanceId: "machine-a" }, now: Date.now }, new AbortController().signal);
+    const profileBindings = homes.map((home, index) => ({ home, agentId: ["codex", "claude-code", "dsh", "opencode", "antigravity"][index]! }));
+    const outcome = refreshMachineSkills({ profileBindings, onVerified, client, scratchRoot: join(root, "cache"), homes, owner: { workspaceId: "tenant-a", instanceId: "machine-a" }, now: Date.now }, new AbortController().signal);
     if (tampered) {
       const error = await outcome.catch(value => value);
       expect(error).toBeInstanceOf(MachineSkillPartialFailure);
-      expect(error.inventory.profiles[0].status).toBe("failed");
+      expect(error.inventory.profiles[0]).toMatchObject({ agentId: "codex", status: "failed" });
       expect(error.inventory.profiles.slice(1).every((profile: { status: string }) => profile.status === "installed")).toBe(true);
       expect(onVerified).not.toHaveBeenCalled();
       return;
@@ -36,6 +37,7 @@ it.each([false, true])("verifies installed trees across configured agent homes, 
     const result = await outcome;
     expect(onVerified).toHaveBeenCalledWith(expect.objectContaining({ skills: [expect.objectContaining({ skillId: skill.skillId, fileModes: { "SKILL.md": 0o600 } })] }), homes, { workspaceId: "tenant-a", instanceId: "machine-a" });
     expect(result.skills).toEqual([skill]); expect(result.profiles).toHaveLength(5);
+    expect(result.profiles.map(profile => profile.agentId)).toEqual(profileBindings.map(profile => profile.agentId));
     for (const profile of result.profiles) expect(await readFile(join(profile.paths[0]!, "SKILL.md"), "utf8")).toBe("# Organization Skill");
     expect(client.read).toHaveBeenCalledTimes(1); expect(client.authorize.mock.calls.length).toBeGreaterThan(2);
   } finally { await rm(root, { recursive: true, force: true }); }
@@ -78,13 +80,15 @@ it("continues after a failed profile and never reports a partial refresh as veri
     const onVerified = vi.fn();
     const error = await refreshMachineSkills({ client: { prepare: async () => envelope, read: vi.fn(), authorize: async () => {} },
       scratchRoot: join(root, "cache"), homes: [broken, healthy], unavailableAgentIds: ["codex"],
+      profileBindings: [{ home: broken, agentId: "dsh" }, { home: healthy, agentId: "opencode" }, { home: healthy, agentId: "antigravity" }, { home: healthy, agentId: "opencode" }],
       owner: { workspaceId: "tenant-a", instanceId: "machine-a" }, now: Date.now, onVerified },
       new AbortController().signal).catch(value => value);
     expect(error).toBeInstanceOf(MachineSkillPartialFailure);
     expect(error.inventory.profiles).toEqual([
       { agentId: "codex", home: "", paths: [], status: "failed", reason: "native_profile_unconfigured" },
-      { home: broken, paths: [], status: "failed", reason: "profile_publication_failed" },
-      { home: healthy, paths: [], status: "installed" },
+      { agentId: "dsh", home: broken, paths: [], status: "failed", reason: "profile_publication_failed" },
+      { agentId: "opencode", home: healthy, paths: [], status: "installed" },
+      { agentId: "antigravity", home: healthy, paths: [], status: "installed" },
     ]);
     expect(onVerified).not.toHaveBeenCalled();
     expect(await readFile(broken, "utf8")).toBe("occupied");

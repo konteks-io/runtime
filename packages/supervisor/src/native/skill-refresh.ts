@@ -40,11 +40,13 @@ async function phase<T>(name: MachineSkillSyncPhase, operation: () => Promise<T>
 export async function refreshMachineSkills(options: {
   client: Pick<NativeSkillSyncClient, "prepare" | "read" | "authorize">;
   scratchRoot: string; homes: readonly string[]; unavailableAgentIds?: readonly string[];
+  profileBindings?: readonly { home: string; agentId: string }[];
   owner: { workspaceId: string; instanceId: string }; now: () => number;
   onVerified?: (staged: StagedOrganizationSkills, homes: readonly string[], owner: { workspaceId: string; instanceId: string }) => void;
 }, signal: AbortSignal): Promise<MachineSkillInventory> {
   const homes = [...options.homes], owner = structuredClone(options.owner);
   const profiles = initialProfiles(homes, options.unavailableAgentIds);
+  const profileBindings = structuredClone(options.profileBindings ?? []);
   const check = () => { if (signal.aborted) throw new Error("Skill synchronization is stopped"); };
   check(); const envelope = await phase("catalog", () => options.client.prepare(signal)); check();
   const assertAuthorized = async () => phase("authorization", async () => { check(); await options.client.authorize(envelope, signal); check(); });
@@ -54,7 +56,8 @@ export async function refreshMachineSkills(options: {
   }));
   for (const home of homes) {
     check();
-    profiles.push(await publishProfile(home, owner, staged, assertAuthorized));
+    const published = await publishProfile(home, owner, staged, assertAuthorized);
+    profiles.push(...identifyProfiles(published, profileBindings));
     check();
   }
   await assertAuthorized();
@@ -94,4 +97,10 @@ function initialProfiles(homes: readonly string[], agentIds?: readonly string[])
   if (!homes.length && profiles.length) throw new MachineSkillPartialFailure({ skills: [], profiles });
   validateDiscoveryHomes(homes);
   return profiles;
+}
+
+/** Several configured agents can discover the same home; publish it once and report each agent. */
+function identifyProfiles(profile: MachineSkillInventory["profiles"][number], bindings: readonly { home: string; agentId: string }[]): MachineSkillInventory["profiles"] {
+  const agents = [...new Set(bindings.filter(binding => resolve(binding.home) === resolve(profile.home)).map(binding => binding.agentId))];
+  return agents.length ? agents.map(agentId => ({ ...profile, paths: [...profile.paths], agentId })) : [profile];
 }

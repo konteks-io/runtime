@@ -2365,6 +2365,7 @@ export class Supervisor {
       const client = this.machineSkillSyncClient();
       return runRequestedSkillSync(client, () => refreshMachineSkills({
       client, homes, unavailableAgentIds,
+      profileBindings: this.options.native!.runners.flatMap(runner => machineSkillHomes([runner]).map(home => ({ home, agentId: runner.RUNNER_AGENT_ID }))),
       scratchRoot: join(this.config.SUPERVISOR_DATA_DIR, "machine-skills"),
       owner: { workspaceId: this.workspaceId ?? "", instanceId: this.instanceId ?? "" },
       now: () => this.clock.coreNow(),
