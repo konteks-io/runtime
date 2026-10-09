@@ -9,6 +9,13 @@ import {
 } from "../skills/local-skills.js";
 import type { NativeSkillSyncClient } from "./skill-sync-client.js";
 
+/** Independent source failures; runtime authority and cancellation were rechecked. */
+export class SkillPublicationPartialFailure extends AggregateError {
+  constructor(failures: unknown[]) {
+    super(failures, "One or more Skill publications failed");
+  }
+}
+
 async function inspectPublicationSource(path: string) {
   try {
     await lstat(path);
@@ -76,5 +83,5 @@ export async function refreshSkillPublications(
     }
   }
   check();
-  if (failures.length) throw new AggregateError(failures, "One or more Skill publications failed");
+  if (failures.length) throw new SkillPublicationPartialFailure(failures);
 }
