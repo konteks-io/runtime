@@ -252,15 +252,20 @@ async function fetchedSkillTree(manifest: RemoteTransferManifest, binding: Remot
 }
 
 /**
- * Renames the staged catalog into place: true once it moved. Another caller
- * that won the same immutable catalog is verified, never overwritten.
+ * Windows can report access denied when rename encounters an existing directory.
+ * A matching error is only a reason to verify the destination, never success.
  */
+function mayHaveExistingDestination(error: unknown): boolean {
+  if (isFsErrorWithCode(error, "EEXIST") || isFsErrorWithCode(error, "ENOTEMPTY")) return true;
+  return process.platform === "win32" && (isFsErrorWithCode(error, "EACCES") || isFsErrorWithCode(error, "EPERM"));
+}
+
 async function publishStaged(temporary: string, destination: string, catalog: RemoteSkillCatalog, options: StageOrganizationSkillsOptions): Promise<boolean> {
   try {
     await rename(temporary, destination);
     return true;
   } catch (error) {
-    if (!isFsErrorWithCode(error, "EEXIST") && !isFsErrorWithCode(error, "ENOTEMPTY")) throw error;
+    if (!mayHaveExistingDestination(error)) throw error;
     await verifyCatalog(destination, catalog, options.now());
     return false;
   }
@@ -331,7 +336,7 @@ export async function stageMachineOrganizationSkills(options: {
 async function publishMachineTree(temporary: string, destination: string): Promise<boolean> {
   try { await rename(temporary, destination); return true; }
   catch (error) {
-    if (!isFsErrorWithCode(error, "EEXIST") && !isFsErrorWithCode(error, "ENOTEMPTY")) throw error;
+    if (!mayHaveExistingDestination(error)) throw error;
     return false;
   }
 }
