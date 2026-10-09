@@ -1,3 +1,4 @@
+import { nativeSkillLoadObservations, type NativeSkillLoad } from "./native-skill-load-observation.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
@@ -166,6 +167,7 @@ export interface RelayedSessionDeps {
   /** Rechecked immediately before a local prompt crosses into the bridge. */
   assertPromptAllowed?: () => void;
   onUsage: (observation: AgentTurnUsageObservation) => Promise<void>;
+  onSkillUsage?: (observation: import("@konteks/remote-common").AgentSkillReadObservation) => Promise<void>;
   /** A turn started or ended: the computer's busy state changed. */
   onTurnActivity?: () => void;
   onClosed: (session: RelayedSession, reason: SessionClosedReason) => Promise<void>;
@@ -591,6 +593,7 @@ export class RelayedSession {
       },
       assertCurrent: () => this.assertLifecycleCurrent(),
       admitSkillLoad: authority => this.admitNativeSkillLoad(authority),
+      recordSkillLoad: load => this.recordNativeSkillLoad(load),
     };
   }
 
@@ -1076,6 +1079,22 @@ export class RelayedSession {
     await this.preparedInputs!.admitNativeLoad!(authority.readOnlyRoots);
     this.assertLifecycleCurrent();
     this.deps.assertPromptAllowed?.();
+  }
+
+  private async recordNativeSkillLoad(load: NativeSkillLoad): Promise<void> {
+    this.assertLifecycleCurrent();
+    this.deps.assertPromptAllowed?.();
+    if (load.acpSessionRef !== this.acpSessionRef || !this.deps.onSkillUsage || !this.preparedInputs?.nativeSkills) throw sessionClosed();
+    this.assertNativeLoadRoots(load.readOnlyRoots);
+    const request = this.deps.journal.pendingRequests.get(`${load.acpSessionRef}:received:${load.requestId}`);
+    const observations = nativeSkillLoadObservations(request, load, this.preparedInputs.nativeSkills);
+    for (const observation of observations) await this.deps.onSkillUsage(observation);
+    this.assertLifecycleCurrent();
+  }
+
+  private assertNativeLoadRoots(observed: readonly string[]): void {
+    const roots = this.preparedInputs?.readOnlyRoots ?? [];
+    if (observed.length !== roots.length || roots.some((root, index) => observed[index] !== root)) throw sessionClosed();
   }
 
   private nativeSkillLoadAvailable(): boolean {

@@ -458,3 +458,6 @@ export type {
 
 export { skillScopeAllows, skillFreshnessFailure } from "@konteks/backstage-plugin-common/remote-instance-internal";
 export type { SkillExecutionContext, SkillFreshnessEvidence } from "@konteks/backstage-plugin-common/remote-instance-internal";
+
+export { AgentSkillReadObservationSchema, RemoteSkillReadObservationRequestSchema, RemoteSkillReadObservationReceiptSchema } from "@konteks/backstage-plugin-common/remote-instance-internal";
+export type { AgentSkillReadObservation } from "@konteks/backstage-plugin-common/remote-instance-internal";

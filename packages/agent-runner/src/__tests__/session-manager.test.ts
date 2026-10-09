@@ -55,14 +55,19 @@ describe("session manager bootstrap", () => {
     const { bridge } = fakeBridge();
     const events = new RunnerEventBus();
     const admitSkillLoad = vi.fn(async () => {});
+    const recordSkillLoad = vi.fn(async () => {});
+    const load = { loadId: "load", readOnlyRoots: ["/verified/skill"], observedAt: "2026-10-10T00:00:00Z" };
+    let turnRecorder: ((value: typeof load) => Promise<void>) | undefined;
     let turnAdmission: ((roots: readonly string[]) => Promise<void>) | undefined;
     const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore(),
       beforePrompt: async (_bridge, turn) => {
         turnAdmission = turn.admitSkillLoad;
         await turnAdmission!(["/verified/skill"]);
+        turnRecorder = turn.recordSkillLoad;
+        await turnRecorder!(load);
       } });
     const { acpSessionRef } = await manager.create({ context, cwd: "/w", mcpServers: [],
-      lifecycle: { beforeCreate: async () => {}, recordProcessOwner: async () => {}, assertCurrent: () => {}, admitSkillLoad } });
+      lifecycle: { beforeCreate: async () => {}, recordProcessOwner: async () => {}, assertCurrent: () => {}, admitSkillLoad, recordSkillLoad } });
     const completed = nextEvent(events, "prompt_result");
     manager.prompt(acpSessionRef, "native-turn", { prompt: [] });
     await completed;
@@ -70,6 +75,9 @@ describe("session manager bootstrap", () => {
     expect(admitSkillLoad).toHaveBeenCalledExactlyOnceWith({ acpSessionRef, requestId: "native-turn", readOnlyRoots: ["/verified/skill"] });
     await expect(turnAdmission!(["/verified/skill"])).rejects.toThrow(/settled/);
     expect(admitSkillLoad).toHaveBeenCalledTimes(1);
+    expect(recordSkillLoad).toHaveBeenCalledExactlyOnceWith({ ...load, acpSessionRef, requestId: "native-turn" });
+    await expect(turnRecorder!(load)).rejects.toThrow(/settled/);
+    expect(recordSkillLoad).toHaveBeenCalledTimes(1);
   });
 
   it("applies the governed session baseline to create and live continuation", async () => {

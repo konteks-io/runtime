@@ -52,3 +52,22 @@ it("bounds each pass and shares simultaneous flushes", async () => {
   await Promise.all([f.delivery.flush(),f.delivery.flush()]);
   expect(f.submitObservation).toHaveBeenCalledTimes(8); expect(f.outbox.depth).toBe(12);
 });
+
+it("retains completed Skill loads across restart without changing retry identity", async () => {
+  const observation = { kind: "skill_read_completed", eventId: "load:skill", instanceId: "i", agentId: "opencode",
+    executionId: "execution", sessionId: "session", assignmentId: "a", attempt: 1, claimId: "claim",
+    recoveryEpoch: 0, readyRevision: 1, runnerIncarnation: "runner", acpSessionRef: "acp", executionRevision: 1,
+    leaseSetId: "lease", turnId: "turn", toolCallId: "native-context:load",
+    capabilityId: "7db42743-32df-4990-ad5d-6f5433f872fc", version: "1.0.1", observedAt: usage.observedAt };
+  const f = await fixture(); f.disable();
+  await f.delivery.submit(observation);
+  await f.delivery.submit(observation);
+  expect(f.outbox.depth).toBe(1);
+  const restarted = await fixture();
+  restarted.submitObservation.mockRejectedValueOnce(new Error("lost response"));
+  await restarted.delivery.flush();
+  expect(restarted.outbox.depth).toBe(1);
+  await restarted.delivery.flush();
+  expect(restarted.outbox.depth).toBe(0);
+  expect(restarted.submitObservation.mock.calls[0]).toEqual(restarted.submitObservation.mock.calls[1]);
+});

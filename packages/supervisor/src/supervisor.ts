@@ -1124,6 +1124,7 @@ export class Supervisor {
         }),
       }),
       onUsage: (observation) => this.sendUsageObservation(observation),
+      onSkillUsage: observation => this.observationDelivery.submit(observation),
     });
   }
 

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { createOpenCodeActivation } from "../host/opencode-activation.js";
 import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises";
@@ -462,7 +463,8 @@ it("admits only verified native primary requests in the live governed turn", asy
   const activation = await createOpenCodeActivation(root, [skillRoot]);
   const callbacks = new Map<string, (input: unknown) => Promise<void>>();
   const admitSkillLoad = vi.fn(async () => {});
-  const turn = { acpSessionRef: "opaque", bridgeSessionId: "native", requestId: "turn", admitSkillLoad };
+  const recordSkillLoad = vi.fn(async (_load: { loadId: string; readOnlyRoots: readonly string[] }) => {});
+  const turn = { acpSessionRef: "opaque", bridgeSessionId: "native", requestId: "turn", admitSkillLoad, recordSkillLoad };
   try {
     const module = await import(pathToFileURL(join(activation.plugin.package, "server.js")).href);
     const cleanup = await module.default.setup({ options: activation.plugin.options,
@@ -480,6 +482,18 @@ it("admits only verified native primary requests in the live governed turn", asy
     expect(admitSkillLoad).toHaveBeenCalledExactlyOnceWith([skillRoot]);
     await callbacks.get("context")!(context);
     expect(admitSkillLoad).toHaveBeenCalledTimes(1);
+    expect(recordSkillLoad).toHaveBeenCalledTimes(2);
+    const firstLoad = recordSkillLoad.mock.calls[0][0];
+    const secondLoad = recordSkillLoad.mock.calls[1][0];
+    expect(firstLoad.readOnlyRoots).toEqual([skillRoot]);
+    expect(secondLoad.loadId).not.toBe(firstLoad.loadId);
+    const digests = content.map(text => createHash("sha256").update(text).digest("hex"));
+    const retry = await fetch(activation.plugin.options.endpoint.replace(/ready$/, "load"), {
+      method: "POST", headers: { authorization: `Bearer ${activation.plugin.options.token}` },
+      body: JSON.stringify({ ...turn, digests, loadId: firstLoad.loadId }),
+    });
+    expect(retry.status).toBe(204);
+    expect(recordSkillLoad).toHaveBeenCalledTimes(2);
     await callbacks.get("http.request")!(scope);
     await callbacks.get("experimental.ws.send")!(scope);
     await expect(callbacks.get("http.request")!({ ...scope, kind: "title" })).rejects.toThrow(/admission/);
@@ -490,14 +504,15 @@ it("admits only verified native primary requests in the live governed turn", asy
   } finally { await activation.release(); }
 });
 
-it.each(["changed plugin snapshot", "authority refusal"])("keeps native transport blocked after %s", async failure => {
+it.each(["changed plugin snapshot", "authority refusal", "missing recorder", "storage refusal"])("keeps native transport blocked after %s", async failure => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "opencode-refusal-"))); roots.push(root);
   const skillRoot = join(root, "review");
   await mkdir(skillRoot);
   await writeFile(join(skillRoot, "SKILL.md"), "---\nname: Review\n---\nOriginal content.");
   const activation = await createOpenCodeActivation(root, [skillRoot]);
   const callbacks = new Map<string, (input: unknown) => Promise<void>>();
-  const admitSkillLoad = vi.fn(async () => { throw new Error("private authority error"); });
+  const admitSkillLoad = vi.fn(async () => { if (failure === "authority refusal") throw new Error("private authority error"); });
+  const recordSkillLoad = vi.fn(async () => { throw new Error("private storage error"); });
   try {
     const file = join(activation.plugin.package, "skills.json");
     if (failure === "changed plugin snapshot") await writeFile(file, JSON.stringify(["Changed content."]));
@@ -508,10 +523,12 @@ it.each(["changed plugin snapshot", "authority refusal"])("keeps native transpor
       session: { hook: async (name: string, callback: (input: unknown) => Promise<void>) => {
         callbacks.set(name, callback); return { dispose: async () => {} };
       } } });
-    activation.prepareTurn({ acpSessionRef: "opaque", bridgeSessionId: "native", requestId: "turn", admitSkillLoad });
+    activation.prepareTurn({ acpSessionRef: "opaque", bridgeSessionId: "native", requestId: "turn", admitSkillLoad,
+      ...(failure === "storage refusal" ? { recordSkillLoad } : {}) });
     await callbacks.get("prompt")!({ sessionID: "native", messageID: "message", prompt: {} });
     await expect(callbacks.get("context")!({ sessionID: "native", messages: [{ id: "message", role: "user", content: content.map(text => ({ type: "text", text })) }] })).rejects.toThrow(/activation was refused/);
     expect(admitSkillLoad).toHaveBeenCalledTimes(failure === "changed plugin snapshot" ? 0 : 1);
+    expect(recordSkillLoad).toHaveBeenCalledTimes(failure === "storage refusal" ? 1 : 0);
     await expect(callbacks.get("http.request")!({ sessionID: "native", kind: "primary" })).rejects.toThrow(/activation was refused/);
     await cleanup();
   } finally { await activation.release(); }

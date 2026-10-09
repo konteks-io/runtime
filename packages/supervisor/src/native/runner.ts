@@ -275,6 +275,7 @@ export class NativeRunner implements RunnerPort {
       },
       assertCurrent: () => { this.requireReady(); lifecycle?.assertCurrent(); },
       ...(lifecycle?.admitSkillLoad ? { admitSkillLoad: lifecycle.admitSkillLoad } : {}),
+      ...(lifecycle?.recordSkillLoad ? { recordSkillLoad: lifecycle.recordSkillLoad } : {}),
     };
   }
 

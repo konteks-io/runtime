@@ -10,6 +10,8 @@ export interface PreparedSessionInputs {
   /** Verified selected organization-skill directories; read authority only, local to this session. */
   readOnlyRoots?: readonly string[];
   skillInstructions: string;
+  /** Immutable selected versions corresponding to readOnlyRoots in the same order. */
+  nativeSkills?: readonly { skillId: string; version: string }[];
   beforePrompt: () => Promise<void>;
   /** Staging only: native model transport still requires admitNativeLoad. */
   prepareNativeLoad?: () => Promise<void>;
@@ -85,6 +87,7 @@ export async function prepareOrganizationSkillSession(options: StageOrganization
     return {
       binding: { ...snapshot.authority.binding }, cwd,
       readOnlyRoots: roots,
+      nativeSkills: Object.freeze(staged.skills.map(skill => Object.freeze({ skillId: skill.skillId, version: skill.version }))),
       skillInstructions: organizationSkillInstructions(staged),
       beforePrompt: async () => {
         await assertRequiredSkillFreshness(snapshot.catalog, options.skillFreshness);

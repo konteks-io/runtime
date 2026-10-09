@@ -83,6 +83,7 @@ interface CreateSessionArgs {
     replaceProcessOwner?(previous: RetainedProcessOwner, replacement: RetainedProcessOwner): Promise<void>;
     assertCurrent(): void;
     admitSkillLoad?(authority: { acpSessionRef: string; requestId: string; readOnlyRoots: readonly string[] }): Promise<void>;
+    recordSkillLoad?(load: { acpSessionRef: string; requestId: string; loadId: string; readOnlyRoots: readonly string[]; observedAt: string }): Promise<void>;
   };
 }
 
@@ -123,6 +124,7 @@ interface SessionRecord {
   completedClose?: Promise<void>;
   assertCurrent?: () => void;
   admitSkillLoad?: NonNullable<CreateSessionArgs["lifecycle"]>["admitSkillLoad"];
+  recordSkillLoad?: NonNullable<CreateSessionArgs["lifecycle"]>["recordSkillLoad"];
   /** Native turns started by a connector-sent prompt (bounded, oldest evicted). */
   connectorTurns?: Set<string>;
   /** The session's current `model` value, as the agent last reported it. */
@@ -645,7 +647,7 @@ export class SessionManager {
     const { bridgeSessionId } = opened;
     if (this.sessions.has(acpSessionRef) || this.byBridgeId.has(bridgeSessionId)) throw new RemoteInstanceError("recovery_required", "bridge session already has a local owner");
     const modelValue = currentModel(opened.response.configOptions);
-    const record: SessionRecord = { bridge, acpSessionRef, bridgeSessionId, context: args.context, cwd: args.cwd, pendingClientRequests: new Map(), activeTurns: 0, operations: new Set(), operationFailed: false, completedTurn: false, continuationSealed: false, recoveryStopping: false, recoveryStop: null, ...(args.lifecycle ? { assertCurrent: args.lifecycle.assertCurrent, admitSkillLoad: args.lifecycle.admitSkillLoad } : {}),
+    const record: SessionRecord = { bridge, acpSessionRef, bridgeSessionId, context: args.context, cwd: args.cwd, pendingClientRequests: new Map(), activeTurns: 0, operations: new Set(), operationFailed: false, completedTurn: false, continuationSealed: false, recoveryStopping: false, recoveryStop: null, ...(args.lifecycle ? { assertCurrent: args.lifecycle.assertCurrent, admitSkillLoad: args.lifecycle.admitSkillLoad, recordSkillLoad: args.lifecycle.recordSkillLoad } : {}),
       ...(modelValue === undefined ? {} : { modelValue }),
       // A new session has spent nothing; a resumed one's total is unknown until the agent reports it.
       ...(opened.newSession ? { sessionCostUsd: 0 } : {}) };
@@ -1124,6 +1126,13 @@ export class SessionManager {
         this.requireBridge(record);
         if (!current) throw new RemoteInstanceError("capability_unavailable", "Skill load turn has settled.");
         await admit({ acpSessionRef, requestId, readOnlyRoots });
+        this.requireBridge(record);
+        if (!current) throw new RemoteInstanceError("capability_unavailable", "Skill load turn has settled.");
+      } } : {}),
+      ...(record.recordSkillLoad ? { recordSkillLoad: async (load: { loadId: string; readOnlyRoots: readonly string[]; observedAt: string }) => {
+        this.requireBridge(record);
+        if (!current) throw new RemoteInstanceError("capability_unavailable", "Skill load turn has settled.");
+        await record.recordSkillLoad!({ ...load, acpSessionRef, requestId });
         this.requireBridge(record);
         if (!current) throw new RemoteInstanceError("capability_unavailable", "Skill load turn has settled.");
       } } : {}),
@@ -1652,6 +1661,7 @@ function adoptSuccessor(record: SessionRecord, args: CreateSessionArgs): void {
   if (args.lifecycle) record.assertCurrent = args.lifecycle.assertCurrent;
   else delete record.assertCurrent;
   record.admitSkillLoad = args.lifecycle?.admitSkillLoad;
+  record.recordSkillLoad = args.lifecycle?.recordSkillLoad;
   record.completedTurn = false;
   record.continuationSealed = false;
 }

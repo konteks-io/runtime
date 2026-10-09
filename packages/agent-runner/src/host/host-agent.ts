@@ -181,6 +181,8 @@ export interface HostPromptTurn {
   readonly requestId: string;
   /** Local authority callback; functions never enter plugin JSON. */
   readonly admitSkillLoad?: (roots: readonly string[]) => Promise<void>;
+  /** Persist verified native context loads; this callback grants no execution authority. */
+  readonly recordSkillLoad?: (load: { loadId: string; readOnlyRoots: readonly string[]; observedAt: string }) => Promise<void>;
 }
 
 export interface HostWorkingCopyBinding {

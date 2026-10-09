@@ -1,4 +1,4 @@
-import { AgentTurnUsageObservationSchema, RuntimeAgentLoginReportSchema, RuntimeUpdateReportSchema,
+import { AgentSkillReadObservationSchema, RemoteSkillReadObservationRequestSchema, RemoteSkillReadObservationReceiptSchema, AgentTurnUsageObservationSchema, RuntimeAgentLoginReportSchema, RuntimeUpdateReportSchema,
   RuntimeUpdateLocalBeginRequestSchema,
   RuntimeUpdateLocalBeginResultSchema,
   allEqual, withoutUndefined,
@@ -781,6 +781,8 @@ export class CoreClient {
 
   /** The mounted Core route accepts one body, and replies only after commit. */
   async submitObservation(instanceId: string, body: unknown): Promise<void> {
+    const skill = AgentSkillReadObservationSchema.safeParse(body);
+    if (skill.success) return this.submitSkillObservation(instanceId, skill.data);
     const observation = AgentTurnUsageObservationSchema.parse(body);
     if (observation.instanceId !== instanceId) throw new RemoteInstanceError("registration_mismatch", "Observation instance mismatch");
     const digest = jcsDigest(observation as unknown as JsonValue);
@@ -789,6 +791,18 @@ export class CoreClient {
       schema: ObservationReceiptSchema, idempotencyKey: `observation:${expectedId}`, operationPolicy: "progressRead" });
     if (result.observationId !== expectedId || result.observationDigest !== digest)
       throw new RemoteInstanceError("registration_mismatch", "Observation receipt does not match submitted bytes");
+  }
+
+  private async submitSkillObservation(instanceId: string, observation: import("@konteks/remote-common").AgentSkillReadObservation): Promise<void> {
+    if (observation.instanceId !== instanceId) throw new RemoteInstanceError("registration_mismatch", "Observation instance mismatch");
+    const digest = jcsDigest(observation as unknown as JsonValue);
+    const request = { observation };
+    const result = await this.http.request({ method: "POST", path: CORE_PATHS.observations(instanceId),
+      bodyFactory: () => RemoteSkillReadObservationRequestSchema.parse({ ...request,
+        proof: this.proof("skill_usage_observation", instanceId, request as unknown as { [key: string]: JsonValue }) }),
+      schema: RemoteSkillReadObservationReceiptSchema, idempotencyKey: `skill-observation:${digest}`, operationPolicy: "progressRead" });
+    if (result.observationId !== `ri:skill:${digest}` || result.observationDigest !== digest)
+      throw new RemoteInstanceError("registration_mismatch", "Skill observation receipt does not match submitted bytes");
   }
 
   async observations(instanceId: string, observations: unknown[]): Promise<number> {

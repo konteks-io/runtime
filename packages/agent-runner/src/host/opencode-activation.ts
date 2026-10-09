@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { RemoteInstanceError } from "@konteks/remote-common";
 
 const source = `import { readFile } from "node:fs/promises";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 export default {
   id: "konteks-managed-skills-activation",
   async setup(context) {
@@ -66,7 +66,7 @@ export default {
         throw new Error("Konteks managed Skill content verification failed");
       }
       const digests = expectedContent.map(text => createHash("sha256").update(text).digest("hex"));
-      await send("load", { ...selectedMessage.turn, digests });
+      await send("load", { ...selectedMessage.turn, digests, loadId: randomUUID() });
     };
     const dispose = () => Promise.all(registrations.map(registration => registration.dispose()));
     try {
