@@ -43,6 +43,7 @@ import {
   contractIssue,
   nextTrail,
   omitPrivateAcpToolPayload,
+  redactActivity,
   redactSessionMessage,
   type CanonicalAcpToolIdentity,
   type ChunkTrail,
@@ -1287,7 +1288,10 @@ export class RelayedSession {
     if (accepted && event.method === "session/prompt" && isNativeTurn(this.assignment)) {
       // Say why before the close: its SIGTERM on the bridge was the only
       // trace of a Codex sign-in that could not refresh.
-      this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, code: event.code, errorClass: event.class, retryable: event.retryable },
+      // The agent's own words, redacted and bounded: a DeepSeek Harness turn
+      // that failed on every prompt logged only -32603 (10-09).
+      this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, code: event.code, errorClass: event.class, retryable: event.retryable,
+        message: String(redactActivity(String(event.message ?? ""), this.sessionCwd())).slice(0, 240) },
         "native turn failed with a request error; closing the assignment as an agent exit");
       await this.close("agent_exited");
     }
