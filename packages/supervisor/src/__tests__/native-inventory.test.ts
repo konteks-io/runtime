@@ -170,3 +170,14 @@ describe("native host inventory", () => {
     expect(antigravity).not.toContain("opencode-free-models-v1");
   });
 });
+
+it("advertises signed Skill sync only while its composed transport is ready", async () => {
+  let ready = false;
+  const inventory = new NativeInventoryCollector({ runners: new Map(), sampler: { sample: async () => signals },
+    bundleVersion: "1.0.0", skillSyncReady: () => ready });
+  expect((await inventory.collect()).components[0]?.capabilities).not.toContain("runtime-skill-sync-v1");
+  ready = true;
+  expect((await inventory.collect()).components[0]?.capabilities).toContain("runtime-skill-sync-v1");
+  ready = false;
+  expect((await inventory.collect()).components[0]?.capabilities).not.toContain("runtime-skill-sync-v1");
+});

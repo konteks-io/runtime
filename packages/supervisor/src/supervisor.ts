@@ -1,3 +1,4 @@
+import { runRequestedSkillSync } from "./native/requested-skill-sync.js";
 import { refreshMachineSkills, machineSkillHomes, MachineSkillPartialFailure, type MachineSkillInventory } from "./native/skill-refresh.js";
 import { SkillSyncCoordinator } from "./skills/sync-coordinator.js";
 import { NativeSkillSyncClient } from "./native/skill-sync-client.js";
@@ -544,6 +545,7 @@ export class Supervisor {
       additionalCapabilities: () => [...this.openCodeCapabilities(), ...this.antigravityCapabilities(), ...this.onComputerCapabilities(), ...(this.browserToolReady() ? [BROWSER_TOOL_CAPABILITY] : []),
         ...(this.integrationCarrier ? integrationTaskCapabilities(this.runners.keys()) : []), ...this.runtimeUpdateCapabilities()],
       decorateAgents: agents => this.withAntigravityDownload(agents),
+      skillSyncReady: () => this.skillSyncReady(),
       // Previews reach a viewer only over the relay's preview channel.
       previewReady: () => this.previewCapable(),
       cancellationDeliveryReady: () => {
@@ -2348,12 +2350,13 @@ export class Supervisor {
     const unavailableAgentIds = this.options.native.runners.filter(runner => machineSkillHomes([runner]).length === 0).map(runner => runner.RUNNER_AGENT_ID);
     this.skillSync ??= new SkillSyncCoordinator(signal => {
       this.assertSkillSyncReady();
-      return refreshMachineSkills({
-      client: this.machineSkillSyncClient(), homes, unavailableAgentIds,
+      const client = this.machineSkillSyncClient();
+      return runRequestedSkillSync(client, () => refreshMachineSkills({
+      client, homes, unavailableAgentIds,
       scratchRoot: join(this.config.SUPERVISOR_DATA_DIR, "machine-skills"),
       owner: { workspaceId: this.workspaceId ?? "", instanceId: this.instanceId ?? "" },
       now: () => this.clock.coreNow(),
-    }, signal);
+    }, signal), signal);
     });
     this.skillSync.startPeriodic(() => this.skillSyncReady(), () => this.logSkillSyncFailure());
     try { return { ...await this.skillSync.sync(), complete: true, loaded: "unknown" as const }; }
