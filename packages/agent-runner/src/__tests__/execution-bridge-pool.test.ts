@@ -409,14 +409,19 @@ it("waits for a background identity read before it reports stopped", async () =>
   // The refused refresh reads the identity again, in the background.
   await vi.waitFor(() => expect(answer).toBeTypeOf("function"));
   const write = vi.spyOn(AgentScopeStore.prototype, "write");
-  let stopped = false;
-  const stopping = f.runtime.stop().then(() => { stopped = true; });
-  await new Promise(resolve => setTimeout(resolve, 20));
-  expect(stopped).toBe(false);
-  answer();
-  await stopping;
-  // Its scope write landed before the stop finished, never after.
-  expect(write).toHaveBeenCalledTimes(1);
+  try {
+    let stopped = false;
+    const stopping = f.runtime.stop().then(() => { stopped = true; });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(stopped).toBe(false);
+    answer();
+    await stopping;
+    // Its scope write landed before the stop finished, never after.
+    expect(write).toHaveBeenCalledTimes(1);
+  } finally {
+    // A later test wraps the real write; a spy left here would wrap itself.
+    write.mockRestore();
+  }
 });
 
 it("drops the last offered models when a refresh says the agent needs signing in", async () => {
