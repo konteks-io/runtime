@@ -397,6 +397,12 @@ interface ActivityTextOptions {
    * chunk it streamed in.
    */
   afterMaskedPath?: boolean;
+  /**
+   * The previous chunk's path ended on "Application" (with or without the
+   * space): a chunk opening "Support/…" is that path's macOS app-data folder,
+   * not a new word.
+   */
+  continuesApplication?: boolean;
 }
 
 const PATH_MASK = "[local-path]";
@@ -427,7 +433,7 @@ function nameWorkspace(text: string, workspaceRoot: string): string {
 }
 
 const PATH_TOKEN_START = /^(?:\/(?![/*])|[A-Za-z]:(?:[\\/]|$)|\\\\)/;
-const TOKEN_DELIMITER = /[\s"'<>`)\]}=(]/;
+const TOKEN_DELIMITER = /[\s"'<>`)[\]}=(]/;
 
 /**
  * Whether streamed text ends inside a local-path token, given whether the
@@ -442,37 +448,55 @@ export function endsInsidePath(text: string, previousEndedInPath: boolean, start
   return PATH_TOKEN_START.test(text.slice(start + 1));
 }
 
+/** What follows an "Application" path end when the path is macOS's app-data folder. */
+const APPLICATION_SUPPORT_TAIL = /^ ?Support(?=[\\/])/;
+
 /** What a stream remembers of its last text chunk: raw text, whether it ended in a path, and what it became. */
 export interface ChunkTrail {
   text: string;
   inPath: boolean;
   output: string;
+  /** Its path ended on "/Application", maybe with the space after it. */
+  endsOnApplication?: boolean;
 }
 
 /** How the next streamed chunk reads, given the stream's last one. */
 export function chunkOptions(previous: ChunkTrail | undefined): Required<ActivityTextOptions> {
   const continuesPath = previous?.inPath ?? false;
+  const continuesApplication = previous?.endsOnApplication ?? false;
   return {
     startsAtBoundary: continuesAtBoundary(previous?.text),
     continuesPath,
-    afterMaskedPath: continuesPath && endsWithPathMask(previous?.output ?? ""),
+    // The space after "Application" may already have gone out after the mask.
+    afterMaskedPath: (continuesPath || continuesApplication) && /\[local-path\] ?$/.test(previous?.output ?? ""),
+    continuesApplication,
   };
 }
 
 /** The trail after a chunk. One that was all continuation leaves the previous mask the one to continue. */
 export function nextTrail(previous: ChunkTrail | undefined, text: string, options: Required<ActivityTextOptions>, output: string): ChunkTrail {
-  return { text, inPath: endsInsidePath(text, options.continuesPath, options.startsAtBoundary), output: output || (previous?.output ?? "") };
+  // A chunk that is all "Support/…" after an "Application" end is still inside that path.
+  const inPath = (options.continuesApplication && APPLICATION_SUPPORT_TAIL.test(text) && !/[\s"'<>`)\]}=(]/.test(text.replace(/^ /, "")))
+    || endsInsidePath(text, options.continuesPath, options.startsAtBoundary);
+  const head = text.match(/^(.*\/Application) ?$/s)?.[1];
+  const endsOnApplication = head !== undefined && endsInsidePath(head, options.continuesPath, options.startsAtBoundary);
+  return { text, inPath, output: output || (previous?.output ?? ""), ...(endsOnApplication ? { endsOnApplication } : {}) };
 }
+
 
 /** Whether text following `previous` starts a new token for path detection. */
 export function continuesAtBoundary(previous: string | undefined): boolean {
-  return previous === undefined || previous.length === 0 || /[\s"'=(]$/.test(previous);
+  return previous === undefined || previous.length === 0 || /[\s"'=(`[]$/.test(previous);
 }
 
 function publicText(value: string, workspaceRoot: string, options: ActivityTextOptions): string {
   const startsAtBoundary = options.startsAtBoundary ?? true;
   let text = redactText(value);
-  if (options.continuesPath) text = text.replace(/^(?=[\w.~\\/-])[^\s"'<>`)\]}*]+/, options.afterMaskedPath ? "" : PATH_MASK);
+  if (options.continuesApplication && APPLICATION_SUPPORT_TAIL.test(text)) {
+    text = text.replace(/^ ?Support[\\/][^\s"'<>`)\]}*]*/, options.afterMaskedPath ? "" : PATH_MASK);
+  } else if (options.continuesPath) {
+    text = text.replace(/^(?=[\w.~\\/-])[^\s"'<>`)\]}*]+/, options.afterMaskedPath ? "" : PATH_MASK);
+  }
   // A chunk opening `:/…` or `:\…` continues a drive path whose letter was
   // emitted in the previous chunk. `://` is excluded because that is a URL
   // scheme, and a chunk ending exactly at the separator defers rather than
@@ -492,7 +516,10 @@ function publicText(value: string, workspaceRoot: string, options: ActivityTextO
     .replace(/\\\\[^\s"'<>`)\]}]+/g, "[local-path]")
     // A path starts with a path character after the slash, and `*` is never
     // part of one: `sudo ls /**` (a root slash and Markdown bold) is not a
-    // private path, and redacting it broke the bold.
-    .replace(/(^|[\s"'=(])\/(?!\/)(?=[\w.~-])[^\s"'<>`)\]}*]+/g, "$1[local-path]");
+    // private path, and redacting it broke the bold. A path in Markdown code
+    // or a link (`/Users/…`, [/Users/…]) is a path too: agents quote theirs in
+    // backticks, and those went out whole (10-09). Not after `*` (a glob's
+    // `**/x`) or `<` (HTML's `</p>`).
+    .replace(/(^|[\s"'=(`[])\/(?!\/)(?=[\w.~-])[^\s"'<>`)\]}*]+/g, "$1[local-path]");
   return releaseHeldSpaces(startsAtBoundary ? out : out.slice(1));
 }

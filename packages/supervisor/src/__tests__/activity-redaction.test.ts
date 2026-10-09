@@ -162,6 +162,27 @@ describe("streamed activity redaction", () => {
     expect(redactActivity("see /Users/me/Library/Application Support/other/x.txt now", root)).toBe("see [local-path] now");
     expect(redactActivity("Application Support is a folder name", root)).toBe("Application Support is a folder name");
   });
+
+  it("redacts a path an agent quotes in Markdown code or a link", () => {
+    expect(redactStream(["I edited `/Users/other/app/x.ts` and [/Users/other/b](/Users/other/b)"]))
+      .toBe("I edited `[local-path]` and [[local-path]]([local-path])");
+    expect(redactStream(["I edited `", "/Users/other/app/x.ts` now"])).toBe("I edited `[local-path]` now");
+    // Globs and HTML are not paths.
+    expect(redactStream(["rg -g '!**/.DS_Store' and </p>"])).toBe("rg -g '!**/.DS_Store' and </p>");
+  });
+
+  it("keeps Application Support inside a path when a chunk ends at its space", () => {
+    // 10-09, connector 0.12.12: Codex streamed "…/Library/Application" then
+    // " Support/konteks-remote/…", and the page read
+    // "/[local-path] Support/konteks-remote/workspaces/codex/session-…/source".
+    const tail = " Support/konteks-remote/workspaces/codex/session-58ca/source`, and it isn’t empty.";
+    expect(redactStream(["I’m in `/", "Users/me/Library/Application", tail])).toBe("I’m in `/[local-path]`, and it isn’t empty.");
+    expect(redactStream(["I’m in `", "/Users/me/Library/Application ", tail.slice(1)])).toBe("I’m in `[local-path] `, and it isn’t empty.");
+    expect(redactStream(["see /Users/me/Library/Application", " Support/konteks", "-remote/x.txt now"])).toBe("see [local-path] now");
+    // Only that folder continues the path: other words after "Application" stay.
+    expect(redactStream(["open /Applications/Foo.app/Application", " Supporting docs"])).toBe("open [local-path] Supporting docs");
+    expect(redactStream(["the Application", " Support/team page"])).toBe("the Application Support/team page");
+  });
 });
 
 
