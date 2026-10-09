@@ -163,3 +163,25 @@ describe("streamed activity redaction", () => {
   });
 });
 
+
+describe("a Codex file search that finds nothing", () => {
+  const failed = (exitCode: number, output = "") => ({
+    sessionUpdate: "tool_call_update", toolCallId: "call-1", status: "failed",
+    rawOutput: { formatted_output: output, exit_code: exitCode },
+  });
+
+  it("is shown as done, not failed", () => {
+    // 10-09: `rg --files -g AGENTS.md` exits 1 on most turns; each read "List files · Failed".
+    expect(canonicalizeAcpToolActivity(failed(1), "codex", { kind: "read", title: "List files" }))
+      .toMatchObject({ status: "completed" });
+    expect(canonicalizeAcpToolActivity(failed(1), "codex", { kind: "search", title: "Search for 'TODO'" }))
+      .toMatchObject({ status: "completed" });
+  });
+
+  it("still fails when the command broke or was not a search", () => {
+    expect(canonicalizeAcpToolActivity(failed(2), "codex", { kind: "read", title: "List files" })).toMatchObject({ status: "failed" });
+    expect(canonicalizeAcpToolActivity(failed(1, "rg: notes: No such file"), "codex", { kind: "read", title: "List files" }))
+      .toMatchObject({ status: "failed" });
+    expect(canonicalizeAcpToolActivity(failed(1), "codex", { kind: "execute", title: "Run command" })).toMatchObject({ status: "failed" });
+  });
+});

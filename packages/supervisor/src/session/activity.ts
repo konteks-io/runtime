@@ -248,8 +248,34 @@ function antigravityReplacesTitle(candidate: Record<string, unknown>, { name, ki
   return title !== undefined && (currentTitle === undefined || ANTIGRAVITY_TOOL_TITLE.test(currentTitle) || name === title || name === "workspace_trust" || kind === "other");
 }
 
+/** Codex's titles for a command that only lists or searches files. */
+const CODEX_FINDING_TITLE = /^(?:List files|Search files|Search for |Search in |Search$)/;
+
+/**
+ * A file listing or search that finds nothing exits 1 (`rg --files -g
+ * AGENTS.md`), and codex-acp reports every non-zero exit as failed: Codex
+ * looks for AGENTS.md on most turns, so most turns showed a red "List files ·
+ * Failed" for a search that worked. Exit 1 with no output is "nothing found".
+ */
+function codexCanonicalizer(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): unknown {
+  if (candidate.sessionUpdate !== "tool_call_update" || candidate.status !== "failed") return candidate;
+  return codexFinds(candidate, prior) && foundNothing(candidate.rawOutput) ? { ...candidate, status: "completed" } : candidate;
+}
+
+function codexFinds(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): boolean {
+  if (prior?.kind === "search") return true;
+  const title = nonBlank(candidate.title) ?? prior?.title;
+  return title !== undefined && CODEX_FINDING_TITLE.test(title);
+}
+
+function foundNothing(rawOutput: unknown): boolean {
+  const output = plainRecord(rawOutput);
+  return output?.exit_code === 1 && nonBlank(output.formatted_output) === undefined;
+}
+
 const DIALECT_CANONICALIZERS: ReadonlyMap<string, ToolCanonicalizer> = new Map([
   ["claude-code", claudeCanonicalizer],
+  ["codex", codexCanonicalizer],
   ["dsh", dshCanonicalizer],
   ["opencode", openCodeCanonicalizer],
   ["antigravity", antigravityCanonicalizer],
