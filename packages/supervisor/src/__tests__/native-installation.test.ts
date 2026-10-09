@@ -10,6 +10,8 @@ import { z } from "zod";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { bundleManifestSigningBytes, computeBundleManifestDigest, controlCall, SupervisorStatusSchema, writeSecretFile } from "@konteks/remote-common";
 import type { BridgeProcess } from "@konteks/remote-agent-runner";
+import { RunnerConfigSchema } from "@konteks/remote-agent-runner";
+import * as antigravityUpdate from "../native/antigravity-update.js";
 import { buildReleaseFixture, installOfflineAgentPackage } from "@konteks/remote-release";
 import * as releasePackages from "@konteks/remote-release";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
@@ -67,6 +69,15 @@ describe("preview tuning from the service environment", () => {
 });
 
 describe("closed native runtime installation", () => {
+  it("preserves installer-bound Skill homes while legacy installations remain opt-in", async () => {
+    const f = await fixture();
+    expect((await loadNativeInstallation(root, f.options)).runners[0]).not.toHaveProperty("RUNNER_NATIVE_SKILL_HOMES");
+    const agentSkillHomes = [join(root, ".agents"), join(root, ".codex-custom")];
+    await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, agentSkillHomes, claudeConfigDir: join(root, ".claude-custom") }));
+    const loaded = await loadNativeInstallation(root, f.options);
+    expect(loaded.runners[0]!.RUNNER_NATIVE_SKILL_HOMES).toEqual(agentSkillHomes);
+    expect(loaded.record.claudeConfigDir).toBe(join(root, ".claude-custom"));
+  });
   it("fully verifies a bundled package once within one installation load", async () => {
     const f = await fixture();
     const verify = vi.spyOn(releasePackages, "verifyOfflineAgentPackage");
@@ -344,7 +355,8 @@ describe("closed native runtime installation", () => {
   it("records Google Antigravity's fetched copy, re-verifies it through its adapter, and leaves a missing copy out to be fetched again on the first yes", async () => {
     const f = await fixture();
     const folder = join(root, "agents", "antigravity", "1.2.1-darwin-arm64");
-    const record = NativeRuntimeRecordSchema.parse({ ...f.record, agents: ["codex", "antigravity"], antigravityVersion: "1.2.1", antigravityRoot: folder });
+    const agentSkillHomes = [join(root, "bound-skills")];
+    const record = NativeRuntimeRecordSchema.parse({ ...f.record, agentSkillHomes, agents: ["codex", "antigravity"], antigravityVersion: "1.2.1", antigravityRoot: folder });
     expect(record).toMatchObject({ antigravityVersion: "1.2.1", antigravityRoot: folder });
     expect(NativeRuntimeRecordSchema.safeParse({ ...f.record, antigravityRoot: "" }).success).toBe(false);
     // The loader's re-verification runs against the connector's own folder: nothing was fetched here.
@@ -363,6 +375,12 @@ describe("closed native runtime installation", () => {
     // Where this release pins a copy, the missing one is fetched again at once (the first yes covers it).
     if (entry!.error.diagnostic === "antigravity_not_fetched") expect(entry!.updating).toBe(true);
     else expect(entry!.updating).toBeUndefined();
+    if (entry!.updating) {
+      const config = RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "antigravity" });
+      const update = vi.spyOn(antigravityUpdate, "updateNativeAntigravity").mockResolvedValue({ config, fetched: {} } as never);
+      try { expect((await entry!.relocate()).RUNNER_NATIVE_SKILL_HOMES).toEqual(agentSkillHomes); }
+      finally { update.mockRestore(); }
+    }
     await expect(antigravityInstallAdapter.selfCheck({} as never)).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "antigravity_not_fetched" });
   });
   it.each([{ releaseId: "../outside" }, { agents: ["codex", "codex"] }, { coreUrl: "http://core.example" }, { coreUrl: "https://user:password@core.example" }, { relayUrl: "ws://relay.example" }, { gatewayKey: "forbidden" }, { environment: { NODE_OPTIONS: "--require untrusted" } }, { deploymentKind: "appliance" }, { command: "/bin/sh" }])("rejects unsafe or unimplemented install fields", async patch => {

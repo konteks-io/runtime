@@ -1,4 +1,4 @@
-import { antigravitySkillHome, dshRuntimePaths, openCodeRuntimePaths } from "@konteks/remote-agent-runner";
+import { antigravitySkillHome, dshRuntimePaths } from "@konteks/remote-agent-runner";
 import { userInfo } from "node:os";
 import { isAbsolute, resolve, join } from "node:path";
 import type { RuntimeSkillSyncItem } from "@konteks/backstage-plugin-common/remote-instance-internal";
@@ -6,16 +6,28 @@ import { NativeSkillSyncTransportFailure, type NativeSkillSyncClient } from "./s
 import { stageMachineOrganizationSkills, type StagedOrganizationSkills } from "../skills/staging.js";
 import { syncAgentHomeSkills, verifyAgentHomeSkillInstallation } from "../skills/home-sync.js";
 /** Discovery homes come from local installation settings and native adapter paths only. */
-export function machineSkillHomes(runners: readonly {
+type SkillHomeRunner = {
   RUNNER_AGENT_ID: string; RUNNER_CREDENTIAL_DIR: string; RUNNER_NATIVE_CODEX_HOME?: string | undefined; RUNNER_NATIVE_CLAUDE_EXECUTABLE?: string | undefined;
-}[], operatorHome = userInfo().homedir): string[] {
-  return [...new Set(runners.flatMap(runner => [
-    ...(runner.RUNNER_AGENT_ID === "codex" && runner.RUNNER_NATIVE_CODEX_HOME ? [runner.RUNNER_NATIVE_CODEX_HOME] : []),
-    ...(runner.RUNNER_AGENT_ID === "claude-code" && runner.RUNNER_NATIVE_CLAUDE_EXECUTABLE ? [join(operatorHome, ".claude")] : []),
-    ...(runner.RUNNER_AGENT_ID === "dsh" ? [dshRuntimePaths(runner.RUNNER_CREDENTIAL_DIR).dshHome] : []),
-    ...(runner.RUNNER_AGENT_ID === "antigravity" ? [antigravitySkillHome(runner.RUNNER_CREDENTIAL_DIR)] : []),
-    ...(runner.RUNNER_AGENT_ID === "opencode" ? [openCodeRuntimePaths(runner.RUNNER_CREDENTIAL_DIR).root] : []),
-  ]))];
+  RUNNER_NATIVE_SKILL_HOMES?: readonly string[] | undefined;
+ RUNNER_NATIVE_CLAUDE_CONFIG_DIR?: string | undefined;
+};
+export function machineSkillHomes(runners: readonly SkillHomeRunner[], operatorHome = userInfo().homedir): string[] {
+  return [...new Set(runners.flatMap(runner => runner.RUNNER_NATIVE_SKILL_HOMES ?? runnerSkillProfileHomes(runner, operatorHome)))];
+}
+export function runnerSkillProfileHomes(runner: SkillHomeRunner, operatorHome = userInfo().homedir): string[] {
+  switch (runner.RUNNER_AGENT_ID) {
+    case "codex": return runner.RUNNER_NATIVE_CODEX_HOME ? [runner.RUNNER_NATIVE_CODEX_HOME] : [];
+    case "claude-code": return claudeSkillProfileHomes(runner, operatorHome);
+    case "dsh": return [dshRuntimePaths(runner.RUNNER_CREDENTIAL_DIR).dshHome];
+    case "antigravity": return [antigravitySkillHome(runner.RUNNER_CREDENTIAL_DIR)];
+    // OpenCode execution uses working-copy-specific XDG_CONFIG_HOME folders.
+    // Its shared state root is not an execution profile.
+    case "opencode": return [];
+    default: return [];
+  }
+}
+function claudeSkillProfileHomes(runner: SkillHomeRunner, operatorHome: string): string[] {
+  return runner.RUNNER_NATIVE_CLAUDE_EXECUTABLE ? [runner.RUNNER_NATIVE_CLAUDE_CONFIG_DIR ?? join(operatorHome, ".claude")] : [];
 }
 export interface MachineSkillInventory {
   skills: RuntimeSkillSyncItem[];

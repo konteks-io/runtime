@@ -98,3 +98,13 @@ it("redacts adapter observation errors into failed freshness proof", async () =>
   await expect(prepared.beforePrompt()).rejects.toMatchObject({ diagnostic: "skill_freshness_failed" });
   await expect(prepared.beforePrompt()).rejects.not.toThrow("private adapter output");
 });
+
+it("does not let a required legacy Skill bypass the load-proof gate by omitting scope", async () => {
+  const input = await fixture();
+  const { catalogDigest: _digest, ...body } = input.catalog;
+  const { scope: _scope, ...skill } = body.skills[0]!;
+  const legacyBody = { ...body, skills: [skill] };
+  const catalog = { ...legacyBody, catalogDigest: computeRemoteSkillCatalogDigest(legacyBody) };
+  const prepared = await prepareOrganizationSkillSession({ ...input, catalog, authority: { ...input.authority, catalogDigest: catalog.catalogDigest } });
+  await expect(prepared.beforePrompt()).rejects.toMatchObject({ diagnostic: "skill_freshness_unknown" });
+});

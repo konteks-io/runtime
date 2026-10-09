@@ -114,3 +114,81 @@ it("accepts only signed tenant-bound local export selections and refuses stale a
   expect(() => new NativeSkillSyncClient({ ...f.options, now: () => Date.parse(body.expiresAt) }).assertLocalExport(request)).toThrow();
   expect(() => f.client.assertLocalExport({ ...request, localId: "c".repeat(64) })).toThrow();
 });
+
+
+function publicationFixture() {
+  const f = fixture();
+  const content = Buffer.from("# Shared Skill");
+  const entries = [{ path: "SKILL.md", mode: 0o600 as const, sizeBytes: content.length,
+    digest: `sha256:${createHash("sha256").update(content).digest("hex")}`, contentBase64: content.toString("base64") }];
+  const tree = { format: "konteks-file-tree-v1", entries, treeDigest: computeRemoteFileTreeDigest(entries) };
+  const body = { requestId: "33333333-3333-4333-8333-333333333333", localId: "a".repeat(64), treeDigest: tree.treeDigest,
+    audience: { kind: "organization" }, context: { kind: "global" }, confirmation: { ongoingPublication: true }, tree };
+  const result = { id: "11111111-1111-4111-8111-111111111111", tenantId: "tenant-a", type: "skill",
+    metadata: { runtimePromotionKey: `machine-a:${body.localId}:${body.treeDigest}` } };
+  const client = new NativeSkillSyncClient({ ...f.options, coreContractVersion: () => "7.6" });
+  f.fetchFn.mockImplementation(async () => new Response(JSON.stringify(result), { headers: { "content-type": "application/json" } }));
+  return { ...f, client, body, result };
+}
+it("shares the consented complete Skill through the leased Core publication path", async () => {
+  const f = publicationFixture();
+  expect(await f.client.share(f.body)).toEqual(f.result);
+  expect(f.fetchFn.mock.calls[0]).toEqual(["https://core.test/api/remote-instances/internal/remote-instances/machine-a/skills/sync/share",
+    expect.objectContaining({ body: expect.any(String), redirect: "error", credentials: "omit", headers: expect.objectContaining({ authorization: "Bearer lease" }) })]);
+  expect(JSON.parse(f.fetchFn.mock.calls[0]![1]!.body as string)).toEqual(f.body);
+});
+it.each(["7.5", undefined])("refuses sharing to a Core without the publication contract: %s", async version => {
+  const f = publicationFixture();
+  const client = new NativeSkillSyncClient({ ...f.options, coreContractVersion: () => version });
+  await expect(client.share(f.body)).rejects.toThrow("unavailable");
+  expect(f.fetchFn).not.toHaveBeenCalled();
+});
+it.each(["foreign-tenant", "wrong-artifact"])("refuses an unrelated publication result: %s", async kind => {
+  const f = publicationFixture();
+  const result = kind === "foreign-tenant" ? { ...f.result, tenantId: "tenant-b" } : { ...f.result, metadata: { runtimePromotionKey: "another-source" } };
+  f.fetchFn.mockImplementation(async () => new Response(JSON.stringify(result), { headers: { "content-type": "application/json" } }));
+  await expect(f.client.share(f.body)).rejects.toThrow("unavailable");
+  expect(f.fetchFn).toHaveBeenCalledTimes(1);
+});
+
+it.each([false, true])("checks and preserves the publication receipt (mismatch=%s)", async mismatch => {
+  const f = publicationFixture();
+  const runtimePublication = { publicationId: f.result.id, revisionId: "22222222-2222-4222-8222-222222222222",
+    acceptedSequence: 17, treeDigest: mismatch ? `sha256:${"b".repeat(64)}` : f.body.treeDigest };
+  const result = { ...f.result, runtimePublication };
+  f.fetchFn.mockImplementation(async () => new Response(JSON.stringify(result), { headers: { "content-type": "application/json" } }));
+  if (mismatch) await expect(f.client.share(f.body)).rejects.toThrow("unavailable");
+  else expect(await f.client.share(f.body)).toEqual(result);
+  expect(f.fetchFn).toHaveBeenCalledTimes(1);
+});
+
+it.each(["wrong-skill", "missing-receipt"])("refuses an unbound edit acceptance: %s", async kind => {
+  const f = publicationFixture();
+  const client = new NativeSkillSyncClient({ ...f.options, coreContractVersion: () => "7.7" });
+  const body = { ...f.body, skillId: f.result.id, expectedRevision: "22222222-2222-4222-8222-222222222222" };
+  const result = kind === "wrong-skill" ? { ...f.result, id: "44444444-4444-4444-8444-444444444444",
+    runtimePublication: { publicationId: f.result.id, revisionId: body.requestId, acceptedSequence: 18, treeDigest: body.treeDigest } } : f.result;
+  f.fetchFn.mockImplementation(async () => new Response(JSON.stringify(result), { headers: { "content-type": "application/json" } }));
+  await expect(client.share(body)).rejects.toThrow("unavailable");
+  expect(f.fetchFn).toHaveBeenCalledTimes(1);
+});
+
+it("does not send revision update fields to a Core that only supports initial publication", async () => {
+  const f = publicationFixture();
+  await expect(f.client.share({ ...f.body, skillId: f.result.id,
+    expectedRevision: "22222222-2222-4222-8222-222222222222" })).rejects.toThrow("unavailable");
+  expect(f.fetchFn).not.toHaveBeenCalled();
+});
+
+it("publishes an edit to a compatible Core and preserves concurrent replacement history", async () => {
+  const f = publicationFixture();
+  const client = new NativeSkillSyncClient({ ...f.options, coreContractVersion: () => "7.7" });
+  const baseRevisionId = "22222222-2222-4222-8222-222222222222";
+  const body = { ...f.body, skillId: f.result.id, expectedRevision: baseRevisionId };
+  const result = { ...f.result, runtimePublication: { publicationId: f.result.id,
+    revisionId: body.requestId, acceptedSequence: 18, treeDigest: body.treeDigest,
+    baseRevisionId, replacedRevisionId: "44444444-4444-4444-8444-444444444444" } };
+  f.fetchFn.mockImplementation(async () => new Response(JSON.stringify(result), { headers: { "content-type": "application/json" } }));
+  expect(await client.share(body)).toEqual(result);
+  expect(JSON.parse(f.fetchFn.mock.calls[0]![1]!.body as string)).toEqual(body);
+});

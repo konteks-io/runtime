@@ -75,7 +75,7 @@ export async function prepareOrganizationSkillSession(options: StageOrganization
       readOnlyRoots: Object.freeze(staged.skills.map(skill => skill.directory)),
       skillInstructions: organizationSkillInstructions(staged),
       beforePrompt: async () => {
-        await assertScopedSkillFreshness(snapshot.catalog, options.skillFreshness);
+        await assertRequiredSkillFreshness(snapshot.catalog, options.skillFreshness);
         try {
           if (await checkedDirectory(options.cwd) !== cwd) throw new Error("source moved");
           const verified = await stageOrganizationSkills(snapshot);
@@ -86,10 +86,9 @@ export async function prepareOrganizationSkillSession(options: StageOrganization
   } catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
 }
 
-/** Scope-aware catalogs require fresh, agent-bound evidence before every turn. */
-async function assertScopedSkillFreshness(catalog: ReturnType<typeof RemoteSkillCatalogSchema.parse>, evidence?: (skillId: string) => Promise<SkillFreshnessEvidence>): Promise<void> {
+/** Selected managed Skills require fresh, agent-bound evidence before every turn. */
+async function assertRequiredSkillFreshness(catalog: ReturnType<typeof RemoteSkillCatalogSchema.parse>, evidence?: (skillId: string) => Promise<SkillFreshnessEvidence>): Promise<void> {
   for (const skill of catalog.skills) {
-    if (!skill.scope) continue;
     const proof = await observedSkillProof(skill.skillId, evidence);
     const failure = skillFreshnessFailure(proof) ?? (matchesDesiredSkill(proof, skill) ? null : "stale");
     if (failure) throw freshnessError(failure);
@@ -117,4 +116,12 @@ function freshnessError(failure: SkillFreshnessFailure): RemoteInstanceError {
 async function observedSkillProof(skillId: string, evidence?: (skillId: string) => Promise<SkillFreshnessEvidence>): Promise<SkillFreshnessEvidence | undefined> {
   try { return await evidence?.(skillId); }
   catch { throw freshnessError("failed"); }
+}
+
+/** Rebuild known freshness refusals from fixed copy; never relay adapter error text. */
+export function safeSkillFreshnessRejection(error: unknown): RemoteInstanceError | undefined {
+  if (!(error instanceof RemoteInstanceError) || error.code !== "capability_unavailable") return undefined;
+  const failure = error.diagnostic?.replace(/^skill_freshness_/, "");
+  if (!failure || error.diagnostic !== `skill_freshness_${failure}` || !Object.hasOwn(freshnessMessages, failure)) return undefined;
+  return freshnessError(failure as SkillFreshnessFailure);
 }

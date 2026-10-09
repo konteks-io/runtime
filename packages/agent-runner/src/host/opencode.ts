@@ -1,3 +1,4 @@
+import { openCodeSkillSources } from "./opencode-skill-sources.js";
 import type { Stats } from "node:fs";
 import { createHash } from "node:crypto";
 import { copyFile, lstat, mkdir, readlink, rm, symlink } from "node:fs/promises";
@@ -197,9 +198,18 @@ export function openCodeWorkingCopyKey(workingCopy: string): string {
   return createHash("sha256").update(resolve(workingCopy)).digest("hex").slice(0, 16);
 }
 
-/** `XDG_CONFIG_HOME` of the OpenCode process serving `workingCopy`. */
-export function openCodeWorkingCopyConfig(credentialDir: string, workingCopy: string, platform: NodeJS.Platform = process.platform): string {
-  return (platform === "win32" ? win32 : posix).join(openCodeRuntimePaths(credentialDir, platform).configs, openCodeWorkingCopyKey(workingCopy));
+/** `XDG_CONFIG_HOME` bound to the working copy and its authorized immutable Skill roots. */
+export function openCodeWorkingCopyConfig(credentialDir: string, workingCopy: string, platform: NodeJS.Platform = process.platform, readOnlyRoots: readonly string[] = []): string {
+  const path = platform === "win32" ? win32 : posix;
+  const key = openCodeWorkingCopyKey(workingCopy);
+  if (!readOnlyRoots.length) return path.join(openCodeRuntimePaths(credentialDir, platform).configs, key);
+  const roots = normalizedSkillRoots(readOnlyRoots, path);
+  const digest = createHash("sha256").update(JSON.stringify(roots)).digest("hex");
+  return path.join(openCodeRuntimePaths(credentialDir, platform).configs, `${key}-skills-${digest}`);
+}
+function normalizedSkillRoots(roots: readonly string[], path: typeof posix): string[] {
+  if (roots.some(root => !path.isAbsolute(root) || CONTROL.test(root))) throw new RemoteInstanceError("agent_unavailable", "OpenCode Skill roots must be absolute local paths.");
+  return [...new Set(roots.map(root => path.normalize(root)))].sort();
 }
 
 /** How a config folder carries the working copy's `AGENTS.md`. */
@@ -272,11 +282,13 @@ function serial<T>(configHome: string, work: (hold: { count: number }) => Promis
   return run;
 }
 
-/** Prepare the config folder of one OpenCode execution process for `workingCopy`. */
-export async function bindOpenCodeWorkingCopy(credentialDir: string, workingCopy: string, deps: OpenCodeInstructionsDeps & { inherited?: NodeJS.ProcessEnv } = {}): Promise<HostWorkingCopyBinding> {
+/** Prepare one OpenCode execution profile, isolated by working copy and authorized Skill roots. */
+export async function bindOpenCodeWorkingCopy(credentialDir: string, workingCopy: string, deps: OpenCodeInstructionsDeps & { inherited?: NodeJS.ProcessEnv } = {}, readOnlyRoots: readonly string[] = []): Promise<HostWorkingCopyBinding> {
   if (!isAbsolute(workingCopy) || CONTROL.test(workingCopy)) throw new RemoteInstanceError("agent_unavailable", "An OpenCode working copy must be an absolute local path.");
-  const configHome = openCodeWorkingCopyConfig(credentialDir, workingCopy);
+  const configHome = openCodeWorkingCopyConfig(credentialDir, workingCopy, process.platform, readOnlyRoots);
+  const sources = await openCodeSkillSources(readOnlyRoots);
   const env = openCodeProcessEnvironment(credentialDir, configHome, deps.inherited);
+  env.OPENCODE_CONFIG_CONTENT = JSON.stringify({ ...renderOpenCodeKonteksConfig(), skills: sources });
   await serial(configHome, async hold => {
     hold.count += 1;
     try { await syncOpenCodeInstructions(configHome, workingCopy, deps); }
@@ -285,7 +297,11 @@ export async function bindOpenCodeWorkingCopy(credentialDir: string, workingCopy
   let released = false;
   return {
     env,
-    beforePrompt: () => serial(configHome, async () => { if (!released) await syncOpenCodeInstructions(configHome, workingCopy, deps); }),
+    beforePrompt: () => serial(configHome, async () => {
+      if (released) return;
+      await openCodeSkillSources(readOnlyRoots);
+      await syncOpenCodeInstructions(configHome, workingCopy, deps);
+    }),
     release: () => {
       if (released) return Promise.resolve();
       released = true;
@@ -369,9 +385,9 @@ export const openCodeRunnerAdapter: HostAgentRunnerAdapter = {
     }
     await prepareOpenCodeHome(config);
   },
-  bindWorkingCopy: async (config, family, workingCopy) => {
+  bindWorkingCopy: async (config, family, workingCopy, readOnlyRoots = []) => {
     binary(config, family);
-    return bindOpenCodeWorkingCopy(config.RUNNER_CREDENTIAL_DIR, workingCopy);
+    return bindOpenCodeWorkingCopy(config.RUNNER_CREDENTIAL_DIR, workingCopy, {}, readOnlyRoots);
   },
   // OpenCode's own `auth login`, driven and relayed (link and code for a
   // subscription, OpenCode's own key prompt for an API key); the one-time

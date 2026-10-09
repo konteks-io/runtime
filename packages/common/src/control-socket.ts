@@ -5,6 +5,7 @@ import { z } from "zod";
 import { RemoteInstanceError, type RecoveryAction } from "./errors.js";
 import { constantTimeEquals } from "./digest.js";
 import { RuntimeRoleSchema } from "./contracts.js";
+import { RuntimeSkillShareRequestSchema } from "@konteks/backstage-plugin-common/remote-instance-internal";
 
 /**
  * The launcher ↔ supervisor loopback control protocol. It is the ONLY way the
@@ -26,6 +27,12 @@ const methodIdSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/);
 export const ControlRequestSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("skills.list") }).strict(),
   z.object({ op: z.literal("skills.sync") }).strict(),
+  z.object({ op: z.literal("skills.inspect"), source: z.discriminatedUnion("kind", [
+    z.object({ kind: z.literal("name"), name: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/) }).strict(),
+    z.object({ kind: z.literal("path"), path: z.string().min(1).max(4096) }).strict(),
+  ]) }).strict(),
+  z.object({ op: z.literal("skills.share"), selection: RuntimeSkillShareRequestSchema,
+    sourcePath: z.string().min(1).max(4096).optional() }).strict(),
   z.object({ op: z.literal("status") }).strict(),
   z.object({ op: z.literal("agents") }).strict(),
   z.object({ op: z.literal("auth.status"), agentId: agentIdSchema.optional() }).strict(),

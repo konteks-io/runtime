@@ -18,6 +18,7 @@
   ],
   "scripts": {
     "build": "tsc --build",
+    "build:dist": "node scripts/build-launcher.mjs",
     "clean": "tsc --build --clean && rm -rf packages/*/dist",
     "typecheck": "tsc --build",
     "lint": "eslint packages/*/src",

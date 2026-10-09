@@ -9,6 +9,16 @@ import { bridgeEnvironment, resolveBridgeSpawnSpec, resolveToolingCommand, verif
 import { RunnerEventSchema } from "../events.js";
 
 describe("bridge spawn spec", () => {
+  it("uses the local Claude config binding without inheriting an unchecked profile", () => {
+    vi.stubEnv("CLAUDE_CONFIG_DIR", "/unvalidated/inherited");
+    const config = RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "claude-code" });
+    const family = findAgentBridge("claude-code")!;
+    expect(bridgeEnvironment(config, family).CLAUDE_CONFIG_DIR).toBeUndefined();
+    const native = { ...config, RUNNER_NATIVE_PACKAGE_PROFILE: offlineFixture().profile,
+      RUNNER_NATIVE_CLAUDE_EXECUTABLE: "/operator/.local/bin/claude", RUNNER_NATIVE_CLAUDE_CONFIG_DIR: "/operator/.claude-custom" };
+    expect(bridgeEnvironment(native, family).CLAUDE_CONFIG_DIR).toBe("/operator/.claude-custom");
+    expect(() => bridgeEnvironment({ ...native, RUNNER_NATIVE_CLAUDE_CONFIG_DIR: "relative" }, family)).toThrow(/profile/);
+  });
   afterEach(() => vi.unstubAllEnvs());
 
   it("uses the local native Codex profile without exposing it to other runner families", () => {

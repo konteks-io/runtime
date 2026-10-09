@@ -631,6 +631,19 @@ describe("native session dispatch uses genuine execution admission", () => {
     expect(f.send.mock.calls.map(call => call[0].body)).toEqual([expect.objectContaining({ kind: "acp_error", id: "request" })]);
   });
 
+  it.each(["stale", "offline", "failed", "unsupported", "unknown"])("preserves actionable Skill freshness %s rejection before dispatch", async state => {
+    const f = await sessionFixture();
+    f.beforePrompt.mockRejectedValueOnce(new RemoteInstanceError("capability_unavailable", "private adapter output", { diagnostic: `skill_freshness_${state}` }));
+    await f.session.onToRuntime(f.envelope);
+    expect(f.runner.prompt).not.toHaveBeenCalled();
+    const record = f.journal.pendingRequests.get("acp:received:request")?.authorization;
+    expect(record).toMatchObject({ state: "denied", completion: { kind: "acp_error", error: { message: expect.stringContaining("Skill") } } });
+    expect(JSON.stringify(record)).not.toContain("private adapter output");
+    expect(JSON.stringify(record)).not.toContain("Required local session inputs are unavailable");
+    await f.session.onToRuntime(f.envelope);
+    expect(f.beforePrompt).toHaveBeenCalledOnce();
+  });
+
   it("persists preparation rejection before replying", async () => {
     const f = await sessionFixture(); f.beforePrompt.mockRejectedValueOnce(new Error("local input unavailable"));
     await f.session.onToRuntime(f.envelope);

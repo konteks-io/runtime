@@ -192,6 +192,32 @@ describe("one OpenCode process per working copy", () => {
     return { root, wc, credentials: join(root, "credentials") };
   }
 
+  it("binds and releases distinct Skill contexts independently through the actual adapter", async () => {
+    const f = await workingCopy("rules");
+    const runner = config({ RUNNER_CREDENTIAL_DIR: f.credentials });
+    const family = findAgentBridge("opencode")!;
+    const source = async (name: string) => {
+      const parent = join(f.root, name), skill = join(parent, "review");
+      await mkdir(parent, { mode: 0o700 }); await mkdir(skill, { mode: 0o700 });
+      await writeFile(join(parent, ".catalog.json"), "{}", { mode: 0o600 });
+      await writeFile(join(skill, "SKILL.md"), "# Review", { mode: 0o600 });
+      return skill;
+    };
+    const a = await source("scope-a"), b = await source("scope-b");
+    const first = await openCodeRunnerAdapter.bindWorkingCopy!(runner, family, f.wc, [a]);
+    const second = await openCodeRunnerAdapter.bindWorkingCopy!(runner, family, f.wc, [b]);
+    expect(JSON.parse(first.env.OPENCODE_CONFIG_CONTENT!).skills).toEqual([join(f.root, "scope-a")]);
+    expect(JSON.parse(second.env.OPENCODE_CONFIG_CONTENT!).skills).toEqual([join(f.root, "scope-b")]);
+    expect(first.env.XDG_CONFIG_HOME).not.toBe(second.env.XDG_CONFIG_HOME);
+    await first.release();
+    await expect(lstat(first.env.XDG_CONFIG_HOME!)).rejects.toThrow();
+    expect(await readFile(join(second.env.XDG_CONFIG_HOME!, "opencode", "AGENTS.md"), "utf8")).toBe("rules");
+    await second.beforePrompt();
+    await mkdir(join(f.root, "scope-b", "unexpected-skill"), { mode: 0o700 });
+    await expect(second.beforePrompt()).rejects.toThrow(/closed/);
+    await second.release();
+  });
+
   it("spawns with a config folder keyed by the working copy whose AGENTS.md links to the working copy's, and nothing secret", async () => {
     for (const [name, value] of Object.entries(OWNER_SECRETS)) vi.stubEnv(name, value);
     const f = await workingCopy("Always answer in French.");
@@ -269,4 +295,20 @@ describe("one OpenCode process per working copy", () => {
     await expect(bindOpenCodeWorkingCopy("/cred", "work")).rejects.toMatchObject({ code: "agent_unavailable" });
     await expect(openCodeRunnerAdapter.bindWorkingCopy!(config(), findAgentBridge("codex")!, "/wc")).rejects.toThrow(/OpenCode/);
   });
+});
+
+it("isolates OpenCode working-copy configuration by the authorized immutable Skill roots", () => {
+ const a = openCodeWorkingCopyConfig("/credentials", "/checkout", "darwin", ["/skills/tenant-a/revision-1"]);
+ const b = openCodeWorkingCopyConfig("/credentials", "/checkout", "darwin", ["/skills/tenant-b/revision-1"]);
+ const c = openCodeWorkingCopyConfig("/credentials", "/checkout", "darwin", ["/skills/tenant-a/revision-2"]);
+ expect(a).not.toBe(b);
+ expect(a).not.toBe(c);
+ expect(a).not.toBe(openCodeWorkingCopyConfig("/credentials", "/checkout", "darwin"));
+ expect(openCodeWorkingCopyConfig("/credentials", "/checkout", "darwin", ["/skills/b", "/skills/a"])).toBe(openCodeWorkingCopyConfig("/credentials", "/checkout", "darwin", ["/skills/a", "/skills/b", "/skills/a"]));
+});
+
+it("validates native Windows Skill root paths and rejects relative or control-bearing roots", () => {
+ expect(openCodeWorkingCopyConfig("C:/credentials", "C:/checkout", "win32", ["C:/skills/revision"])).toContain("-skills-");
+ expect(() => openCodeWorkingCopyConfig("/credentials", "/checkout", "darwin", ["relative"])).toThrow(/absolute/);
+ expect(() => openCodeWorkingCopyConfig("/credentials", "/checkout", "darwin", ["/skills/unsafe\n"])).toThrow(/absolute/);
 });

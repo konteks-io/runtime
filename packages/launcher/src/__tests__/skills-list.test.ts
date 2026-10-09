@@ -53,3 +53,16 @@ it("reports each configured agent profile without claiming installation or load 
   const json = await list(undefined, true, "en", profiles);
   expect(JSON.parse(json.text).profiles).toEqual(profiles);
 });
+
+it("renders verified installation separately from unknown agent loads", async () => {
+ const profiles = [{ agentId: "opencode", home: "/profiles/opencode", installed: "verified", loaded: "unknown" },
+ { agentId: "codex", home: "/profiles/codex", installed: "stale", loaded: "unknown" }];
+ const english = await list(undefined, false, "en", profiles);
+ expect(english.text).toContain("installed=verified, loaded=unknown");
+ expect(english.text).toContain("installed=stale, loaded=unknown");
+ const indonesian = await list(undefined, false, "id", profiles);
+ expect(indonesian.text).toContain("terpasang=terverifikasi, dimuat=belum diketahui");
+ expect(indonesian.text).toContain("terpasang=perlu sinkronisasi, dimuat=belum diketahui");
+ const json = await list(undefined, true, "en", profiles);
+ expect(JSON.parse(json.text).profiles).toEqual(profiles);
+});

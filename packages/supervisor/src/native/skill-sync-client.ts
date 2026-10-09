@@ -1,6 +1,8 @@
 import { LocalSkillInventorySchema, LocalSkillExportDeliverySchema, LocalSkillExportResultSchema, type LocalSkillExportIntent } from "@konteks/backstage-plugin-common/remote-instance-internal";
 import { coreContractAtLeast } from "@konteks/remote-common";
 import {
+  RuntimeSkillSharePublishRequestSchema, RuntimeSkillSharePublicationResultSchema,
+  RUNTIME_SKILL_SHARE_MIN_CORE_CONTRACT_VERSION, RUNTIME_SKILL_REVISION_MIN_CORE_CONTRACT_VERSION, REMOTE_SKILL_OWNER_BODY_MAX_BYTES, type RuntimeSkillSharePublicationResult,
   RuntimeSkillSyncEnvelopeSchema, RuntimeSkillSyncFileRequestSchema,
   RuntimeSkillSyncPublishRequestSchema, RemoteFileTreeSchema,
   RuntimeSkillSyncDeliveryResponseSchema, RuntimeSkillSyncReceiptSchema,
@@ -35,6 +37,25 @@ export class NativeSkillSyncClient {
     const envelope = RuntimeSkillSyncEnvelopeSchema.parse(value), identity = this.options.identity(), now = this.options.now();
     if (!Number.isFinite(now) || !this.verifier.verifyRuntimeSkillSync(envelope) || envelope.instanceId !== identity.instanceId || envelope.catalog.binding.workspaceId !== identity.workspaceId || Date.parse(envelope.issuedAt) > now + 1000 || Date.parse(envelope.expiresAt) <= now) throw unavailable();
     return envelope;
+  }
+  async share(value: unknown, signal?: AbortSignal): Promise<RuntimeSkillSharePublicationResult> {
+    try {
+      if (!coreContractAtLeast(this.options.coreContractVersion(), RUNTIME_SKILL_SHARE_MIN_CORE_CONTRACT_VERSION)) throw unavailable();
+      const body = RuntimeSkillSharePublishRequestSchema.parse(structuredClone(value));
+      if (body.skillId && !coreContractAtLeast(this.options.coreContractVersion(), RUNTIME_SKILL_REVISION_MIN_CORE_CONTRACT_VERSION)) throw unavailable();
+      if (Buffer.byteLength(JSON.stringify(body)) > REMOTE_SKILL_OWNER_BODY_MAX_BYTES) throw unavailable();
+      const identity = structuredClone(this.options.identity());
+      return await this.request("share", body, REMOTE_INPUT_METADATA_MAX_BYTES, candidate => {
+        const result = RuntimeSkillSharePublicationResultSchema.parse(candidate);
+        const expected = `${identity.instanceId}:${body.localId}:${body.treeDigest}`;
+        if (result.tenantId !== identity.workspaceId || result.metadata.runtimePromotionKey !== expected) throw unavailable();
+        if (body.skillId && (result.id !== body.skillId || !result.runtimePublication)) throw unavailable();
+        return result;
+      }, signal);
+    } catch (error) {
+      if (error instanceof NativeSkillSyncTransportFailure) throw error;
+      throw unavailable();
+    }
   }
   async reportLocalInventory(value: unknown, signal?: AbortSignal): Promise<void> {
     await this.request('local-inventory', LocalSkillInventorySchema.parse(value), 1024, candidate => {

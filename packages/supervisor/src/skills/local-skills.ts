@@ -1,6 +1,6 @@
 import { constants, type Stats } from "node:fs";
 import { lstat, readdir, open, realpath, type FileHandle } from "node:fs/promises";
-import { join, isAbsolute } from "node:path";
+import { join, isAbsolute, basename } from "node:path";
 import { createHash } from "node:crypto";
 import {
   computeRemoteFileTreeDigest,
@@ -118,10 +118,40 @@ export async function discoverLocalSkills(homes: readonly string[]): Promise<Loc
 export async function exportLocalSkill(
   homes: readonly string[],
   selection: Pick<LocalSkillSummary, "localId" | "treeDigest">,
+  sourcePath?: string,
 ): Promise<RemoteFileTree> {
-  const candidate = (await candidates(homes)).find((item) => item.localId === selection.localId);
-  if (!candidate) throw unavailable();
+  const candidate = sourcePath === undefined ? (await candidates(homes)).find((item) => item.localId === selection.localId) : await pathCandidate(sourcePath);
+  if (!candidate || candidate.localId !== selection.localId) throw unavailable();
   const result = await tree(candidate.directory);
   if (result.treeDigest !== selection.treeDigest) throw unavailable();
   return result;
+}
+
+async function pathCandidate(path: string): Promise<Candidate> {
+  if (!isAbsolute(path)) throw unavailable();
+  const before = await lstat(path); assertDirectory(before);
+  const directory = await realpath(path), after = await lstat(directory);
+  assertDirectory(after);
+  if (!same(before, after)) throw unavailable();
+  const name = basename(directory);
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(name)) throw unavailable();
+  return { directory, name, localId: hash(`konteks-personal-skill-v1\0${directory}`) };
+}
+
+export async function inspectLocalSkillPath(path: string): Promise<LocalSkillSummary> {
+  const item = await pathCandidate(path), files = await tree(item.directory);
+  const after = await pathCandidate(path);
+  if (after.localId !== item.localId) throw unavailable();
+  return LocalSkillSummarySchema.parse({ localId: item.localId, name: item.name, treeDigest: files.treeDigest,
+    fileCount: files.entries.length, sizeBytes: files.entries.reduce((sum, file) => sum + file.sizeBytes, 0) });
+}
+
+/** A name must identify one physical source across all configured profiles. */
+export async function inspectLocalSkill(homes: readonly string[], name: string): Promise<LocalSkillSummary> {
+  const matches = new Map((await candidates(homes)).filter(item => item.name === name).map(item => [item.localId, item]));
+  if (matches.size !== 1) throw new Error("Skill name is unavailable or ambiguous; select a specific source folder.");
+  const item = [...matches.values()][0]!;
+  const files = await tree(item.directory);
+  return LocalSkillSummarySchema.parse({ localId: item.localId, name: item.name, treeDigest: files.treeDigest,
+    fileCount: files.entries.length, sizeBytes: files.entries.reduce((sum, file) => sum + file.sizeBytes, 0) });
 }

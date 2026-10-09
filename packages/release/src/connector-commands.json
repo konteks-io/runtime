@@ -1,6 +1,7 @@
 {
   "$comment": "The konteks-remote commands a person runs on a connected computer, one plain line each, for the systems each applies to (runtime-view R20). The connector carries them in its executable and sends them on the heartbeat as connectorCommands with its bundle version (packages/release/src/connector-commands.ts); a release also ships them as commands.json (scripts/release-assets.mjs commands). packages/launcher/src/__tests__/connector-commands.test.ts checks every entry against the launcher's real command table, and that every command a person runs is listed.",
   "commands": [
+    { "id": "skills.share", "command": "konteks-remote skills share <skill>", "description": "Publishes a complete Skill folder with explicit audience and ongoing-sharing consent.", "os": ["macos", "windows", "debian"] },
     { "id": "skills.sync", "command": "konteks-remote skills sync", "description": "Synchronizes authorized runtime Skills into configured agent profiles.", "os": ["macos", "windows", "debian"] },
     { "id": "skills.list", "command": "konteks-remote skills list", "description": "Lists authorized runtime Skills and their verification status.", "os": ["macos", "windows", "debian"] },
     { "id": "status", "command": "konteks-remote status", "description": "Shows whether this computer is connected to Konteks and ready for work.", "os": ["macos", "windows", "debian"] },

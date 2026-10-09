@@ -201,7 +201,7 @@ it("ignores a hostile repository's own OpenCode configuration", async () => {
   const { env } = f.spawned[1]!;
   // Project config is off; our configuration is the only one passed; the folder OpenCode reads holds only the AGENTS.md link.
   expect(env.OPENCODE_CONFIG_PROJECT_DISABLE).toBe("1");
-  expect(JSON.parse(env.OPENCODE_CONFIG_CONTENT!)).toEqual(renderOpenCodeKonteksConfig());
+  expect(JSON.parse(env.OPENCODE_CONFIG_CONTENT!)).toEqual({ ...renderOpenCodeKonteksConfig(), skills: [] });
   expect(env.OPENCODE_CONFIG_DIR).toBeUndefined();
   const folder = join(env.XDG_CONFIG_HOME!, "opencode");
   expect(await readdir(folder)).toEqual(["AGENTS.md"]);

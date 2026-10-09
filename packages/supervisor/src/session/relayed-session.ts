@@ -33,7 +33,7 @@ import type { TransportManager } from "../transport/relay-transport.js";
 import { deferredPermissionBody, PermissionBroker, registerDeferral, sanitizeElicitationRequest, sanitizePermissionRequest, type PendingHumanRequest, type SanitizedElicitation, type SanitizedPermission } from "./permissions.js";
 import type { CapabilityTokenIssue, DeferredPermissionBody } from "../core/client.js";
 import { deferredPermissionRequest, type AdmittedMcpTool, type PolicyDecision, type PolicyResponder } from "./policy-responder.js";
-import type { PreparedSessionInputs } from "../skills/session-inputs.js";
+import { safeSkillFreshnessRejection, type PreparedSessionInputs } from "../skills/session-inputs.js";
 import { McpCapabilityFacade, type McpLocalTransportIdentity } from "../mcp/capability-facade.js";
 import { PREVIEW_WORK_KINDS, PreviewMcpServer, type SessionPreviewAccess } from "../preview/mcp-server.js";
 import { PreviewBrowserGateway } from "../preview/browser-gateway.js";
@@ -366,7 +366,7 @@ export class RelayedSession {
     if (this.closed) throw sessionClosed();
     let prepared: PreparedSessionInputs;
     try { prepared = await this.bootstrapStage("input_preparation", () => this.deps.prepareInputs(this.assignment)); }
-    catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
+    catch (error) { throw safeSkillFreshnessRejection(error) ?? new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
     this.deps.assertExecutionOwned?.();
     const binding = this.verifiedBinding(prepared);
     const readOnlyRoots = Object.freeze([...(prepared.readOnlyRoots ?? [])]);
@@ -1070,7 +1070,7 @@ export class RelayedSession {
 
   private async runBeforePrompt(): Promise<void> {
     try { await this.preparedInputs?.beforePrompt(); }
-    catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
+    catch (error) { throw safeSkillFreshnessRejection(error) ?? new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
   }
 
   /** The staged skills line goes in front of the person's text. */

@@ -243,6 +243,7 @@ export class OpenCodeToolGovernance implements HostToolGovernance {
   readonly quarantineMessage = "OpenCode ran a tool without Konteks' approval. Update or reinstall OpenCode, then restart the connector.";
   private readonly calls = new Map<string, ObservedCall>();
   private readonly asked = new Set<string>();
+  private readonly denied = new Set<string>();
   /** Per Code Mode block: the calls Konteks approved (empty when refused). */
   private readonly approved = new Map<string, string[]>();
   /** Code Mode blocks Konteks refused. */
@@ -281,13 +282,23 @@ export class OpenCodeToolGovernance implements HostToolGovernance {
   private observeEnd(toolCallId: string, value: Record<string, unknown>): HostToolBypass | null {
     const status = value.status;
     const observed = this.calls.get(toolCallId);
-    const block: BlockDecision = { askedFirst: this.asked.has(toolCallId), approved: this.approved.get(toolCallId), refusedBlock: this.refused.has(toolCallId) };
+    const block: BlockDecision = { askedFirst: this.permissionNotDenied(toolCallId), approved: this.approved.get(toolCallId), refusedBlock: this.refused.has(toolCallId) };
     this.forget(toolCallId);
     if (!observed || status === "cancelled") return null;
     if (observed.tool === "execute") return unapprovedCodeModeCall(toolCallId, value.rawOutput, block);
     // Only a call that ran to completion did something.
     if (status !== "completed" || block.askedFirst) return null;
     return UNGATED.has(observed.tool) ? null : { toolCallId, title: observed.tool };
+  }
+
+  answered(toolCallId: string, allowed: boolean): void {
+    if (!this.calls.has(toolCallId) || allowed) return;
+    this.denied.add(toolCallId);
+    this.refused.add(toolCallId);
+  }
+
+  private permissionNotDenied(toolCallId: string): boolean {
+    return this.asked.has(toolCallId) && !this.denied.has(toolCallId);
   }
 
   decide(request: RequestPermissionRequest, context: HostPermissionContext): HostPermissionDecision {
@@ -336,6 +347,7 @@ export class OpenCodeToolGovernance implements HostToolGovernance {
   private forget(toolCallId: string): void {
     this.calls.delete(toolCallId);
     this.asked.delete(toolCallId);
+    this.denied.delete(toolCallId);
     this.approved.delete(toolCallId);
     this.refused.delete(toolCallId);
   }

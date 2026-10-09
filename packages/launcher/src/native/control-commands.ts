@@ -38,16 +38,20 @@ function releaseChannelLine(channel: NonNullable<UpdateChannelReport>): string {
 
 const SkillListSchema = z.object({ skills: z.array(RuntimeSkillSyncItemSchema), catalogDigest: z.string(),
   installed: z.literal("unknown"), loaded: z.literal("unknown"),
-  profiles: z.array(z.object({ agentId: z.string(), home: z.string().optional(), installed: z.literal("unknown"),
+  profiles: z.array(z.object({ agentId: z.string(), home: z.string().optional(), installed: z.enum(["unknown", "verified", "stale"]),
     loaded: z.literal("unknown"), reason: z.literal("skill_home_unavailable").optional() }).strict()).optional() }).strict();
+function installedSkillLabel(status: "unknown" | "verified" | "stale", indonesian: boolean): string {
+  return indonesian ? { unknown: "belum diketahui", verified: "terverifikasi", stale: "perlu sinkronisasi" }[status] : status;
+}
 export async function listSkills(context: ControlContext): Promise<void> {
   const value = await context.control.call({ op: "skills.list" }, SkillListSchema, { timeoutMs: 95_000 });
   context.output.result(value);
   const id = outputLocale(context.output) === "id";
-  context.output.line(id ? "Status pemasangan dan pemuatan Skill belum terverifikasi." : "Skill installation and load status are not yet verified.");
+  context.output.line(id ? "Status pemuatan Skill belum terverifikasi." : "Skill load status is not yet verified.");
   for (const profile of value.profiles ?? []) {
     const label = profile.home ? `${profile.agentId} (${profile.home})` : profile.agentId;
-    const status = id ? "terpasang=belum diketahui, dimuat=belum diketahui" : "installed=unknown, loaded=unknown";
+    const installed = installedSkillLabel(profile.installed, id);
+    const status = id ? `terpasang=${installed}, dimuat=belum diketahui` : `installed=${installed}, loaded=unknown`;
     context.output.line(`${label}: ${status}${profile.reason ? ` (${profile.reason})` : ""}`);
   }
   for (const skill of value.skills) {

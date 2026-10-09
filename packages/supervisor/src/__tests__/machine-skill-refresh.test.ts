@@ -4,11 +4,16 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { computeRemoteFileTreeDigest, computeRuntimeSkillSyncCatalogDigest } from "@konteks/backstage-plugin-common/remote-instance-internal";
-import { MachineSkillPartialFailure, MachineSkillSyncFailure, machineSkillHomes, refreshMachineSkills } from "../native/skill-refresh.js";
+import { MachineSkillPartialFailure, MachineSkillSyncFailure, machineSkillHomes, runnerSkillProfileHomes, refreshMachineSkills } from "../native/skill-refresh.js";
+it("uses installer-bound discovery homes instead of replacing them with defaults", () => {
+  const homes = [join(tmpdir(), "custom-skills")];
+  expect(machineSkillHomes([{ RUNNER_AGENT_ID: "codex", RUNNER_CREDENTIAL_DIR: "/credentials",
+    RUNNER_NATIVE_CODEX_HOME: "/default-codex", RUNNER_NATIVE_SKILL_HOMES: homes }])).toEqual(homes);
+});
 it.each([false, true])("verifies installed trees across configured agent homes, tampered=%s", async tampered => {
   const root = await mkdtemp(join(tmpdir(), "machine-refresh-"));
   try {
-    const homes = machineSkillHomes([{ RUNNER_AGENT_ID: "codex", RUNNER_CREDENTIAL_DIR: join(root, "codex-auth"), RUNNER_NATIVE_CODEX_HOME: join(root, ".codex") }, { RUNNER_AGENT_ID: "claude-code", RUNNER_CREDENTIAL_DIR: join(root, "claude-auth"), RUNNER_NATIVE_CLAUDE_EXECUTABLE: join(root, "claude") }, { RUNNER_AGENT_ID: "dsh", RUNNER_CREDENTIAL_DIR: join(root, "dsh-auth") }, { RUNNER_AGENT_ID: "opencode", RUNNER_CREDENTIAL_DIR: join(root, "opencode-auth") }, { RUNNER_AGENT_ID: "antigravity", RUNNER_CREDENTIAL_DIR: join(root, "antigravity-auth") }], root);
+    const homes = machineSkillHomes([{ RUNNER_AGENT_ID: "codex", RUNNER_CREDENTIAL_DIR: join(root, "codex-auth"), RUNNER_NATIVE_CODEX_HOME: join(root, ".codex") }, { RUNNER_AGENT_ID: "claude-code", RUNNER_CREDENTIAL_DIR: join(root, "claude-auth"), RUNNER_NATIVE_CLAUDE_EXECUTABLE: join(root, "claude") }, { RUNNER_AGENT_ID: "dsh", RUNNER_CREDENTIAL_DIR: join(root, "dsh-auth") }, { RUNNER_AGENT_ID: "antigravity", RUNNER_CREDENTIAL_DIR: join(root, "antigravity-auth") }], root);
     for (const home of homes) await mkdir(home, { recursive: true, mode: 0o700 });
     const content = Buffer.from("# Organization Skill");
     const entries = [{ path: "SKILL.md", mode: 0o600 as const, sizeBytes: content.length, digest: `sha256:${createHash("sha256").update(content).digest("hex")}`, contentBase64: content.toString("base64") }];
@@ -24,7 +29,7 @@ it.each([false, true])("verifies installed trees across configured agent homes, 
       }
     }) };
     const onVerified = vi.fn();
-    const profileBindings = homes.map((home, index) => ({ home, agentId: ["codex", "claude-code", "dsh", "opencode", "antigravity"][index]! }));
+    const profileBindings = homes.map((home, index) => ({ home, agentId: ["codex", "claude-code", "dsh", "antigravity"][index]! }));
     const outcome = refreshMachineSkills({ profileBindings, onVerified, client, scratchRoot: join(root, "cache"), homes, owner: { workspaceId: "tenant-a", instanceId: "machine-a" }, now: Date.now }, new AbortController().signal);
     if (tampered) {
       const error = await outcome.catch(value => value);
@@ -36,7 +41,7 @@ it.each([false, true])("verifies installed trees across configured agent homes, 
     }
     const result = await outcome;
     expect(onVerified).toHaveBeenCalledWith(expect.objectContaining({ skills: [expect.objectContaining({ skillId: skill.skillId, fileModes: { "SKILL.md": 0o600 } })] }), homes, { workspaceId: "tenant-a", instanceId: "machine-a" });
-    expect(result.skills).toEqual([skill]); expect(result.profiles).toHaveLength(5);
+    expect(result.skills).toEqual([skill]); expect(result.profiles).toHaveLength(4);
     expect(result.profiles.map(profile => profile.agentId)).toEqual(profileBindings.map(profile => profile.agentId));
     for (const profile of result.profiles) expect(await readFile(join(profile.paths[0]!, "SKILL.md"), "utf8")).toBe("# Organization Skill");
     expect(client.read).toHaveBeenCalledTimes(1); expect(client.authorize.mock.calls.length).toBeGreaterThan(2);
@@ -145,4 +150,15 @@ it("reports every unconfigured agent without fetching a catalog when no profile 
   expect(read).not.toHaveBeenCalled();
   expect(authorize).not.toHaveBeenCalled();
   expect(onVerified).not.toHaveBeenCalled();
+});
+
+it("attributes agent profiles to their adapter home, not every machine discovery home", () => {
+ const runner = { RUNNER_AGENT_ID: "codex", RUNNER_CREDENTIAL_DIR: "/credentials", RUNNER_NATIVE_CODEX_HOME: "/codex-profile", RUNNER_NATIVE_SKILL_HOMES: ["/claude-profile", "/opencode-profile"] };
+ expect(runnerSkillProfileHomes(runner)).toEqual(["/codex-profile"]);
+ expect(runnerSkillProfileHomes({ ...runner, RUNNER_AGENT_ID: "claude-code", RUNNER_NATIVE_CLAUDE_EXECUTABLE: "/bin/claude", RUNNER_NATIVE_CLAUDE_CONFIG_DIR: "/custom-claude" })).toEqual(["/custom-claude"]);
+ expect(runnerSkillProfileHomes({ ...runner, RUNNER_AGENT_ID: "unknown" })).toEqual([]);
+});
+
+it("does not mistake OpenCode shared state for a working-copy execution profile", () => {
+ expect(runnerSkillProfileHomes({ RUNNER_AGENT_ID: "opencode", RUNNER_CREDENTIAL_DIR: "/credentials/opencode" })).toEqual([]);
 });

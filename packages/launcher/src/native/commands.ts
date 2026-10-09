@@ -8,6 +8,7 @@ import { EMBEDDED_RELEASE_ROOTS, findAgentBridge, resolveNativeConnectorExecutab
 import { createNativeService, hostAgentInstallAdapter, loadNativeInstallation, ownedByAnotherConnector, readNativeUpdateLedger, verifyInstalledNativeConnector, NATIVE_SHUTDOWN_RECEIPT_FILE, type HostAgentInstallAdapter, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { ReleaseAcceptedSchema, RemoteInstanceError, SupervisorStatusSchema, runCommand, sanitizeInheritedChildProcessEnv, writeSecretFile } from "@konteks/remote-common";
 import { syncSkills, listSkills, agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyList, gitKeyRemove, previewStatus, status, supportBundle, type ControlContext } from "./control-commands.js";
+import { shareSkill } from "./skill-share-command.js";
 import { SupervisorControl } from "../control.js";
 import { addNativeAgent, fetchHostAgent, installNative, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, removeNativeAgent, restoreNativeRecord, stageNativeEnrollment } from "./install.js";
 import { terminalFetchConsent, type FetchConsent } from "./consent.js";
@@ -484,6 +485,7 @@ const CONTROL_OPERATIONS: Readonly<Record<ControlInput["operation"], ControlOper
   agents: context => agents(context),
   "skills.list": context => listSkills(context),
   "skills.sync": context => syncSkills(context),
+  "skills.share": (context, input) => shareSkill(context, input.skillShare!),
   doctor: doctorOrSupport,
   support: doctorOrSupport,
   "preview.status": context => previewStatus(context),
@@ -498,7 +500,7 @@ const CONTROL_OPERATIONS: Readonly<Record<ControlInput["operation"], ControlOper
 };
 
 /** Operations that act through the running connector, and so wait for one that is starting. */
-const WAITS_FOR_CONNECTOR: ReadonlySet<string> = new Set(["skills.sync", "skills.list", "status", "preview.status", "agents", "auth.status", "auth.login", "auth.logout", "git.key.add", "git.key.list", "git.key.remove"]);
+const WAITS_FOR_CONNECTOR: ReadonlySet<string> = new Set(["skills.share", "skills.sync", "skills.list", "status", "preview.status", "agents", "auth.status", "auth.login", "auth.logout", "git.key.add", "git.key.list", "git.key.remove"]);
 
 const productionNativeStopDeps: NativeStopDeps = {
   definition: serviceDefinition,
@@ -648,6 +650,17 @@ export async function startNativeConnector(
   // only "started" invited a second and third `start` against a service that
   // was already coming up.
   setupDetail(input.output, "serviceStarting");
+}
+
+/** Foreground startup shares the installer's guarded port recovery with OS-service startup. */
+export async function prepareNativeForegroundPort(input: NativeCommandContext,
+  deps: Parameters<typeof startNativeConnector>[1] = {}): Promise<void> {
+  const { platform, roots, executeService, definitionOf } = startDefaults(deps);
+  const definition = await definitionOf(input.root);
+  const serviceState = () => readServiceState(executeService, definition, stoppedExitCodes(platform.os),
+    windowsOwnerReader(input.root, platform.os, deps.serviceOwner));
+  if ((await serviceState()) === "running") return;
+  await moveOffOccupiedPort(input, { roots, platform }, serviceState);
 }
 
 async function moveOffOccupiedPort(input: NativeCommandContext, release: { roots: readonly EmbeddedReleaseRoot[]; platform: ReturnType<typeof nativePlatform> }, serviceState: () => Promise<"running" | "stopped">): Promise<void> {
@@ -1241,6 +1254,7 @@ export const nativeCliActions: NativeCliActions = {
       await new Promise(resolve => setTimeout(resolve, SERVICE_RELOAD_GRACE_MS));
       process.stderr.write("the service manager did not restart this connector onto its definition; starting on the one it has\n");
     }
+    await prepareNativeForegroundPort(input);
     const service = createNativeService({ root: input.root, roots: EMBEDDED_RELEASE_ROOTS, platform: nativePlatform(),
       prepareRepositoryWorktree: (cwd, agentId) => prepareDeliveryGraft(input.root, cwd, agentId),
       exitProcess: code => process.exit(code) });
