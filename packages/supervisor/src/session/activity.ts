@@ -292,7 +292,22 @@ const CODEX_FINDING_TITLE = /^(?:List files|Search files|Search for |Search in |
  */
 function codexCanonicalizer(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): unknown {
   if (candidate.sessionUpdate !== "tool_call_update" || candidate.status !== "failed") return candidate;
-  return codexFinds(candidate, prior) && foundNothing(candidate.rawOutput) ? { ...candidate, status: "completed" } : candidate;
+  const nothingFound = (codexFinds(candidate, prior) && foundNothing(candidate.rawOutput)) || lastSearchFoundNothing(candidate, prior);
+  return nothingFound ? { ...candidate, status: "completed" } : candidate;
+}
+
+/** A command whose last step is a search: `cat a; rg --files -g AGENTS.md`, or `… | grep x`. */
+const ENDS_IN_SEARCH = /(?:^|[;|&]\s*)(?:rg|grep|egrep|fgrep)\s[^;|&]*$/;
+
+/**
+ * The same AGENTS.md lookup at the end of a longer command (`cat …; cat …;
+ * rg --files -g AGENTS.md …`) read "Failed" although every step worked
+ * (10-09): rg and grep exit 1 only when nothing matched (2 on an error), and
+ * the command's exit is its last step's.
+ */
+function lastSearchFoundNothing(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): boolean {
+  const title = (nonBlank(candidate.title) ?? prior?.title)?.replace(/^["']|["']$/g, "");
+  return title !== undefined && ENDS_IN_SEARCH.test(title) && plainRecord(candidate.rawOutput)?.exit_code === 1;
 }
 
 function codexFinds(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): boolean {
@@ -397,6 +412,14 @@ interface ActivityTextOptions {
    * chunk it streamed in.
    */
   afterMaskedPath?: boolean;
+  /**
+   * The previous chunk's path ended on "Application" (with or without the
+   * space): a chunk opening "Support/…" is that path's macOS app-data folder,
+   * not a new word.
+   */
+  continuesApplication?: boolean;
+  /** The previous chunk ended on a backtick or `[`: a host path may open this one. */
+  afterQuote?: boolean;
 }
 
 const PATH_MASK = "[local-path]";
@@ -427,7 +450,7 @@ function nameWorkspace(text: string, workspaceRoot: string): string {
 }
 
 const PATH_TOKEN_START = /^(?:\/(?![/*])|[A-Za-z]:(?:[\\/]|$)|\\\\)/;
-const TOKEN_DELIMITER = /[\s"'<>`)\]}=(]/;
+const TOKEN_DELIMITER = /[\s"'<>`)[\]}=(]/;
 
 /**
  * Whether streamed text ends inside a local-path token, given whether the
@@ -439,40 +462,92 @@ export function endsInsidePath(text: string, previousEndedInPath: boolean, start
     if (TOKEN_DELIMITER.test(text[index]!)) { start = index; break; }
   }
   if (start === -1) return previousEndedInPath || (startsAtBoundary && PATH_TOKEN_START.test(text));
-  return PATH_TOKEN_START.test(text.slice(start + 1));
+  // After `<` it is a tag: a chunk ending "</" made the next chunk's "h2>" a
+  // path's continuation ("<h2>Title</[local-path]>", 10-09).
+  return text[start] !== "<" && PATH_TOKEN_START.test(text.slice(start + 1));
 }
+
+/** What follows an "Application" path end when the path is macOS's app-data folder. */
+const APPLICATION_SUPPORT_TAIL = /^ ?Support(?=[\\/])/;
 
 /** What a stream remembers of its last text chunk: raw text, whether it ended in a path, and what it became. */
 export interface ChunkTrail {
   text: string;
   inPath: boolean;
   output: string;
+  /** Its path ended on "/Application", maybe with the space after it. */
+  endsOnApplication?: boolean;
 }
 
 /** How the next streamed chunk reads, given the stream's last one. */
 export function chunkOptions(previous: ChunkTrail | undefined): Required<ActivityTextOptions> {
-  const continuesPath = previous?.inPath ?? false;
+  return trailOptions(previous ?? { text: "", inPath: false, output: "" }, previous === undefined);
+}
+
+function trailOptions(previous: ChunkTrail, first: boolean): Required<ActivityTextOptions> {
+  const continuesApplication = previous.endsOnApplication === true;
   return {
-    startsAtBoundary: continuesAtBoundary(previous?.text),
-    continuesPath,
-    afterMaskedPath: continuesPath && endsWithPathMask(previous?.output ?? ""),
+    startsAtBoundary: first || continuesAtBoundary(previous.text),
+    continuesPath: previous.inPath,
+    // The space after "Application" may already have gone out after the mask.
+    afterMaskedPath: (previous.inPath || continuesApplication) && /\[local-path\] ?$/.test(previous.output),
+    continuesApplication,
+    afterQuote: /[`[]$/.test(previous.text),
   };
 }
 
 /** The trail after a chunk. One that was all continuation leaves the previous mask the one to continue. */
 export function nextTrail(previous: ChunkTrail | undefined, text: string, options: Required<ActivityTextOptions>, output: string): ChunkTrail {
-  return { text, inPath: endsInsidePath(text, options.continuesPath, options.startsAtBoundary), output: output || (previous?.output ?? "") };
+  // A path that opens right after a backtick or bracket is a token start too.
+  const atBoundary = options.startsAtBoundary || options.afterQuote;
+  const inPath = allApplicationSupport(text, options) || endsInsidePath(text, options.continuesPath, atBoundary);
+  const endsOnApplication = endsOnApplicationPath(text, options.continuesPath, atBoundary);
+  return { text, inPath, output: output || (previous?.output ?? ""), ...(endsOnApplication ? { endsOnApplication } : {}) };
 }
+
+/** A chunk that is all "Support/…" after an "Application" end is still inside that path. */
+function allApplicationSupport(text: string, options: Required<ActivityTextOptions>): boolean {
+  return options.continuesApplication && APPLICATION_SUPPORT_TAIL.test(text) && !TOKEN_DELIMITER.test(text.replace(/^ /, ""));
+}
+
+/** Whether a chunk's path ends on "/Application", maybe with the space after it. */
+function endsOnApplicationPath(text: string, continuesPath: boolean, atBoundary: boolean): boolean {
+  const head = text.match(/^(.*\/Application) ?$/s)?.[1];
+  return head !== undefined && endsInsidePath(head, continuesPath, atBoundary);
+}
+
 
 /** Whether text following `previous` starts a new token for path detection. */
 export function continuesAtBoundary(previous: string | undefined): boolean {
   return previous === undefined || previous.length === 0 || /[\s"'=(]$/.test(previous);
 }
 
+/** The chunk's opening continuation of the previous chunk's path, masked once. */
+function continuedText(text: string, options: ActivityTextOptions): string {
+  if (options.continuesApplication && APPLICATION_SUPPORT_TAIL.test(text)) {
+    return text.replace(/^ ?Support[\\/][^\s"'<>`)\]}*]*/, options.afterMaskedPath ? "" : PATH_MASK);
+  }
+  if (options.continuesPath) return text.replace(/^(?=[\w.~\\/-])[^\s"'<>`)\]}*]+/, options.afterMaskedPath ? "" : PATH_MASK);
+  return text;
+}
+
+/** Where on this computer a quoted absolute path is surely private: under a home or system root. */
+const HOST_ROOT = "(?:Users|home|root|private|var|tmp|opt|etc|Volumes|mnt|Library)/";
+
+/**
+ * A path an agent quotes in Markdown code or a link went out whole, user name
+ * included (`/Users/…`, [/Users/…], 10-09). A quoted path under a host root
+ * is masked; one that is not (`/storefront/app/…`, an agent's root-anchored
+ * slip that a refusal quotes back to it) stays readable.
+ */
+function maskQuotedHostPaths(text: string, afterQuote: boolean): string {
+  const quoted = new RegExp(`(${afterQuote ? "^|" : ""}[\`[])\\/(?=${HOST_ROOT})[^\\s"'<>\`)\\]}*]+`, "g");
+  return text.replace(quoted, "$1[local-path]");
+}
+
 function publicText(value: string, workspaceRoot: string, options: ActivityTextOptions): string {
   const startsAtBoundary = options.startsAtBoundary ?? true;
-  let text = redactText(value);
-  if (options.continuesPath) text = text.replace(/^(?=[\w.~\\/-])[^\s"'<>`)\]}*]+/, options.afterMaskedPath ? "" : PATH_MASK);
+  let text = continuedText(redactText(value), options);
   // A chunk opening `:/…` or `:\…` continues a drive path whose letter was
   // emitted in the previous chunk. `://` is excluded because that is a URL
   // scheme, and a chunk ending exactly at the separator defers rather than
@@ -494,5 +569,5 @@ function publicText(value: string, workspaceRoot: string, options: ActivityTextO
     // part of one: `sudo ls /**` (a root slash and Markdown bold) is not a
     // private path, and redacting it broke the bold.
     .replace(/(^|[\s"'=(])\/(?!\/)(?=[\w.~-])[^\s"'<>`)\]}*]+/g, "$1[local-path]");
-  return releaseHeldSpaces(startsAtBoundary ? out : out.slice(1));
+  return maskQuotedHostPaths(releaseHeldSpaces(startsAtBoundary ? out : out.slice(1)), options.afterQuote ?? false);
 }

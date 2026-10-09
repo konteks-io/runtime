@@ -1057,6 +1057,9 @@ export class WorkOrchestrator {
     if (!execution || execution.phase === "opened") return;
     if (this.releaseRecoveredPredecessor(channelId, predecessor, prior, assignment)) return;
     this.logBlockedSuccessor(assignment, sessionId, predecessor, prior, execution);
+    // Core may have settled it since (a person's Stop): ask again now, so the next message runs.
+    void this.reports.healNow(predecessor.assignment.id, predecessor.assignment.attempt)
+      .catch(error => this.logger.warn({ err: error }, "halted claim healing failed"));
     throw new RemoteInstanceError("recovery_required",
       "The previous execution stopped unexpectedly and its background work could not be confirmed stopped. This session requires recovery before retrying.",
       { diagnostic: "predecessor_recovery_unqualified" });
@@ -1101,8 +1104,18 @@ export class WorkOrchestrator {
   private recoveredExecutionSettled(prior: LocalAdmission): boolean {
     const execution = this.deps.journal.execution.execution(prior);
     return execution?.phase === "interrupted_unqualified" && execution.processStoppedAt !== undefined &&
-      this.reports.acknowledgedTerminalReport(prior.assignmentId, prior.attempt, prior.claimId) !== undefined &&
-      this.pendingRecoveryEvidence(prior).length === 0;
+      this.claimSettledByCore(prior) && this.pendingRecoveryEvidence(prior).length === 0;
+  }
+
+  /**
+   * Core holds the claim's terminal: ours acknowledged, or one it already had
+   * (a Stop it settled itself answers the healed report terminal_winner_exists).
+   * 10-09: a session stayed blocked after a settled Stop, every message refused.
+   */
+  private claimSettledByCore(prior: LocalAdmission): boolean {
+    if (this.reports.acknowledgedTerminalReport(prior.assignmentId, prior.attempt, prior.claimId) !== undefined) return true;
+    const entry = this.deps.journal.assignments.get(`${prior.assignmentId}:${prior.attempt}`);
+    return entry?.claimId === prior.claimId && entry.state === "completed";
   }
 
   private pendingRecoveryEvidence(prior: LocalAdmission): RecoveryEvidenceRecord[] {
