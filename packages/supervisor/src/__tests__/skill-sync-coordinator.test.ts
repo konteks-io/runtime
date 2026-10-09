@@ -29,3 +29,48 @@ it("restores historical success and commits persistence before reporting new suc
   persist.mockResolvedValueOnce(); await sync.sync();
   expect(sync.status().lastSuccess).toEqual({ syncedAt: new Date(2000).toISOString(), inventory: ["new"] });
 });
+
+it("periodically reconciles only while ready and stops its fallback timer", async () => {
+  vi.useFakeTimers();
+  const refresh = vi.fn(async () => ["latest"]), failure = vi.fn();
+  let ready = false;
+  const sync = new SkillSyncCoordinator(refresh);
+  try {
+    sync.startPeriodic(() => ready, failure, 1000);
+    sync.startPeriodic(() => ready, failure, 1000);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(refresh).not.toHaveBeenCalled();
+    ready = true;
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(refresh).toHaveBeenCalledTimes(1);
+    refresh.mockRejectedValueOnce(new Error("offline"));
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(failure).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(refresh).toHaveBeenCalledTimes(3);
+    sync.stop();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(refresh).toHaveBeenCalledTimes(3);
+  } finally { sync.stop(); vi.useRealTimers(); }
+});
+
+it("waits for an aborted refresh to finish before shutdown can release ownership", async () => {
+  let finish!: (value: string[]) => void;
+  const refresh = vi.fn((signal: AbortSignal) => {
+    expect(signal.aborted).toBe(false);
+    return new Promise<string[]>(resolve => { finish = resolve; });
+  });
+  const sync = new SkillSyncCoordinator(refresh);
+  const pending = sync.sync();
+  await Promise.resolve();
+  sync.stop();
+  let settled = false;
+  const shutdown = sync.settle().then(() => { settled = true; });
+  await Promise.resolve();
+  expect(settled).toBe(false);
+  finish(["late"]);
+  await expect(pending).rejects.toThrow("stopped");
+  await shutdown;
+  expect(settled).toBe(true);
+  expect(sync.status().lastSuccess).toBeUndefined();
+});

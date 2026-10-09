@@ -2,6 +2,7 @@
 export class SkillSyncCoordinator<T> {
   private pending: Promise<T> | undefined;
   private closed = false;
+  private periodic: ReturnType<typeof setInterval> | undefined;
   private controller: AbortController | undefined;
   private lastSuccess: { syncedAt: string; inventory: T } | undefined;
   constructor(private readonly refresh: (signal: AbortSignal) => Promise<T>, private readonly now = Date.now,
@@ -28,5 +29,20 @@ export class SkillSyncCoordinator<T> {
     }).finally(() => { if (this.pending === pending) { this.pending = undefined; this.controller = undefined; } });
     this.pending = pending; return pending;
   }
-  stop(): void { this.closed = true; this.controller?.abort(); }
+  startPeriodic(ready: () => boolean, onFailure: () => void, intervalMs = 60_000): void {
+    if (this.closed || this.periodic) return;
+    this.periodic = setInterval(() => {
+      if (ready()) void this.sync().catch(() => onFailure());
+    }, intervalMs);
+    this.periodic.unref();
+  }
+  async settle(): Promise<void> {
+    await this.pending?.catch(() => undefined);
+  }
+  stop(): void {
+    this.closed = true;
+    if (this.periodic) clearInterval(this.periodic);
+    this.periodic = undefined;
+    this.controller?.abort();
+  }
 }

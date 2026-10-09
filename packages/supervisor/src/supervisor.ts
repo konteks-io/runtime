@@ -1670,6 +1670,7 @@ export class Supervisor {
     this.activeLoopStarted = true;
     this.reconnectRefusal = null;
     this.beginActiveWork();
+    this.requestAutomaticSkillSync();
     await this.work.reports.flushAll();
   }
 
@@ -1809,6 +1810,7 @@ export class Supervisor {
     try {
       await this.refreshConfiguration();
       await this.reconciliation.run();
+      this.requestAutomaticSkillSync();
     } catch (error) {
       this.logger.warn({ err: error }, "https reconciliation failed; will retry");
       setTimeout(() => void this.reconnectOverHttps(), 15_000).unref();
@@ -1941,6 +1943,7 @@ export class Supervisor {
   private async onControlMessage(body: unknown): Promise<void> {
     if ((body as { manifestId?: string }).manifestId !== undefined) {
       await this.reconciliation.apply(body);
+      this.requestAutomaticSkillSync();
       return;
     }
     await this.control.handle(body);
@@ -2343,17 +2346,39 @@ export class Supervisor {
     this.nativeOwnership.assertOwned();
     const homes = machineSkillHomes(this.options.native.runners);
     const unavailableAgentIds = this.options.native.runners.filter(runner => machineSkillHomes([runner]).length === 0).map(runner => runner.RUNNER_AGENT_ID);
-    this.skillSync ??= new SkillSyncCoordinator(signal => refreshMachineSkills({
+    this.skillSync ??= new SkillSyncCoordinator(signal => {
+      this.assertSkillSyncReady();
+      return refreshMachineSkills({
       client: this.machineSkillSyncClient(), homes, unavailableAgentIds,
       scratchRoot: join(this.config.SUPERVISOR_DATA_DIR, "machine-skills"),
       owner: { workspaceId: this.workspaceId ?? "", instanceId: this.instanceId ?? "" },
       now: () => this.clock.coreNow(),
-    }, signal));
+    }, signal);
+    });
+    this.skillSync.startPeriodic(() => this.skillSyncReady(), () => this.logSkillSyncFailure());
     try { return { ...await this.skillSync.sync(), complete: true, loaded: "unknown" as const }; }
     catch (error) {
       if (error instanceof MachineSkillPartialFailure) return { ...error.inventory, complete: false, loaded: "unknown" as const };
       throw error;
     }
+  }
+
+  private skillSyncReady(): boolean {
+    return !this.stopping && !!this.options.native && !!this.nativeOwnership && this.reconciliation.isComplete && this.lease.mode() === "active" && coreContractAtLeast(this.coreContractVersion, "7.5");
+  }
+
+  private assertSkillSyncReady(): void {
+    if (!this.skillSyncReady()) throw new RemoteInstanceError("capability_unavailable", "Skill synchronization requires a recovered runtime, active lease and Core contract 7.5.");
+    this.nativeOwnership!.assertOwned();
+  }
+
+  private logSkillSyncFailure(): void {
+    this.logger.warn({ event: "skills.sync_failed" }, "Automatic Skill sync failed; retry with skills sync or inspect runtime readiness.");
+  }
+
+  private requestAutomaticSkillSync(): void {
+    if (!this.skillSyncReady()) return;
+    void this.syncSkills().then(report => { if (!report.complete) this.logSkillSyncFailure(); }, () => this.logSkillSyncFailure());
   }
 
   private async listSkills() {
@@ -3097,6 +3122,7 @@ export class Supervisor {
     await this.waitForShutdownStep("start", this.startPromise?.catch(() => undefined));
     await this.waitForShutdownStep("active_loop_start", this.activeLoopStarting);
     this.stopWorkTimers();
+    await this.waitForShutdownStep("skill_sync", this.skillSync?.settle());
     await this.waitForShutdownStep("cancellation_replay", this.cancellationReplay?.stop());
     stopInterval(this.configurationTimer);
     await this.settleControlLoops();
