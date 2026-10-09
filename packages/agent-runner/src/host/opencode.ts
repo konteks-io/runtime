@@ -300,13 +300,14 @@ export async function bindOpenCodeWorkingCopy(credentialDir: string, workingCopy
   let released = false;
   return {
     env,
-    beforePrompt: async () => {
+    beforePrompt: async turn => {
       if (released) throw new RemoteInstanceError("agent_unavailable", "The OpenCode execution context has been released. Start a new execution context before retrying.");
       await activation?.wait();
       return serial(configHome, async () => {
         if (released) throw new RemoteInstanceError("agent_unavailable", "The OpenCode execution context has been released. Start a new execution context before retrying.");
         await openCodeSkillSources(skillRoots);
         await syncOpenCodeInstructions(configHome, workingCopy, deps);
+        activation?.prepareTurn(turn);
       });
     },
     release: () => {

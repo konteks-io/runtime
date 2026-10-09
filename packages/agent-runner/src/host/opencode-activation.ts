@@ -1,6 +1,7 @@
+import type { HostPromptTurn } from "./host-agent.js";
 import { openCodeSkillContent } from "./opencode-skill-content.js";
 import { randomBytes } from "node:crypto";
-import { createServer, type Server } from "node:http";
+import { createServer, type Server, type ServerResponse } from "node:http";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { RemoteInstanceError } from "@konteks/remote-common";
@@ -17,6 +18,7 @@ export default {
         redirect: "error", signal: AbortSignal.timeout(5000)
       });
       if (!response.ok) throw new Error("Konteks plugin activation was refused");
+      if (action === "turn") return response.json();
       await response.body?.cancel();
     };
     const registrations = [];
@@ -25,6 +27,8 @@ export default {
     const select = async input => {
       selectedMessage = undefined;
       if (!nativeID(input.sessionID) || !nativeID(input.messageID)) throw new Error("OpenCode native Skill prompt identity is unavailable");
+      const turn = await send("turn");
+      if (turn.bridgeSessionId !== input.sessionID) throw new Error("OpenCode native Skill prompt does not match the governed turn");
       const result = await context.skill.list();
       if (!Array.isArray(result.data)) throw new Error("OpenCode Skill inventory is unavailable");
       const selected = context.options.skillFiles.map(path => {
@@ -98,13 +102,21 @@ export async function createOpenCodeActivation(configHome: string, skillRoots: r
   const directory = await mkdtemp(join(configHome, ".managed-plugin-"));
   const token = randomBytes(32).toString("hex");
   let active = false, closed = false, stopped = false;
+  let turn: HostPromptTurn | undefined;
   let resolveReady!: () => void;
   const ready = new Promise<void>(resolve => { resolveReady = resolve; });
+  const takeTurn = (response: ServerResponse) => {
+    const current = turn;
+    turn = undefined;
+    if (!active || !current) { response.writeHead(403).end(); return; }
+    response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(current));
+  };
   const server = createServer((request, response) => {
     request.resume();
     if (closed || stopped || request.method !== "POST" || request.headers.authorization !== `Bearer ${token}`) {
       response.writeHead(403).end(); return;
     }
+    if (request.url === "/turn") { takeTurn(response); return; }
     if (request.url !== "/ready" && request.url !== "/closed") {
       response.writeHead(404).end(); return;
     }
@@ -123,6 +135,10 @@ export async function createOpenCodeActivation(configHome: string, skillRoots: r
     server.unref();
     return {
       plugin: { package: directory, options: { endpoint: `http://127.0.0.1:${port}/ready`, token, skillFiles: skillRoots.map(root => join(root, "SKILL.md")) } },
+      prepareTurn: (value?: HostPromptTurn) => {
+        if (closed || !active) throw unavailable();
+        turn = value ? Object.freeze({ ...value }) : undefined;
+      },
       wait: async () => {
         let timer: ReturnType<typeof setTimeout> | undefined;
         try {
@@ -134,7 +150,7 @@ export async function createOpenCodeActivation(configHome: string, skillRoots: r
       },
       release: async () => {
         if (closed) return;
-        closed = true; active = false; resolveReady();
+        closed = true; active = false; turn = undefined; resolveReady();
         try { await close(server); } finally { await rm(directory, { recursive: true, force: true }); }
       },
     };

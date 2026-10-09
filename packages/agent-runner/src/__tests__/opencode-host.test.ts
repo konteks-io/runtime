@@ -423,6 +423,12 @@ it("selects native Skill attachments only from the exact authorized source files
     const select = callbacks.get("prompt")!;
     const input = { sessionID: "native-session", messageID: "native-message", prompt: { text: "Work", skills: [] } };
     expect(select).toBeTypeOf("function");
+    const arm = () => activation.prepareTurn({ acpSessionRef: "governed-session", bridgeSessionId: "native-session", requestId: "governed-turn" });
+    await expect(select(input)).rejects.toThrow(/activation was refused/);
+    arm();
+    await expect(select({ ...input, sessionID: "foreign-session" })).rejects.toThrow(/governed turn/);
+    await expect(select(input)).rejects.toThrow(/activation was refused/);
+    arm();
     await select(input);
     expect(input.prompt.skills).toEqual([{ id: "approved" }]);
     const verify = callbacks.get("context")! as unknown as (input: unknown) => Promise<void>;
@@ -431,11 +437,14 @@ it("selects native Skill attachments only from the exact authorized source files
     const expectedContent = JSON.parse(await readFile(join(activation.plugin.package, "skills.json"), "utf8")) as string[];
     await expect(verify({ sessionID: "native-session", messages: [{ id: "native-message", role: "user", content: [{ type: "text", text: "tampered" }] }] })).rejects.toThrow(/content verification failed/);
     await expect(verify({ sessionID: "native-session", messages: [{ id: "native-message", role: "user", content: expectedContent.map(text => ({ type: "text", text })) }] })).rejects.toThrow(/load admission is unavailable/);
+    arm();
     await expect(select({ ...input, prompt: { skills: [{ id: "personal" }] } })).rejects.toThrow(/unauthorized/);
     await expect(verify({ sessionID: "native-session", messages: [{ id: "native-message", role: "user" }] })).rejects.toThrow(/current native message/);
     inventory.push({ id: "duplicate", path: join(skillRoot, "SKILL.md") });
+    arm();
     await expect(select({ ...input, prompt: {} })).rejects.toThrow(/ambiguous/);
     inventory.splice(0);
+    arm();
     await expect(select({ ...input, prompt: {} })).rejects.toThrow(/ambiguous/);
     await cleanup();
   } finally { await activation.release(); }

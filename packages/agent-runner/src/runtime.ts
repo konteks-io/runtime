@@ -370,7 +370,7 @@ export class AgentRuntime {
     return {
       bridge: () => this.bridge,
       ...this.executionBridgeHooks(),
-      ...(this.perWorkingCopy ? { beforePrompt: (bridge: BridgeProcess) => this.workingCopyBindings.get(bridge)?.beforePrompt() } : {}),
+      ...(this.perWorkingCopy ? { beforePrompt: (bridge, turn) => this.workingCopyBindings.get(bridge)?.beforePrompt(turn) } : {}),
       ...sessionGovernance(this.family.agentId, this.host),
       ...(this.host ? hostSessionHooks(this.host, options.config, () => this.hostSettings) : {}),
       usageLabel: modelValue => this.usageLabel(modelValue),

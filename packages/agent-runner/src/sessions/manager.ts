@@ -17,7 +17,7 @@ import { AcpNativeObservationSchema, RemoteInstanceError, type AgentTurnUsageObs
 import type { BridgeProcess } from "../bridge/process.js";
 import { classifyBridgeError } from "../bridge/process.js";
 import type { RunnerEventBus } from "../events.js";
-import type { HostPromptPrelude, HostPromptSession, HostTurnError } from "../host/host-agent.js";
+import type { HostPromptPrelude, HostPromptSession, HostPromptTurn, HostTurnError } from "../host/host-agent.js";
 import { konteksAgentTitledMetadata, konteksCodingSessionTitle, konteksSessionMetadata, type KonteksSessionLabel } from "./title.js";
 import type { MeasuredTurn } from "./usage-label.js";
 import {
@@ -166,7 +166,7 @@ export interface SessionManagerOptions {
    * re-checks, and on Windows refreshes, its working copy's instructions).
    * Returns nothing when there is none, so the prompt is sent at once.
    */
-  beforePrompt?: (bridge: BridgeProcess) => Promise<void> | undefined;
+  beforePrompt?: (bridge: BridgeProcess, turn: HostPromptTurn) => Promise<void> | undefined;
   events: RunnerEventBus;
   /** Durable map acpSessionRef → bridge session id inside the credential volume (survives restart). */
   refStore: SessionRefStore;
@@ -1114,7 +1114,7 @@ export class SessionManager {
     const publishMeasured = this.beginTurn(record, bridge);
     const send = () => this.sendPrompt(record, bridge, params);
     const prepare = this.options.beforePrompt;
-    const prepared = prepare ? Promise.resolve().then(() => prepare(bridge)) : undefined;
+    const prepared = prepare ? Promise.resolve().then(() => prepare(bridge, { acpSessionRef, bridgeSessionId: record.bridgeSessionId!, requestId })) : undefined;
     const operation = (prepared ? prepared.then(send) : send())
       .then(result => this.settlePrompt(record, requestId, result, publishMeasured))
       .catch((error: unknown) => {

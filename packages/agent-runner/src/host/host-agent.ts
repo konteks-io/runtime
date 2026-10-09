@@ -175,6 +175,12 @@ export interface HostFileAuthority {
 }
 
 /** One execution process's hold on its working copy (`bindWorkingCopy`). */
+export interface HostPromptTurn {
+  readonly acpSessionRef: string;
+  readonly bridgeSessionId: string;
+  readonly requestId: string;
+}
+
 export interface HostWorkingCopyBinding {
   /** Present when the child enforces a fixed read authority for its lifetime. */
   readonly authority?: HostFileAuthority;
@@ -184,7 +190,7 @@ export interface HostWorkingCopyBinding {
   /** The complete environment of the process serving this working copy. */
   readonly env: NodeJS.ProcessEnv;
   /** Before each prompt: re-check (and, where it is a copy, refresh) what the process reads from the working copy. */
-  beforePrompt(): Promise<void>;
+  beforePrompt(turn?: HostPromptTurn): Promise<void>;
   /** Remove preparation after the owning child no longer needs it; fixed read authority requires qualified group/tree cleanup. Idempotent; errors remain visible. */
   release(): Promise<void>;
 }
