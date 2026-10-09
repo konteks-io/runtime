@@ -320,6 +320,7 @@ export class AgentRuntime {
    * the last good answer while it is read again (`discoverModelCapability`). */
   private readonly modelCapabilities = new Map<string, ModelCapabilityEntry>();
   private stopping = false;
+  private readonly backgroundProbes = new Set<Promise<void>>();
   /** Set when the agent broke a governance guarantee; no bridge starts again in this process. */
   private quarantined: string | null = null;
   /** A host-installed agent's adapter (DeepSeek Harness, OpenCode); null for a bundled agent. */
@@ -383,7 +384,7 @@ export class AgentRuntime {
         this.authRequired = true;
         this.publishReadiness();
         // A host agent's credentials may now say why (Antigravity: no licence found).
-        if (this.host?.identity && !this.stopping) void this.probe(false).catch(() => undefined);
+        if (this.host?.identity && !this.stopping) this.probeInBackground();
       },
     };
   }
@@ -463,6 +464,8 @@ export class AgentRuntime {
     await this.bridge?.stop();
     this.bridge = null;
     this.connectionState = "exited";
+    // A background identity read started before the stop writes the scope file.
+    await Promise.all([...this.backgroundProbes]);
     await this.sweepLeftovers();
     if (errors.length) throw new AggregateError(errors, "Native execution owners could not all be stopped.");
   }
@@ -1117,7 +1120,7 @@ export class AgentRuntime {
    */
   private readStderrFailure(line: string): RemoteInstanceError | null {
     const failure = this.host!.stderrFailure!(line, this.options.config);
-    if (failure && this.host?.identity && !this.stopping) void this.probe(false).catch(() => undefined);
+    if (failure && this.host?.identity && !this.stopping) this.probeInBackground();
     return failure;
   }
 
@@ -1132,7 +1135,14 @@ export class AgentRuntime {
       this.authRequired = true;
       this.publishReadiness();
     }
-    void this.probe(false, false, { fresh: true }).catch(() => undefined);
+    this.probeInBackground({ fresh: true });
+  }
+
+  /** An identity read nobody waits for; `stop()` still does, so none writes after it. */
+  private probeInBackground(options: { fresh?: boolean } = {}): void {
+    const probe = this.probe(false, false, options).then(() => undefined, () => undefined);
+    this.backgroundProbes.add(probe);
+    void probe.finally(() => this.backgroundProbes.delete(probe));
   }
 
   /**
