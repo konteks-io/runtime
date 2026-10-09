@@ -213,6 +213,8 @@ export class RelayedSession {
   private releaseChannel: (() => void) | null = null;
   /** Last streamed text per chunk kind, so redaction can tell a mid-token chunk start. */
   private readonly lastChunkText = new Map<string, ChunkTrail>();
+  /** A thinking signal went out and no other update has followed it yet. */
+  private thinking = false;
   /** Safe tool identity carried from `tool_call` to sparse terminal updates. */
   private readonly toolActivityIdentity = new Map<string, CanonicalAcpToolIdentity>();
   /** Rebuilds a host agent's permission requests and trips on an unapproved tool (host-tool-governance.ts: DeepSeek Harness, OpenCode). */
@@ -897,9 +899,24 @@ export class RelayedSession {
       this.counters.malformedResponses += 1;
       return null;
     }
-    if (body.params.update.sessionUpdate === "agent_thought_chunk") return null;
+    if (body.params.update.sessionUpdate === "agent_thought_chunk") return this.thinkingSignal(body);
+    this.thinking = false;
     if (canonicalIdentity) this.rememberToolIdentity(canonicalIdentity);
     return this.redactedUpdate(body, canonicalIdentity);
+  }
+
+  /**
+   * The agent's reasoning stays on this computer. A person's direct session
+   * still needs to see that the agent is thinking: Claude Code reasoned for
+   * 4 min 42 s before its first word while the page said only "Working"
+   * (10-09). The first thought of each stretch goes out as a content-free
+   * signal ("…"); the page shows "Thinking", never the text.
+   */
+  private thinkingSignal(body: SessionToCoreMessage): SessionToCoreMessage | null {
+    if (this.thinking || !isDirectAssignment(this.assignment)) return null;
+    this.thinking = true;
+    const update = (body as { params: { update: Record<string, unknown> } }).params.update;
+    return { ...body, params: { ...(body as { params: object }).params, update: { ...update, content: { type: "text", text: "…" } } } } as SessionToCoreMessage;
   }
 
   private rememberToolIdentity({ toolCallId, identity, terminal }: CanonicalIdentity): void {
