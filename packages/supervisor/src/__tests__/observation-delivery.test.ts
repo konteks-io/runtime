@@ -10,13 +10,18 @@ beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "observation-ack-"))
 afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
 const usage = { instanceId: "i", assignmentId: "a", agentId: "claude-code", attempt: 1,
   moneyBasis: "unavailable_local_subscription" as const, observedAt: "2026-09-22T00:00:00Z", outputTokens: 3 };
-async function fixture() {
+const skillObservation = { kind: "skill_read_completed", eventId: "load:skill", instanceId: "i", agentId: "opencode",
+    executionId: "execution", sessionId: "session", assignmentId: "a", attempt: 1, claimId: "claim",
+    recoveryEpoch: 0, readyRevision: 1, runnerIncarnation: "runner", acpSessionRef: "acp", executionRevision: 1,
+    leaseSetId: "lease", turnId: "turn", toolCallId: "native-context:load",
+    capabilityId: "7db42743-32df-4990-ad5d-6f5433f872fc", version: "1.0.1", observedAt: usage.observedAt };
+async function fixture(contract: string | undefined = "7.5") {
   const outbox = new DurableOutbox(dir); await outbox.load();
   let enabled = true;
   const submitObservation = vi.fn(async () => undefined);
   const delivery = new ObservationDelivery({ outbox, core: { submitObservation }, instanceId: () => "i",
-    clock: new FixedClock(Date.parse(usage.observedAt)), canSend: () => enabled });
-  return { outbox, delivery, submitObservation, disable: () => { enabled = false; } };
+    coreContractVersion: () => contract, clock: new FixedClock(Date.parse(usage.observedAt)), canSend: () => enabled });
+  return { outbox, delivery, submitObservation, setContract: (value: string | undefined) => { contract = value; }, disable: () => { enabled = false; } };
 }
 it("retires historical usage only after the correlated Core receipt, across restart", async () => {
   const f = await fixture();
@@ -54,11 +59,7 @@ it("bounds each pass and shares simultaneous flushes", async () => {
 });
 
 it("retains completed Skill loads across restart without changing retry identity", async () => {
-  const observation = { kind: "skill_read_completed", eventId: "load:skill", instanceId: "i", agentId: "opencode",
-    executionId: "execution", sessionId: "session", assignmentId: "a", attempt: 1, claimId: "claim",
-    recoveryEpoch: 0, readyRevision: 1, runnerIncarnation: "runner", acpSessionRef: "acp", executionRevision: 1,
-    leaseSetId: "lease", turnId: "turn", toolCallId: "native-context:load",
-    capabilityId: "7db42743-32df-4990-ad5d-6f5433f872fc", version: "1.0.1", observedAt: usage.observedAt };
+  const observation = skillObservation;
   const f = await fixture(); f.disable();
   await f.delivery.submit(observation);
   await f.delivery.submit(observation);
@@ -70,4 +71,28 @@ it("retains completed Skill loads across restart without changing retry identity
   await restarted.delivery.flush();
   expect(restarted.outbox.depth).toBe(0);
   expect(restarted.submitObservation.mock.calls[0]).toEqual(restarted.submitObservation.mock.calls[1]);
+});
+
+it.each(["7.4", "unknown"])("blocks completed-load recording until signed Core contract supports it: %s", async version => {
+  const f = await fixture(version === "unknown" ? "7.4" : version);
+  if (version === "unknown") f.setContract(undefined);
+  await expect(f.delivery.submit(skillObservation)).rejects.toThrow(/Core contract/);
+  expect(f.outbox.depth).toBe(0);
+  expect(f.submitObservation).not.toHaveBeenCalled();
+  f.setContract("7.5");
+  await f.delivery.submit(skillObservation); await f.delivery.flush();
+  expect(f.submitObservation).toHaveBeenCalledWith("i", skillObservation);
+});
+
+it("holds retained Skill events across unsupported reconnect and resumes without changing bytes", async () => {
+  const f = await fixture(); f.disable();
+  await f.delivery.submit(skillObservation);
+  const restarted = await fixture("7.4");
+  await restarted.delivery.flush();
+  expect(restarted.outbox.depth).toBe(1);
+  expect(restarted.submitObservation).not.toHaveBeenCalled();
+  restarted.setContract("7.5");
+  await restarted.delivery.flush();
+  expect(restarted.outbox.depth).toBe(0);
+  expect(restarted.submitObservation).toHaveBeenCalledExactlyOnceWith("i", skillObservation);
 });

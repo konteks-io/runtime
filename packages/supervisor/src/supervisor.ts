@@ -497,6 +497,7 @@ export class Supervisor {
       credential: () => this.lease.current()?.lease ?? this.provisioningCredential,
     });
     this.observationDelivery = new ObservationDelivery({ outbox: this.outbox, core: this.core,
+      coreContractVersion: () => this.coreContractVersion,
       instanceId: () => this.instanceId ?? "", clock: this.clock, logger: this.logger,
       canSend: () => !this.stopping && Boolean(this.instanceId) && Boolean(this.lease.current()) && this.recoveryAuthority() !== null });
     this.observationDelivery.start();
