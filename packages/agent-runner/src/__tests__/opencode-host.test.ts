@@ -1,6 +1,8 @@
+import { createOpenCodeActivation } from "../host/opencode-activation.js";
 import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { findAgentBridge } from "@konteks/remote-release";
 import { RunnerConfigSchema } from "../config.js";
@@ -214,10 +216,14 @@ describe("one OpenCode process per working copy", () => {
     await expect(lstat(first.env.XDG_CONFIG_HOME!)).rejects.toThrow();
     await expect(first.beforePrompt()).rejects.toMatchObject({ code: "agent_unavailable" });
     expect(await readFile(join(second.env.XDG_CONFIG_HOME!, "opencode", "AGENTS.md"), "utf8")).toBe("rules");
+    const plugin = JSON.parse(second.env.OPENCODE_CONFIG_CONTENT!).plugins[0];
+    const module = await import(pathToFileURL(join(plugin.package, "server.mjs")).href);
+    const deactivate = await module.default.setup({ options: plugin.options });
     await second.beforePrompt();
     selectedRoots.length = 0;
     await mkdir(join(f.root, "scope-b", "unexpected-skill"), { mode: 0o700 });
     await expect(second.beforePrompt()).rejects.toThrow(/closed/);
+    await deactivate();
     await second.release();
   });
 
@@ -298,6 +304,35 @@ describe("one OpenCode process per working copy", () => {
     await expect(bindOpenCodeWorkingCopy("/cred", "work")).rejects.toMatchObject({ code: "agent_unavailable" });
     await expect(openCodeRunnerAdapter.bindWorkingCopy!(config(), findAgentBridge("codex")!, "/wc")).rejects.toThrow(/OpenCode/);
   });
+
+  it("requires authenticated activation of the packaged managed-Skill plugin before a prompt", async () => {
+    const f = await workingCopy(null);
+    const snapshot = join(f.root, "snapshot");
+    const skill = join(snapshot, "review");
+    await mkdir(skill, { recursive: true, mode: 0o700 });
+    await writeFile(join(snapshot, ".catalog.json"), "{}", { mode: 0o600 });
+    await writeFile(join(skill, "SKILL.md"), "# Review", { mode: 0o600 });
+    const binding = await bindOpenCodeWorkingCopy(f.credentials, f.wc, {}, [skill]);
+    try {
+      const settings = JSON.parse(binding.env.OPENCODE_CONFIG_CONTENT!);
+      expect(settings.plugins).toHaveLength(1);
+      const plugin = settings.plugins[0];
+      expect((await lstat(plugin.package)).isDirectory()).toBe(true);
+      expect((await fetch(plugin.options.endpoint, { method: "POST" })).status).toBe(403);
+      let admitted = false;
+      const prompt = binding.beforePrompt().then(() => { admitted = true; });
+      await Promise.resolve();
+      expect(admitted).toBe(false);
+      const module = await import(pathToFileURL(join(plugin.package, "server.mjs")).href);
+      const deactivate = await module.default.setup({ options: plugin.options });
+      await prompt;
+      expect(admitted).toBe(true);
+      await deactivate();
+      expect((await fetch(plugin.options.endpoint, { method: "POST", headers: { authorization: `Bearer ${plugin.options.token}` } })).status).toBe(403);
+      await expect(binding.beforePrompt()).rejects.toThrow(/activation is unavailable/);
+    } finally { await binding.release(); }
+    await expect(binding.beforePrompt()).rejects.toThrow(/released/);
+  });
 });
 
 it("isolates OpenCode working-copy configuration by the authorized immutable Skill roots", () => {
@@ -314,4 +349,15 @@ it("validates native Windows Skill root paths and rejects relative or control-be
  expect(openCodeWorkingCopyConfig("C:/credentials", "C:/checkout", "win32", ["C:/skills/revision"])).toContain("-skills-");
  expect(() => openCodeWorkingCopyConfig("/credentials", "/checkout", "darwin", ["relative"])).toThrow(/absolute/);
  expect(() => openCodeWorkingCopyConfig("/credentials", "/checkout", "darwin", ["/skills/unsafe\n"])).toThrow(/absolute/);
+});
+
+
+it("releases an activation waiter immediately when its execution context closes", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "opencode-activation-"))); roots.push(root);
+  const activation = await createOpenCodeActivation(root);
+  const waiting = expect(activation.wait()).rejects.toMatchObject({ code: "agent_unavailable" });
+  await activation.release();
+  await waiting;
+  await activation.release();
+  await expect(lstat(activation.plugin.package)).rejects.toThrow();
 });

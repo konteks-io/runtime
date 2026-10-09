@@ -1,4 +1,5 @@
 import { openCodeSkillSources } from "./opencode-skill-sources.js";
+import { createOpenCodeActivation } from "./opencode-activation.js";
 import type { Stats } from "node:fs";
 import { createHash } from "node:crypto";
 import { copyFile, lstat, mkdir, readlink, rm, symlink } from "node:fs/promises";
@@ -288,26 +289,32 @@ export async function bindOpenCodeWorkingCopy(credentialDir: string, workingCopy
   const skillRoots = Object.freeze([...readOnlyRoots]);
   const configHome = openCodeWorkingCopyConfig(credentialDir, workingCopy, process.platform, skillRoots);
   const sources = await openCodeSkillSources(skillRoots);
+  const activation = skillRoots.length ? await createOpenCodeActivation(configHome) : undefined;
   const env = openCodeProcessEnvironment(credentialDir, configHome, deps.inherited);
-  env.OPENCODE_CONFIG_CONTENT = JSON.stringify({ ...renderOpenCodeKonteksConfig(), skills: sources });
+  env.OPENCODE_CONFIG_CONTENT = JSON.stringify({ ...renderOpenCodeKonteksConfig(), skills: sources, ...(activation ? { plugins: [activation.plugin] } : {}) });
   await serial(configHome, async hold => {
     hold.count += 1;
     try { await syncOpenCodeInstructions(configHome, workingCopy, deps); }
-    catch (error) { hold.count -= 1; throw error; }
+    catch (error) { hold.count -= 1; await activation?.release(); throw error; }
   });
   let released = false;
   return {
     env,
-    beforePrompt: () => serial(configHome, async () => {
+    beforePrompt: async () => {
       if (released) throw new RemoteInstanceError("agent_unavailable", "The OpenCode execution context has been released. Start a new execution context before retrying.");
-      await openCodeSkillSources(skillRoots);
-      await syncOpenCodeInstructions(configHome, workingCopy, deps);
-    }),
+      await activation?.wait();
+      return serial(configHome, async () => {
+        if (released) throw new RemoteInstanceError("agent_unavailable", "The OpenCode execution context has been released. Start a new execution context before retrying.");
+        await openCodeSkillSources(skillRoots);
+        await syncOpenCodeInstructions(configHome, workingCopy, deps);
+      });
+    },
     release: () => {
       if (released) return Promise.resolve();
       released = true;
       return serial(configHome, async hold => {
         hold.count -= 1;
+        await activation?.release();
         if (hold.count === 0) await rm(configHome, { recursive: true, force: true });
       });
     },
