@@ -1020,7 +1020,8 @@ it("settles a synchronous pre-prompt refusal without sending or retaining an act
   const { bridge, calls } = fakeBridge();
   const events = new RunnerEventBus();
   const beforePrompt = vi.fn(() => { throw new RemoteInstanceError("capability_unavailable", "Required Skill admission is unavailable."); });
-  const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore(), beforePrompt });
+  const afterPrompt = vi.fn((_bridge: unknown, _turn: unknown) => undefined);
+  const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore(), beforePrompt, afterPrompt });
   const { acpSessionRef } = await manager.create({ context, cwd: "/w", mcpServers: [] });
   const failed = nextEvent(events, "request_error");
   expect(() => manager.prompt(acpSessionRef, "blocked-turn", { prompt: [] })).not.toThrow();
@@ -1028,4 +1029,21 @@ it("settles a synchronous pre-prompt refusal without sending or retaining an act
   await vi.waitFor(() => expect(manager.activeTurns).toBe(0));
   expect(calls.prompt).toBeUndefined();
   expect(beforePrompt).toHaveBeenCalledWith(bridge, { acpSessionRef, bridgeSessionId: "bridge-s1", requestId: "blocked-turn" });
+  expect(afterPrompt).toHaveBeenCalledWith(bridge, { acpSessionRef, bridgeSessionId: "bridge-s1", requestId: "blocked-turn" });
+});
+
+it("invalidates the same immutable host turn after a successful prompt", async () => {
+  const { bridge } = fakeBridge();
+  const events = new RunnerEventBus();
+  const beforePrompt = vi.fn(async () => undefined);
+  const afterPrompt = vi.fn((_bridge: unknown, _turn: unknown) => undefined);
+  const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore(), beforePrompt, afterPrompt });
+  const { acpSessionRef } = await manager.create({ context, cwd: "/w", mcpServers: [] });
+  const result = nextEvent(events, "prompt_result");
+  manager.prompt(acpSessionRef, "completed-turn", { prompt: [] });
+  await result;
+  await vi.waitFor(() => expect(manager.activeTurns).toBe(0));
+  const turn = afterPrompt.mock.calls[0][1];
+  expect(beforePrompt).toHaveBeenCalledWith(bridge, turn);
+  expect(Object.isFrozen(turn)).toBe(true);
 });

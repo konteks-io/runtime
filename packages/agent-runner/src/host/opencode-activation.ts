@@ -139,6 +139,9 @@ export async function createOpenCodeActivation(configHome: string, skillRoots: r
         if (closed || !active) throw unavailable();
         turn = value ? Object.freeze({ ...value }) : undefined;
       },
+      finishTurn: (value: HostPromptTurn) => {
+        if (turn?.acpSessionRef === value.acpSessionRef && turn.requestId === value.requestId) turn = undefined;
+      },
       wait: async () => {
         let timer: ReturnType<typeof setTimeout> | undefined;
         try {

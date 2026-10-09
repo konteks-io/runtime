@@ -191,6 +191,8 @@ export interface HostWorkingCopyBinding {
   readonly env: NodeJS.ProcessEnv;
   /** Before each prompt: re-check (and, where it is a copy, refresh) what the process reads from the working copy. */
   beforePrompt(turn?: HostPromptTurn): Promise<void>;
+  /** Invalidate pending per-turn preparation on completion or refusal. */
+  afterPrompt?(turn: HostPromptTurn): void;
   /** Remove preparation after the owning child no longer needs it; fixed read authority requires qualified group/tree cleanup. Idempotent; errors remain visible. */
   release(): Promise<void>;
 }

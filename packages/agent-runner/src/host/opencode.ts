@@ -310,6 +310,7 @@ export async function bindOpenCodeWorkingCopy(credentialDir: string, workingCopy
         activation?.prepareTurn(turn);
       });
     },
+    afterPrompt: turn => activation?.finishTurn(turn),
     release: () => {
       if (released) return Promise.resolve();
       released = true;

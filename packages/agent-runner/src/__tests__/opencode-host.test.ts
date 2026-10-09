@@ -429,6 +429,10 @@ it("selects native Skill attachments only from the exact authorized source files
     await expect(select({ ...input, sessionID: "foreign-session" })).rejects.toThrow(/governed turn/);
     await expect(select(input)).rejects.toThrow(/activation was refused/);
     arm();
+    activation.finishTurn({ acpSessionRef: "governed-session", bridgeSessionId: "native-session", requestId: "governed-turn" });
+    await expect(select(input)).rejects.toThrow(/activation was refused/);
+    arm();
+    activation.finishTurn({ acpSessionRef: "governed-session", bridgeSessionId: "native-session", requestId: "older-turn" });
     await select(input);
     expect(input.prompt.skills).toEqual([{ id: "approved" }]);
     const verify = callbacks.get("context")! as unknown as (input: unknown) => Promise<void>;

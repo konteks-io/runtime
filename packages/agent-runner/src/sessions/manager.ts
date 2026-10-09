@@ -167,6 +167,8 @@ export interface SessionManagerOptions {
    * Returns nothing when there is none, so the prompt is sent at once.
    */
   beforePrompt?: (bridge: BridgeProcess, turn: HostPromptTurn) => Promise<void> | undefined;
+  /** Synchronous local turn invalidation; runs on preparation and dispatch failures too. */
+  afterPrompt?: (bridge: BridgeProcess, turn: HostPromptTurn) => void;
   events: RunnerEventBus;
   /** Durable map acpSessionRef → bridge session id inside the credential volume (survives restart). */
   refStore: SessionRefStore;
@@ -1113,8 +1115,9 @@ export class SessionManager {
     if (this.refusedPrompt(record, requestId, params.prompt)) return;
     const publishMeasured = this.beginTurn(record, bridge);
     const send = () => this.sendPrompt(record, bridge, params);
+    const turn = Object.freeze({ acpSessionRef, bridgeSessionId: record.bridgeSessionId!, requestId });
     const prepare = this.options.beforePrompt;
-    const prepared = prepare ? Promise.resolve().then(() => prepare(bridge, { acpSessionRef, bridgeSessionId: record.bridgeSessionId!, requestId })) : undefined;
+    const prepared = prepare ? Promise.resolve().then(() => prepare(bridge, turn)) : undefined;
     const operation = (prepared ? prepared.then(send) : send())
       .then(result => this.settlePrompt(record, requestId, result, publishMeasured))
       .catch((error: unknown) => {
@@ -1126,6 +1129,7 @@ export class SessionManager {
       })
       .finally(() => {
         record.activeTurns = Math.max(0, record.activeTurns - 1);
+        this.options.afterPrompt?.(bridge, turn);
       });
     this.track(record, operation);
   }
