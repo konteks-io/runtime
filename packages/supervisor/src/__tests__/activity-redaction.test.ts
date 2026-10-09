@@ -162,6 +162,31 @@ describe("streamed activity redaction", () => {
     expect(redactActivity("see /Users/me/Library/Application Support/other/x.txt now", root)).toBe("see [local-path] now");
     expect(redactActivity("Application Support is a folder name", root)).toBe("Application Support is a folder name");
   });
+
+  it("redacts a path an agent quotes in Markdown code or a link", () => {
+    expect(redactStream(["I edited `/Users/other/app/x.ts` and [/Users/other/b](/Users/other/b)"]))
+      .toBe("I edited `[local-path]` and [[local-path]]([local-path])");
+    expect(redactStream(["I edited `", "/Users/other/app/x.ts` now"])).toBe("I edited `[local-path]` now");
+    expect(redactStream(["I edited `", "/Users/oth", "er/app/x.ts` now"])).toBe("I edited `[local-path]` now");
+    // A quoted root-anchored slip that is not a host path stays readable: a refusal quotes it back.
+    expect(redactStream(["`/storefront/app/page.tsx` starts at the root"])).toBe("`/storefront/app/page.tsx` starts at the root");
+    // Globs and HTML are not paths, even with a closing tag split across chunks.
+    expect(redactStream(["rg -g '!**/.DS_Store' and </p>"])).toBe("rg -g '!**/.DS_Store' and </p>");
+    expect(redactStream(["renders as <h2>Title</", "h2>. Added a test."])).toBe("renders as <h2>Title</h2>. Added a test.");
+  });
+
+  it("keeps Application Support inside a path when a chunk ends at its space", () => {
+    // 10-09, connector 0.12.12: Codex streamed "…/Library/Application" then
+    // " Support/konteks-remote/…", and the page read
+    // "/[local-path] Support/konteks-remote/workspaces/codex/session-…/source".
+    const tail = " Support/konteks-remote/workspaces/codex/session-58ca/source`, and it isn’t empty.";
+    expect(redactStream(["I’m in `/", "Users/me/Library/Application", tail])).toBe("I’m in `/[local-path]`, and it isn’t empty.");
+    expect(redactStream(["I’m in `", "/Users/me/Library/Application ", tail.slice(1)])).toBe("I’m in `[local-path] `, and it isn’t empty.");
+    expect(redactStream(["see /Users/me/Library/Application", " Support/konteks", "-remote/x.txt now"])).toBe("see [local-path] now");
+    // Only that folder continues the path: other words after "Application" stay.
+    expect(redactStream(["open /Applications/Foo.app/Application", " Supporting docs"])).toBe("open [local-path] Supporting docs");
+    expect(redactStream(["the Application", " Support/team page"])).toBe("the Application Support/team page");
+  });
 });
 
 
@@ -177,6 +202,18 @@ describe("a Codex file search that finds nothing", () => {
       .toMatchObject({ status: "completed" });
     expect(canonicalizeAcpToolActivity(failed(1), "codex", { kind: "search", title: "Search for 'TODO'" }))
       .toMatchObject({ status: "completed" });
+  });
+
+  it("is shown as done when a longer command ends in a search that found nothing", () => {
+    // 10-09: `cat …; cat …; rg --files -g AGENTS.md …` read "Failed" though every step worked.
+    const title = "\"cat tests/test_cli.py; cat pytest.ini; rg --files --hidden -g AGENTS.md -g '!.venv/**'\"";
+    expect(canonicalizeAcpToolActivity({ ...failed(1, "[pytest]\ntestpaths = tests"), title }, "codex", undefined))
+      .toMatchObject({ status: "completed" });
+    expect(canonicalizeAcpToolActivity({ ...failed(1, "x"), title: "git log | grep fixme" }, "codex", undefined))
+      .toMatchObject({ status: "completed" });
+    // A search that broke (2), or a command that ends in something else, still failed.
+    expect(canonicalizeAcpToolActivity({ ...failed(2, "rg: bad flag"), title }, "codex", undefined)).toMatchObject({ status: "failed" });
+    expect(canonicalizeAcpToolActivity({ ...failed(1, "x"), title: "rg -n foo src; pytest -q" }, "codex", undefined)).toMatchObject({ status: "failed" });
   });
 
   it("still fails when the command broke or was not a search", () => {
