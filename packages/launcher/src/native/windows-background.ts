@@ -30,6 +30,10 @@ export function windowsBackgroundDefinition(input: BackgroundInput): NativeServi
 }
 
 function backgroundContext(input: BackgroundInput, helper: string, shortcut: string): string {
+  const legacyHelper = win32.join(input.root, "service.js");
+  // Older releases omitted quotes. That spelling has the same single path
+  // argument only when the path contains neither whitespace nor a quote.
+  const legacyUnquoted = /[\s"]/.test(legacyHelper) ? "$null" : literal(`//B //NoLogo //E:JScript ${legacyHelper}`);
   return [
     "$ErrorActionPreference = 'Stop'",
     `$root = ${literal(input.root)}`,
@@ -40,7 +44,8 @@ function backgroundContext(input: BackgroundInput, helper: string, shortcut: str
     "$program = Join-Path $env:SystemRoot 'System32\\wscript.exe'",
     `$arguments = ${literal(`//B //NoLogo //E:JScript ${argument(helper)}`)}`,
     "$loginArguments = $arguments + ' --login'",
-    `$legacyArguments = ${literal(`//B //NoLogo //E:JScript ${argument(win32.join(input.root, "service.js"))}`)}`,
+    `$legacyArguments = ${literal(`//B //NoLogo //E:JScript ${argument(legacyHelper)}`)}`,
+    `$legacyUnquotedArguments = ${legacyUnquoted}`,
     "$state = Join-Path $root 'supervisor\\background-host.json'",
     "$stop = Join-Path $root 'supervisor\\background-stop'",
     "function HostRunning {",
@@ -74,7 +79,8 @@ function legacyTaskProbe(): string {
     "  if ($actions.Count -ne 1) { throw 'The legacy Konteks task has an unexpected action.' }",
     "  $action = $actions[0]",
     "  $exe = $action.Execute",
-    "  $isHelper = [Environment]::ExpandEnvironmentVariables($exe) -ieq $program -and $action.Arguments -ceq $legacyArguments",
+    "  $isLegacyArguments = $action.Arguments -ceq $legacyArguments -or ($null -ne $legacyUnquotedArguments -and $action.Arguments -ceq $legacyUnquotedArguments)",
+    "  $isHelper = [Environment]::ExpandEnvironmentVariables($exe) -ieq $program -and $isLegacyArguments",
     "  $isConnector = $exe.StartsWith(($root.TrimEnd('\\') + '\\releases\\'), [StringComparison]::OrdinalIgnoreCase) -and ([IO.Path]::GetFileName($exe) -in @('connector.exe','konteks-connector.exe'))",
     "  $quotedRoot = [string][char]34 + $root + [char]34",
     "  $isRoot = $action.Arguments -ieq ('serve --root ' + $quotedRoot) -or $action.Arguments -ieq ('serve --root ' + $root)",
@@ -114,7 +120,9 @@ function startHost(waitPid?: number): string {
     "[IO.File]::Delete($stop)",
     ...defer,
     "$start = New-Object Diagnostics.ProcessStartInfo",
-    "$start.FileName = $program; $start.Arguments = $arguments; $start.UseShellExecute = $false; $start.CreateNoWindow = $true",
+    // The fixed GUI host must not inherit the caller's captured output pipes:
+    // otherwise Node waits for the whole background tree after PowerShell exits.
+    "$start.FileName = $program; $start.Arguments = $arguments; $start.UseShellExecute = $true; $start.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden",
     "[void][Diagnostics.Process]::Start($start)",
     "$deadline = [DateTime]::UtcNow.AddSeconds(20)",
     "do { if (HostRunning) { exit 0 }; Start-Sleep -Milliseconds 100 } while ([DateTime]::UtcNow -lt $deadline)",
