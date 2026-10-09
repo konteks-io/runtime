@@ -44,9 +44,9 @@ it("rechecks freshness before every turn and rejects a substituted desired diges
   const prepared = await prepareOrganizationSkillSession({ ...input, skillFreshness: evidence });
   await prepared.beforePrompt();
   evidence.mockResolvedValueOnce({ ...proof, loadedDigest: "sha256:" + "b".repeat(64) });
-  await expect(prepared.beforePrompt()).rejects.toMatchObject({ code: "capability_unavailable" });
+  await expect(prepared.beforePrompt()).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "skill_freshness_stale" });
   evidence.mockResolvedValueOnce({ ...proof, desiredDigest: "sha256:" + "b".repeat(64), installedDigest: "sha256:" + "b".repeat(64), loadedDigest: "sha256:" + "b".repeat(64) });
-  await expect(prepared.beforePrompt()).rejects.toMatchObject({ code: "capability_unavailable" });
+  await expect(prepared.beforePrompt()).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "skill_freshness_stale" });
   expect(evidence).toHaveBeenCalledTimes(3);
 });
 
@@ -83,4 +83,18 @@ it("enforces signed scope at the staging boundary even without the session wrapp
   const catalog = { ...signedBody, catalogDigest: computeRemoteSkillCatalogDigest(signedBody) };
   await expect(stageOrganizationSkills({ ...input, catalog, authority: { ...input.authority, catalogDigest: catalog.catalogDigest } })).rejects.toMatchObject({ code: "workspace_binding_invalid" });
   expect(input.fetchTree).not.toHaveBeenCalled();
+});
+
+it.each(["offline", "failed", "unsupported", "unknown"] as const)("reports actionable %s freshness refusal without retrying delivery", async state => {
+  const input = await fixture();
+  const prepared = await prepareOrganizationSkillSession({ ...input, skillFreshness: async () => ({ desiredVersion: "1", desiredDigest: input.catalog.skills[0]!.transfer.treeDigest, state }) });
+  await expect(prepared.beforePrompt()).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: `skill_freshness_${state}` });
+  expect(input.fetchTree).toHaveBeenCalledTimes(1);
+});
+
+it("redacts adapter observation errors into failed freshness proof", async () => {
+  const input = await fixture();
+  const prepared = await prepareOrganizationSkillSession({ ...input, skillFreshness: async () => { throw new Error("private adapter output"); } });
+  await expect(prepared.beforePrompt()).rejects.toMatchObject({ diagnostic: "skill_freshness_failed" });
+  await expect(prepared.beforePrompt()).rejects.not.toThrow("private adapter output");
 });

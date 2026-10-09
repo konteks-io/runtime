@@ -75,9 +75,9 @@ export async function prepareOrganizationSkillSession(options: StageOrganization
       readOnlyRoots: Object.freeze(staged.skills.map(skill => skill.directory)),
       skillInstructions: organizationSkillInstructions(staged),
       beforePrompt: async () => {
+        await assertScopedSkillFreshness(snapshot.catalog, options.skillFreshness);
         try {
           if (await checkedDirectory(options.cwd) !== cwd) throw new Error("source moved");
-          await assertScopedSkillFreshness(snapshot.catalog, options.skillFreshness);
           const verified = await stageOrganizationSkills(snapshot);
           if (verified.root !== staged.root) throw new Error("skill root moved");
         } catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
@@ -90,13 +90,31 @@ export async function prepareOrganizationSkillSession(options: StageOrganization
 async function assertScopedSkillFreshness(catalog: ReturnType<typeof RemoteSkillCatalogSchema.parse>, evidence?: (skillId: string) => Promise<SkillFreshnessEvidence>): Promise<void> {
   for (const skill of catalog.skills) {
     if (!skill.scope) continue;
-    const proof = await evidence?.(skill.skillId);
-    if (skillFreshnessFailure(proof) !== null || !matchesDesiredSkill(proof, skill)) {
-      throw new RemoteInstanceError("capability_unavailable", "Required Skill freshness has not been verified for this coding agent.");
-    }
+    const proof = await observedSkillProof(skill.skillId, evidence);
+    const failure = skillFreshnessFailure(proof) ?? (matchesDesiredSkill(proof, skill) ? null : "stale");
+    if (failure) throw freshnessError(failure);
   }
 }
 
 function matchesDesiredSkill(proof: SkillFreshnessEvidence | undefined, skill: ReturnType<typeof RemoteSkillCatalogSchema.parse>["skills"][number]): boolean {
   return proof?.desiredDigest === skill.transfer.treeDigest && proof?.desiredVersion === skill.version;
+}
+
+type SkillFreshnessFailure = NonNullable<ReturnType<typeof skillFreshnessFailure>>;
+
+const freshnessMessages: Record<SkillFreshnessFailure, string> = {
+  stale: "Required Skills are stale. Sync this coding-agent profile and replace its cached execution context before retrying.",
+  offline: "Required Skill freshness cannot be checked while offline. Reconnect this runtime and sync before retrying.",
+  failed: "Required Skill verification failed. Inspect this coding-agent profile and retry synchronization before starting a turn.",
+  unsupported: "This coding-agent adapter cannot prove required Skill loads. Select a supported coding-agent profile.",
+  unknown: "Required Skill load proof is unavailable. Synchronize and verify this coding-agent profile before starting a turn.",
+};
+
+function freshnessError(failure: SkillFreshnessFailure): RemoteInstanceError {
+  return new RemoteInstanceError("capability_unavailable", freshnessMessages[failure], { diagnostic: `skill_freshness_${failure}` });
+}
+
+async function observedSkillProof(skillId: string, evidence?: (skillId: string) => Promise<SkillFreshnessEvidence>): Promise<SkillFreshnessEvidence | undefined> {
+  try { return await evidence?.(skillId); }
+  catch { throw freshnessError("failed"); }
 }
