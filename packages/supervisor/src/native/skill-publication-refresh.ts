@@ -38,16 +38,17 @@ export async function refreshSkillPublications(
   check();
   const records = await options.store.list(options.tenantId, options.runtimeId);
   const discovered = await discoverLocalSkills(options.homes);
-  for (const record of records) {
+  const failures: unknown[] = [];
+  const refresh = async (record: Awaited<ReturnType<typeof options.store.list>>[number]) => {
     check();
     const current =
       record.sourcePath === undefined
         ? discovered.find((skill) => skill.localId === record.selection.localId)
         : await inspectPublicationSource(record.sourcePath);
-    if (!current) continue;
+    if (!current) return;
     if (current.localId !== record.selection.localId)
       throw new Error("Shared Skill source identity changed");
-    if (current.treeDigest === record.receipt.treeDigest) continue;
+    if (current.treeDigest === record.receipt.treeDigest) return;
     if (!record.selection.skillId)
       throw new Error(
         "Shared Skill requires a new sharing confirmation before automatic publication",
@@ -64,5 +65,16 @@ export async function refreshSkillPublications(
     check();
     if (!result.runtimePublication) throw new Error("Shared Skill revision was not acknowledged");
     await options.store.save({ ...record, selection, receipt: result.runtimePublication });
+  };
+  for (const record of records) {
+    check();
+    try {
+      await refresh(record);
+    } catch (error) {
+      check();
+      failures.push(error);
+    }
   }
+  check();
+  if (failures.length) throw new AggregateError(failures, "One or more Skill publications failed");
 }

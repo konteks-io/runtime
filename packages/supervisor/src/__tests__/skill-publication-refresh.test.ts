@@ -14,6 +14,27 @@ vi.mock("../skills/local-skills.js", () => ({
   inspectLocalSkillPath: vi.fn(),
 }));
 beforeEach(() => vi.resetAllMocks());
+it("publishes other consented Skills after one source fails and reports partial failure", async () => {
+  const f = fixture();
+  const second = { ...f.record, selection: { ...f.record.selection, localId: "local-b" } };
+  f.store.list.mockResolvedValue([f.record, second]);
+  vi.mocked(discoverLocalSkills).mockResolvedValue([
+    { localId: "local-a", treeDigest: "new" },
+    { localId: "local-b", treeDigest: "new" },
+  ] as never);
+  vi.mocked(exportLocalSkill)
+    .mockRejectedValueOnce(new Error("invalid first source"))
+    .mockResolvedValueOnce({ treeDigest: "new" } as never);
+  await expect(
+    refreshSkillPublications(f.options as never, new AbortController().signal),
+  ).rejects.toThrow("One or more Skill publications failed");
+  expect(f.client.share).toHaveBeenCalledTimes(1);
+  expect(f.store.save).toHaveBeenCalledWith(
+    expect.objectContaining({
+      selection: expect.objectContaining({ localId: "local-b" }),
+    }),
+  );
+});
 function fixture() {
   const record = {
     version: 1,
@@ -76,13 +97,14 @@ it("does not save an unacknowledged update or retry uncertain transport", async 
   f.client.share.mockRejectedValue(new Error("unavailable"));
   await expect(
     refreshSkillPublications(f.options as never, new AbortController().signal),
-  ).rejects.toThrow("unavailable");
+  ).rejects.toThrow("One or more Skill publications failed");
   expect(f.client.share).toHaveBeenCalledTimes(1);
   expect(f.store.save).not.toHaveBeenCalled();
 });
 
 it("does not publish when authority changes while exporting the source", async () => {
   const f = fixture();
+  f.store.list.mockResolvedValue([f.record, f.record]);
   vi.mocked(exportLocalSkill).mockImplementation(async () => {
     f.options.assertReady.mockImplementation(() => {
       throw new Error("identity changed");
@@ -94,6 +116,7 @@ it("does not publish when authority changes while exporting the source", async (
   ).rejects.toThrow("identity changed");
   expect(f.client.share).not.toHaveBeenCalled();
   expect(f.store.save).not.toHaveBeenCalled();
+  expect(exportLocalSkill).toHaveBeenCalledTimes(1);
 });
 
 it("does not persist acceptance after the sync has been cancelled", async () => {
@@ -133,7 +156,7 @@ it("reports an incomplete existing source instead of treating it as removed", as
     );
     await expect(
       refreshSkillPublications(f.options as never, new AbortController().signal),
-    ).rejects.toThrow("incomplete Skill tree");
+    ).rejects.toThrow("One or more Skill publications failed");
     expect(f.client.share).not.toHaveBeenCalled();
     expect(f.store.save).not.toHaveBeenCalled();
   } finally {
