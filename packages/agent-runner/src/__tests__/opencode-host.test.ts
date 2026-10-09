@@ -205,7 +205,8 @@ describe("one OpenCode process per working copy", () => {
     };
     const a = await source("scope-a"), b = await source("scope-b");
     const first = await openCodeRunnerAdapter.bindWorkingCopy!(runner, family, f.wc, [a]);
-    const second = await openCodeRunnerAdapter.bindWorkingCopy!(runner, family, f.wc, [b]);
+    const selectedRoots = [b];
+    const second = await openCodeRunnerAdapter.bindWorkingCopy!(runner, family, f.wc, selectedRoots);
     expect(JSON.parse(first.env.OPENCODE_CONFIG_CONTENT!).skills).toEqual([join(f.root, "scope-a")]);
     expect(JSON.parse(second.env.OPENCODE_CONFIG_CONTENT!).skills).toEqual([join(f.root, "scope-b")]);
     expect(first.env.XDG_CONFIG_HOME).not.toBe(second.env.XDG_CONFIG_HOME);
@@ -213,6 +214,7 @@ describe("one OpenCode process per working copy", () => {
     await expect(lstat(first.env.XDG_CONFIG_HOME!)).rejects.toThrow();
     expect(await readFile(join(second.env.XDG_CONFIG_HOME!, "opencode", "AGENTS.md"), "utf8")).toBe("rules");
     await second.beforePrompt();
+    selectedRoots.length = 0;
     await mkdir(join(f.root, "scope-b", "unexpected-skill"), { mode: 0o700 });
     await expect(second.beforePrompt()).rejects.toThrow(/closed/);
     await second.release();

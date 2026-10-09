@@ -285,8 +285,9 @@ function serial<T>(configHome: string, work: (hold: { count: number }) => Promis
 /** Prepare one OpenCode execution profile, isolated by working copy and authorized Skill roots. */
 export async function bindOpenCodeWorkingCopy(credentialDir: string, workingCopy: string, deps: OpenCodeInstructionsDeps & { inherited?: NodeJS.ProcessEnv } = {}, readOnlyRoots: readonly string[] = []): Promise<HostWorkingCopyBinding> {
   if (!isAbsolute(workingCopy) || CONTROL.test(workingCopy)) throw new RemoteInstanceError("agent_unavailable", "An OpenCode working copy must be an absolute local path.");
-  const configHome = openCodeWorkingCopyConfig(credentialDir, workingCopy, process.platform, readOnlyRoots);
-  const sources = await openCodeSkillSources(readOnlyRoots);
+  const skillRoots = Object.freeze([...readOnlyRoots]);
+  const configHome = openCodeWorkingCopyConfig(credentialDir, workingCopy, process.platform, skillRoots);
+  const sources = await openCodeSkillSources(skillRoots);
   const env = openCodeProcessEnvironment(credentialDir, configHome, deps.inherited);
   env.OPENCODE_CONFIG_CONTENT = JSON.stringify({ ...renderOpenCodeKonteksConfig(), skills: sources });
   await serial(configHome, async hold => {
@@ -299,7 +300,7 @@ export async function bindOpenCodeWorkingCopy(credentialDir: string, workingCopy
     env,
     beforePrompt: () => serial(configHome, async () => {
       if (released) return;
-      await openCodeSkillSources(readOnlyRoots);
+      await openCodeSkillSources(skillRoots);
       await syncOpenCodeInstructions(configHome, workingCopy, deps);
     }),
     release: () => {
