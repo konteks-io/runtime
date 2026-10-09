@@ -2361,7 +2361,7 @@ export class Supervisor {
     return this.skillSyncClient;
   }
 
-  private async syncSkills() {
+  private async syncSkills(reconcileAfterPending?: boolean) {
     if (this.stopping || !this.options.native || !this.nativeOwnership || !this.reconciliation.isComplete) {
       throw new RemoteInstanceError("capability_unavailable", "Skill sync is unavailable until runtime recovery completes.");
     }
@@ -2390,7 +2390,7 @@ export class Supervisor {
       });
     });
     this.skillSync.startPeriodic(() => this.skillSyncReady(), () => this.logSkillSyncFailure());
-    try { return { ...await this.skillSync.sync(), complete: true, loaded: "unknown" as const }; }
+    try { return { ...await this.skillSync.sync(reconcileAfterPending), complete: true, loaded: "unknown" as const }; }
     catch (error) {
       if (error instanceof MachineSkillPartialFailure) return { ...error.inventory, complete: false, loaded: "unknown" as const };
       throw error;
@@ -2427,7 +2427,7 @@ export class Supervisor {
 
   private requestAutomaticSkillSync(): void {
     if (!this.skillSyncReady()) return;
-    void this.syncSkills().then(report => { if (!report.complete) this.logSkillSyncFailure(); }, () => this.logSkillSyncFailure());
+    void this.syncSkills(true).then(report => { if (!report.complete) this.logSkillSyncFailure(); }, () => this.logSkillSyncFailure());
   }
 
   private async listSkills() {

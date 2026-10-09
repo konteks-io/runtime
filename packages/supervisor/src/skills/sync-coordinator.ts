@@ -1,6 +1,7 @@
 /** One organization refresh at a time; failed refreshes retain last successful inventory. */
 export class SkillSyncCoordinator<T> {
   private pending: Promise<T> | undefined;
+  private refreshAgain = false;
   private closed = false;
   private periodic: ReturnType<typeof setInterval> | undefined;
   private controller: AbortController | undefined;
@@ -12,22 +13,38 @@ export class SkillSyncCoordinator<T> {
   status(): { syncing: boolean; lastSuccess?: { syncedAt: string; inventory: T } } {
     return structuredClone({ syncing: !!this.pending, ...(this.lastSuccess ? { lastSuccess: this.lastSuccess } : {}) });
   }
-  sync(): Promise<T> {
+  sync(reconcileAfterPending = false): Promise<T> {
     if (this.closed) return Promise.reject(new Error("Skill synchronization is stopped"));
-    if (this.pending) return this.pending;
+    if (this.pending) {
+      this.refreshAgain ||= reconcileAfterPending;
+      return this.pending;
+    }
     const controller = new AbortController(); this.controller = controller;
-    const pending = Promise.resolve().then(() => {
-      if (controller.signal.aborted) throw new Error("Skill synchronization is stopped");
-      return this.refresh(controller.signal);
-    }).then(async inventory => {
-      if (controller.signal.aborted) throw new Error("Skill synchronization is stopped");
-      const success = { syncedAt: new Date(this.now()).toISOString(), inventory: structuredClone(inventory) };
-      await this.persistence?.persistSuccess?.(structuredClone(success));
-      if (controller.signal.aborted) throw new Error("Skill synchronization is stopped");
-      this.lastSuccess = success;
-      return inventory;
-    }).finally(() => { if (this.pending === pending) { this.pending = undefined; this.controller = undefined; } });
+    const pending = Promise.resolve().then(() => this.reconcile(controller.signal))
+      .finally(() => { if (this.pending === pending) { this.pending = undefined; this.controller = undefined; } });
     this.pending = pending; return pending;
+  }
+  private async reconcile(signal: AbortSignal): Promise<T> {
+    do {
+      this.refreshAgain = false;
+      try {
+        const inventory = await this.refreshAndRecord(signal);
+        if (!this.refreshAgain) return inventory;
+      } catch (error) {
+        if (signal.aborted || !this.refreshAgain) throw error;
+      }
+    } while (!signal.aborted);
+    throw new Error("Skill synchronization is stopped");
+  }
+  private async refreshAndRecord(signal: AbortSignal): Promise<T> {
+    if (signal.aborted) throw new Error("Skill synchronization is stopped");
+    const inventory = await this.refresh(signal);
+    if (signal.aborted) throw new Error("Skill synchronization is stopped");
+    const success = { syncedAt: new Date(this.now()).toISOString(), inventory: structuredClone(inventory) };
+    await this.persistence?.persistSuccess?.(structuredClone(success));
+    if (signal.aborted) throw new Error("Skill synchronization is stopped");
+    this.lastSuccess = success;
+    return inventory;
   }
   startPeriodic(ready: () => boolean, onFailure: () => void, intervalMs = 60_000): void {
     if (this.closed || this.periodic) return;

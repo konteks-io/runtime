@@ -1,5 +1,42 @@
 import { expect, it, vi } from "vitest";
 import { SkillSyncCoordinator } from "../skills/sync-coordinator.js";
+it("reconciles again after a burst of automatic requests during an older refresh", async () => {
+  const gate = Promise.withResolvers<string[]>();
+  const refresh = vi.fn().mockReturnValueOnce(gate.promise).mockResolvedValue(["latest"]);
+  const sync = new SkillSyncCoordinator<string[]>(refresh);
+  const first = sync.sync();
+  await Promise.resolve();
+  for (let index = 0; index < 10; index++) expect(sync.sync(true)).toBe(first);
+  gate.resolve(["older"]);
+  await expect(first).resolves.toEqual(["latest"]);
+  expect(refresh).toHaveBeenCalledTimes(2);
+  expect(sync.status().lastSuccess?.inventory).toEqual(["latest"]);
+});
+
+it("uses a queued automatic refresh after an older attempt fails", async () => {
+  const gate = Promise.withResolvers<string[]>();
+  const refresh = vi.fn().mockReturnValueOnce(gate.promise).mockResolvedValue(["recovered"]);
+  const sync = new SkillSyncCoordinator<string[]>(refresh);
+  const pending = sync.sync();
+  await Promise.resolve();
+  sync.sync(true);
+  gate.reject(new Error("old connection closed"));
+  await expect(pending).resolves.toEqual(["recovered"]);
+  expect(refresh).toHaveBeenCalledTimes(2);
+});
+
+it("does not start a queued automatic refresh after shutdown", async () => {
+  const gate = Promise.withResolvers<string[]>();
+  const refresh = vi.fn(() => gate.promise);
+  const sync = new SkillSyncCoordinator(refresh);
+  const pending = sync.sync();
+  await Promise.resolve();
+  sync.sync(true);
+  sync.stop();
+  gate.resolve(["older"]);
+  await expect(pending).rejects.toThrow("stopped");
+  expect(refresh).toHaveBeenCalledOnce();
+});
 it("coalesces startup/manual requests and retains successful inventory after failure", async () => {
   let finish!: (value: string[]) => void;
   const refresh = vi.fn(() => new Promise<string[]>(resolve => { finish = resolve; }));
