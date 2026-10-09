@@ -16,8 +16,21 @@ const source = `export default {
       if (!response.ok) throw new Error("Konteks plugin activation was refused");
       await response.body?.cancel();
     };
-    await send("ready");
-    return () => send("closed");
+    const registrations = [];
+    const deny = async () => { throw new Error("Konteks managed Skill load admission is unavailable"); };
+    const dispose = () => Promise.all(registrations.map(registration => registration.dispose()));
+    try {
+      for (const name of ["context", "http.request", "experimental.ws.send"]) {
+        registrations.push(await context.session.hook(name, deny));
+      }
+      await send("ready");
+    } catch (error) {
+      await dispose();
+      throw error;
+    }
+    return async () => {
+      try { await send("closed"); } finally { await dispose(); }
+    };
   }
 };
 `;

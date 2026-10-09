@@ -219,7 +219,7 @@ describe("one OpenCode process per working copy", () => {
     expect(await readFile(join(second.env.XDG_CONFIG_HOME!, "opencode", "AGENTS.md"), "utf8")).toBe("rules");
     const plugin = JSON.parse(second.env.OPENCODE_CONFIG_CONTENT!).plugins[0];
     const module = await import(pathToFileURL(join(plugin.package, "server.js")).href);
-    const deactivate = await module.default.setup({ options: plugin.options });
+    const deactivate = await module.default.setup({ options: plugin.options, session: { hook: async () => ({ dispose: async () => {} }) } });
     await second.beforePrompt();
     selectedRoots.length = 0;
     await mkdir(join(f.root, "scope-b", "unexpected-skill"), { mode: 0o700 });
@@ -326,7 +326,7 @@ describe("one OpenCode process per working copy", () => {
       await Promise.resolve();
       expect(admitted).toBe(false);
       const module = await import(pathToFileURL(join(plugin.package, "server.js")).href);
-      const deactivate = await module.default.setup({ options: plugin.options });
+      const deactivate = await module.default.setup({ options: plugin.options, session: { hook: async () => ({ dispose: async () => {} }) } });
       await prompt;
       expect(admitted).toBe(true);
       await deactivate();
@@ -362,4 +362,25 @@ it("releases an activation waiter immediately when its execution context closes"
   await waiting;
   await activation.release();
   await expect(lstat(activation.plugin.package)).rejects.toThrow();
+});
+
+
+it("registers provider-independent native request guards before activation", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "opencode-guards-"))); roots.push(root);
+  const activation = await createOpenCodeActivation(root);
+  const callbacks = new Map<string, () => Promise<void>>();
+  const dispose = vi.fn(async () => {});
+  const hook = vi.fn(async (name: string, callback: () => Promise<void>) => {
+    callbacks.set(name, callback); return { dispose };
+  });
+  try {
+    const module = await import(pathToFileURL(join(activation.plugin.package, "server.js")).href);
+    const cleanup = await module.default.setup({ options: activation.plugin.options, session: { hook } });
+    await activation.wait();
+    expect([...callbacks.keys()]).toEqual(["context", "http.request", "experimental.ws.send"]);
+    for (const callback of callbacks.values()) await expect(callback()).rejects.toThrow(/load admission/);
+    expect(hook.mock.calls.every(call => call.length === 2)).toBe(true);
+    await cleanup();
+    expect(dispose).toHaveBeenCalledTimes(3);
+  } finally { await activation.release(); }
 });
