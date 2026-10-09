@@ -101,7 +101,7 @@ async function writeBoundProfile(options: Preparation, authority: HostFileAuthor
     const payloads = new Map<string, Uint8Array | string>([
       [backendPath, await backendBytes()],
       [join(policyDir, "read-policy.json"), `${JSON.stringify(authority)}\n`],
-      [join(policyDir, "package.json"), `${JSON.stringify({ name: "@konteks/dsh-session-filesystem", private: true, type: "module" })}\n`],
+      [join(policyDir, "package.json"), policyPackageManifest("@konteks/dsh-session-filesystem")],
       [patchPath, renderDshReadFence(backendPath, authority)],
     ]);
     for (const [path, bytes] of payloads) { await privateFile(path, bytes); files.set(path, digest(bytes)); }
@@ -162,6 +162,17 @@ async function atomicPrivateFile(path: string, bytes: Uint8Array | string): Prom
   finally { await rm(temporary, { force: true }); }
 }
 
+/**
+ * The manifest beside a policy backend. dsh's default-on plugin package
+ * inventory reads the nearest manifest of every loaded module and refuses
+ * one without a name and a version; without the version every DeepSeek
+ * request failed before it was sent ("DeepSeek request extension
+ * preparation failed", REQUEST_EXTENSION; 10-09, runtime 0.12.10).
+ */
+export function policyPackageManifest(name: string): string {
+  return `${JSON.stringify({ name, version: "1.0.0", private: true, type: "module" })}\n`;
+}
+
 /** Control/model discovery creates real native sessions too. Its filesystem
  * service is restricted before initialize/new to an owned empty workspace;
  * credential/profile startup reads remain trusted direct native operations. */
@@ -178,7 +189,7 @@ export async function prepareDshControlReadProfile(credentialDir: string): Promi
   const files = new Map<string, Uint8Array | string>([
     [backend, await backendBytes()],
     [join(paths.policyDir, "read-policy.json"), `${JSON.stringify(authority)}\n`],
-    [join(paths.policyDir, "package.json"), `${JSON.stringify({ name: "@konteks/dsh-control-filesystem", private: true, type: "module" })}\n`],
+    [join(paths.policyDir, "package.json"), policyPackageManifest("@konteks/dsh-control-filesystem")],
     [paths.patchPath, renderDshReadFence(backend, authority)],
   ]);
   for (const [path, bytes] of files) await atomicPrivateFile(path, bytes);
