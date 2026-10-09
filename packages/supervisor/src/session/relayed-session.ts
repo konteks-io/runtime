@@ -39,12 +39,13 @@ import { PREVIEW_WORK_KINDS, PreviewMcpServer, type SessionPreviewAccess } from 
 import { PreviewBrowserGateway } from "../preview/browser-gateway.js";
 import {
   canonicalizeAcpToolActivity,
-  continuesAtBoundary,
+  chunkOptions,
   contractIssue,
-  endsInsidePath,
+  nextTrail,
   omitPrivateAcpToolPayload,
   redactSessionMessage,
   type CanonicalAcpToolIdentity,
+  type ChunkTrail,
 } from "./activity.js";
 import { NativeExecutionGate, type NativeExecutionGateOptions } from "../native/execution-gate.js";
 import {
@@ -208,7 +209,7 @@ export class RelayedSession {
   private channelOpened = false;
   private releaseChannel: (() => void) | null = null;
   /** Last streamed text per chunk kind, so redaction can tell a mid-token chunk start. */
-  private readonly lastChunkText = new Map<string, { text: string; inPath: boolean }>();
+  private readonly lastChunkText = new Map<string, ChunkTrail>();
   /** Safe tool identity carried from `tool_call` to sparse terminal updates. */
   private readonly toolActivityIdentity = new Map<string, CanonicalAcpToolIdentity>();
   /** Rebuilds a host agent's permission requests and trips on an unapproved tool (host-tool-governance.ts: DeepSeek Harness, OpenCode). */
@@ -875,8 +876,12 @@ export class RelayedSession {
 
   private redactedUpdate(body: SessionToCoreMessage, canonicalIdentity: CanonicalIdentity | undefined): SessionToCoreMessage | null {
     const update = (body as { params: { update: { sessionUpdate: string; content?: { type?: string; text?: unknown } } } }).params.update;
-    const chunk = this.chunkContext(update);
-    const safe = SessionToCoreMessageSchema.safeParse(redactSessionMessage(body, this.sessionCwd(), chunk));
+    const chunkText = streamedText(update);
+    const previous = chunkText === undefined ? undefined : this.lastChunkText.get(update.sessionUpdate);
+    const chunk = chunkOptions(previous);
+    const redacted = redactSessionMessage(body, this.sessionCwd(), chunk);
+    this.rememberChunk(update.sessionUpdate, chunkText, previous, chunk, redacted);
+    const safe = SessionToCoreMessageSchema.safeParse(redacted);
     if (safe.success) return safe.data;
     this.counters.malformedResponses += 1;
     this.logger.warn({
@@ -892,17 +897,14 @@ export class RelayedSession {
   }
 
   /**
-   * Streamed text is split at arbitrary points; judge a chunk's first
-   * character against the previous chunk of the same stream.
+   * Streamed text is split at arbitrary points: the next chunk is judged
+   * against what this one was and what it became once redacted.
    */
-  private chunkContext(update: { sessionUpdate: string; content?: { type?: string; text?: unknown } }): { startsAtBoundary: boolean; continuesPath: boolean } {
-    const chunkText = streamedText(update);
-    const previous = chunkText === undefined ? undefined : this.lastChunkText.get(update.sessionUpdate);
-    const startsAtBoundary = continuesAtBoundary(previous?.text);
-    const continuesPath = previous?.inPath ?? false;
-    if (chunkText === undefined) this.lastChunkText.clear();
-    else this.lastChunkText.set(update.sessionUpdate, { text: chunkText, inPath: endsInsidePath(chunkText, continuesPath, startsAtBoundary) });
-    return { startsAtBoundary, continuesPath };
+  private rememberChunk(sessionUpdate: string, chunkText: string | undefined, previous: ChunkTrail | undefined,
+    chunk: ReturnType<typeof chunkOptions>, redacted: unknown): void {
+    if (chunkText === undefined) { this.lastChunkText.clear(); return; }
+    const output = (redacted as { params?: { update?: { content?: { text?: unknown } } } }).params?.update?.content?.text;
+    this.lastChunkText.set(sessionUpdate, nextTrail(previous, chunkText, chunk, typeof output === "string" ? output : ""));
   }
 
   /** Inbound from the grant holder / orchestrator. */

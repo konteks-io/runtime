@@ -1490,7 +1490,7 @@ describe("relayed session", () => {
       ["acp", "session/update", "plan"],
     ]);
     const text = bodies.slice(0, 3).map(body => body.params.update.content?.text).join("");
-    expect(text).toBe("Editing [local-path][local-path] now and running the tests.");
+    expect(text).toBe("Editing [local-path] now and running the tests.");
     expect(JSON.stringify(bodies)).not.toContain("private-person");
   });
 
