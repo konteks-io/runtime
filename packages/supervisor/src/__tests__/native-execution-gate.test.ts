@@ -269,6 +269,44 @@ it("keeps a delivery turn Core renewed running past its assignment's issued hour
   await vi.waitFor(() => expect(f.onAuthorityLost).toHaveBeenCalledTimes(1));
 });
 
+it("keeps a direct turn Core renewed running past its first prompt's hour, adopting only the later lifetime (10-09)", async () => {
+  vi.useFakeTimers();
+  const f = await fixture();
+  const direct: RemoteWorkAssignment = { ...assignment, kind: "direct", agentRoute: { agentId: "codex", requiredRole: "assistant" },
+    source: { kind: "direct_session", portability: "instance_bound", ownerInstanceId: "instance", sessionId: "session", turnRef: "turn" } };
+  await f.journal.assignments.put({ ...f.journal.assignments.get("assignment:1")!, kind: "direct" });
+  const persistUpdate = f.journal.assignments.update.bind(f.journal.assignments);
+  let persistence: Promise<unknown> = Promise.resolve();
+  vi.spyOn(f.journal.assignments, "update").mockImplementation((...args) => {
+    const pending = persistUpdate(...args);
+    persistence = pending;
+    return pending;
+  });
+  const gate = f.makeGate({ assignment: direct });
+  const operation = await gate.admit(f.envelope);
+  await gate.begin(operation);
+  const { iss: _iss, aud: _aud, iat: _iat, exp: _exp, operationId: _op, permitId: _permit, kind: _kind, method: _method,
+    requestId: _request, payloadDigest: _digest, sender: _sender, ...held } = f.claims;
+  const check = (fields: Record<string, unknown> = {}) => async () => ({ executionId: "execution", executionRevision: 1,
+    expiresAt: new Date(f.clock.coreNow() + 30_000).toISOString(),
+    lease: signed({ ...held, expiresAt: new Date(f.clock.coreNow() + 3_600_000).toISOString(), ...fields, checkId: "check",
+      iss: "konteks:control-plane", aud: "konteks:remote-execution-lease", iat: f.clock.coreNow() / 1000, exp: f.clock.coreNow() / 1000 + 30 }) });
+  // Core renews the direct turn: its signed checks carry the same authority with a later expiresAt.
+  f.client.checkExecution.mockImplementation(check());
+  for (let second = 0; second < 65 * 60; second += 25) {
+    f.advance(25_000); await vi.advanceTimersByTimeAsync(25_000); await persistence;
+  }
+  expect(f.clock.coreNow()).toBeGreaterThan(Date.parse(direct.expiresAt));
+  expect(f.onAuthorityLost).not.toHaveBeenCalled();
+  expect(f.client.checkExecution).toHaveBeenCalled();
+  expect(Date.parse(f.journal.assignments.get("assignment:1")!.expiresAt)).toBeGreaterThan(f.clock.coreNow() + 3_000_000);
+  expect(gate.liveUntil()).toBeGreaterThan(f.clock.coreNow() + 3_000_000);
+  // Anything but a later lifetime is still another authority: a changed lease set fences at once.
+  f.client.checkExecution.mockImplementation(check({ leaseSetId: "other" }));
+  for (let second = 0; second < 60; second += 5) { f.advance(5_000); await vi.advanceTimersByTimeAsync(5_000); await persistence; }
+  await vi.waitFor(() => expect(f.onAuthorityLost).toHaveBeenCalledTimes(1));
+});
+
 it("still stops a renewed delivery turn when Core answers that it is gone", async () => {
   vi.useFakeTimers();
   const f = await deliveryFixture();

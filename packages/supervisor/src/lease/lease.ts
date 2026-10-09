@@ -2,7 +2,7 @@ import { RemoteInstanceError, RemoteInstanceLeaseClaimsSchema, parseRfc3339, typ
 import type { LeaseRecord } from "../state/store.js";
 
 /** Only Core lease acquisition/adoption; never agent execution or recovery. */
-export type LeaseAcquisition = <T>(operation: () => Promise<T>) => Promise<T>;
+export type LeaseAcquisition = <T>(operation: () => Promise<T>, name?: string) => Promise<T>;
 
 /**
  * Lease handling. The lease is a Core-signed token; the supervisor reads its

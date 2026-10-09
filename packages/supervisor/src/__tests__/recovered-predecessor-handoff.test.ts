@@ -2,12 +2,20 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { RequestError } from "@agentclientprotocol/sdk";
 import { FixedClock, RemoteInstanceError, type RemoteWorkAssignment } from "@konteks/remote-common";
 import { SupervisorJournal, recoveryEvidenceRecordKey } from "../state/journal.js";
 import { DurableOutbox } from "../state/outbox.js";
 import { WorkOrchestrator } from "../work/orchestrator.js";
 import type { LocalAdmission } from "../state/local-admission.js";
+import type { RunnerSessionInput, RunnerSessionLifecycle } from "../runner-port.js";
+import type { RelayedSession } from "../session/relayed-session.js";
+import { PermissionBroker } from "../session/permissions.js";
+import { EvaluatorPolicyResponder } from "../session/policy-responder.js";
+import { InMemorySessionRefStore, SessionManager } from "../../../agent-runner/src/sessions/manager.js";
+import { RunnerEventBus } from "../../../agent-runner/src/events.js";
+import type { BridgeProcess } from "../../../agent-runner/src/bridge/process.js";
 
 // A session fenced after its execution lease could not renew must be
 // able to start again once its process is proven stopped and Core settled the
@@ -215,4 +223,144 @@ it("lets a later recovery stop an execution an earlier one already interrupted, 
   // refused here on every retry, and the computer never came back online.
   await fenceAndStop(journal, stopped, "stopped-ref");
   expect(journal.execution.execution(stopped)).toEqual(before);
+});
+
+// 10-09 (production): Core fenced a direct Claude Code turn; the connector
+// stopped it and recorded the interruption. Every later message failed at
+// acp_session_bootstrap ("This message did not reach the agent") because the
+// runner still held the fenced owner of the agent's own session.
+describe("a direct session after its turn was stopped by force", () => {
+  const direct = (identity: LocalAdmission, acpSessionRef: string): RemoteWorkAssignment => ({
+    ...conversation(identity), kind: "direct", agentRoute: { requiredRole: "assistant", agentId: identity.agentId },
+    source: { kind: "direct_session", portability: "instance_bound", ownerInstanceId: identity.instanceId, sessionId: "session",
+      turnRef: `turn-${identity.assignmentId}`, acpSessionRef } });
+
+  function bridge(sessionId: string, loadSession: () => Promise<unknown>): BridgeProcess & { calls: Record<string, unknown[]> } {
+    const calls: Record<string, unknown[]> = {};
+    const call = (name: string, result: () => Promise<unknown>) => vi.fn(async (params: unknown) => { (calls[name] ??= []).push(params); return result(); });
+    return { calls, exited: false, stderrTail: () => [], stop: vi.fn(async () => undefined),
+      initializeResult: { protocolVersion: 1, agentCapabilities: { loadSession: true } },
+      connection: { newSession: call("newSession", async () => ({ sessionId })), loadSession: call("loadSession", loadSession),
+        cancel: call("cancel", async () => undefined) } } as unknown as BridgeProcess & { calls: Record<string, unknown[]> };
+  }
+
+  /** A real runner session manager whose first turn was fenced, stopped, and whose process exited. */
+  async function fencedRunner(loadSession: () => Promise<unknown>) {
+    const store = new InMemorySessionRefStore();
+    const first = bridge("provider-session", async () => ({}));
+    const next = bridge("provider-session-new", loadSession);
+    let currentBridge: BridgeProcess = first;
+    const manager = new SessionManager({ bridge: () => currentBridge, events: new RunnerEventBus(), refStore: store });
+    const { acpSessionRef } = await manager.create({ context: { instanceId: "instance", assignmentId: "fenced", attempt: 1, agentId: "claude-code" }, cwd: dir, mcpServers: [] });
+    await manager.stopForRecovery(acpSessionRef);
+    Object.assign(first, { exited: true });
+    manager.closeAll("agent_exited", first);
+    currentBridge = next;
+    const runner = {
+      createSession: vi.fn(async (input: RunnerSessionInput, lifecycle?: RunnerSessionLifecycle) => {
+        const args = { context: input.context, readinessDeadlineAt: input.readinessDeadlineAt, cwd: input.cwd, mcpServers: input.mcpServers,
+          ...(input.freshSessionWhenRestoreLost ? { freshSessionWhenRestoreLost: true } : {}), ...(input.agentTitled ? { agentTitled: true } : {}),
+          ...(lifecycle ? { lifecycle } : {}) };
+        return input.restoreAcpSessionRef ? manager.restore(args, input.restoreAcpSessionRef) : manager.create(args);
+      }),
+      forgetRecoveredSession: vi.fn((ref: string) => manager.forgetRecovered(ref)),
+      closeSession: vi.fn(async () => undefined), cancel: vi.fn(async () => undefined),
+    };
+    return { store, manager, nextBridge: next, acpSessionRef, runner };
+  }
+
+  async function dispatchAfterFence(loadSession: () => Promise<unknown>) {
+    const r = await fencedRunner(loadSession);
+    const journal = new SupervisorJournal(dir); await journal.load();
+    const outbox = new DurableOutbox(dir); await outbox.load();
+    const fenced = { ...admission("fenced"), agentId: "claude-code" };
+    const next = { ...admission("next", "process", "2026-09-06T00:00:02.000Z"), agentId: "claude-code" };
+    await admit(journal, fenced, direct(fenced, r.acpSessionRef)); await admit(journal, next, direct(next, r.acpSessionRef));
+    await journal.execution.open(fenced, current, fenced.openedAt);
+    await journal.execution.bindReference(fenced, r.acpSessionRef, current);
+    await journal.execution.bindProcessOwner(fenced, processOwner, current);
+    await fenceAndStop(journal, fenced, r.acpSessionRef);
+    await interruptedClaim(journal, fenced, "assistant_execution", true);
+    const assignment = direct(next, r.acpSessionRef);
+    const entry = { assignmentId: next.assignmentId, attempt: 1, claimId: next.claimId, kind: "direct" as const, placementId: assignment.placementId,
+      workspaceId: next.workspaceId, agentId: "claude-code", state: "claimed" as const, recoveryEpoch: 0, reports: { nextSequence: 1, durableWatermark: 0 },
+      evidenceUpload: "structured_only" as const, expiresAt: assignment.expiresAt, latestResumeAt: assignment.policy.latestResumeAt, updatedAt: clock.nowIso() };
+    await journal.assignments.put(entry);
+    const transport = { send: () => undefined, openChannel: () => undefined, closeChannel: () => undefined };
+    const registerReady = vi.fn(async () => ({ workspaceId: "workspace", instanceId: "instance", sessionId: "session", channelId: "session:session",
+      assignmentId: next.assignmentId, attempt: 1, claimId: next.claimId, recoveryEpoch: 0, runnerIncarnation: "process",
+      agentId: "claude-code", acpSessionRef: journal.execution.execution(next)?.acpSessionRef, readyRevision: 1, registeredAt: clock.nowIso() }));
+    const broker = new PermissionBroker({ clock, deadlineSeconds: () => 60, onTimeout: async () => undefined });
+    const work = new WorkOrchestrator({ journal, outbox, transport, clock, runners: new Map([["claude-code", r.runner]]),
+      instanceId: () => "instance", workspaceId: () => "workspace", runnerIncarnation: () => "process", assertOwned: () => undefined,
+      recoveryAuthority: () => "accepted", reportDeliveryAllowed: () => false, onUsage: async () => undefined, recoveryEvidence: { submit: vi.fn() },
+      sessionDeps: () => ({ clock, journal, transport, runner: r.runner, policy: new EvaluatorPolicyResponder(null, () => true), broker,
+        instanceId: "instance", workspaceRoot: dir, registerReady, redeemCapabilityToken: async () => { throw new Error("a direct session redeems nothing"); },
+        prepareInputs: async (item: RemoteWorkAssignment) => ({ binding: { workspaceId: item.workspaceId, sessionId: "session",
+          assignmentId: item.id, instanceId: item.instanceId, attempt: item.attempt }, cwd: dir, skillInstructions: "", beforePrompt: async () => undefined }) }),
+    } as never);
+    const internal = work as unknown as { channelOwners: Map<string, unknown>; sessions: Map<string, unknown>; bootstrapping: Map<string, Promise<void>>;
+      startRelayedSession(item: RemoteWorkAssignment, claim: typeof entry, assertCurrent: () => void): Promise<void>;
+      bootstrapRelayedSession(session: RelayedSession): Promise<void>; handleDispatchFailure(...args: unknown[]): Promise<void> };
+    // The recovery-fenced owner still holds the logical session channel in memory.
+    const owner = { assignment: direct(fenced, r.acpSessionRef), acpSessionRef: r.acpSessionRef, isClosed: true,
+      releaseRecoveredChannel: vi.fn(() => { internal.channelOwners.delete("session:session"); }) };
+    internal.channelOwners.set("session:session", owner);
+    internal.sessions.set("fenced:1", owner);
+    let session: RelayedSession | undefined;
+    vi.spyOn(internal, "bootstrapRelayedSession").mockImplementation(async value => { session = value; await value.bootstrap(); });
+    const failed = vi.spyOn(internal, "handleDispatchFailure").mockResolvedValue(undefined);
+    await internal.startRelayedSession(assignment, entry, current);
+    await internal.bootstrapping.get("next:1");
+    return { ...r, journal, fenced, next, registerReady, failed, owner, close: () => session?.close("cancelled") };
+  }
+
+  it("releases the fenced owner once and restores the agent's own session under a new reference", async () => {
+    const f = await dispatchAfterFence(async () => ({}));
+    try {
+      expect(f.failed).not.toHaveBeenCalled();
+      expect(f.runner.forgetRecoveredSession).toHaveBeenCalledOnce();
+      expect(f.runner.forgetRecoveredSession).toHaveBeenCalledWith(f.acpSessionRef);
+      expect(f.owner.releaseRecoveredChannel).toHaveBeenCalledOnce();
+      expect(f.runner.createSession).toHaveBeenCalledOnce();
+      expect(f.runner.createSession.mock.calls[0]?.[0]).toMatchObject({ restoreAcpSessionRef: f.acpSessionRef, freshSessionWhenRestoreLost: true });
+      const restored = f.journal.execution.execution(f.next)?.acpSessionRef;
+      expect(restored).toBeTruthy();
+      expect(restored).not.toBe(f.acpSessionRef);
+      expect(f.nextBridge.calls.loadSession?.[0]).toMatchObject({ sessionId: "provider-session" });
+      expect(f.nextBridge.calls.newSession).toBeUndefined();
+      expect(await f.store.get(restored!)).toBe("provider-session");
+      expect(f.registerReady).toHaveBeenCalledOnce();
+      // The fenced reference is never reused and its journal fence stays.
+      expect(f.journal.execution.execution(f.fenced)).toMatchObject({ phase: "interrupted_unqualified", acpSessionRef: f.acpSessionRef });
+    } finally { await f.close(); }
+  });
+
+  it("answers the turn in a new session when the agent cannot reopen its transcript", async () => {
+    const f = await dispatchAfterFence(async () => { throw new RequestError(-32602, "no such session"); });
+    try {
+      expect(f.failed).not.toHaveBeenCalled();
+      expect(f.runner.forgetRecoveredSession).toHaveBeenCalledOnce();
+      expect(f.nextBridge.calls.loadSession).toHaveLength(1);
+      expect(f.nextBridge.calls.newSession).toHaveLength(1);
+      const restored = f.journal.execution.execution(f.next)?.acpSessionRef;
+      expect(restored).not.toBe(f.acpSessionRef);
+      expect(await f.store.get(restored!)).toBe("provider-session-new");
+      expect(f.registerReady).toHaveBeenCalledOnce();
+      expect(f.journal.execution.execution(f.fenced)).toMatchObject({ phase: "interrupted_unqualified", acpSessionRef: f.acpSessionRef });
+    } finally { await f.close(); }
+  });
+
+  it("keeps the session blocked when the runner refuses to release the fenced owner", async () => {
+    const f = await fencedConversation({ acknowledged: true });
+    f.submit.mockRejectedValue(new RemoteInstanceError("assignment_conflict", "Recovery evidence does not match current work authority"));
+    await f.work.retryRecoveryEvidence();
+    const forgetRecoveredSession = vi.fn(() => { throw new RemoteInstanceError("recovery_required", "still running", { diagnostic: "forget_not_recovered" }); });
+    (f.work as unknown as { deps: { runners: Map<string, unknown> } }).deps.runners.set("codex", { forgetRecoveredSession });
+    await expect(f.internal.takeOverCompletedChannel(conversation(f.next), f.next, current)).rejects.toMatchObject({
+      code: "recovery_required", diagnostic: "predecessor_recovery_unqualified" });
+    expect(forgetRecoveredSession).toHaveBeenCalledWith("fenced-ref");
+    expect(f.owner.releaseRecoveredChannel).not.toHaveBeenCalled();
+    expect(f.internal.channelOwners.has("session:session")).toBe(true);
+  });
 });

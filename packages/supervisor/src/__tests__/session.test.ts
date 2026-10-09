@@ -509,6 +509,27 @@ describe("relayed session", () => {
       } finally { await f.session.close("cancelled"); }
     });
 
+    // 10-09: Claude Code reasoned for 4 min 42 s before its first word; the page said only "Working".
+    it("tells the page the agent is thinking, once per stretch, never what it thinks", async () => {
+      const f = await build({ restoreReference: "acp-0" }, directWork);
+      try {
+        await f.session.bootstrap();
+        const before = f.sent.length;
+        const update = (u: unknown) => f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: u } } as never);
+        await update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "private-plan-one" } });
+        await update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "private-plan-two" } });
+        await update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Done." } });
+        await update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "private-plan-three" } });
+        const updates = f.sent.slice(before).map(message => (message.body as { params: { update: { sessionUpdate: string; content?: { text?: string } } } }).params.update);
+        expect(updates.map(u => [u.sessionUpdate, u.content?.text])).toEqual([
+          ["agent_thought_chunk", "…"],
+          ["agent_message_chunk", "Done."],
+          ["agent_thought_chunk", "…"],
+        ]);
+        expect(JSON.stringify(f.sent)).not.toContain("private-plan");
+      } finally { await f.session.close("cancelled"); }
+    });
+
     it("refuses new model policy before preparation and provider effects unless signed Core 7.4 is accepted", async () => {
       const prepareInputs = vi.fn();
       const f = await build(
