@@ -7,10 +7,15 @@ const unavailable = () =>
     "agent_unavailable",
     "OpenCode Skill discovery requires a closed, private authorized snapshot.",
   );
-function owned(stat: Stats, directory: boolean): void {
+function privateModes(directory: boolean, executableSupport: boolean): number[] {
+  if (directory) return [0o700];
+  return executableSupport ? [0o600, 0o700] : [0o600];
+}
+function owned(stat: Stats, directory: boolean, executableSupport = false): void {
   if (stat.isSymbolicLink() || !expectedKind(stat, directory)) throw unavailable();
   if (process.platform === "win32") return;
-  if (stat.uid !== process.getuid?.() || (stat.mode & 0o777) !== (directory ? 0o700 : 0o600))
+  const modes = privateModes(directory, executableSupport);
+  if (stat.uid !== process.getuid?.() || !modes.includes(stat.mode & 0o777))
     throw unavailable();
 }
 function expectedKind(stat: Stats, directory: boolean): boolean {
@@ -35,7 +40,7 @@ async function selectedSkillOnly(root: string): Promise<void> {
   const entries = await readdir(root, { recursive: true, withFileTypes: true });
   for (const entry of entries) {
     if (entry.name === "SKILL.md" && entry.parentPath !== root) throw unavailable();
-    owned(await lstat(join(entry.parentPath, entry.name)), entry.isDirectory());
+    owned(await lstat(join(entry.parentPath, entry.name)), entry.isDirectory(), true);
   }
 }
 function canonicalRoot(root: string): void {

@@ -1,9 +1,9 @@
 import { expect, it } from "vitest";
-import { mkdtemp, mkdir, writeFile, realpath, rm, symlink, link } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, realpath, rm, symlink, link, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openCodeSkillSources } from "../host/opencode-skill-sources.js";
-it.skipIf(process.platform === "win32")("rejects supporting files linked to mutable external content", async () => {
+it("rejects supporting files linked to mutable external content", async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "opencode-linked-support-")));
   const external = await realpath(await mkdtemp(join(tmpdir(), "opencode-external-support-")));
   try {
@@ -17,6 +17,22 @@ it.skipIf(process.platform === "win32")("rejects supporting files linked to muta
   } finally {
     await rm(root, { recursive: true, force: true });
     await rm(external, { recursive: true, force: true });
+  }
+});
+it.skipIf(process.platform === "win32")("accepts private executable support scripts but rejects group-writable scripts", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "opencode-executable-support-")));
+  try {
+    const skill = join(root, "review");
+    await mkdir(skill, { mode: 0o700 });
+    await writeFile(join(root, ".catalog.json"), "{}", { mode: 0o600 });
+    await writeFile(join(skill, "SKILL.md"), "# Review", { mode: 0o600 });
+    const script = join(skill, "check.sh");
+    await writeFile(script, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    expect(await openCodeSkillSources([skill])).toEqual([root]);
+    await chmod(script, 0o720);
+    await expect(openCodeSkillSources([skill])).rejects.toThrow();
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 it("exposes only closed selected Skill snapshots and rejects unexpected sibling Skills", async () => {
