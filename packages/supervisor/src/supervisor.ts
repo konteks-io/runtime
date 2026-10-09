@@ -1,3 +1,4 @@
+import { NativeSkillSyncClient } from "./native/skill-sync-client.js";
 import { ObservationDelivery } from "./control/observation-delivery.js";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -217,6 +218,7 @@ export class Supervisor {
   private hostSettings = { openCodeFreeModels: false, coreAcceptsRouteBilling: false };
   /** The Core wire-contract version from the applied desired configuration (absent before one is applied). */
   private coreContractVersion: string | undefined;
+  private skillSyncClient: NativeSkillSyncClient | undefined;
   /** Runs `integration` work; composed with the native runners. */
   private integrationCarrier: IntegrationWorkCarrier | undefined;
   private roleBindings: RoleBinding[] = [];
@@ -2321,6 +2323,26 @@ export class Supervisor {
       ...(this.configuration.softMaxConcurrent === undefined ? {} : { softMaxConcurrent: this.configuration.softMaxConcurrent }) };
   }
 
+  private machineSkillSyncClient(): NativeSkillSyncClient {
+    this.skillSyncClient ??= new NativeSkillSyncClient({
+      baseUrl: this.config.SUPERVISOR_CORE_URL, roots: this.roots,
+      now: () => this.clock.coreNow(), coreContractVersion: () => this.coreContractVersion,
+      identity: () => ({ workspaceId: this.workspaceId ?? "", instanceId: this.instanceId ?? "" }),
+      credential: () => !this.stopping && this.lease.mode() === "active" ? this.lease.current()?.lease ?? null : null,
+    });
+    return this.skillSyncClient;
+  }
+
+  private async listSkills() {
+    if (this.stopping || !this.options.native || !this.nativeOwnership || !this.reconciliation.isComplete) {
+      throw new RemoteInstanceError("capability_unavailable", "Skill inventory is unavailable until runtime recovery completes.");
+    }
+    this.nativeOwnership.assertOwned();
+    const envelope = await this.machineSkillSyncClient().prepare();
+    return { skills: envelope.catalog.skills, catalogDigest: envelope.catalogDigest,
+      installed: "unknown", loaded: "unknown" };
+  }
+
   controlHandler(): ControlHandler {
     const ops = this.controlOps();
     return async (request, emit) => (ops[request.op] as (request: ControlRequest, emit: ControlEmitter) => unknown)(request, emit);
@@ -2330,6 +2352,7 @@ export class Supervisor {
   private controlOps(): ControlOps {
     return {
       status: () => this.status(),
+      "skills.list": () => this.listSkills(),
       agents: () => {
         const agents = this.lastSnapshot?.agents ?? this.inventory.agents();
         return { agents: [...agents, ...this.leftOutAgents(agents)], roles: this.heartbeat?.roles() ?? [], roleBindings: this.roleBindings };

@@ -1,3 +1,4 @@
+import { RuntimeSkillSyncItemSchema } from "@konteks/backstage-plugin-common/remote-instance-internal";
 import { z } from "zod";
 import { DoctorReportSchema, PreviewStatusReportSchema, RemoteInstanceError, SupervisorStatusSchema, UpdateChannelReportSchema, type ControlLoginEvent, type UpdateChannelReport } from "@konteks/remote-common";
 import type { SupervisorControl } from "../control.js";
@@ -33,6 +34,16 @@ function releaseChannelLine(channel: NonNullable<UpdateChannelReport>): string {
   const where = channel.override ? `${channel.host} (override: KONTEKS_RELEASE_MANIFEST_URL)` : channel.host;
   if (channel.error) return `${where} — cannot be read, no update can arrive: ${channel.error}`;
   return `${where}${channel.lastCheckedAt ? `, checked ${channel.lastCheckedAt}` : ", not checked yet"}`;
+}
+
+const SkillListSchema = z.object({ skills: z.array(RuntimeSkillSyncItemSchema), catalogDigest: z.string(),
+  installed: z.literal("unknown"), loaded: z.literal("unknown") }).strict();
+export async function listSkills(context: ControlContext): Promise<void> {
+  const value = await context.control.call({ op: "skills.list" }, SkillListSchema, { timeoutMs: 95_000 });
+  context.output.result(value);
+  const id = outputLocale(context.output) === "id";
+  context.output.line(id ? "Status pemasangan dan pemuatan Skill belum terverifikasi." : "Skill installation and load status are not yet verified.");
+  for (const skill of value.skills) context.output.line(`${skill.name}  ${skill.version}  ${skill.skillId}`);
 }
 
 export async function status(context: ControlContext): Promise<void> {

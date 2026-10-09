@@ -11,6 +11,17 @@ function fixture() {
 }
 
 describe("native customer entry point", () => {
+  it.each([{ argv: ["skills", "list", "--json"] }, { argv: ["--json", "skills", "list"] }])("routes Skills listing with JSON output: %j", async ({ argv }) => {
+    const { program, actions } = fixture();
+    await program.parseAsync(argv, { from: "user" });
+    expect(actions.control).toHaveBeenCalledWith(expect.objectContaining({ operation: "skills.list" }));
+    expect(program.opts().json).toBe(true);
+  });
+  it("does not accept caller-supplied tenant or owner for Skills listing", async () => {
+    const { program, actions } = fixture();
+    await expect(program.parseAsync(["skills", "list", "--tenant", "foreign"], { from: "user" })).rejects.toThrow();
+    expect(actions.control).not.toHaveBeenCalled();
+  });
   it("accepts claude as the Claude Code sign-in alias", async () => {
     const { program, actions } = fixture();
     await program.parseAsync(["auth", "login", "claude"], { from: "user" });
