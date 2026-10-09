@@ -2407,7 +2407,13 @@ export class Supervisor {
     this.nativeOwnership.assertOwned();
     const envelope = await this.machineSkillSyncClient().prepare();
     return { skills: envelope.catalog.skills, catalogDigest: envelope.catalogDigest,
-      installed: "unknown", loaded: "unknown" };
+      installed: "unknown", loaded: "unknown",
+      profiles: this.options.native.runners.flatMap<{ agentId: string; home?: string; installed: "unknown"; loaded: "unknown"; reason?: "skill_home_unavailable" }>(runner => {
+        const status = { agentId: runner.RUNNER_AGENT_ID, installed: "unknown" as const, loaded: "unknown" as const };
+        const homes = machineSkillHomes([runner]);
+        return homes.length ? homes.map(home => ({ ...status, home }))
+          : [{ ...status, reason: "skill_home_unavailable" as const }];
+      }) };
   }
 
   controlHandler(): ControlHandler {

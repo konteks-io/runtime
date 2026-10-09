@@ -3,10 +3,10 @@ import { expect, it, vi } from "vitest";
 import { listSkills } from "../native/control-commands.js";
 import { createOutput } from "../output.js";
 
-async function list(scope: unknown, json = false, locale: "en" | "id" = "en") {
+async function list(scope: unknown, json = false, locale: "en" | "id" = "en", profiles?: unknown[]) {
   let text = "";
   const stdout = new Writable({ write(chunk, _encoding, done) { text += String(chunk); done(); } });
-  const value = { skills: [{ skillId: "11111111-1111-4111-8111-111111111111", name: "review", version: "1.0.0", description: "Review", treeDigest: `sha256:${"a".repeat(64)}`, sizeBytes: 1, fileCount: 1, ...(scope ? { scope } : {}) }], catalogDigest: "catalog-a", installed: "unknown", loaded: "unknown" };
+  const value = { skills: [{ skillId: "11111111-1111-4111-8111-111111111111", name: "review", version: "1.0.0", description: "Review", treeDigest: `sha256:${"a".repeat(64)}`, sizeBytes: 1, fileCount: 1, ...(scope ? { scope } : {}) }], catalogDigest: "catalog-a", installed: "unknown", loaded: "unknown", ...(profiles ? { profiles } : {}) };
   const call = vi.fn(async (_request: unknown, schema: { parse(value: unknown): unknown }) => schema.parse(value));
   await listSkills({ output: createOutput({ json, stdout, locale }), control: { call } } as never);
   return { text, value };
@@ -36,4 +36,20 @@ it("shows the organization tenant without treating global context as unrestricte
   const { text } = await list({ tenantId: "tenant-a", audience: { kind: "organization" }, context: { kind: "global" } });
   expect(text).toContain("Organization: tenant-a");
   expect(text).toContain("All authorized contexts");
+});
+
+it("reports each configured agent profile without claiming installation or load proof", async () => {
+  const profiles = [
+    { agentId: "codex", home: "/profiles/shared", installed: "unknown", loaded: "unknown" },
+    { agentId: "opencode", home: "/profiles/shared", installed: "unknown", loaded: "unknown" },
+    { agentId: "antigravity", installed: "unknown", loaded: "unknown", reason: "skill_home_unavailable" },
+  ];
+  const { text } = await list(undefined, false, "en", profiles);
+  expect(text).toContain("codex (/profiles/shared): installed=unknown, loaded=unknown");
+  expect(text).toContain("opencode (/profiles/shared): installed=unknown, loaded=unknown");
+  expect(text).toContain("antigravity: installed=unknown, loaded=unknown (skill_home_unavailable)");
+  const indonesian = await list(undefined, false, "id", profiles);
+  expect(indonesian.text).toContain("terpasang=belum diketahui, dimuat=belum diketahui");
+  const json = await list(undefined, true, "en", profiles);
+  expect(JSON.parse(json.text).profiles).toEqual(profiles);
 });
