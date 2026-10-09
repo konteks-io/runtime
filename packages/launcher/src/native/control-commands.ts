@@ -43,7 +43,29 @@ export async function listSkills(context: ControlContext): Promise<void> {
   context.output.result(value);
   const id = outputLocale(context.output) === "id";
   context.output.line(id ? "Status pemasangan dan pemuatan Skill belum terverifikasi." : "Skill installation and load status are not yet verified.");
-  for (const skill of value.skills) context.output.line(`${skill.name}  ${skill.version}  ${skill.skillId}`);
+  for (const skill of value.skills) {
+    context.output.line(`${skill.name}  ${skill.version}  ${skill.skillId}`);
+    context.output.line(`  ${skillAudience(skill.scope, id)}`);
+    context.output.line(`  ${skillContext(skill.scope, id)}`);
+  }
+}
+
+
+type SkillScope = z.infer<typeof RuntimeSkillSyncItemSchema>["scope"];
+function skillAudience(scope: SkillScope, id: boolean): string {
+  if (!scope) return id ? "Cakupan belum diketahui" : "Unknown scope";
+  const audience = scope.audience;
+  const labels = id ? { personal: "Pribadi", systems: "Sistem", organization: "Organisasi" } : { personal: "Personal", systems: "Systems", organization: "Organization" };
+  switch (audience.kind) {
+    case "personal": return `${labels.personal}: ${audience.ownerUserRef}`;
+    case "systems": return `${labels.systems}: ${audience.systemRefs.join(", ")}`;
+    case "organization": return `${labels.organization}: ${scope.tenantId}`;
+  }
+}
+function skillContext(scope: SkillScope, id: boolean): string {
+  if (!scope) return id ? "Konteks belum diketahui" : "Unknown context";
+  if (scope.context.kind === "global") return id ? "Semua konteks yang diizinkan" : "All authorized contexts";
+  return `${id ? "Inisiatif" : "Initiatives"}: ${scope.context.initiativeRefs.join(", ")}`;
 }
 
 const SkillSyncSchema = z.object({ complete: z.boolean(), loaded: z.literal("unknown"),
