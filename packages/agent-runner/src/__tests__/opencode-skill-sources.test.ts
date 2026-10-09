@@ -19,7 +19,7 @@ it("rejects supporting files linked to mutable external content", async () => {
     await rm(external, { recursive: true, force: true });
   }
 });
-it.skipIf(process.platform === "win32")("accepts private executable support scripts but rejects group-writable scripts", async () => {
+it.skipIf(process.platform === "win32")("accepts private executable Skill files but rejects group-writable scripts", async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "opencode-executable-support-")));
   try {
     const skill = join(root, "review");
@@ -28,6 +28,7 @@ it.skipIf(process.platform === "win32")("accepts private executable support scri
     await writeFile(join(skill, "SKILL.md"), "# Review", { mode: 0o600 });
     const script = join(skill, "check.sh");
     await writeFile(script, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    await chmod(join(skill, "SKILL.md"), 0o700);
     expect(await openCodeSkillSources([skill])).toEqual([root]);
     await chmod(script, 0o720);
     await expect(openCodeSkillSources([skill])).rejects.toThrow();

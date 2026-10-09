@@ -30,7 +30,7 @@ async function closedSnapshot(parent: string, roots: readonly string[]): Promise
   owned(await lstat(join(parent, ".catalog.json")), false);
   for (const root of roots) {
     owned(await lstat(root), true);
-    owned(await lstat(join(root, "SKILL.md")), false);
+    owned(await lstat(join(root, "SKILL.md")), false, true);
     await selectedSkillOnly(root);
   }
   if (JSON.stringify((await readdir(parent)).sort()) !== JSON.stringify(expected))
