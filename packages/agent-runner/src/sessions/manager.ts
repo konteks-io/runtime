@@ -1113,7 +1113,8 @@ export class SessionManager {
     if (this.refusedPrompt(record, requestId, params.prompt)) return;
     const publishMeasured = this.beginTurn(record, bridge);
     const send = () => this.sendPrompt(record, bridge, params);
-    const prepared = this.options.beforePrompt?.(bridge);
+    const prepare = this.options.beforePrompt;
+    const prepared = prepare ? Promise.resolve().then(() => prepare(bridge)) : undefined;
     const operation = (prepared ? prepared.then(send) : send())
       .then(result => this.settlePrompt(record, requestId, result, publishMeasured))
       .catch((error: unknown) => {

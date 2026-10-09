@@ -1014,3 +1014,17 @@ describe("restoring a conversation after its turn was stopped for recovery", () 
     expect(await store.get(refused.acpSessionRef)).toBe("bridge-new-2");
   });
 });
+
+
+it("settles a synchronous pre-prompt refusal without sending or retaining an active turn", async () => {
+  const { bridge, calls } = fakeBridge();
+  const events = new RunnerEventBus();
+  const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore(),
+    beforePrompt: () => { throw new RemoteInstanceError("capability_unavailable", "Required Skill admission is unavailable."); } });
+  const { acpSessionRef } = await manager.create({ context, cwd: "/w", mcpServers: [] });
+  const failed = nextEvent(events, "request_error");
+  expect(() => manager.prompt(acpSessionRef, "blocked-turn", { prompt: [] })).not.toThrow();
+  expect(await failed).toMatchObject({ requestId: "blocked-turn", method: "session/prompt" });
+  await vi.waitFor(() => expect(manager.activeTurns).toBe(0));
+  expect(calls.prompt).toBeUndefined();
+});
