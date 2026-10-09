@@ -289,7 +289,7 @@ export async function bindOpenCodeWorkingCopy(credentialDir: string, workingCopy
   const skillRoots = Object.freeze([...readOnlyRoots]);
   const configHome = openCodeWorkingCopyConfig(credentialDir, workingCopy, process.platform, skillRoots);
   const sources = await openCodeSkillSources(skillRoots);
-  const activation = skillRoots.length ? await createOpenCodeActivation(configHome) : undefined;
+  const activation = skillRoots.length ? await createOpenCodeActivation(configHome, skillRoots) : undefined;
   const env = openCodeProcessEnvironment(credentialDir, configHome, deps.inherited);
   env.OPENCODE_CONFIG_CONTENT = JSON.stringify({ ...renderOpenCodeKonteksConfig(), skills: sources, ...(activation ? { plugins: [activation.plugin] } : {}) });
   await serial(configHome, async hold => {

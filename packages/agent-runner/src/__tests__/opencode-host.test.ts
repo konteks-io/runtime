@@ -377,11 +377,13 @@ it("registers provider-independent native request guards before activation", asy
     const module = await import(pathToFileURL(join(activation.plugin.package, "server.js")).href);
     const cleanup = await module.default.setup({ options: activation.plugin.options, session: { hook } });
     await activation.wait();
-    expect([...callbacks.keys()]).toEqual(["context", "http.request", "experimental.ws.send"]);
-    for (const callback of callbacks.values()) await expect(callback()).rejects.toThrow(/load admission/);
+    expect([...callbacks.keys()]).toEqual(["prompt", "context", "http.request", "experimental.ws.send"]);
+    for (const [name, callback] of callbacks) {
+      if (name !== "prompt") await expect(callback()).rejects.toThrow(/load admission/);
+    }
     expect(hook.mock.calls.every(call => call.length === 2)).toBe(true);
     await cleanup();
-    expect(dispose).toHaveBeenCalledTimes(3);
+    expect(dispose).toHaveBeenCalledTimes(4);
   } finally { await activation.release(); }
 });
 
@@ -398,5 +400,34 @@ it("refuses unsupported native hook registrations without acknowledging readines
     const waiting = expect(activation.wait()).rejects.toMatchObject({ code: "agent_unavailable" });
     await activation.release();
     await waiting;
+  } finally { await activation.release(); }
+});
+
+
+it("selects native Skill attachments only from the exact authorized source files", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "opencode-selection-"))); roots.push(root);
+  const skillRoot = join(root, "review");
+  const activation = await createOpenCodeActivation(root, [skillRoot]);
+  type NativePrompt = { prompt: { text?: string; skills?: { id: string }[] } };
+  const callbacks = new Map<string, (input: NativePrompt) => Promise<void>>();
+  const inventory = [{ id: "approved", path: join(skillRoot, "SKILL.md") }, { id: "personal", path: join(root, "personal", "SKILL.md") }];
+  try {
+    const module = await import(pathToFileURL(join(activation.plugin.package, "server.js")).href);
+    const cleanup = await module.default.setup({ options: activation.plugin.options,
+      skill: { list: async () => ({ data: inventory }) },
+      session: { hook: async (name: string, callback: (input: NativePrompt) => Promise<void>) => {
+        callbacks.set(name, callback); return { dispose: async () => {} };
+      } } });
+    const select = callbacks.get("prompt")!;
+    const input = { prompt: { text: "Work", skills: [] } };
+    expect(select).toBeTypeOf("function");
+    await select(input);
+    expect(input.prompt.skills).toEqual([{ id: "approved" }]);
+    await expect(select({ prompt: { skills: [{ id: "personal" }] } })).rejects.toThrow(/unauthorized/);
+    inventory.push({ id: "duplicate", path: join(skillRoot, "SKILL.md") });
+    await expect(select({ prompt: {} })).rejects.toThrow(/ambiguous/);
+    inventory.splice(0);
+    await expect(select({ prompt: {} })).rejects.toThrow(/ambiguous/);
+    await cleanup();
   } finally { await activation.release(); }
 });

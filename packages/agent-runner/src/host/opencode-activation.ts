@@ -17,11 +17,28 @@ const source = `export default {
       await response.body?.cancel();
     };
     const registrations = [];
+    const select = async input => {
+      const result = await context.skill.list();
+      if (!Array.isArray(result.data)) throw new Error("OpenCode Skill inventory is unavailable");
+      const selected = context.options.skillFiles.map(path => {
+        const matches = result.data.filter(skill => skill.path === path);
+        if (matches.length !== 1 || typeof matches[0].id !== "string" || !matches[0].id) {
+          throw new Error("Required OpenCode Skill inventory is missing or ambiguous");
+        }
+        return { id: matches[0].id };
+      });
+      const ids = new Set(selected.map(skill => skill.id));
+      if (ids.size !== selected.length) throw new Error("Required OpenCode Skill inventory is ambiguous");
+      if ((input.prompt.skills ?? []).some(skill => !ids.has(skill.id))) {
+        throw new Error("OpenCode requested an unauthorized Skill attachment");
+      }
+      input.prompt.skills = selected;
+    };
     const deny = async () => { throw new Error("Konteks managed Skill load admission is unavailable"); };
     const dispose = () => Promise.all(registrations.map(registration => registration.dispose()));
     try {
-      for (const name of ["context", "http.request", "experimental.ws.send"]) {
-        const registration = await context.session.hook(name, deny);
+      for (const [name, callback] of [["prompt", select], ["context", deny], ["http.request", deny], ["experimental.ws.send", deny]]) {
+        const registration = await context.session.hook(name, callback);
         if (typeof registration?.dispose !== "function") throw new Error("OpenCode native Skill hooks are unsupported");
         registrations.push(registration);
       }
@@ -55,7 +72,7 @@ function close(server: Server): Promise<void> {
 }
 
 /** Startup activation only. This acknowledgement never certifies a Skill load. */
-export async function createOpenCodeActivation(configHome: string) {
+export async function createOpenCodeActivation(configHome: string, skillRoots: readonly string[] = []) {
   await mkdir(configHome, { recursive: true, mode: 0o700 });
   const directory = await mkdtemp(join(configHome, ".managed-plugin-"));
   const token = randomBytes(32).toString("hex");
@@ -83,7 +100,7 @@ export async function createOpenCodeActivation(configHome: string) {
     const port = await listen(server);
     server.unref();
     return {
-      plugin: { package: directory, options: { endpoint: `http://127.0.0.1:${port}/ready`, token } },
+      plugin: { package: directory, options: { endpoint: `http://127.0.0.1:${port}/ready`, token, skillFiles: skillRoots.map(root => join(root, "SKILL.md")) } },
       wait: async () => {
         let timer: ReturnType<typeof setTimeout> | undefined;
         try {
