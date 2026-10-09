@@ -37,6 +37,8 @@ export interface RunnerSessionInput {
   restoreAcpSessionRef?: string;
   /** Start with staged platform context rather than loading the provider transcript. */
   freshProviderSessionOnRestore?: boolean;
+  /** A person's turn: when the agent's transcript cannot be reopened, open one new session instead of failing. */
+  freshSessionWhenRestoreLost?: boolean;
   /** Display-only naming for the provider session list; never authority. */
   sessionLabel?: RemoteSessionLabel;
   /** A person's direct session: the agent titles it; Konteks adds only `[konteks] `. */
@@ -88,6 +90,10 @@ export interface RunnerPort {
    * process resident for the next session instead of stopping it; a `void`
    * result means the process was stopped as before. */
   releaseSealedSession?(ref: string): Promise<{ processRetained: boolean } | void>;
+  /** Native: drop a recovery-stopped owner whose process exited, after Core
+   * settled its turn. Throws (`forget_not_recovered`) for anything else,
+   * before anything changes. Synchronous: the successor gate calls it. */
+  forgetRecoveredSession?(ref: string): void;
   /** Restart-only exact process stop. This is not qualified quiescence, and a
    * native runner refuses it for an identity still live under a local owner. */
   stopRetainedExecution?(owner: RetainedProcessOwner): Promise<void>;

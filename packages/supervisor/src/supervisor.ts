@@ -67,6 +67,7 @@ import { acceptedWorkKinds } from "./work/accepted-kinds.js";
 import { integrationTaskCapabilities, type IntegrationWorkCarrier } from "./integration/carrier.js";
 import { composeIntegrationCarrier } from "./integration/compose.js";
 import { LeaseState, decodeLeaseClaims, decodeStoredLeaseClaims, leaseRecordFromClaims } from "./lease/lease.js";
+import { LeaseLane } from "./lease/lease-lane.js";
 import { channelOfId, coreChannelId, CORE_BOUND_CHANNELS } from "./relay/channel-ids.js";
 import { PreviewWorktreePermits } from "./preview/worktree-permits.js";
 import { PreviewChannel } from "./preview/preview-channel.js";
@@ -136,6 +137,12 @@ const PREVIEW_START_WAIT_MS = 45_000;
 const PREVIEW_VIEWER_RETRY_MS = 60_000;
 
 /** bb releases sessions idle for 30 minutes, checked every 5 minutes. */
+/**
+ * Longest a lease operation may hold the lease lane: a heartbeat request
+ * gives up after four 30 s attempts, a reconnect likewise. Past this the lane
+ * moves on so renewals keep the lease alive (10-09, a wedged connector).
+ */
+const LEASE_LANE_HOLD_MS = 3 * 60_000;
 const IDLE_SESSION_RELEASE_MS = 30 * 60_000;
 const IDLE_SESSION_SWEEP_MS = 5 * 60_000;
 const LIVENESS_CHECK_MS = 30_000;
@@ -286,7 +293,7 @@ export class Supervisor {
   private heartbeatIntervalSeconds: number | null = null;
   private leaseAuthorityEpoch = 0;
   private leaseMutation: Promise<void> = Promise.resolve();
-  private leaseAcquisition: Promise<void> = Promise.resolve();
+  private leaseLane!: LeaseLane;
   private leaseLossCleanup: Promise<void> | null = null;
   private leaseLossCleanupFailed = false;
   private leaseRestorationAllowed = false;
@@ -330,6 +337,10 @@ export class Supervisor {
   constructor(config: SupervisorConfig = loadSupervisorConfig(), private readonly options: SupervisorOptions = {}) {
     this.config = config;
     this.logger = createLogger({ name: "supervisor" });
+    this.leaseLane = new LeaseLane({
+      holdMs: LEASE_LANE_HOLD_MS,
+      onOverrun: detail => this.logger.error({ event: "lease.lane_overrun", ...detail }, "a lease operation held the lease lane too long; moving on without it"),
+    });
     this.stateMutations = new StateMutationGate(() => {
       if (!this.nativeOwnership) throw new RemoteInstanceError("temporarily_unavailable", "Native state ownership has not been acquired.");
       this.nativeOwnership.assertOwned();
@@ -1197,7 +1208,7 @@ export class Supervisor {
         }
       },
       captureLeaseFence: () => this.captureLeaseFence(),
-      withLeaseAcquisition: operation => this.withLeaseAcquisition(operation),
+      withLeaseAcquisition: (operation, name) => this.withLeaseAcquisition(operation, name),
     });
 
   }
@@ -1212,7 +1223,7 @@ export class Supervisor {
       core: this.core,
       onResult: (result, assertCurrent) => this.adoptHeartbeat(result, assertCurrent),
       captureLeaseFence: () => this.captureLeaseFence(),
-      withLeaseAcquisition: operation => this.withLeaseAcquisition(operation),
+      withLeaseAcquisition: (operation, name) => this.withLeaseAcquisition(operation, name),
       onFailure: error => this.onHeartbeatFailure(error),
       inventory: this.inventory,
       onInventory: (snapshot) => {
@@ -1814,8 +1825,10 @@ export class Supervisor {
 
   private captureLeaseFence(): () => void {
     const epoch = this.leaseAuthorityEpoch;
+    const lane = this.leaseLane.current();
     return () => {
       if (this.stopping || epoch !== this.leaseAuthorityEpoch) throw new RemoteInstanceError("temporarily_unavailable", "Lease response belongs to an invalidated lifecycle.");
+      if (lane !== this.leaseLane.current()) throw new RemoteInstanceError("temporarily_unavailable", "Lease operation outlived its turn in the lease lane.");
       if (!this.nativeOwnership) throw new RemoteInstanceError("temporarily_unavailable", "Native state ownership is unavailable.");
       this.nativeOwnership.assertOwned();
     };
@@ -1827,13 +1840,11 @@ export class Supervisor {
     return pending;
   }
 
-  private withLeaseAcquisition<T>(operation: () => Promise<T>): Promise<T> {
-    const pending = this.leaseAcquisition.then(() => {
+  private withLeaseAcquisition<T>(operation: () => Promise<T>, name = "lease operation"): Promise<T> {
+    return this.leaseLane.run(() => {
       this.captureLeaseFence()();
       return operation();
-    });
-    this.leaseAcquisition = pending.then(() => undefined, () => undefined);
-    return pending;
+    }, name);
   }
 
   private async adoptLease(lease: string, assertCurrent = this.captureLeaseFence()): Promise<void> {
@@ -3054,7 +3065,7 @@ export class Supervisor {
     await this.settleControlLoops();
     this.heartbeat?.stop();
     await this.waitForShutdownStep("heartbeat", this.heartbeat?.settle());
-    await this.waitForShutdownStep("lease_acquisition", this.leaseAcquisition);
+    await this.waitForShutdownStep("lease_acquisition", this.leaseLane.idle());
     await this.waitForShutdownStep("lease_mutation", this.leaseMutation);
     await this.waitForShutdownStep("lease_loss_cleanup", this.leaseLossCleanup);
   }

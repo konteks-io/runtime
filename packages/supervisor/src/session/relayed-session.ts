@@ -213,6 +213,8 @@ export class RelayedSession {
   private releaseChannel: (() => void) | null = null;
   /** Last streamed text per chunk kind, so redaction can tell a mid-token chunk start. */
   private readonly lastChunkText = new Map<string, ChunkTrail>();
+  /** A thinking signal went out and no other update has followed it yet. */
+  private thinking = false;
   /** Safe tool identity carried from `tool_call` to sparse terminal updates. */
   private readonly toolActivityIdentity = new Map<string, CanonicalAcpToolIdentity>();
   /** Rebuilds a host agent's permission requests and trips on an unapproved tool (host-tool-governance.ts: DeepSeek Harness, OpenCode). */
@@ -349,8 +351,9 @@ export class RelayedSession {
     // The browser is a stdio server the runner adds; OpenCode's Code Mode
     // gate and its tools line need its name too.
     this.sessionServers = new Set([...mcpServers.map(server => server.name), ...(browser ? [BROWSER_MCP_SERVER_NAME] : [])]);
-    const created = await this.bootstrapStage("acp_session_bootstrap", () => this.deps.runner.createSession(
-      this.sessionRequest(prepared.cwd, mcpServers, references, browser), lifecycle));
+    const request = this.sessionRequest(prepared.cwd, mcpServers, references, browser);
+    const created = await this.bootstrapStage("acp_session_bootstrap", () => this.deps.runner.createSession(request, lifecycle));
+    this.logRestoreOutcome(request, created);
     await this.adoptCreated(created, lifecycle !== undefined, reserved);
     const readyProjection = await this.registerReadiness(created);
     await this.announceReady(created, readyProjection);
@@ -637,12 +640,23 @@ export class RelayedSession {
 
   /**
    * A conversation's context is Konteks's to restage; a direct session's is
-   * only the agent's own transcript, so that one is loaded.
+   * only the agent's own transcript, so that one is loaded. A person's turn
+   * whose transcript cannot be reopened gets a new session rather than a
+   * refusal that every later message would repeat.
    */
   private restoreOptions(restoreRef: string | undefined): Partial<RunnerSessionInput> {
     if (!restoreRef) return {};
     const fresh = this.assignment.source.kind === "conversation" && this.assignment.agentRoute.agentId === "claude-code";
-    return { restoreAcpSessionRef: restoreRef, ...(fresh ? { freshProviderSessionOnRestore: true } : {}) };
+    if (fresh) return { restoreAcpSessionRef: restoreRef, freshProviderSessionOnRestore: true };
+    return { restoreAcpSessionRef: restoreRef, ...(continuedSession(this.assignment.source) ? { freshSessionWhenRestoreLost: true } : {}) };
+  }
+
+  /** Says plainly when a restore asked for the agent's transcript and got a new session instead. */
+  private logRestoreOutcome(request: RunnerSessionInput, created: RunnerSessionCreated): void {
+    if (!request.restoreAcpSessionRef || request.freshProviderSessionOnRestore || created.resumed) return;
+    this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, stage: "acp_session_bootstrap",
+      outcome: "restore_lost_fresh_session", diagnostic: "agent_session_lost" },
+    "the agent could not reopen its earlier conversation; this turn runs in a new session");
   }
 
   /** A person's direct session keeps the agent's own title behind "[konteks] "; engineering work is named from Core's label. */
@@ -897,9 +911,24 @@ export class RelayedSession {
       this.counters.malformedResponses += 1;
       return null;
     }
-    if (body.params.update.sessionUpdate === "agent_thought_chunk") return null;
+    if (body.params.update.sessionUpdate === "agent_thought_chunk") return this.thinkingSignal(body);
+    this.thinking = false;
     if (canonicalIdentity) this.rememberToolIdentity(canonicalIdentity);
     return this.redactedUpdate(body, canonicalIdentity);
+  }
+
+  /**
+   * The agent's reasoning stays on this computer. A person's direct session
+   * still needs to see that the agent is thinking: Claude Code reasoned for
+   * 4 min 42 s before its first word while the page said only "Working"
+   * (10-09). The first thought of each stretch goes out as a content-free
+   * signal ("…"); the page shows "Thinking", never the text.
+   */
+  private thinkingSignal(body: SessionToCoreMessage): SessionToCoreMessage | null {
+    if (this.thinking || !isDirectAssignment(this.assignment)) return null;
+    this.thinking = true;
+    const update = (body as { params: { update: Record<string, unknown> } }).params.update;
+    return { ...body, params: { ...(body as { params: object }).params, update: { ...update, content: { type: "text", text: "…" } } } } as SessionToCoreMessage;
   }
 
   private rememberToolIdentity({ toolCallId, identity, terminal }: CanonicalIdentity): void {

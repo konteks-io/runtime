@@ -35,6 +35,7 @@ describe("native host inventory", () => {
       "agent:codex",
       "execution-permits-v1",
       "direct-model-fallback.v1",
+      "direct-turn-renewal-v1",
       'delivery-execution-permits-v1',
       'delivery-turn-renewal-v1',
       "session-label-v1",
@@ -81,7 +82,7 @@ describe("native host inventory", () => {
   it("advertises permit admission only while a live owner and ready agent exist", async () => {
     let owned = true;
     const f = fixture(() => owned);
-    expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(["agent:codex", "execution-permits-v1", "direct-model-fallback.v1",
+    expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(["agent:codex", "execution-permits-v1", "direct-model-fallback.v1", "direct-turn-renewal-v1",
       "session-label-v1", "core-contract-version-v1",
     ]);
     owned = false;
