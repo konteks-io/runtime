@@ -85,6 +85,32 @@ describe("integration work kind", () => {
     expect(journal.assignments.get("asg-int:1")?.state).toBe("running");
   });
 
+  it("hands a claimed read off the claim lane, so one slow read never holds the next claim", async () => {
+    let finish!: () => void;
+    const carrier = {
+      execute: vi.fn(() => new Promise<{ structuredOutput: unknown }>(resolve => { finish = () => resolve({ structuredOutput: { schemaVersion: 1 } }); })),
+      onRunnerEvent: vi.fn(async () => undefined),
+    };
+    const { work, journal } = await orchestrator({ integrationCarrier: carrier });
+    const entry = { assignmentId: integration.id, attempt: 1, claimId: "claim-1", kind: "integration" as const, placementId: "pl", workspaceId: "ws-1", agentId: "codex",
+      state: "claimed" as const, recoveryEpoch: 0, reports: { nextSequence: 1, durableWatermark: 0 }, evidenceUpload: "structured_only" as const,
+      expiresAt: integration.expiresAt, latestResumeAt: integration.policy.latestResumeAt, updatedAt: clock.nowIso() };
+    await journal.assignments.put(entry);
+    const submit = vi.spyOn(work.reports, "submit").mockResolvedValue(undefined as never);
+    const internals = work as unknown as {
+      dispatchClaimed(claimed: { key: string; assignment: RemoteWorkAssignment; entry: typeof entry; assertAuthority: () => void }): Promise<void>;
+      dispatching: Map<string, Promise<void>>;
+    };
+    await internals.dispatchClaimed({ key: "asg-int:1", assignment: integration, entry, assertAuthority: () => undefined });
+    // The claim handler returned while the read still runs, and the read stays owned.
+    await vi.waitFor(() => expect(carrier.execute).toHaveBeenCalledOnce());
+    expect(submit).not.toHaveBeenCalled();
+    expect(internals.dispatching.has("asg-int:1")).toBe(true);
+    finish();
+    await vi.waitFor(() => expect(submit).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(internals.dispatching.has("asg-int:1")).toBe(false));
+  });
+
   it("passes runner events to the carrier so its own ACP session hears them", async () => {
     const carrier = { execute: vi.fn(), onRunnerEvent: vi.fn(async () => undefined) };
     const { work } = await orchestrator({ integrationCarrier: carrier });
