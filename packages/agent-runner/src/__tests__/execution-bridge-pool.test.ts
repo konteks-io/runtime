@@ -390,6 +390,40 @@ it("drops the last offered models when a refresh is definitely refused", async (
   expect(f.runtime.readiness().readiness).toBe("ready");
 });
 
+it("waits for a background identity read before it reports stopped", async () => {
+  let now = Date.parse("2026-10-02T00:00:00Z");
+  let fail: Error | false = false;
+  let answer!: () => void;
+  let reads = 0;
+  const f = await fixture({ now: () => new Date(now), modelCapabilityTtlMs: 60_000, newSessionFails: () => fail,
+    probe: async () => {
+      reads += 1;
+      if (reads > 1) await new Promise<void>(resolve => { answer = resolve; });
+      return { kind: "signal" as const, fingerprint: "opaque-identity-fingerprint" };
+    } });
+  await f.runtime.probe(false);
+  await f.runtime.discoverModelCapability("model");
+  now += 90_000;
+  fail = new RequestError(-32602, "Invalid params");
+  await f.runtime.discoverModelCapability("model");
+  // The refused refresh reads the identity again, in the background.
+  await vi.waitFor(() => expect(answer).toBeTypeOf("function"));
+  const write = vi.spyOn(AgentScopeStore.prototype, "write");
+  try {
+    let stopped = false;
+    const stopping = f.runtime.stop().then(() => { stopped = true; });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(stopped).toBe(false);
+    answer();
+    await stopping;
+    // Its scope write landed before the stop finished, never after.
+    expect(write).toHaveBeenCalledTimes(1);
+  } finally {
+    // A later test wraps the real write; a spy left here would wrap itself.
+    write.mockRestore();
+  }
+});
+
 it("drops the last offered models when a refresh says the agent needs signing in", async () => {
   let now = Date.parse("2026-10-02T00:00:00Z");
   let fail: Error | false = false;

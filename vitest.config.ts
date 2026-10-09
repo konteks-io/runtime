@@ -14,6 +14,9 @@ export default defineConfig({
       {
         test: {
           name: "unit",
+          // A project does not inherit the root's test options: without this,
+          // unit tests ran at Vitest's 5 s default and timed out on busy runners.
+          testTimeout: 10_000,
           include: ["packages/*/src/**/*.test.ts"],
           exclude: ["packages/*/src/__characterization__/**"],
         },
