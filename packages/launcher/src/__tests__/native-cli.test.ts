@@ -11,6 +11,12 @@ function fixture() {
 }
 
 describe("native customer entry point", () => {
+  it.each([["skills", "sync", "--json"], ["--json", "skills", "sync"]])("routes Skills synchronization with JSON output: %j", async (...argv) => {
+    const { program, actions } = fixture();
+    await program.parseAsync(argv, { from: "user" });
+    expect(actions.control).toHaveBeenCalledWith(expect.objectContaining({ operation: "skills.sync" }));
+    expect(program.opts().json).toBe(true);
+  });
   it.each([{ argv: ["skills", "list", "--json"] }, { argv: ["--json", "skills", "list"] }])("routes Skills listing with JSON output: %j", async ({ argv }) => {
     const { program, actions } = fixture();
     await program.parseAsync(argv, { from: "user" });

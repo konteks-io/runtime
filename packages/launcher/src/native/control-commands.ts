@@ -46,6 +46,18 @@ export async function listSkills(context: ControlContext): Promise<void> {
   for (const skill of value.skills) context.output.line(`${skill.name}  ${skill.version}  ${skill.skillId}`);
 }
 
+const SkillSyncSchema = z.object({ complete: z.boolean(), loaded: z.literal("unknown"),
+  skills: z.array(RuntimeSkillSyncItemSchema), profiles: z.array(z.object({ home: z.string(), paths: z.array(z.string()),
+    status: z.enum(["installed", "failed"]), reason: z.string().optional(), agentId: z.string().optional() }).strict()) }).strict();
+export async function syncSkills(context: ControlContext): Promise<void> {
+  const value = await context.control.call({ op: "skills.sync" }, SkillSyncSchema, { timeoutMs: 95_000 });
+  context.output.result(value);
+  const id = outputLocale(context.output) === "id";
+  context.output.line(id ? "Status pemuatan Skill belum terverifikasi." : "Skill load status is not yet verified.");
+  for (const profile of value.profiles) context.output.line(`${profile.agentId ?? profile.home}: ${profile.status}${profile.reason ? ` (${profile.reason})` : ""}`);
+  if (!value.complete) throw new AlreadyToldError("capability_unavailable", id ? "Sinkronisasi Skill selesai sebagian." : "Skill synchronization partially failed.");
+}
+
 export async function status(context: ControlContext): Promise<void> {
   const value = await context.control.call({ op: "status" }, SupervisorStatusSchema);
   // A connector from before `update.channel` refuses the op: the line is simply left out.

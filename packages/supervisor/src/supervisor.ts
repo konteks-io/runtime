@@ -1,3 +1,5 @@
+import { refreshMachineSkills, machineSkillHomes, MachineSkillPartialFailure, type MachineSkillInventory } from "./native/skill-refresh.js";
+import { SkillSyncCoordinator } from "./skills/sync-coordinator.js";
 import { NativeSkillSyncClient } from "./native/skill-sync-client.js";
 import { ObservationDelivery } from "./control/observation-delivery.js";
 import { existsSync } from "node:fs";
@@ -219,6 +221,7 @@ export class Supervisor {
   /** The Core wire-contract version from the applied desired configuration (absent before one is applied). */
   private coreContractVersion: string | undefined;
   private skillSyncClient: NativeSkillSyncClient | undefined;
+  private skillSync: SkillSyncCoordinator<MachineSkillInventory> | undefined;
   /** Runs `integration` work; composed with the native runners. */
   private integrationCarrier: IntegrationWorkCarrier | undefined;
   private roleBindings: RoleBinding[] = [];
@@ -2333,6 +2336,26 @@ export class Supervisor {
     return this.skillSyncClient;
   }
 
+  private async syncSkills() {
+    if (this.stopping || !this.options.native || !this.nativeOwnership || !this.reconciliation.isComplete) {
+      throw new RemoteInstanceError("capability_unavailable", "Skill sync is unavailable until runtime recovery completes.");
+    }
+    this.nativeOwnership.assertOwned();
+    const homes = machineSkillHomes(this.options.native.runners);
+    const unavailableAgentIds = this.options.native.runners.filter(runner => machineSkillHomes([runner]).length === 0).map(runner => runner.RUNNER_AGENT_ID);
+    this.skillSync ??= new SkillSyncCoordinator(signal => refreshMachineSkills({
+      client: this.machineSkillSyncClient(), homes, unavailableAgentIds,
+      scratchRoot: join(this.config.SUPERVISOR_DATA_DIR, "machine-skills"),
+      owner: { workspaceId: this.workspaceId ?? "", instanceId: this.instanceId ?? "" },
+      now: () => this.clock.coreNow(),
+    }, signal));
+    try { return { ...await this.skillSync.sync(), complete: true, loaded: "unknown" as const }; }
+    catch (error) {
+      if (error instanceof MachineSkillPartialFailure) return { ...error.inventory, complete: false, loaded: "unknown" as const };
+      throw error;
+    }
+  }
+
   private async listSkills() {
     if (this.stopping || !this.options.native || !this.nativeOwnership || !this.reconciliation.isComplete) {
       throw new RemoteInstanceError("capability_unavailable", "Skill inventory is unavailable until runtime recovery completes.");
@@ -2353,6 +2376,7 @@ export class Supervisor {
     return {
       status: () => this.status(),
       "skills.list": () => this.listSkills(),
+      "skills.sync": () => this.syncSkills(),
       agents: () => {
         const agents = this.lastSnapshot?.agents ?? this.inventory.agents();
         return { agents: [...agents, ...this.leftOutAgents(agents)], roles: this.heartbeat?.roles() ?? [], roleBindings: this.roleBindings };
@@ -3005,6 +3029,7 @@ export class Supervisor {
   stop(): Promise<void> {
     this.leaseAuthorityEpoch++;
     this.stopping = true;
+    this.skillSync?.stop();
     // Before anything that can outlast the daemon's exit watchdog.
     this.nativeCodexOwner?.shutdownRequested();
     this.draining = true;

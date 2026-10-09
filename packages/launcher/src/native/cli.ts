@@ -29,7 +29,7 @@ export interface NativeCliActions {
   stop(input: NativeCommandContext): Promise<void>;
   update(input: NativeCommandContext & { check: boolean; unattended: boolean }): Promise<void>;
   uninstall(input: NativeCommandContext): Promise<void>;
-  control(input: NativeCommandContext & { operation: "skills.list" | "status" | "agents" | "doctor" | "support" | "preview.status" | "auth.status" | "auth.login" | "auth.logout" | "git.key.add" | "git.key.list" | "git.key.remove"; agent?: string; organization?: boolean; provider?: string; method?: string; reuse?: boolean; project?: string; location?: string; title?: string; keyRef?: string }): Promise<void>;
+  control(input: NativeCommandContext & { operation: "skills.sync" | "skills.list" | "status" | "agents" | "doctor" | "support" | "preview.status" | "auth.status" | "auth.login" | "auth.logout" | "git.key.add" | "git.key.list" | "git.key.remove"; agent?: string; organization?: boolean; provider?: string; method?: string; reuse?: boolean; project?: string; location?: string; title?: string; keyRef?: string }): Promise<void>;
 }
 
 /** One customer architecture: the native connector. No provider-key or cloud-agent fallback switch. */
@@ -130,6 +130,8 @@ export function createNativeProgram(actions: NativeCliActions): Command {
   const skills = program.command("skills").description("Skills authorized for this runtime");
   skills.command("list").description("list authorized Skills; installation and load status are reported separately")
     .action(async () => actions.control({ ...context(), operation: "skills.list" }));
+  skills.command("sync").description("synchronize authorized Skills into configured agent profiles")
+    .action(async () => actions.control({ ...context(), operation: "skills.sync" }));
   const preview = program.command("preview").description("live previews of sessions' work, served from this computer");
   preview.command("status").description("list this computer's session previews and why any of them stopped")
     .action(async () => actions.control({ ...context(), operation: "preview.status" }));
