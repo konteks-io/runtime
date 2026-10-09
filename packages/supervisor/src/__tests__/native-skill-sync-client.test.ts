@@ -1,7 +1,7 @@
 import { expect, it, vi } from "vitest";
 import { createHash, sign } from "node:crypto";
 import { generateEd25519 } from "@konteks/remote-common";
-import { computeRemoteFileTreeDigest, computeRuntimeSkillSyncCatalogDigest, runtimeSkillSyncSigningBytes, runtimeSkillSyncRequestSigningBytes } from "@konteks/backstage-plugin-common/remote-instance-internal";
+import { computeRemoteFileTreeDigest, computeRuntimeSkillSyncCatalogDigest, runtimeSkillSyncSigningBytes, runtimeSkillSyncRequestSigningBytes, localSkillExportSigningBytes } from "@konteks/backstage-plugin-common/remote-instance-internal";
 import { NativeSkillSyncClient, NativeSkillSyncTransportFailure } from "../native/skill-sync-client.js";
 function fixture() {
   const key = generateEd25519(); const now = Date.now();
@@ -101,4 +101,16 @@ it.each([undefined, "7.4", "invalid"])("does not contact unsupported Core %s", a
   const client = new NativeSkillSyncClient({ ...f.options, coreContractVersion: () => version });
   await expect(client.prepare()).rejects.toThrow("unavailable");
   expect(f.fetchFn).not.toHaveBeenCalled();
+});
+
+it("accepts only signed tenant-bound local export selections and refuses stale authority", async () => {
+  const f = fixture();
+  const body = { type: "runtime_skill_export", workspaceId: "tenant-a", instanceId: "machine-a", requestId: "export-a", localId: "a".repeat(64), treeDigest: `sha256:${"b".repeat(64)}`, issuedAt: f.body.issuedAt, expiresAt: f.body.expiresAt };
+  const request = { ...body, signature: sign(null, localSkillExportSigningBytes(body), f.key.privateKey).toString("base64url") };
+  f.fetchFn.mockImplementation(async () => new Response(JSON.stringify({ request }), { headers: { "content-type": "application/json" } }));
+  expect(await f.client.pendingLocalExport()).toEqual(request);
+  expect(() => new NativeSkillSyncClient({ ...f.options, identity: () => ({ workspaceId: "other", instanceId: "machine-a" }) }).assertLocalExport(request)).toThrow();
+  expect(() => new NativeSkillSyncClient({ ...f.options, now: () => NaN }).assertLocalExport(request)).toThrow();
+  expect(() => new NativeSkillSyncClient({ ...f.options, now: () => Date.parse(body.expiresAt) }).assertLocalExport(request)).toThrow();
+  expect(() => f.client.assertLocalExport({ ...request, localId: "c".repeat(64) })).toThrow();
 });

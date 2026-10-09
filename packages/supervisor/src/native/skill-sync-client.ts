@@ -1,3 +1,4 @@
+import { LocalSkillInventorySchema, LocalSkillExportDeliverySchema, LocalSkillExportResultSchema, type LocalSkillExportIntent } from "@konteks/backstage-plugin-common/remote-instance-internal";
 import { coreContractAtLeast } from "@konteks/remote-common";
 import {
   RuntimeSkillSyncEnvelopeSchema, RuntimeSkillSyncFileRequestSchema,
@@ -34,6 +35,29 @@ export class NativeSkillSyncClient {
     const envelope = RuntimeSkillSyncEnvelopeSchema.parse(value), identity = this.options.identity(), now = this.options.now();
     if (!Number.isFinite(now) || !this.verifier.verifyRuntimeSkillSync(envelope) || envelope.instanceId !== identity.instanceId || envelope.catalog.binding.workspaceId !== identity.workspaceId || Date.parse(envelope.issuedAt) > now + 1000 || Date.parse(envelope.expiresAt) <= now) throw unavailable();
     return envelope;
+  }
+  async reportLocalInventory(value: unknown, signal?: AbortSignal): Promise<void> {
+    await this.request('local-inventory', LocalSkillInventorySchema.parse(value), 1024, candidate => {
+      if (!candidate || typeof candidate !== 'object' || (candidate as { accepted?: unknown }).accepted !== true) throw unavailable();
+    }, signal);
+  }
+  async pendingLocalExport(signal?: AbortSignal): Promise<LocalSkillExportIntent | null> {
+    return this.request('export-request', {}, REMOTE_INPUT_METADATA_MAX_BYTES, value => {
+      const { request } = LocalSkillExportDeliverySchema.parse(value); if (!request) return null;
+      this.assertLocalExport(request); return request;
+    }, signal);
+  }
+  assertLocalExport(request: LocalSkillExportIntent): void {
+    const identity = this.options.identity(), now = this.options.now();
+    if (!Number.isFinite(now) || !this.verifier.verifyLocalSkillExport(request) || request.workspaceId !== identity.workspaceId || request.instanceId !== identity.instanceId || !this.options.credential() || Date.parse(request.issuedAt) > now + 1000 || Date.parse(request.expiresAt) <= now) throw unavailable();
+  }
+  async reportLocalExport(request: LocalSkillExportIntent, tree: RemoteFileTree | null, signal?: AbortSignal): Promise<void> {
+    this.assertLocalExport(request);
+    if (tree !== null && tree.treeDigest !== request.treeDigest) throw unavailable();
+    await this.request('export-result', LocalSkillExportResultSchema.parse({ requestId: request.requestId, tree }), 1024, candidate => {
+      this.assertLocalExport(request);
+      if (!candidate || typeof candidate !== 'object' || (candidate as { accepted?: unknown }).accepted !== true) throw unavailable();
+    }, signal);
   }
   async pendingRequest(signal?: AbortSignal): Promise<RuntimeSkillSyncRequest | null> {
     return this.request("request", {}, REMOTE_INPUT_METADATA_MAX_BYTES, value => {

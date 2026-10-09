@@ -176,8 +176,10 @@ it("advertises signed Skill sync only while its composed transport is ready", as
   const inventory = new NativeInventoryCollector({ runners: new Map(), sampler: { sample: async () => signals },
     bundleVersion: "1.0.0", skillSyncReady: () => ready });
   expect((await inventory.collect()).components[0]?.capabilities).not.toContain("runtime-skill-sync-v1");
+  expect((await inventory.collect()).components[0]?.capabilities).not.toContain("runtime-skill-promotion-v1");
   ready = true;
   expect((await inventory.collect()).components[0]?.capabilities).toContain("runtime-skill-sync-v1");
+  expect((await inventory.collect()).components[0]?.capabilities).toContain("runtime-skill-promotion-v1");
   ready = false;
   expect((await inventory.collect()).components[0]?.capabilities).not.toContain("runtime-skill-sync-v1");
 });

@@ -1,4 +1,4 @@
-import { REMOTE_RUNTIME_SKILL_SYNC_CAPABILITY } from "@konteks/backstage-plugin-common/remote-instance-internal";
+import { LOCAL_SKILL_PROMOTION_CAPABILITY, REMOTE_RUNTIME_SKILL_SYNC_CAPABILITY } from "@konteks/backstage-plugin-common/remote-instance-internal";
 import { z } from "zod";
 import { DELIVERY_TURN_RENEWAL_CAPABILITY } from "./delivery-turn-renewal.js";
 import { ConnectedAgentViewSchema, REMOTE_CORE_CONTRACT_CAPABILITY,
@@ -183,6 +183,7 @@ export class NativeInventoryCollector {
   private deliveryChannelCapabilities(): string[] {
     const readiness: Array<[string, (() => boolean) | undefined]> = [
       [REMOTE_RUNTIME_SKILL_SYNC_CAPABILITY, this.options.skillSyncReady],
+      [LOCAL_SKILL_PROMOTION_CAPABILITY, this.options.skillSyncReady],
       [REMOTE_CANCELLATION_DELIVERY_CAPABILITY, this.options.cancellationDeliveryReady],
       [REMOTE_AGENT_LOGIN_CAPABILITY, this.options.agentLoginReady],
       [REMOTE_AGENT_LOGIN_BROWSER_CAPABILITY, this.options.agentLoginBrowserReady],

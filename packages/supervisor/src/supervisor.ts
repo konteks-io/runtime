@@ -1,3 +1,4 @@
+import { exchangeLocalSkills } from "./native/local-skill-exchange.js";
 import { runRequestedSkillSync } from "./native/requested-skill-sync.js";
 import { refreshMachineSkills, machineSkillHomes, MachineSkillPartialFailure, type MachineSkillInventory } from "./native/skill-refresh.js";
 import { SkillSyncCoordinator } from "./skills/sync-coordinator.js";
@@ -2348,9 +2349,12 @@ export class Supervisor {
     this.nativeOwnership.assertOwned();
     const homes = machineSkillHomes(this.options.native.runners);
     const unavailableAgentIds = this.options.native.runners.filter(runner => machineSkillHomes([runner]).length === 0).map(runner => runner.RUNNER_AGENT_ID);
-    this.skillSync ??= new SkillSyncCoordinator(signal => {
+    this.skillSync ??= new SkillSyncCoordinator(async signal => {
       this.assertSkillSyncReady();
       const client = this.machineSkillSyncClient();
+      try { await exchangeLocalSkills({ client, homes, now: () => this.clock.coreNow(), assertReady: () => this.assertSkillSyncReady() }, signal); }
+      catch { this.logger.warn({ event: "skills.local_inventory_unavailable" }, "Runtime Skill inventory or signed export could not be delivered."); }
+      this.assertSkillSyncReady();
       return runRequestedSkillSync(client, () => refreshMachineSkills({
       client, homes, unavailableAgentIds,
       scratchRoot: join(this.config.SUPERVISOR_DATA_DIR, "machine-skills"),
