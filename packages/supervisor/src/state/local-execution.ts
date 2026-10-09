@@ -675,7 +675,7 @@ export class LocalExecutionJournal {
     assertCurrent(); this.assertAdmission(predecessor); this.assertAdmission(successor);
     if (predecessor.executionGeneration === successor.executionGeneration || predecessor.assignmentId === successor.assignmentId ||
         !allEqual([[predecessor.instanceId, successor.instanceId], [predecessor.workspaceId, successor.workspaceId], [predecessor.agentId, successor.agentId]]) ||
-        (predecessor.runnerIncarnation === successor.runnerIncarnation) !== sameIncarnation) throw conflict();
+        (predecessor.runnerIncarnation === successor.runnerIncarnation) !== sameIncarnation) throw conflict("transfer_admissions_unrelated");
     this.assertTransferStarts(value);
   }
 
@@ -690,15 +690,17 @@ export class LocalExecutionJournal {
   private assertTransferStarts(value: LiveContinuationTransfer): void {
     const predecessorStart = this.start(value.predecessor.assignmentId, value.predecessor.attempt);
     const successorStart = this.start(value.successor.assignmentId, value.successor.attempt);
-    if (!predecessorStart || !successorStart || !transferStartsMatch(predecessorStart, successorStart, value)) throw conflict();
+    if (!predecessorStart || !successorStart || !transferStartsMatch(predecessorStart, successorStart, value)) throw conflict("transfer_starts_mismatch");
     if (successorStart.delivery === "allocated") this.assertChosenClaimEffect(successorStart);
   }
 
   /** The predecessor is opened, completed and still owns the session reference, and the handoff is not before it. */
   private continuablePredecessor(before: LocalExecutionState | undefined, after: LocalExecutionState | undefined, value: LiveContinuationTransfer): SettledExecution {
     this.index();
-    if (!before || after || !continuableBefore(before, value) || this.references.get(value.acpSessionRef) !== value.predecessor.executionGeneration) throw conflict();
-    if (Date.parse(value.continuedAt) < Math.max(Date.parse(before.openedAt), Date.parse(before.completedTurnSettledAt), Date.parse(value.successor.openedAt))) throw conflict();
+    if (!before || after) throw conflict(before ? "transfer_successor_exists" : "transfer_predecessor_missing");
+    if (!continuableBefore(before, value)) throw conflict("transfer_predecessor_not_continuable");
+    if (this.references.get(value.acpSessionRef) !== value.predecessor.executionGeneration) throw conflict("transfer_reference_moved");
+    if (Date.parse(value.continuedAt) < Math.max(Date.parse(before.openedAt), Date.parse(before.completedTurnSettledAt), Date.parse(value.successor.openedAt))) throw conflict("transfer_before_completion");
     return before;
   }
 
@@ -852,7 +854,8 @@ function sameHarnessHead(
   return equal(stable(left), stable(right));
 }
 function bytes(value: LocalAdmissionStart): number { return Buffer.byteLength(canonicalize(value as JsonValue), "utf8"); }
-function conflict(): RemoteInstanceError { return new RemoteInstanceError("recovery_required", "Local execution history cannot prove this admission or absence.", { diagnostic: "local_execution_unprovable" }); }
+/** `diagnostic` names the exact check for the connector log; the generic one says only that history could not prove it. */
+function conflict(diagnostic = "local_execution_unprovable"): RemoteInstanceError { return new RemoteInstanceError("recovery_required", "Local execution history cannot prove this admission or absence.", { diagnostic }); }
 
 function logicalSessionId(assignment: RemoteWorkAssignment): string | undefined {
   return assignment.source.kind === "conversation" || assignment.source.kind === "direct_session"
