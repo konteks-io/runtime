@@ -212,6 +212,7 @@ describe("one OpenCode process per working copy", () => {
     expect(first.env.XDG_CONFIG_HOME).not.toBe(second.env.XDG_CONFIG_HOME);
     await first.release();
     await expect(lstat(first.env.XDG_CONFIG_HOME!)).rejects.toThrow();
+    await expect(first.beforePrompt()).rejects.toMatchObject({ code: "agent_unavailable" });
     expect(await readFile(join(second.env.XDG_CONFIG_HOME!, "opencode", "AGENTS.md"), "utf8")).toBe("rules");
     await second.beforePrompt();
     selectedRoots.length = 0;

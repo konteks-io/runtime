@@ -299,7 +299,7 @@ export async function bindOpenCodeWorkingCopy(credentialDir: string, workingCopy
   return {
     env,
     beforePrompt: () => serial(configHome, async () => {
-      if (released) return;
+      if (released) throw new RemoteInstanceError("agent_unavailable", "The OpenCode execution context has been released. Start a new execution context before retrying.");
       await openCodeSkillSources(skillRoots);
       await syncOpenCodeInstructions(configHome, workingCopy, deps);
     }),
