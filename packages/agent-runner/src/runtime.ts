@@ -895,6 +895,20 @@ export class AgentRuntime {
   }
 
   /**
+   * A recovery-stopped reference the supervisor is finished with (Core
+   * settled its turn, its exact process group is proven gone, and its session
+   * record was forgotten) returns its capacity slot: its process exited. The
+   * key stays, so the reference is never reused. Without this every forced
+   * stop held a slot until the connector restarted.
+   */
+  finalizeRecoveredExecution(ref: string): boolean {
+    const owner = this.executionBridges.get(ref);
+    if (!owner || owner.finalized || !owner.stopping || owner.live?.exited !== true) return false;
+    owner.finalized = true;
+    return true;
+  }
+
+  /**
    * Qualified finalization of an idle sealed release. The caller has proven
    * (`SessionManager.releaseSealed`) that the session was an idle, settled
    * completion with no turn, operation or pending request, and awaited the

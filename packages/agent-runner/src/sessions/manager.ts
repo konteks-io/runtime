@@ -58,6 +58,13 @@ interface CreateSessionArgs {
   acpSessionRef?: string;
   /** Restart recovery whose durable context was staged outside the provider transcript. */
   freshProviderSessionOnRestore?: boolean;
+  /**
+   * A person's turn: when the agent's own transcript cannot be reopened
+   * (`agent_session_lost`), open one new session for this turn instead of
+   * failing it. The files are on disk; only the agent's memory of the
+   * conversation is gone.
+   */
+  freshSessionWhenRestoreLost?: boolean;
   /** Display-only naming for the provider session list; never authority. */
   sessionLabel?: KonteksSessionLabel;
   /**
@@ -110,6 +117,8 @@ interface SessionRecord {
   continuationSealed: boolean;
   recoveryStopping: boolean;
   recoveryStop: Promise<void> | null;
+  /** The recovery stop (or completed close) has finished, whatever its outcome. */
+  recoveryStopSettled?: boolean;
   completedClose?: Promise<void>;
   assertCurrent?: () => void;
   /** Native turns started by a connector-sent prompt (bounded, oldest evicted). */
@@ -464,9 +473,18 @@ export class SessionManager {
   }
 
   private reserveBridgeId(bridgeId: string, reserved: { bridgeId: string | null }): void {
-    if (this.byBridgeId.has(bridgeId) || this.creatingBridgeIds.has(bridgeId)) throw new RemoteInstanceError("recovery_required", "bridge session already has a live or uncertain local owner");
+    const owner = this.byBridgeId.get(bridgeId);
+    if (owner || this.creatingBridgeIds.has(bridgeId)) throw this.bridgeSessionOwned(owner);
     this.creatingBridgeIds.add(bridgeId);
     reserved.bridgeId = bridgeId;
+  }
+
+  /** Which earlier local owner still holds the agent's session, logged; the refusal to throw. */
+  private bridgeSessionOwned(owner: SessionRecord | undefined): RemoteInstanceError {
+    const ownerState = !owner ? "creating" : owner.recoveryStopping ? "recovery_fenced" : "live";
+    this.logger.warn({ diagnostic: "bridge_session_owned", ownerState, ...(owner ? { ownerBridgeExited: owner.bridge.exited, agentId: owner.context.agentId } : {}) },
+      "the agent's session is still held by an earlier local owner");
+    return new RemoteInstanceError("recovery_required", `bridge session already has a ${ownerState} local owner`, { diagnostic: "bridge_session_owned" });
   }
 
   /**
@@ -528,7 +546,7 @@ export class SessionManager {
     // same-process continuation still uses continueLive below.
     const loadProviderHistory = loadFromRef !== undefined && args.freshProviderSessionOnRestore !== true;
     const opened = loadProviderHistory
-      ? await this.loadPriorSession(args, bridge, loadFromRef, capabilities.sessionResume, reserveBridgeId, bootstrapAttempt)
+      ? await this.loadPriorOrFresh(args, bridge, acpSessionRef, loadFromRef, capabilities.sessionResume, reserveBridgeId, bootstrapAttempt)
       : await this.newBridgeSession(args, bridge, acpSessionRef, reserveBridgeId, bootstrapAttempt);
     const record = await this.ownCreatedSession(args, acpSessionRef, bridge, opened);
     // An agent that drifted from what Konteks governs (Antigravity: no model
@@ -541,6 +559,23 @@ export class SessionManager {
     return { acpSessionRef, resumed: opened.resumed, capabilities,
       ...(modelSelection ? { modelSelection } : {}),
     };
+  }
+
+  /**
+   * The prior provider session; for a person's turn whose transcript is lost
+   * (no mapping, or the agent refuses the load), one new session on the same
+   * process and reference instead, so the turn is answered.
+   */
+  private async loadPriorOrFresh(args: CreateSessionArgs, bridge: BridgeProcess, acpSessionRef: string, loadFromRef: string, sessionResume: boolean, reserveBridgeId: (id: string) => void, bootstrapAttempt: number): Promise<OpenedSession> {
+    try {
+      return await this.loadPriorSession(args, bridge, loadFromRef, sessionResume, reserveBridgeId, bootstrapAttempt);
+    } catch (error) {
+      if (args.freshSessionWhenRestoreLost !== true || !isSessionLostError(error) || bridge.exited) throw error;
+      this.logger.warn({ ...contextLog(args), bootstrapAttempt, diagnostic: "agent_session_lost", outcome: "fresh_session" },
+        "the agent could not reopen its earlier conversation; this turn starts a new session");
+      args.lifecycle?.assertCurrent();
+      return this.newBridgeSession(args, bridge, acpSessionRef, reserveBridgeId, bootstrapAttempt);
+    }
   }
 
   /** The prior provider session, resumed (or loaded) with this assignment's tools: identity is kept, tool authority is not. */
@@ -928,6 +963,7 @@ export class SessionManager {
     const record = this.require(acpSessionRef);
     record.recoveryStopping = true;
     record.completedClose = this.settleCompleted(record);
+    markStopSettled(record, record.completedClose);
     return record.completedClose;
   }
 
@@ -1019,7 +1055,31 @@ export class SessionManager {
         // failed supervisor journal write can retry without reopening work.
       } finally { if (timer) clearTimeout(timer); }
     })();
+    markStopSettled(record, record.recoveryStop);
     return record.recoveryStop;
+  }
+
+  /**
+   * Drop a recovery-stopped owner whose process has exited, once the
+   * supervisor has proven the rest (Core settled the turn, the exact
+   * process group is gone). Until then the record deliberately holds the
+   * agent's own session id, so a later restore of that same conversation was
+   * refused (`bridge_session_owned`) until the connector restarted. The
+   * reference itself is never reused: a restore opens a new one. Anything
+   * else (a live owner, a stop still running, a process still up) is refused
+   * before anything changes; an unknown reference has nothing to forget.
+   */
+  forgetRecovered(acpSessionRef: string): void {
+    const record = this.sessions.get(acpSessionRef);
+    if (!record) return;
+    if (!record.recoveryStopping || record.recoveryStopSettled !== true || !record.bridge.exited) {
+      throw new RemoteInstanceError("recovery_required", "Only a recovery-stopped session whose process exited can be forgotten.", { diagnostic: "forget_not_recovered" });
+    }
+    for (const pending of record.pendingClientRequests.values()) pending.reject(new Error("session recovered"));
+    this.sessions.delete(acpSessionRef);
+    if (this.byBridgeId.get(record.bridgeSessionId) === record) this.byBridgeId.delete(record.bridgeSessionId);
+    this.logger.info({ agentId: record.context.agentId, assignmentId: record.context.assignmentId, attempt: record.context.attempt, outcome: "forgotten" },
+      "a recovery-stopped session was released; its conversation may be restored under a new reference");
   }
 
   /** Cancel the turn and settle this session's ACP operations, then close it on the agent when it can. */
@@ -1498,6 +1558,17 @@ function isRetryableBootstrapDeadline(error: unknown): boolean {
 
 function contextLog(args: CreateSessionArgs): { assignmentId: string; attempt: number; agentId: string } {
   return { assignmentId: args.context.assignmentId, attempt: args.context.attempt, agentId: args.context.agentId };
+}
+
+/** Records when a recovery stop or completed close finishes, whatever its outcome. */
+function markStopSettled(record: SessionRecord, stop: Promise<void>): void {
+  const settled = () => { record.recoveryStopSettled = true; };
+  void stop.then(settled, settled);
+}
+
+/** The agent's own transcript cannot be reopened here (no mapping, or the agent refused the load). */
+function isSessionLostError(error: unknown): boolean {
+  return error instanceof RemoteInstanceError && error.diagnostic === "agent_session_lost";
 }
 
 /** Fence the record for recovery (its ownership is retained); returns `error` for a throw. */

@@ -351,8 +351,9 @@ export class RelayedSession {
     // The browser is a stdio server the runner adds; OpenCode's Code Mode
     // gate and its tools line need its name too.
     this.sessionServers = new Set([...mcpServers.map(server => server.name), ...(browser ? [BROWSER_MCP_SERVER_NAME] : [])]);
-    const created = await this.bootstrapStage("acp_session_bootstrap", () => this.deps.runner.createSession(
-      this.sessionRequest(prepared.cwd, mcpServers, references, browser), lifecycle));
+    const request = this.sessionRequest(prepared.cwd, mcpServers, references, browser);
+    const created = await this.bootstrapStage("acp_session_bootstrap", () => this.deps.runner.createSession(request, lifecycle));
+    this.logRestoreOutcome(request, created);
     await this.adoptCreated(created, lifecycle !== undefined, reserved);
     const readyProjection = await this.registerReadiness(created);
     await this.announceReady(created, readyProjection);
@@ -639,12 +640,23 @@ export class RelayedSession {
 
   /**
    * A conversation's context is Konteks's to restage; a direct session's is
-   * only the agent's own transcript, so that one is loaded.
+   * only the agent's own transcript, so that one is loaded. A person's turn
+   * whose transcript cannot be reopened gets a new session rather than a
+   * refusal that every later message would repeat.
    */
   private restoreOptions(restoreRef: string | undefined): Partial<RunnerSessionInput> {
     if (!restoreRef) return {};
     const fresh = this.assignment.source.kind === "conversation" && this.assignment.agentRoute.agentId === "claude-code";
-    return { restoreAcpSessionRef: restoreRef, ...(fresh ? { freshProviderSessionOnRestore: true } : {}) };
+    if (fresh) return { restoreAcpSessionRef: restoreRef, freshProviderSessionOnRestore: true };
+    return { restoreAcpSessionRef: restoreRef, ...(continuedSession(this.assignment.source) ? { freshSessionWhenRestoreLost: true } : {}) };
+  }
+
+  /** Says plainly when a restore asked for the agent's transcript and got a new session instead. */
+  private logRestoreOutcome(request: RunnerSessionInput, created: RunnerSessionCreated): void {
+    if (!request.restoreAcpSessionRef || request.freshProviderSessionOnRestore || created.resumed) return;
+    this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, stage: "acp_session_bootstrap",
+      outcome: "restore_lost_fresh_session", diagnostic: "agent_session_lost" },
+    "the agent could not reopen its earlier conversation; this turn runs in a new session");
   }
 
   /** A person's direct session keeps the agent's own title behind "[konteks] "; engineering work is named from Core's label. */
