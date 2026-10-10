@@ -149,9 +149,18 @@ describe("channel mux", () => {
 
   it("group-commits a burst: one write covers every frame queued behind the last, none is emitted before a write holds it, and a restart replays them all", async () => {
     const dir = await mkdtemp(join(tmpdir(), "kr-relay-burst-"));
+    // Every write into dir, so cleanup waits for the last one: the final send
+    // below starts a save nobody awaits, and removing dir under it failed
+    // CI and the v0.12.14 release with ENOTEMPTY.
+    const saves: Promise<unknown>[] = [];
     try {
       const store = new SupervisorStore(dir);
       await store.init();
+      const save = (state: Parameters<SupervisorStore["saveRelayState"]>[0]) => {
+        const written = store.saveRelayState(state);
+        saves.push(written);
+        return written;
+      };
       let writes = 0, gate: PromiseWithResolvers<void> | null = null;
       const durable = new Set<number>();
       const early: number[] = [];
@@ -161,7 +170,7 @@ describe("channel mux", () => {
         persistRelayState: async state => {
           writes += 1;
           if (gate) await gate.promise;
-          await store.saveRelayState(state);
+          await save(state);
           for (const entry of state.outbound.s ?? []) durable.add(entry.frame.seq);
         },
         emit: envelope => {
@@ -190,13 +199,14 @@ describe("channel mux", () => {
       expect(early).toEqual([]);
       expect(emittedSeqs).toEqual(Array.from({ length: burst }, (_, index) => index + 1));
 
-      const restarted = buildMux({ replayBufferBytes: 1_000_000, persistRelayState: state => store.saveRelayState(state) });
+      const restarted = buildMux({ replayBufferBytes: 1_000_000, persistRelayState: state => save(state) });
       restarted.mux.restoreDurableState((await new SupervisorStore(dir).relayState())!, () => "session");
       await restarted.mux.applyHandshake({ connectionEpoch: 2, resume: { s: { to_core: 0, to_runtime: 0 } }, reset: [] });
       expect(restarted.emitted.map(frame => [(frame as ToCoreRelayFrame).seq, (frame as ToCoreRelayFrame).connectionEpoch]))
         .toEqual(Array.from({ length: burst }, (_, index) => [index + 1, 2]));
       expect(restarted.mux.send("s", "session", { kind: "session_closed", assignmentId: "next", reason: "completed" })).toBe(burst + 1);
     } finally {
+      for (let settled = 0; settled < saves.length; settled = saves.length) await Promise.allSettled(saves.slice(settled));
       await rm(dir, { recursive: true, force: true });
     }
   });
