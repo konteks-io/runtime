@@ -192,7 +192,10 @@ session's working copy. It calls `preview_start` (with `preview_status` and
   log lines.
 
 People open the preview from the session in Konteks; the relay carries it to
-this computer, which forwards it only to that session's port. When a viewer
+this computer, which forwards it only to that session's port. The app keeps
+its own sign-in: its cookies and `Authorization` reach it, and its
+`set-cookie` reaches the viewer's browser for the preview's host only. Konteks's
+own `konteks_` cookies never reach the app, and the app cannot set them. When a viewer
 opens a preview and nothing runs, the connector starts it itself, if the
 session's worktree is still here. When it cannot start (nothing to serve, a
 failed install, an app that exits), the viewer gets a 503 that starts with

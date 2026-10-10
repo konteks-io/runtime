@@ -3,6 +3,7 @@ import { WebSocket as NodeWebSocket } from "ws";
 import {
   PREVIEW_LIMITS,
   createLogger,
+  previewAppSetCookies,
   rewritePreviewLocation,
   sanitizePreviewHeaders,
   validatePreviewHeaders,
@@ -23,6 +24,11 @@ import {
  * the process manager and must be a loopback address. It never follows a
  * redirect, validates what arrives (receiver mode) and sanitizes what it
  * emits (sender mode), and caps bodies, frames, streams and idle time.
+ *
+ * The app's own session passes (D46): Core sends its `cookie` (never a
+ * Konteks cookie, which is refused here too) and `authorization`, and the
+ * app's `set-cookie` goes back as `setCookie`, host-only and never naming a
+ * Konteks cookie, to a Core that accepts it.
  */
 export interface PreviewForwarderOptions {
   /** The running preview's loopback origin (`http://127.0.0.1:<port>`), or null when none runs. */
@@ -37,7 +43,13 @@ export interface PreviewForwarderOptions {
   waitForCapacity?: () => Promise<boolean>;
   /** Viewer traffic keeps the preview from being stopped as idle. */
   onActivity?: () => void;
-  createWebSocket?: (url: string, protocols: string[] | undefined) => NodeWebSocket;
+  /**
+   * Whether Core takes a response's `setCookie` (its contract is at least
+   * `REMOTE_PREVIEW_APP_CREDENTIALS_MIN_CORE_CONTRACT_VERSION`). Absent or
+   * false, the app's `set-cookie` is dropped: an older Core refuses the chunk.
+   */
+  forwardSetCookies?: () => boolean;
+  createWebSocket?: (url: string, protocols: string[] | undefined, headers: Record<string, string>) => NodeWebSocket;
   requestFn?: typeof httpRequest;
   logger?: Logger;
   now?: () => number;
@@ -263,7 +275,12 @@ export class PreviewForwarder {
     const status = response.statusCode ?? 502;
     const headers = this.responseHeaders(streamId, response, status, origin);
     if (headers === null) return;
-    await this.relayBody(streamId, stream, response, new ResponseSink(this.options.send, streamId, status, headers));
+    await this.relayBody(streamId, stream, response, new ResponseSink(this.options.send, streamId, status, headers, this.appSetCookies(response)));
+  }
+
+  /** The app's own `set-cookie` values for a Core that takes them (D46); none otherwise. */
+  private appSetCookies(response: IncomingMessage): string[] {
+    return this.options.forwardSetCookies?.() === true ? previewAppSetCookies(response.headers["set-cookie"]) : [];
   }
 
   /** Sends the buffered request to the preview; null when it could not be sent or was cancelled meanwhile. */
@@ -376,7 +393,7 @@ export class PreviewForwarder {
     const target = `${origin.replace(/^http/, "ws")}${path}`;
     let socket: NodeWebSocket;
     try {
-      socket = (this.options.createWebSocket ?? ((url, subprotocols) => new NodeWebSocket(url, subprotocols, { perMessageDeflate: false, followRedirects: false, maxPayload: this.limits.maxWsFrameBytes })))(target, protocols);
+      socket = (this.options.createWebSocket ?? ((url, subprotocols, appHeaders) => new NodeWebSocket(url, subprotocols, { headers: appHeaders, perMessageDeflate: false, followRedirects: false, maxPayload: this.limits.maxWsFrameBytes })))(target, protocols, appCredentials(headers));
     } catch {
       this.counters.upstreamFailures += 1;
       return this.reply(streamId, 502, "The preview dev server refused the WebSocket.");
@@ -517,6 +534,14 @@ function plainLoopbackUrl(url: URL): boolean {
   return url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname) && url.port !== "" && url.pathname === "/" && !url.username && !url.password;
 }
 
+/** The app's own `cookie` and `authorization`, for a WebSocket the app may authenticate. */
+function appCredentials(headers: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (headers.cookie !== undefined) out.cookie = headers.cookie;
+  if (headers.authorization !== undefined) out.authorization = headers.authorization;
+  return out;
+}
+
 function outgoingHeaders(stream: HttpStream, url: URL, body: Buffer | undefined): Record<string, string> {
   const outgoing: Record<string, string> = { ...stream.headers, host: url.host };
   if (body) outgoing["content-length"] = String(body.byteLength);
@@ -556,10 +581,12 @@ class ResponseSink {
     private readonly streamId: string,
     private readonly status: number,
     private readonly headers: Record<string, string>,
+    private readonly setCookie: string[] = [],
   ) {}
 
   emit(piece: string | undefined, final: boolean): void {
-    this.send({ streamId: this.streamId, kind: "response", status: this.status, headers: (this.headSent ? {} : this.headers) as never, ...(piece === undefined ? {} : { body: piece }), final });
+    const head = !this.headSent && this.setCookie.length > 0 ? { setCookie: this.setCookie } : {};
+    this.send({ streamId: this.streamId, kind: "response", status: this.status, headers: (this.headSent ? {} : this.headers) as never, ...head, ...(piece === undefined ? {} : { body: piece }), final });
     this.headSent = true;
   }
 }

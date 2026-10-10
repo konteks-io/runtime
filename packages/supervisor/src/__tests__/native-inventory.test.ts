@@ -65,7 +65,7 @@ describe("native host inventory", () => {
     const readiness = vi.fn(async () => ({ agent, utilization: { activeSessions: 0, activeTurns: 0 } }));
     const inventory = new NativeInventoryCollector({ runners: new Map([["codex", { readiness }]]), sampler: { sample: async () => signals }, bundleVersion: "1.0.0", previewReady: () => relay });
     const snapshot = await inventory.collect();
-    expect(snapshot.components[0]).toMatchObject({ kind: "agent_runner", capabilities: ["agent:codex", "session-label-v1", "core-contract-version-v1", "preview.dev_server"] });
+    expect(snapshot.components[0]).toMatchObject({ kind: "agent_runner", capabilities: ["agent:codex", "session-label-v1", "core-contract-version-v1", "preview.dev_server", "preview.app_credentials"] });
     expect(advertisesPreview(snapshot.components)).toBe(true);
     relay = false;
     expect(advertisesPreview((await inventory.collect()).components)).toBe(false);
