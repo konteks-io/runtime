@@ -6,6 +6,7 @@ import {
   chunkOptions,
   contractIssue,
   nextTrail,
+  omitPrivateAcpToolPayload,
   redactActivity,
   redactSessionMessage,
   type ChunkTrail,
@@ -113,6 +114,43 @@ describe("streamed activity redaction", () => {
       kind: "other",
       status: "pending",
     }, "claude-code")).not.toHaveProperty("name");
+  });
+
+  it.each([
+    ["bash", { command: "python -m pytest -q" }, "python -m pytest -q", "execute"],
+    ["edit", { file_path: "/Users/me/work/temps.py", old_string: "a", new_string: "b" }, "Edit temps.py", "edit"],
+    ["write", { file_path: "tests/test_temps.py", content: "x" }, "Write tests/test_temps.py", "edit"],
+    ["read", { file_path: "/Users/me/work/README.md" }, "Read README.md", "read"],
+    ["grep", { pattern: "def celsius", path: "." }, "Search for def celsius", "search"],
+    ["glob", { pattern: "**/*.py" }, "Find **/*.py", "search"],
+    ["web_search", { queries: ["kelvin formula"] }, "Search the web for kelvin formula", "fetch"],
+  ] as const)("names a DeepSeek Harness %s step by what it touches", (tool, rawInput, title, kind) => {
+    const canonical = canonicalizeAcpToolActivity({
+      sessionUpdate: "tool_call", toolCallId: `dsh-${tool}`, title: tool, kind: "other", status: "in_progress", rawInput,
+    }, "dsh");
+
+    expect(redactActivity(omitPrivateAcpToolPayload(canonical), "/Users/me/work")).toEqual({
+      sessionUpdate: "tool_call", toolCallId: `dsh-${tool}`, title, kind, status: "in_progress",
+    });
+    // Its end carries no title, so the page keeps the one above.
+    expect(canonicalizeAcpToolActivity({ sessionUpdate: "tool_call_update", toolCallId: `dsh-${tool}`, status: "failed" }, "dsh", { kind, title }))
+      .toEqual({ sessionUpdate: "tool_call_update", toolCallId: `dsh-${tool}`, status: "failed", kind });
+  });
+
+  it("shows a command's paths by their last part instead of a mask, but never a home folder", () => {
+    const titled = (title: string) => redactActivity(boundPublicToolTitle({ sessionUpdate: "tool_call", toolCallId: "codex-1", title, kind: "execute" }, "/Users/me/work"), "/Users/me/work") as { title: string };
+    expect(titled("/opt/homebrew/bin/uv --cache-dir /Users/me/.cache/uv pip install --python /Users/me/work/.venv/bin/python pytest").title)
+      .toBe("…/uv --cache-dir …/uv pip install --python [workspace]/.venv/bin/python pytest");
+    expect(titled("ls /Users/me").title).toBe("ls [local-path]");
+    expect(titled('cat "C:\\Users\\me\\work\\notes.txt"').title).toBe('cat "…/notes.txt"');
+    expect(titled("echo https://example.com/a/b/c").title).toBe("echo https://example.com/a/b/c");
+  });
+
+  it("keeps DeepSeek Harness' own title when the step's input names nothing", () => {
+    expect(canonicalizeAcpToolActivity({ sessionUpdate: "tool_call", toolCallId: "dsh-todo", title: "todo", kind: "other", rawInput: { items: [] } }, "dsh"))
+      .toMatchObject({ title: "todo" });
+    expect(canonicalizeAcpToolActivity({ sessionUpdate: "tool_call", toolCallId: "dsh-edit", title: "edit", kind: "other", rawInput: "not json" }, "dsh"))
+      .toMatchObject({ title: "edit", kind: "edit" });
   });
 
   it("does not mistake a catalog ref split at a chunk boundary for a local path", () => {
