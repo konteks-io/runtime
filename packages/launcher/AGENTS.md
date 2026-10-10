@@ -72,6 +72,11 @@ uninstall. It talks to the running supervisor over the local control socket
   `install`, `uninstall`, `stage-enrollment`, with nothing or a `pending`
   record installed, when its own version is newer, or when the target is not a
   regular file at exactly `releases\<id>\<name>` under the root's real path.
+- **Hints name the command that runs here.** Human text written through
+  `createOutput` rewrites `konteks-remote <command>` to the running
+  executable's quoted path when the first `konteks-remote` on PATH is not it
+  (`src/cli-command.ts`, resolved once per process). `--json` output, Windows
+  and source runs keep the name. Write hints as plain `konteks-remote …`.
 - Resolve the connector executable with `resolveNativeConnectorExecutable`,
   never a literal file name (root `AGENTS.md`).
 
