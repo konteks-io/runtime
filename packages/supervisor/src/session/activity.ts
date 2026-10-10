@@ -72,7 +72,11 @@ const TITLE_ABSOLUTE_PATH = /(^|[\s"'=(])((?:\/(?!\/)|[A-Za-z]:[\\/])[^\s"'<>`)\
  */
 function readablePaths(title: string, workspaceRoot: string): string {
   const root = workspaceRoot.replace(/[\\/]$/, "");
-  return title.replace(TITLE_ABSOLUTE_PATH, (whole, before: string, path: string) => {
+  // The workspace is named first, whole: its path can hold a space ("Application
+  // Support"), where a path match stops, so it read "…/Application Support/…"
+  // instead of "[workspace]" (10-10).
+  const named = nameWorkspaceIn(title, root);
+  return named.replace(TITLE_ABSOLUTE_PATH, (whole, before: string, path: string) => {
     // The workspace's own paths stay, named relative to it by the redaction.
     if (root.length > 1 && (path === root || path.startsWith(`${root}/`) || path.startsWith(`${root}\\`))) return whole;
     const parts = path.split(/[\\/]/).filter(part => part.length > 0 && !/^[A-Za-z]:$/.test(part));
@@ -97,6 +101,11 @@ export function toolLifecycleOnly(message: unknown): unknown {
 const TOOL_LIFECYCLE_FIELDS: ReadonlySet<string> = new Set(["sessionUpdate", "toolCallId", "status", "kind", "name", "title"]);
 
 type ToolCanonicalizer = (candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined) => unknown;
+
+function nameWorkspaceIn(title: string, root: string): string {
+  if (root.length <= 1 || !title.includes(root)) return title;
+  return title.split(`${root}/`).join("[workspace]/").split(`${root}\\`).join("[workspace]/").split(root).join("[workspace]");
+}
 
 /**
  * Promote a bridge-specific tool identity into ACP's ordinary public fields
