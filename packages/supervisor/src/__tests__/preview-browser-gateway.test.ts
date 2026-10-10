@@ -76,6 +76,21 @@ describe("the QA browser's gateway", () => {
     await expect(viaProxy(g.proxyUrl, `${target}/`)).resolves.toMatchObject({ status: 200, body: expect.stringContaining("restarted") });
   });
 
+  it("logs what it refused as an origin only, so browser background traffic is told apart from the app", async () => {
+    const preview = await upstream("preview");
+    const lines: Array<Record<string, unknown>> = [];
+    const logger = { info: (fields: Record<string, unknown>) => void lines.push(fields), warn: () => undefined } as never;
+    const g = await gateway(() => preview, { logger });
+    await viaProxy(g.proxyUrl, "http://example.com/private/path?token=x");
+    await tunnel(g.proxyUrl, "accounts.example.com:443");
+    const refused = lines.filter(line => line.event === "preview.browser_refused");
+    expect(refused).toEqual([
+      expect.objectContaining({ status: 403, asked: "http://example.com", tunnel: false }),
+      expect.objectContaining({ status: 403, asked: "https://accounts.example.com", tunnel: true }),
+    ]);
+    expect(JSON.stringify(refused)).not.toContain("token");
+  });
+
   it("tunnels CONNECT (WebSockets) only to the preview's own port", async () => {
     const echo = createTcpServer(socket => socket.on("data", () => socket.write("pong")));
     await new Promise<void>(resolve => echo.listen(0, "127.0.0.1", resolve));

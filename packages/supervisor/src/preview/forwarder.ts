@@ -90,6 +90,8 @@ interface HttpStream {
   cancelled: boolean;
   executing: boolean;
   lastActivityAt: number;
+  /** When the first chunk of the request arrived, for the timing log. */
+  receivedAt: number;
 }
 
 interface WsStream {
@@ -124,6 +126,13 @@ export function notRunningMessage(failure: string | null, fallback: string): str
 }
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
+/** A request that spends this long on this computer is logged with its stages. */
+const SLOW_REQUEST_MS = 250;
+
+/** The dev server's response has fully arrived and nothing of it is left to read. */
+function responseEnded(response: IncomingMessage): boolean {
+  return response.complete && response.readableLength === 0;
+}
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
 export class PreviewForwarder {
@@ -196,7 +205,7 @@ export class PreviewForwarder {
       this.openWebSocket(chunk.streamId, admitted.origin, admitted.path, admitted.headers);
       return;
     }
-    const stream: HttpStream = { kind: "http", chunks: [], bytes: 0, method: chunk.method, path: admitted.path, headers: admitted.headers, cancel: () => { stream.cancelled = true; }, cancelled: false, executing: false, lastActivityAt: this.now() };
+    const stream: HttpStream = { kind: "http", chunks: [], bytes: 0, method: chunk.method, path: admitted.path, headers: admitted.headers, cancel: () => { stream.cancelled = true; }, cancelled: false, executing: false, lastActivityAt: this.now(), receivedAt: this.now() };
     this.streams.set(chunk.streamId, stream);
     this.receiveBody(chunk, stream);
   }
@@ -270,12 +279,37 @@ export class PreviewForwarder {
       this.counters.refusedNoPreview += 1;
       return this.reply(streamId, 503, notRunningMessage(this.options.failure?.() ?? null, "No preview is running for this session."));
     }
+    const dialAt = this.now();
     const response = await this.dial(streamId, stream, origin);
     if (response === null) return;
+    const headersAt = this.now();
     const status = response.statusCode ?? 502;
     const headers = this.responseHeaders(streamId, response, status, origin);
     if (headers === null) return;
-    await this.relayBody(streamId, stream, response, new ResponseSink(this.options.send, streamId, status, headers, this.appSetCookies(response)));
+    const sink = new ResponseSink(this.options.send, streamId, status, headers, this.appSetCookies(response));
+    await this.relayBody(streamId, stream, response, sink);
+    this.logTiming(streamId, stream, { dialAt, headersAt, status, frames: sink.frames });
+  }
+
+  /**
+   * A request that took long on this computer, by stage: waiting for its
+   * body, the dev server's answer (first byte), and sending the body back to
+   * the relay. The stream id is the one Core and the relay log (D52).
+   */
+  private logTiming(streamId: string, stream: HttpStream, at: { dialAt: number; headersAt: number; status: number; frames: number }): void {
+    const endedAt = this.now();
+    if (endedAt - stream.receivedAt < SLOW_REQUEST_MS) return;
+    this.logger.info({
+      event: "preview.forward.slow",
+      streamId,
+      method: stream.method,
+      status: at.status,
+      frames: at.frames,
+      requestMs: at.dialAt - stream.receivedAt,
+      firstByteMs: at.headersAt - at.dialAt,
+      bodyMs: endedAt - at.headersAt,
+      totalMs: endedAt - stream.receivedAt,
+    }, "a preview request was slow on this computer");
   }
 
   /** The app's own `set-cookie` values for a Core that takes them (D46); none otherwise. */
@@ -335,7 +369,7 @@ export class PreviewForwarder {
 
   private async relayBody(streamId: string, stream: HttpStream, response: IncomingMessage, sink: ResponseSink): Promise<void> {
     try {
-      if (await this.relayChunks(streamId, stream, response, sink)) sink.emit(undefined, true);
+      if (await this.relayChunks(streamId, stream, response, sink) && !sink.finalSent) sink.emit(undefined, true);
     } catch (error) {
       if (!stream.cancelled) this.streamFailed(streamId, sink, error);
     } finally {
@@ -354,7 +388,7 @@ export class PreviewForwarder {
         this.oversizedResponse(streamId, stream, sink);
         return false;
       }
-      if (!await this.sendPieces(streamId, stream, value, sink)) return false;
+      if (!await this.sendPieces(streamId, stream, value, sink, responseEnded(response))) return false;
     }
     return this.streams.has(streamId);
   }
@@ -367,7 +401,12 @@ export class PreviewForwarder {
     this.options.send({ streamId, kind: "close", code: 1009, final: true });
   }
 
-  private async sendPieces(streamId: string, stream: HttpStream, value: Buffer, sink: ResponseSink): Promise<boolean> {
+  /**
+   * Sends one body piece in bounded chunks. When the response has already
+   * ended, the last chunk carries `final` itself: one frame fewer per
+   * response, and every frame is a hop through the relay (D52).
+   */
+  private async sendPieces(streamId: string, stream: HttpStream, value: Buffer, sink: ResponseSink, ended: boolean): Promise<boolean> {
     for (let offset = 0; offset < value.byteLength; offset += this.limits.maxChunkBytes) {
       if (this.options.waitForCapacity && !(await this.options.waitForCapacity())) {
         stream.cancel();
@@ -375,7 +414,8 @@ export class PreviewForwarder {
         return false;
       }
       if (!this.streams.has(streamId)) { stream.cancel(); return false; }
-      sink.emit(value.subarray(offset, Math.min(offset + this.limits.maxChunkBytes, value.byteLength)).toString("base64url"), false);
+      const end = Math.min(offset + this.limits.maxChunkBytes, value.byteLength);
+      sink.emit(value.subarray(offset, end).toString("base64url"), ended && end === value.byteLength);
       stream.lastActivityAt = this.now();
     }
     return true;
@@ -575,6 +615,8 @@ function sendToSocket(socket: NodeWebSocket, opcode: WsFrameChunk["opcode"], pay
 /** One HTTP response to the viewer: the status and headers go with the first piece only. */
 class ResponseSink {
   headSent = false;
+  finalSent = false;
+  frames = 0;
 
   constructor(
     private readonly send: PreviewForwarderOptions["send"],
@@ -588,6 +630,8 @@ class ResponseSink {
     const head = !this.headSent && this.setCookie.length > 0 ? { setCookie: this.setCookie } : {};
     this.send({ streamId: this.streamId, kind: "response", status: this.status, headers: (this.headSent ? {} : this.headers) as never, ...head, ...(piece === undefined ? {} : { body: piece }), final });
     this.headSent = true;
+    this.finalSent = final;
+    this.frames += 1;
   }
 }
 

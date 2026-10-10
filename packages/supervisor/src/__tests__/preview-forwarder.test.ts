@@ -71,6 +71,44 @@ describe("preview forwarder (loopback only, preview policy on this hop)", () => 
     expect(instance.activeStreams).toBe(0);
   });
 
+  it("sends a small response in one frame that carries final itself (D52)", async () => {
+    handler = (_request, response) => response.end("{\"ok\":true}");
+    const { instance, sent } = forwarder();
+    instance.handle({ streamId: "one", kind: "request", method: "GET", path: "/api/session", headers: {}, final: true });
+    const last = await final(sent, "one");
+    expect(sent.filter(chunk => chunk.streamId === "one")).toHaveLength(1);
+    expect(last).toMatchObject({ kind: "response", status: 200, final: true, body: b64("{\"ok\":true}") });
+  });
+
+  it("still ends a streamed response that is open when a piece arrives", async () => {
+    let finish: (() => void) | undefined;
+    handler = (_request, response) => {
+      response.write("first");
+      finish = () => response.end();
+    };
+    const { instance, sent } = forwarder();
+    instance.handle({ streamId: "sse", kind: "request", method: "GET", path: "/events", headers: {}, final: true });
+    await vi.waitFor(() => expect(sent.find(chunk => chunk.streamId === "sse")).toMatchObject({ final: false, body: b64("first") }));
+    finish!();
+    const last = await final(sent, "sse");
+    expect(last).toMatchObject({ kind: "response", final: true });
+    expect(responseOf(sent, "sse").body).toBe("first");
+  });
+
+  it("logs a slow request by stage with its stream id, never its path", async () => {
+    let now = 1_000;
+    handler = (_request, response) => { now += 400; response.end("late"); };
+    const lines: Array<Record<string, unknown>> = [];
+    const logger = { info: (fields: Record<string, unknown>) => void lines.push(fields), warn: () => undefined } as never;
+    const { instance, sent } = forwarder({ now: () => now, logger });
+    instance.handle({ streamId: "slow", kind: "request", method: "GET", path: "/api/contacts?id=7", headers: {}, final: true });
+    await final(sent, "slow");
+    await vi.waitFor(() => expect(lines.find(line => line.event === "preview.forward.slow")).toBeDefined());
+    const line = lines.find(entry => entry.event === "preview.forward.slow")!;
+    expect(line).toMatchObject({ streamId: "slow", method: "GET", status: 200, frames: 1, firstByteMs: 400, totalMs: 400 });
+    expect(JSON.stringify(line)).not.toContain("contacts");
+  });
+
   it("reassembles a request body sent across chunks, and refuses one over the cap with 413", async () => {
     handler = (request, response, body) => response.end(`${request.method} ${body.toString()}`);
     const { instance, sent } = forwarder({ limits: { maxRequestBodyBytes: 8 } });
