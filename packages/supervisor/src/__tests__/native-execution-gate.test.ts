@@ -648,9 +648,19 @@ describe("native session dispatch uses genuine execution admission", () => {
     expect(f.runner.closeSession).toHaveBeenCalledOnce();
     expect(f.session.isClosed).toBe(true);
     expect(f.send.mock.calls.map(call => call[0].body)).toEqual([
-      expect.objectContaining({ kind: "acp_error", id: "request" }),
+      expect.objectContaining({ kind: "acp_error", id: "request",
+        error: { code: -32603, class: "internal", message: "temporarily_unavailable: Core request failed", retryable: true } }),
       { kind: "session_closed", assignmentId: "assignment", reason: "agent_exited" },
     ]);
+  });
+
+  it("keeps an unavailable execution authority retryable before dispatch", async () => {
+    const f = await sessionFixture();
+    f.client.checkExecution.mockRejectedValueOnce(new RemoteInstanceError("execution_authority_unavailable", "Assistant delegation authority is unavailable"));
+    await f.session.onToRuntime(f.envelope);
+    expect(f.runner.prompt).not.toHaveBeenCalled();
+    expect(f.send.mock.calls[0]?.[0].body).toMatchObject({ kind: "acp_error", id: "request",
+      error: { class: "internal", message: "execution_authority_unavailable: Assistant delegation authority is unavailable", retryable: true } });
   });
 
   it("closes a native turn on a matched agent prompt error, ignoring unrelated errors", async () => {
@@ -703,6 +713,14 @@ describe("native session dispatch uses genuine execution admission", () => {
     await f.session.onToRuntime(f.envelope);
     expect(f.runner.prompt).not.toHaveBeenCalled();
     expect(f.journal.pendingRequests.get("acp:received:request")?.authorization?.state).toBe("denied");
+    expect(f.send.mock.calls[0]?.[0].body).toMatchObject({ kind: "acp_error", error: { class: "internal", message: "revoked", retryable: false } });
+  });
+
+  it("keeps a definitive check refusal before dispatch final", async () => {
+    const f = await sessionFixture(); f.client.checkExecution.mockRejectedValueOnce(new RemoteInstanceError("execution_fenced", "moved"));
+    await f.session.onToRuntime(f.envelope);
+    expect(f.runner.prompt).not.toHaveBeenCalled();
+    expect(f.send.mock.calls[0]?.[0].body).toMatchObject({ kind: "acp_error", error: { class: "internal", message: "moved", retryable: false } });
   });
 
   it("surfaces a failed per-session safety stop without claiming successful closure", async () => {
