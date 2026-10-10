@@ -1,5 +1,5 @@
 import { RemoteInstanceError } from "@konteks/remote-common";
-import { dirname } from "node:path";
+import { dirname, isAbsolute } from "node:path";
 import { dshRuntimePaths, type RunnerConfig } from "@konteks/remote-agent-runner";
 import type { NativeRuntimeRecord } from "./installation.js";
 import { locateNativeDsh, resolveNativeDshInstallation, resolveNativeDshNode, verifyNativeDshRoot } from "./dsh-installation.js";
@@ -77,6 +77,18 @@ export interface HostAgentInstallAdapter {
   selfCheck(config: RunnerConfig, deps?: HostAgentSelfCheckDeps): Promise<void>;
 }
 
+/**
+ * npm's global prefix for the Node DeepSeek Harness runs with, when nothing
+ * else names one: `npm install -g` with that Node puts the package under it.
+ * The connector runs as a service without the person's shell PATH, so a
+ * version manager's prefix (`~/.nvm/versions/node/<v>`) was never searched
+ * (10-10: the owner's global install read "Not installed" on 0.12.18).
+ */
+function withRecordedNodePrefix(env: NodeJS.ProcessEnv, node: string | undefined): NodeJS.ProcessEnv {
+  if (env.npm_config_prefix || !node || !isAbsolute(node)) return env;
+  return { ...env, npm_config_prefix: dirname(dirname(node)) };
+}
+
 /** The person's own DeepSeek Harness. */
 const dshInstallAdapter: HostAgentInstallAdapter = {
   agentId: "dsh",
@@ -90,9 +102,10 @@ const dshInstallAdapter: HostAgentInstallAdapter = {
   // refusal stands.
   async runnerSettings(record) {
     const recorded = record.dshRoot;
+    const env = withRecordedNodePrefix(process.env, record.dshNode);
     const dsh = recorded === undefined
-      ? await resolveNativeDshInstallation()
-      : await verifyNativeDshRoot(recorded).catch(async (error: unknown) => resolveNativeDshInstallation().catch(() => { throw error; }));
+      ? await resolveNativeDshInstallation(env)
+      : await verifyNativeDshRoot(recorded).catch(async (error: unknown) => resolveNativeDshInstallation(env).catch(() => { throw error; }));
     const node = await resolveNativeDshNode(dsh, record.dshNode === undefined ? process.env : { DSH_NODE: record.dshNode });
     return {
       RUNNER_NATIVE_DSH_ROOT: dsh.root, RUNNER_NATIVE_DSH_ENTRY: dsh.entry, RUNNER_NATIVE_DSH_NODE: node,

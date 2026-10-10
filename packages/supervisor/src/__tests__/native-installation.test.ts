@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { EventEmitter } from "node:events";
 import { createServer } from "node:net";
 import { z } from "zod";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { bundleManifestSigningBytes, computeBundleManifestDigest, controlCall, SupervisorStatusSchema, writeSecretFile } from "@konteks/remote-common";
 import type { BridgeProcess } from "@konteks/remote-agent-runner";
 import { buildReleaseFixture, installOfflineAgentPackage } from "@konteks/remote-release";
@@ -240,6 +240,12 @@ describe("closed native runtime installation", () => {
     await expect(resolveNativeCodexSocket(root, home, `${root}/../foreign/s`)).rejects.toThrow();
   });
   it.runIf(process.platform !== "win32")("runs DeepSeek Harness from the person's own installation, with no bundled artifact", async () => {
+    // A service's environment: no version manager on PATH, no npm prefix. The
+    // search must not find whatever this machine has installed.
+    vi.stubEnv("PATH", "/usr/bin:/bin");
+    vi.stubEnv("npm_config_prefix", "");
+    vi.stubEnv("DSH_EXECUTABLE", undefined as unknown as string);
+    onTestFinished(() => { vi.unstubAllEnvs(); });
     const f = await fixture();
     const dsh = async (version: string) => {
       const pkg = join(root, `dsh-${version}`);
@@ -269,19 +275,21 @@ describe("closed native runtime installation", () => {
     const hostOnly = await loadNativeInstallation(root, f.options);
     await expect(verifyInstalledNativeBridges(hostOnly.release, hostOnly.runners, f.options.platform)).resolves.toBeUndefined();
     // 10-09: the recorded copy sat in npm's npx cache and npm cleared it. The
-    // copy the person installs again is found where it is, with no `agent add`.
+    // person installs it again with `npm install -g` using the same Node (an
+    // nvm prefix the service's PATH never names): it is found with no `agent add`.
     const vanished = await dsh("0.1.7-rc.2-npx");
     await rm(vanished, { recursive: true });
+    const globalCopy = join(root, "person-node", "lib", "node_modules", "@deepseek-ai", "dsh");
+    await mkdir(join(globalCopy, "lib"), { recursive: true });
+    await writeFile(join(globalCopy, "lib", "bin.js"), "#!/usr/bin/env node\n");
+    await writeFile(join(globalCopy, "package.json"), JSON.stringify({ name: "@deepseek-ai/dsh", version: "0.1.7-rc.2", bin: { dsh: "lib/bin.js" } }));
     await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, agents: ["codex", "dsh"], dshRoot: vanished, dshNode: node }));
-    const previousOverride = process.env.DSH_EXECUTABLE;
-    process.env.DSH_EXECUTABLE = join(supported, "lib", "bin.js");
     try {
       const relocated = await loadNativeInstallation(root, f.options);
       expect(relocated.runners.map(entry => entry.RUNNER_AGENT_ID)).toEqual(["codex", "dsh"]);
-      expect(relocated.runners[1]).toMatchObject({ RUNNER_NATIVE_DSH_ROOT: supported, RUNNER_BRIDGE_VERSION: "0.1.7-rc.2" });
+      expect(relocated.runners[1]).toMatchObject({ RUNNER_NATIVE_DSH_ROOT: await realpath(globalCopy), RUNNER_BRIDGE_VERSION: "0.1.7-rc.2" });
     } finally {
-      if (previousOverride === undefined) delete process.env.DSH_EXECUTABLE;
-      else process.env.DSH_EXECUTABLE = previousOverride;
+      await rm(globalCopy, { recursive: true });
     }
     // An upgrade out of the tested range never runs silently: dsh is left out
     // with the install hint (retried by the supervisor), and Codex still loads
