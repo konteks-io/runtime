@@ -1633,12 +1633,18 @@ export class RelayedSession {
     await this.sendToCore({ kind: "acp", method: "session/request_permission", id: requestId, params: { sessionId: ref, toolCall: { toolCallId: asked.toolCall.toolCallId, title: sanitized.params.title, ...(sanitized.params.toolKind ? { kind: sanitized.params.toolKind } : {}) }, options: sanitized.params.options } as never });
   }
 
-  /** Put the policy's note on a refused tool call (an ACP `tool_call_update` carrying only content). */
+  /**
+   * Put the policy's note on a refused tool call (an ACP `tool_call_update`
+   * carrying only content). The note is for the person (`audience: ["user"]`):
+   * that is how a page tells it from the tool's own output and shows it on the
+   * step, which otherwise read only "Failed" (10-10, E33).
+   */
   private async noteRefusedToolCall(ref: string, toolCallId: string, message: string): Promise<void> {
     // Like every update, it is redacted on the way out: the working copy's
     // path reads `[workspace]`.
     await this.sendToCore({ kind: "acp", method: "session/update", params: { sessionId: ref, update: {
-      sessionUpdate: "tool_call_update", toolCallId, content: [{ type: "content", content: { type: "text", text: message } }],
+      sessionUpdate: "tool_call_update", toolCallId,
+      content: [{ type: "content", content: { type: "text", text: message, annotations: { audience: ["user"] } } }],
     } } as never });
   }
 
