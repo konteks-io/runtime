@@ -184,7 +184,7 @@ export class PreviewBrowserGateway {
       return;
     }
     const verdict = this.admit(request.url);
-    if (!verdict.ok) return this.refuse(response, verdict.status, verdict.message);
+    if (!verdict.ok) return this.refuse(response, verdict.status, verdict.message, askedOrigin(request.url));
     this.options.onActivity?.();
     this.counters.forwarded += 1;
     this.forward(request, response, verdict);
@@ -216,7 +216,7 @@ export class PreviewBrowserGateway {
     socket.on("error", () => undefined);
     const refuse = (status: number, message: string) => {
       this.counters.refused += 1;
-      if (status !== 404) this.logger.info({ event: "preview.browser_refused", status, ...this.options.context }, "the QA browser asked for something outside its preview");
+      if (status !== 404) this.logRefused(status, askedOrigin(`https://${request.url ?? ""}`), true);
       socket.end(`HTTP/1.1 ${status} Refused\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n${message}\n`);
     };
     const verdict = this.closed ? { ok: false as const, status: 503, message: "The session has ended." } : this.admit(`http://${request.url ?? ""}`, true);
@@ -290,12 +290,23 @@ export class PreviewBrowserGateway {
     return upstream;
   }
 
-  private refuse(response: ServerResponse, status: number, message: string): void {
+  /** What was refused, as an origin only (never a path or query), so the log says whether it was the app or the browser's own traffic. */
+  private logRefused(status: number, asked: string, tunnel: boolean): void {
+    this.logger.info({ event: "preview.browser_refused", status, asked, tunnel, ...this.options.context }, "the QA browser asked for something outside its preview");
+  }
+
+  private refuse(response: ServerResponse, status: number, message: string, asked = "unknown"): void {
     this.counters.refused += 1;
-    if (status !== 404) this.logger.info({ event: "preview.browser_refused", status, ...this.options.context }, "the QA browser asked for something outside its preview");
+    if (status !== 404) this.logRefused(status, asked, false);
     response.writeHead(status, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", Connection: "close" });
     response.end(`<!doctype html><html><head><title>Konteks preview</title></head><body><p>${escapeHtml(message)}</p></body></html>\n`);
   }
+}
+
+/** The origin a refused request named (`https://host:port` for a CONNECT), never its path or query. */
+function askedOrigin(raw: string | undefined): string {
+  const url = parsedUrl(raw ?? "");
+  return url && (url.protocol === "http:" || url.protocol === "https:") ? `${url.protocol}//${url.host}` : "unparsable";
 }
 
 /** An http(s) origin and nothing else (no path, credentials, query or fragment), or null. */
