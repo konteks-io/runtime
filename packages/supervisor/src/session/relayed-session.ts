@@ -50,7 +50,7 @@ import {
   type CanonicalAcpToolIdentity,
   type ChunkTrail,
 } from "./activity.js";
-import { NativeExecutionGate, type NativeExecutionGateOptions } from "../native/execution-gate.js";
+import { NativeExecutionGate, isTransientExecutionRefusal, type NativeExecutionGateOptions } from "../native/execution-gate.js";
 import {
   admittedDirectModelReceipt,
   assertDirectModelAuthority,
@@ -2173,6 +2173,11 @@ function classify(error: unknown): AcpJsonRpcError {
   const message = error instanceof Error ? error.message.slice(0, 1_024) : "request failed";
   if (error && typeof error === "object" && "code" in error && (error as { code: string }).code === "agent_auth_required") {
     return { code: -32000, class: "agent_auth_required", message, retryable: false };
+  }
+  // A temporary Core refusal keeps its code and retryability so the Assistant
+  // retries the turn instead of failing it.
+  if (error instanceof RemoteInstanceError && isTransientExecutionRefusal(error)) {
+    return { code: -32603, class: "internal", message: `${error.code}: ${message}`.slice(0, 1_024), retryable: true };
   }
   return { code: -32603, class: "internal", message, retryable: false };
 }

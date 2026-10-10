@@ -82,7 +82,9 @@ const ADMISSION_KEYS_RETRY_MAX_MS = 8_000;
 // authority Core issued. Retries remain fenced by the original monotonic
 // deadline, so this changes availability rather than trust semantics.
 const RENEWAL_LEAD_MS = 25_000;
-const transientLoss = (error: unknown): boolean =>
+/** Core's refusal is temporary (its authority is unavailable for now), so the
+ * same step can be retried; anything else is final. */
+export const isTransientExecutionRefusal = (error: unknown): boolean =>
   error instanceof RemoteInstanceError &&
   (error.code === "execution_authority_unavailable" || error.code === "temporarily_unavailable" || error.retryable);
 
@@ -238,7 +240,7 @@ export class NativeExecutionGate {
   /** Whether a failed key read is retried within the permit's own lifetime; said either way. */
   private keysRetryAllowed(error: unknown, attempt: { retry: number; delayMs: number; permitExpiresAtMs: number | undefined }): boolean {
     const { retry, delayMs, permitExpiresAtMs } = attempt;
-    const willRetry = transientLoss(error) && !this.stopped && permitExpiresAtMs !== undefined &&
+    const willRetry = isTransientExecutionRefusal(error) && !this.stopped && permitExpiresAtMs !== undefined &&
       this.options.clock.coreNow() + delayMs < permitExpiresAtMs;
     this.logger.warn({ event: "execution.admission_keys_unavailable", assignmentId: this.options.assignment.id,
       attempt: this.options.assignment.attempt, retry, ...errorFields(error),
@@ -427,7 +429,7 @@ export class NativeExecutionGate {
         budgetMs: NATIVE_EXECUTION_RENEWAL_BUDGET_MS,
         remainingLeaseMs: Math.max(0, this.monotonicDeadline - this.monotonic()),
         code: errorCode(error),
-        retryable: transientLoss(error), skewMs: this.options.clock.skewMs() }, "Native execution renewal failed");
+        retryable: isTransientExecutionRefusal(error), skewMs: this.options.clock.skewMs() }, "Native execution renewal failed");
       throw error;
     }
   }
@@ -512,7 +514,7 @@ export class NativeExecutionGate {
       await this.checkRunning(this.authority);
     } catch (error) {
       if (this.stopped) return;
-      if (transientLoss(error)) return this.scheduleRenewalRetry(error);
+      if (isTransientExecutionRefusal(error)) return this.scheduleRenewalRetry(error);
       this.logFenced(error);
       await this.fenceAuthority();
     }
