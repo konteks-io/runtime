@@ -6,10 +6,13 @@ import {
   type SetupForeground,
 } from "./foreground-progress.js";
 import { isVerbose } from "./verbose.js";
+import { cliCommand, commandHintText } from "./cli-command.js";
 
 /**
  * Stable, actionable, secret-redacted output. Every line the launcher prints
- * passes through the redactor; `--json` emits one redacted JSON document.
+ * passes through the redactor and names `konteks-remote` the way this
+ * computer runs it (`cli-command.ts`); `--json` emits one redacted JSON
+ * document, unchanged.
  */
 export interface Output {
   json: boolean;
@@ -32,6 +35,8 @@ export class AlreadyToldError extends RemoteInstanceError {}
 
 interface OutputOptions { json: boolean; stdout?: NodeJS.WritableStream; stderr?: NodeJS.WritableStream; locale?: SetupLocale
   foreground?: SetupForeground;
+  /** How hints name the command; resolved for this process when absent. */
+  command?: string;
 }
 
 function foregroundProgress(
@@ -59,12 +64,14 @@ export function createOutput(options: OutputOptions): Output {
   const stdout = options.stdout ?? process.stdout;
   const stderr = options.stderr ?? process.stderr;
   const progress = foregroundProgress(options, stdout, stderr, locale);
+  const command = options.command ?? cliCommand;
+  const human = (text: string) => commandHintText(redactText(text), command);
   return {
     json: options.json,
     setupLocale: locale,
     ...(progress
       ? {
-          progress: (text: string) => progress.start(redactText(text)),
+          progress: (text: string) => progress.start(human(text)),
           finishProgress: () => progress.stop(),
         }
       : {}),
@@ -73,20 +80,20 @@ export function createOutput(options: OutputOptions): Output {
           detail: (text: string) => {
             if (isVerbose()) {
               progress.clear();
-              stderr.write(`${redactText(text)}\n`);
+              stderr.write(`${human(text)}\n`);
             }
           },
         }
       : {}),
     line: (text) => {
       progress?.clear();
-      if (!options.json) stdout.write(`${redactText(text)}\n`);
+      if (!options.json) stdout.write(`${human(text)}\n`);
     },
     table: (rows) => {
       progress?.clear();
       if (options.json) return;
       const width = Math.max(...rows.map(([key]) => key.length), 0);
-      for (const [key, value] of rows) stdout.write(`${redactText(key.padEnd(width))}  ${redactText(value)}\n`);
+      for (const [key, value] of rows) stdout.write(`${redactText(key.padEnd(width))}  ${human(value)}\n`);
     },
     result: (value) => {
       progress?.stop();
@@ -98,12 +105,12 @@ export function createOutput(options: OutputOptions): Output {
         const actions = error.recoveryActions.map((action) => describeAction(action, locale)).filter((text) => text.length > 0);
         if (options.json) stderr.write(`${JSON.stringify(redactValue({ error: error.toJSON() }))}\n`);
         else if (error instanceof AlreadyToldError) return;
-        else stderr.write(`${redactText(setupText("error", { code: error.code, detail: setupFailureText(error, locale) }, locale))}\n${actions.map((action) => `  → ${action}`).join("\n")}${actions.length > 0 ? "\n" : ""}`);
+        else stderr.write(`${human(setupText("error", { code: error.code, detail: setupFailureText(error, locale) }, locale))}\n${actions.map((action) => `  → ${commandHintText(action, command)}`).join("\n")}${actions.length > 0 ? "\n" : ""}`);
         return;
       }
       const message = error instanceof Error ? error.message : String(error);
       if (options.json) stderr.write(`${JSON.stringify({ error: { code: "internal", message: redactText(message) } })}\n`);
-      else stderr.write(`${redactText(setupText("unknownError", { detail: message }, locale))}\n`);
+      else stderr.write(`${human(setupText("unknownError", { detail: message }, locale))}\n`);
     },
   };
 }
