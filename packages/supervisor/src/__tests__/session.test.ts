@@ -765,7 +765,7 @@ describe("relayed session", () => {
         expect(sequence).toEqual(["note", "answer"]);
         expect(f.sent.slice(sentBefore)).toContainEqual(expect.objectContaining({ body: expect.objectContaining({ kind: "acp", method: "session/update",
           params: expect.objectContaining({ update: { sessionUpdate: "tool_call_update", toolCallId: "unresolved-write", content: [{ type: "content", content: { type: "text",
-            text: "Konteks refused this file change: the call names no path to judge. Name every affected path inside the working copy and try again." } }] } }),
+            text: "Konteks refused this file change: the call names no path to judge. Name every affected path inside the working copy and try again.", annotations: { audience: ["user"] } } }] } }),
         }) }));
       } finally { await f.session.close("cancelled"); }
     });
@@ -789,7 +789,7 @@ describe("relayed session", () => {
         expect(answer).toHaveBeenCalledWith("acp-1", "commit", { outcome: { outcome: "selected", optionId: "reject" } });
         expect(f.sent.slice(sentBefore)).toContainEqual(expect.objectContaining({ body: expect.objectContaining({ kind: "acp", method: "session/update",
           params: expect.objectContaining({ update: { sessionUpdate: "tool_call_update", toolCallId: "commit", content: [{ type: "content", content: { type: "text",
-            text: "Konteks doesn't let agents run `git commit` on this computer. Run it yourself if you want it." } }] } }),
+            text: "Konteks doesn't let agents run `git commit` on this computer. Run it yourself if you want it.", annotations: { audience: ["user"] } } }] } }),
         }) }));
       } finally { await f.session.close("cancelled"); }
     });
