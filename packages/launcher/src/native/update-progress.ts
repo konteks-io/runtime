@@ -4,6 +4,7 @@ import {
   SystemClock,
   allEqual,
   coreContractAtLeast,
+  createLogger,
   jcsDigest,
   type FetchFn,
   type JsonValue,
@@ -114,6 +115,10 @@ async function progressClient(
     clock,
     key: () => key,
     credential: () => lease.lease,
+    // Best-effort progress for the site: its retries are not the person's to
+    // read. `konteks-remote update` printed raw JSON log lines under
+    // "Updated to 0.12.17." when the report timed out (10-09, E30).
+    logger: createLogger({ name: "update-progress", silent: true }),
     ...(options.fetchFn ? { fetchFn: options.fetchFn } : {}),
   });
 }
