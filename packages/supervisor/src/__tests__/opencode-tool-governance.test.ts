@@ -281,3 +281,25 @@ it.each(["read", "grep", "glob", "list"])("carries every explicit %s path throug
   governance.observe(input("outside", { path: "/other-session/private", pattern: "x" }), WC);
   expect(governance.decide(ask("outside", kind, "outside", { path: "/other-session/private", pattern: "x" }), context)).toMatchObject({ kind: "deny" });
 });
+
+it("treats a completed tool after final permission denial as a bypass", () => {
+ const { governance, shell } = governed();
+ shell("denied", "cat README.md");
+ governance.answered("denied", false);
+ expect(governance.observe(done("denied"), WC)).toEqual({ toolCallId: "denied", title: "shell" });
+ shell("allowed", "cat README.md");
+ governance.answered("allowed", true);
+ expect(governance.observe(done("allowed"), WC)).toBeNull();
+});
+
+it.each(["failed", "cancelled"] as const)("does not count a %s denied call as completed execution", status => {
+ const { governance, shell } = governed();
+ shell("denied", "cat README.md"); governance.answered("denied", false);
+ expect(governance.observe(done("denied", status), WC)).toBeNull();
+});
+it("does not let a later answer erase denial of the same tool call", () => {
+ const { governance, shell } = governed();
+ shell("denied", "cat README.md");
+ governance.answered("denied", false); governance.answered("denied", true);
+ expect(governance.observe(done("denied"), WC)).toMatchObject({ toolCallId: "denied" });
+});

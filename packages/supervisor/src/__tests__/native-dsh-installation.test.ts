@@ -1,8 +1,20 @@
 import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolveNativeDshInstallation, resolveNativeDshNode, verifyNativeDshRoot } from "../native/dsh-installation.js";
+
+// Global installations on the test host must not outrank fixture packages.
+// Keep the production discovery order and use real filesystem checks in fixtures.
+vi.mock("node:fs/promises", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  const { join: joinFixturePath } = await import("node:path");
+  const globalRoots = ["/opt/homebrew", "/usr/local", "/usr"].map(prefix => joinFixturePath(prefix, "lib", "node_modules", "@deepseek-ai", "dsh"));
+  return { ...actual, realpath: vi.fn(async (path: string) => {
+    if (globalRoots.includes(path)) throw Object.assign(new Error("Fixture excludes host installation"), { code: "ENOENT" });
+    return actual.realpath(path);
+  }) };
+});
 
 const posix = process.platform !== "win32";
 

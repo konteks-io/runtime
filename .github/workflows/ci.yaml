@@ -137,6 +137,16 @@ jobs:
       - name: Verify signed Windows local release
         if: runner.os == 'Windows'
         run: npx vitest run --maxWorkers=1 packages/launcher/src/__tests__/e2e-smoke-release.test.ts -t "adds a real Windows connector and Codex package to the signed local release"
+      - name: Verify Skill installation and scope fences on each native OS
+        run: >-
+          npx vitest run --project unit --maxWorkers=1
+          packages/supervisor/src/__tests__/skill-staging.test.ts
+          packages/supervisor/src/__tests__/skill-home-sync.test.ts
+          packages/supervisor/src/__tests__/machine-skill-staging.test.ts
+          packages/supervisor/src/__tests__/machine-skill-refresh.test.ts
+          packages/supervisor/src/__tests__/skill-scope-admission.test.ts
+          packages/supervisor/src/__tests__/skill-sync-coordinator.test.ts
+          packages/supervisor/src/__tests__/requested-skill-sync.test.ts
       - name: Verify organization Skill staging on Windows
         if: runner.os == 'Windows'
         run: npx vitest run --maxWorkers=1 packages/supervisor/src/__tests__/skill-staging.test.ts -t "retains digest-bound executable metadata on Windows instead of guessing it from stat"

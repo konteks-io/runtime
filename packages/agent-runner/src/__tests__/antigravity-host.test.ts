@@ -8,7 +8,7 @@ import { RunnerConfigSchema } from "../config.js";
 import { bridgeEnvironment, resolveBridgeSpawnSpec } from "../bridge/spec.js";
 import {
   ANTIGRAVITY_ENABLED_TOOLS, ANTIGRAVITY_MAX_INSTRUCTIONS_BYTES, ANTIGRAVITY_SESSION_META, ANTIGRAVITY_SETTING_NAMES, antigravityAgentErrorText, antigravityEnvironment,
-  antigravityProcessEnvironment, antigravityPromptPrelude, antigravityRunnerAdapter, antigravityRuntimePaths, antigravityStderrFailure, prepareAntigravityHome,
+  antigravityProcessEnvironment, antigravityPromptPrelude, antigravityRunnerAdapter, antigravityRuntimePaths, antigravitySkillHome, antigravityStderrFailure, prepareAntigravityHome,
   readAntigravitySignIn, renderAntigravitySettings, sweepAntigravityProcesses, verifyAntigravitySession, writeAntigravitySignIn,
 } from "../host/antigravity.js";
 import { HOST_INHERITED_VARIABLES } from "../host/allow-list-environment.js";
@@ -380,4 +380,20 @@ describe("the organisation's MCP Servers setting as a Gemini Enterprise session 
       await rm(credentialDir, { recursive: true, force: true });
     }
   });
+});
+
+it("keeps managed Skills across Antigravity discovery resets", async () => {
+  const root = await mkdtemp(join(tmpdir(), "antigravity-skill-retention-"));
+  try {
+    const paths = await prepareAntigravityHome(root);
+    const managed = join(antigravitySkillHome(root), "skills");
+    const fixture = join(managed, "retained-skill");
+    await mkdir(fixture);
+    await writeFile(join(fixture, "SKILL.md"), "retained revision");
+    await prepareAntigravityHome(root);
+    for (const discovery of [join(paths.geminiHome, "config", "skills"), join(paths.geminiHome, "antigravity-cli", "skills")]) {
+      expect(await realpath(discovery)).toBe(await realpath(managed));
+      expect(await readFile(join(discovery, "retained-skill", "SKILL.md"), "utf8")).toBe("retained revision");
+    }
+  } finally { await rm(root, { recursive: true, force: true }); }
 });

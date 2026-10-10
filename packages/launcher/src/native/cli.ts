@@ -7,6 +7,7 @@ import { createOutput, type Output } from "../output.js";
 import { setVerbose } from "../verbose.js";
 import { setupLocale } from "../setup-locale.js";
 import type { SetupForeground } from "../foreground-progress.js";
+import type { SkillShareOptions } from "./skill-share-command.js";
 
 /**
  * The agents a native runtime runs: Claude Code and Codex from signed
@@ -29,7 +30,7 @@ export interface NativeCliActions {
   stop(input: NativeCommandContext): Promise<void>;
   update(input: NativeCommandContext & { check: boolean; unattended: boolean }): Promise<void>;
   uninstall(input: NativeCommandContext): Promise<void>;
-  control(input: NativeCommandContext & { operation: "status" | "agents" | "doctor" | "support" | "preview.status" | "auth.status" | "auth.login" | "auth.logout" | "git.key.add" | "git.key.list" | "git.key.remove"; agent?: string; organization?: boolean; provider?: string; method?: string; reuse?: boolean; project?: string; location?: string; title?: string; keyRef?: string }): Promise<void>;
+  control(input: NativeCommandContext & { operation: "skills.share" | "skills.sync" | "skills.list" | "status" | "agents" | "doctor" | "support" | "preview.status" | "auth.status" | "auth.login" | "auth.logout" | "git.key.add" | "git.key.list" | "git.key.remove"; skillShare?: SkillShareOptions; agent?: string; organization?: boolean; provider?: string; method?: string; reuse?: boolean; project?: string; location?: string; title?: string; keyRef?: string }): Promise<void>;
 }
 
 /** One customer architecture: the native connector. No provider-key or cloud-agent fallback switch. */
@@ -127,6 +128,20 @@ export function createNativeProgram(actions: NativeCliActions): Command {
   for (const operation of ["status", "agents", "doctor", "support"] as const) program.command(operation).description(CONTROL_HELP[operation]).action(async () => actions.control({ ...context(), operation }));
   // Read-only. Whether this computer serves previews is switched per machine
   // in Konteks (Customize → Runtimes), never here.
+  const skills = program.command("skills").description("Skills authorized for this runtime");
+  skills.command("list").description("list authorized Skills; installation and load status are reported separately")
+    .action(async () => actions.control({ ...context(), operation: "skills.list" }));
+  skills.command("sync").description("synchronize authorized Skills into configured agent profiles")
+    .action(async () => actions.control({ ...context(), operation: "skills.sync" }));
+  skills.command("share").description("publish a complete Skill folder with explicit sharing consent")
+    .argument("<skill>", "local Skill name or folder path")
+    .option("--organization", "share within the organization", false)
+    .option("--system <id>", "share with an application/repository System; repeat for multiple Systems", (value: string, previous: string[]) => [...previous, value], [])
+    .option("--initiative <id>", "restrict to an Initiative; repeat for multiple Initiatives", (value: string, previous: string[]) => [...previous, value], [])
+    .option("--confirm-ongoing-publication", "explicitly authorize sharing the complete folder and automatic publication of subsequent edits", false)
+    .action(async (skill: string, options: { organization: boolean; system: string[]; initiative: string[]; confirmOngoingPublication: boolean }) =>
+      actions.control({ ...context(), operation: "skills.share", skillShare: { skill, organization: options.organization,
+        systems: options.system, initiatives: options.initiative, confirmOngoingPublication: options.confirmOngoingPublication } }));
   const preview = program.command("preview").description("live previews of sessions' work, served from this computer");
   preview.command("status").description("list this computer's session previews and why any of them stopped")
     .action(async () => actions.control({ ...context(), operation: "preview.status" }));

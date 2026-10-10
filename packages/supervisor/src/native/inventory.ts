@@ -1,3 +1,4 @@
+import { LOCAL_SKILL_PROMOTION_CAPABILITY, REMOTE_RUNTIME_SKILL_SYNC_CAPABILITY } from "@konteks/backstage-plugin-common/remote-instance-internal";
 import { z } from "zod";
 import { DELIVERY_TURN_RENEWAL_CAPABILITY } from "./delivery-turn-renewal.js";
 import { DIRECT_TURN_RENEWAL_CAPABILITY } from "./direct-turn-renewal.js";
@@ -25,6 +26,8 @@ interface NativeInventoryOptions {
   deliveryExecutionPermitsReady?: () => boolean;
   /** Cancellation remains available independently of agent sign-in/readiness. */
   cancellationDeliveryReady?: () => boolean;
+  /** The owned runtime has the signed Skill sync transport and request consumer. */
+  skillSyncReady?: () => boolean;
   /** A person may start this machine's Codex login from the site. */
   agentLoginReady?: () => boolean;
   /** ...and Claude Code's, which needs a browser this machine can open. */
@@ -179,11 +182,14 @@ export class NativeInventoryCollector {
 
   /** Cancellation delivery and site-started logins, whatever the agents' readiness. */
   private deliveryChannelCapabilities(): string[] {
-    const channels: string[] = [];
-    if (this.options.cancellationDeliveryReady?.()) channels.push(REMOTE_CANCELLATION_DELIVERY_CAPABILITY);
-    if (this.options.agentLoginReady?.()) channels.push(REMOTE_AGENT_LOGIN_CAPABILITY);
-    if (this.options.agentLoginBrowserReady?.()) channels.push(REMOTE_AGENT_LOGIN_BROWSER_CAPABILITY);
-    return channels;
+    const readiness: Array<[string, (() => boolean) | undefined]> = [
+      [REMOTE_RUNTIME_SKILL_SYNC_CAPABILITY, this.options.skillSyncReady],
+      [LOCAL_SKILL_PROMOTION_CAPABILITY, this.options.skillSyncReady],
+      [REMOTE_CANCELLATION_DELIVERY_CAPABILITY, this.options.cancellationDeliveryReady],
+      [REMOTE_AGENT_LOGIN_CAPABILITY, this.options.agentLoginReady],
+      [REMOTE_AGENT_LOGIN_BROWSER_CAPABILITY, this.options.agentLoginBrowserReady],
+    ];
+    return readiness.filter(([, ready]) => ready?.() === true).map(([capability]) => capability);
   }
 
   private withAdditional(capabilities: string[]): string[] {

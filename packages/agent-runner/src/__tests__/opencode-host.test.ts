@@ -1,6 +1,10 @@
+import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
+import { createOpenCodeActivation } from "../host/opencode-activation.js";
 import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { findAgentBridge } from "@konteks/remote-release";
 import { RunnerConfigSchema } from "../config.js";
@@ -192,6 +196,39 @@ describe("one OpenCode process per working copy", () => {
     return { root, wc, credentials: join(root, "credentials") };
   }
 
+  it("binds and releases distinct Skill contexts independently through the actual adapter", async () => {
+    const f = await workingCopy("rules");
+    const runner = config({ RUNNER_CREDENTIAL_DIR: f.credentials });
+    const family = findAgentBridge("opencode")!;
+    const source = async (name: string) => {
+      const parent = join(f.root, name), skill = join(parent, "review");
+      await mkdir(parent, { mode: 0o700 }); await mkdir(skill, { mode: 0o700 });
+      await writeFile(join(parent, ".catalog.json"), "{}", { mode: 0o600 });
+      await writeFile(join(skill, "SKILL.md"), "# Review", { mode: 0o600 });
+      return skill;
+    };
+    const a = await source("scope-a"), b = await source("scope-b");
+    const first = await openCodeRunnerAdapter.bindWorkingCopy!(runner, family, f.wc, [a]);
+    const selectedRoots = [b];
+    const second = await openCodeRunnerAdapter.bindWorkingCopy!(runner, family, f.wc, selectedRoots);
+    expect(JSON.parse(first.env.OPENCODE_CONFIG_CONTENT!).skills).toEqual([join(f.root, "scope-a")]);
+    expect(JSON.parse(second.env.OPENCODE_CONFIG_CONTENT!).skills).toEqual([join(f.root, "scope-b")]);
+    expect(first.env.XDG_CONFIG_HOME).not.toBe(second.env.XDG_CONFIG_HOME);
+    await first.release();
+    await expect(lstat(first.env.XDG_CONFIG_HOME!)).rejects.toThrow();
+    await expect(first.beforePrompt()).rejects.toMatchObject({ code: "agent_unavailable" });
+    expect(await readFile(join(second.env.XDG_CONFIG_HOME!, "opencode", "AGENTS.md"), "utf8")).toBe("rules");
+    const plugin = JSON.parse(second.env.OPENCODE_CONFIG_CONTENT!).plugins[0];
+    const module = await import(pathToFileURL(join(plugin.package, "server.js")).href);
+    const deactivate = await module.default.setup({ options: plugin.options, session: { hook: async () => ({ dispose: async () => {} }) } });
+    await second.beforePrompt();
+    selectedRoots.length = 0;
+    await mkdir(join(f.root, "scope-b", "unexpected-skill"), { mode: 0o700 });
+    await expect(second.beforePrompt()).rejects.toThrow(/closed/);
+    await deactivate();
+    await second.release();
+  });
+
   it("spawns with a config folder keyed by the working copy whose AGENTS.md links to the working copy's, and nothing secret", async () => {
     for (const [name, value] of Object.entries(OWNER_SECRETS)) vi.stubEnv(name, value);
     const f = await workingCopy("Always answer in French.");
@@ -269,4 +306,230 @@ describe("one OpenCode process per working copy", () => {
     await expect(bindOpenCodeWorkingCopy("/cred", "work")).rejects.toMatchObject({ code: "agent_unavailable" });
     await expect(openCodeRunnerAdapter.bindWorkingCopy!(config(), findAgentBridge("codex")!, "/wc")).rejects.toThrow(/OpenCode/);
   });
+
+  it("requires authenticated activation of the packaged managed-Skill plugin before a prompt", async () => {
+    const f = await workingCopy(null);
+    const snapshot = join(f.root, "snapshot");
+    const skill = join(snapshot, "review");
+    await mkdir(skill, { recursive: true, mode: 0o700 });
+    await writeFile(join(snapshot, ".catalog.json"), "{}", { mode: 0o600 });
+    await writeFile(join(skill, "SKILL.md"), "# Review", { mode: 0o600 });
+    const binding = await bindOpenCodeWorkingCopy(f.credentials, f.wc, {}, [skill]);
+    try {
+      const settings = JSON.parse(binding.env.OPENCODE_CONFIG_CONTENT!);
+      expect(settings.plugins).toHaveLength(1);
+      const plugin = settings.plugins[0];
+      expect((await lstat(plugin.package)).isDirectory()).toBe(true);
+      expect(createRequire(import.meta.url).resolve(join(plugin.package, "server"))).toBe(join(plugin.package, "server.js"));
+      expect((await fetch(plugin.options.endpoint, { method: "POST" })).status).toBe(403);
+      let admitted = false;
+      const prompt = binding.beforePrompt().then(() => { admitted = true; });
+      await Promise.resolve();
+      expect(admitted).toBe(false);
+      const module = await import(pathToFileURL(join(plugin.package, "server.js")).href);
+      const deactivate = await module.default.setup({ options: plugin.options, session: { hook: async () => ({ dispose: async () => {} }) } });
+      await prompt;
+      expect(admitted).toBe(true);
+      await deactivate();
+      expect((await fetch(plugin.options.endpoint, { method: "POST", headers: { authorization: `Bearer ${plugin.options.token}` } })).status).toBe(403);
+      await expect(binding.beforePrompt()).rejects.toThrow(/activation is unavailable/);
+    } finally { await binding.release(); }
+    await expect(binding.beforePrompt()).rejects.toThrow(/released/);
+  });
+});
+
+it("isolates OpenCode working-copy configuration by the authorized immutable Skill roots", () => {
+ const a = openCodeWorkingCopyConfig("/credentials", "/checkout", "darwin", ["/skills/tenant-a/revision-1"]);
+ const b = openCodeWorkingCopyConfig("/credentials", "/checkout", "darwin", ["/skills/tenant-b/revision-1"]);
+ const c = openCodeWorkingCopyConfig("/credentials", "/checkout", "darwin", ["/skills/tenant-a/revision-2"]);
+ expect(a).not.toBe(b);
+ expect(a).not.toBe(c);
+ expect(a).not.toBe(openCodeWorkingCopyConfig("/credentials", "/checkout", "darwin"));
+ expect(openCodeWorkingCopyConfig("/credentials", "/checkout", "darwin", ["/skills/b", "/skills/a"])).toBe(openCodeWorkingCopyConfig("/credentials", "/checkout", "darwin", ["/skills/a", "/skills/b", "/skills/a"]));
+});
+
+it("validates native Windows Skill root paths and rejects relative or control-bearing roots", () => {
+ expect(openCodeWorkingCopyConfig("C:/credentials", "C:/checkout", "win32", ["C:/skills/revision"])).toContain("-skills-");
+ expect(() => openCodeWorkingCopyConfig("/credentials", "/checkout", "darwin", ["relative"])).toThrow(/absolute/);
+ expect(() => openCodeWorkingCopyConfig("/credentials", "/checkout", "darwin", ["/skills/unsafe\n"])).toThrow(/absolute/);
+});
+
+
+it("releases an activation waiter immediately when its execution context closes", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "opencode-activation-"))); roots.push(root);
+  const activation = await createOpenCodeActivation(root);
+  const waiting = expect(activation.wait()).rejects.toMatchObject({ code: "agent_unavailable" });
+  await activation.release();
+  await waiting;
+  await activation.release();
+  await expect(lstat(activation.plugin.package)).rejects.toThrow();
+});
+
+
+it("registers provider-independent native request guards before activation", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "opencode-guards-"))); roots.push(root);
+  const activation = await createOpenCodeActivation(root);
+  const callbacks = new Map<string, () => Promise<void>>();
+  const dispose = vi.fn(async () => {});
+  const hook = vi.fn(async (name: string, callback: () => Promise<void>) => {
+    callbacks.set(name, callback); return { dispose };
+  });
+  try {
+    const module = await import(pathToFileURL(join(activation.plugin.package, "server.js")).href);
+    const cleanup = await module.default.setup({ options: activation.plugin.options, session: { hook } });
+    await activation.wait();
+    expect([...callbacks.keys()]).toEqual(["prompt", "context", "http.request", "experimental.ws.send"]);
+    for (const [name, callback] of callbacks) {
+      if (name !== "prompt") await expect(callback()).rejects.toThrow(/load admission/);
+    }
+    expect(hook.mock.calls.every(call => call.length === 2)).toBe(true);
+    await cleanup();
+    expect(dispose).toHaveBeenCalledTimes(4);
+  } finally { await activation.release(); }
+});
+
+
+it("refuses unsupported native hook registrations without acknowledging readiness", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "opencode-unsupported-"))); roots.push(root);
+  const activation = await createOpenCodeActivation(root);
+  const dispose = vi.fn(async () => {});
+  const hook = vi.fn().mockResolvedValueOnce({ dispose }).mockResolvedValueOnce(undefined);
+  try {
+    const module = await import(pathToFileURL(join(activation.plugin.package, "server.js")).href);
+    await expect(module.default.setup({ options: activation.plugin.options, session: { hook } })).rejects.toThrow(/unsupported/);
+    expect(dispose).toHaveBeenCalledTimes(1);
+    const waiting = expect(activation.wait()).rejects.toMatchObject({ code: "agent_unavailable" });
+    await activation.release();
+    await waiting;
+  } finally { await activation.release(); }
+});
+
+
+it("selects native Skill attachments only from the exact authorized source files", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "opencode-selection-"))); roots.push(root);
+  const skillRoot = join(root, "review");
+  await mkdir(skillRoot, { mode: 0o700 });
+  await writeFile(join(skillRoot, "SKILL.md"), "---\nname: Review\n---\nOriginal content", { mode: 0o600 });
+  const activation = await createOpenCodeActivation(root, [skillRoot]);
+  type NativePrompt = { sessionID: string; messageID: string; prompt: { text?: string; skills?: { id: string }[] } };
+  const callbacks = new Map<string, (input: NativePrompt) => Promise<void>>();
+  const inventory = [{ id: "approved", path: join(skillRoot, "SKILL.md") }, { id: "personal", path: join(root, "personal", "SKILL.md") }];
+  try {
+    const module = await import(pathToFileURL(join(activation.plugin.package, "server.js")).href);
+    const cleanup = await module.default.setup({ options: activation.plugin.options,
+      skill: { list: async () => ({ data: inventory }) },
+      session: { hook: async (name: string, callback: (input: NativePrompt) => Promise<void>) => {
+        callbacks.set(name, callback); return { dispose: async () => {} };
+      } } });
+    const select = callbacks.get("prompt")!;
+    const input = { sessionID: "native-session", messageID: "native-message", prompt: { text: "Work", skills: [] } };
+    expect(select).toBeTypeOf("function");
+    const arm = () => activation.prepareTurn({ acpSessionRef: "governed-session", bridgeSessionId: "native-session", requestId: "governed-turn" });
+    await expect(select(input)).rejects.toThrow(/activation was refused/);
+    arm();
+    await expect(select({ ...input, sessionID: "foreign-session" })).rejects.toThrow(/governed turn/);
+    await expect(select(input)).rejects.toThrow(/activation was refused/);
+    arm();
+    activation.finishTurn({ acpSessionRef: "governed-session", bridgeSessionId: "native-session", requestId: "governed-turn" });
+    await expect(select(input)).rejects.toThrow(/activation was refused/);
+    arm();
+    activation.finishTurn({ acpSessionRef: "governed-session", bridgeSessionId: "native-session", requestId: "older-turn" });
+    await select(input);
+    expect(input.prompt.skills).toEqual([{ id: "approved" }]);
+    const verify = callbacks.get("context")! as unknown as (input: unknown) => Promise<void>;
+    await expect(verify({ sessionID: "other", messages: [{ id: "native-message", role: "user" }] })).rejects.toThrow(/current native message/);
+    await expect(verify({ sessionID: "native-session", messages: [{ id: "old-message", role: "user" }] })).rejects.toThrow(/current native message/);
+    const expectedContent = JSON.parse(await readFile(join(activation.plugin.package, "skills.json"), "utf8")) as string[];
+    await expect(verify({ sessionID: "native-session", messages: [{ id: "native-message", role: "user", content: [{ type: "text", text: "tampered" }] }] })).rejects.toThrow(/content verification failed/);
+    await expect(verify({ sessionID: "native-session", messages: [{ id: "native-message", role: "user", content: expectedContent.map(text => ({ type: "text", text })) }] })).rejects.toThrow(/load admission is unavailable/);
+    arm();
+    await expect(select({ ...input, prompt: { skills: [{ id: "personal" }] } })).rejects.toThrow(/unauthorized/);
+    await expect(verify({ sessionID: "native-session", messages: [{ id: "native-message", role: "user" }] })).rejects.toThrow(/current native message/);
+    inventory.push({ id: "duplicate", path: join(skillRoot, "SKILL.md") });
+    arm();
+    await expect(select({ ...input, prompt: {} })).rejects.toThrow(/ambiguous/);
+    inventory.splice(0);
+    arm();
+    await expect(select({ ...input, prompt: {} })).rejects.toThrow(/ambiguous/);
+    await cleanup();
+  } finally { await activation.release(); }
+});
+
+it("admits only verified native primary requests in the live governed turn", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "opencode-admission-"))); roots.push(root);
+  const skillRoot = join(root, "review");
+  await mkdir(skillRoot);
+  await writeFile(join(skillRoot, "SKILL.md"), "---\nname: Review\n---\nReview carefully.");
+  const activation = await createOpenCodeActivation(root, [skillRoot]);
+  const callbacks = new Map<string, (input: unknown) => Promise<void>>();
+  const admitSkillLoad = vi.fn(async () => {});
+  const recordSkillLoad = vi.fn(async (_load: { loadId: string; readOnlyRoots: readonly string[] }) => {});
+  const turn = { acpSessionRef: "opaque", bridgeSessionId: "native", requestId: "turn", admitSkillLoad, recordSkillLoad };
+  try {
+    const module = await import(pathToFileURL(join(activation.plugin.package, "server.js")).href);
+    const cleanup = await module.default.setup({ options: activation.plugin.options,
+      skill: { list: async () => ({ data: [{ id: "skill", path: join(skillRoot, "SKILL.md") }] }) },
+      session: { hook: async (name: string, callback: (input: unknown) => Promise<void>) => {
+        callbacks.set(name, callback); return { dispose: async () => {} };
+      } } });
+    activation.prepareTurn(turn);
+    await callbacks.get("prompt")!({ sessionID: "native", messageID: "message", prompt: {} });
+    const scope = { sessionID: "native", kind: "primary" };
+    await expect(callbacks.get("http.request")!(scope)).rejects.toThrow(/refused/);
+    const content = JSON.parse(await readFile(join(activation.plugin.package, "skills.json"), "utf8")) as string[];
+    const context = { sessionID: "native", messages: [{ id: "message", role: "user", content: content.map(text => ({ type: "text", text })) }] };
+    await callbacks.get("context")!(context);
+    expect(admitSkillLoad).toHaveBeenCalledExactlyOnceWith([skillRoot]);
+    await callbacks.get("context")!(context);
+    expect(admitSkillLoad).toHaveBeenCalledTimes(1);
+    expect(recordSkillLoad).toHaveBeenCalledTimes(2);
+    const firstLoad = recordSkillLoad.mock.calls[0][0];
+    const secondLoad = recordSkillLoad.mock.calls[1][0];
+    expect(firstLoad.readOnlyRoots).toEqual([skillRoot]);
+    expect(secondLoad.loadId).not.toBe(firstLoad.loadId);
+    const digests = content.map(text => createHash("sha256").update(text).digest("hex"));
+    const retry = await fetch(activation.plugin.options.endpoint.replace(/ready$/, "load"), {
+      method: "POST", headers: { authorization: `Bearer ${activation.plugin.options.token}` },
+      body: JSON.stringify({ ...turn, digests, loadId: firstLoad.loadId }),
+    });
+    expect(retry.status).toBe(204);
+    expect(recordSkillLoad).toHaveBeenCalledTimes(2);
+    await callbacks.get("http.request")!(scope);
+    await callbacks.get("experimental.ws.send")!(scope);
+    await expect(callbacks.get("http.request")!({ ...scope, kind: "title" })).rejects.toThrow(/admission/);
+    await expect(callbacks.get("http.request")!({ ...scope, sessionID: "other" })).rejects.toThrow(/admission/);
+    activation.finishTurn(turn);
+    await expect(callbacks.get("http.request")!(scope)).rejects.toThrow(/refused/);
+    await cleanup();
+  } finally { await activation.release(); }
+});
+
+it.each(["changed plugin snapshot", "authority refusal", "missing recorder", "storage refusal"])("keeps native transport blocked after %s", async failure => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "opencode-refusal-"))); roots.push(root);
+  const skillRoot = join(root, "review");
+  await mkdir(skillRoot);
+  await writeFile(join(skillRoot, "SKILL.md"), "---\nname: Review\n---\nOriginal content.");
+  const activation = await createOpenCodeActivation(root, [skillRoot]);
+  const callbacks = new Map<string, (input: unknown) => Promise<void>>();
+  const admitSkillLoad = vi.fn(async () => { if (failure === "authority refusal") throw new Error("private authority error"); });
+  const recordSkillLoad = vi.fn(async () => { throw new Error("private storage error"); });
+  try {
+    const file = join(activation.plugin.package, "skills.json");
+    if (failure === "changed plugin snapshot") await writeFile(file, JSON.stringify(["Changed content."]));
+    const content = JSON.parse(await readFile(file, "utf8")) as string[];
+    const module = await import(pathToFileURL(join(activation.plugin.package, "server.js")).href);
+    const cleanup = await module.default.setup({ options: activation.plugin.options,
+      skill: { list: async () => ({ data: [{ id: "skill", path: join(skillRoot, "SKILL.md") }] }) },
+      session: { hook: async (name: string, callback: (input: unknown) => Promise<void>) => {
+        callbacks.set(name, callback); return { dispose: async () => {} };
+      } } });
+    activation.prepareTurn({ acpSessionRef: "opaque", bridgeSessionId: "native", requestId: "turn", admitSkillLoad,
+      ...(failure === "storage refusal" ? { recordSkillLoad } : {}) });
+    await callbacks.get("prompt")!({ sessionID: "native", messageID: "message", prompt: {} });
+    await expect(callbacks.get("context")!({ sessionID: "native", messages: [{ id: "message", role: "user", content: content.map(text => ({ type: "text", text })) }] })).rejects.toThrow(/activation was refused/);
+    expect(admitSkillLoad).toHaveBeenCalledTimes(failure === "changed plugin snapshot" ? 0 : 1);
+    expect(recordSkillLoad).toHaveBeenCalledTimes(failure === "storage refusal" ? 1 : 0);
+    await expect(callbacks.get("http.request")!({ sessionID: "native", kind: "primary" })).rejects.toThrow(/activation was refused/);
+    await cleanup();
+  } finally { await activation.release(); }
 });

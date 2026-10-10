@@ -1,9 +1,14 @@
+import { pathToFileURL } from "node:url";
+import { createOpenCodeActivation } from "../../../agent-runner/src/host/opencode-activation.js";
+import { ObservationDelivery } from "../control/observation-delivery.js";
+import { DurableOutbox } from "../state/outbox.js";
+import { CoreClient, CORE_AUDIENCE } from "../core/client.js";
 import { generateKeyPairSync, sign } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { FixedClock, RemoteInstanceError, generateEd25519, ed25519Sign, remoteControlSigningBytes, computeExecutionRevisionControlIntentDigest, computeRemoteExecutionOperationDigest, type RemoteDeliveryAcceptanceReceipt, type RemoteWorkAssignment } from "@konteks/remote-common";
+import { FixedClock, generateInstanceKey, jcsDigest, verifyInstanceProof, type JsonValue, RemoteInstanceError, generateEd25519, ed25519Sign, remoteControlSigningBytes, computeExecutionRevisionControlIntentDigest, computeRemoteExecutionOperationDigest, type RemoteDeliveryAcceptanceReceipt, type RemoteWorkAssignment } from "@konteks/remote-common";
 import { CoreSignatureVerifier } from "../control/core-signature.js";
 import { PermissionAnswerReceiver } from "../control/permission-answer-receiver.js";
 import { SupervisorJournal } from "../state/journal.js";
@@ -12,7 +17,7 @@ import { terminalOperationDispositions } from "../state/operation-dispositions.j
 import { RelayedSession } from "../session/relayed-session.js";
 import { PermissionBroker } from "../session/permissions.js";
 import { EvaluatorPolicyResponder } from "../session/policy-responder.js";
-import type { RunnerPort } from "../runner-port.js";
+import type { RunnerPort, RunnerSessionLifecycle } from "../runner-port.js";
 import type { TransportManager } from "../transport/relay-transport.js";
 
 let root: string;
@@ -31,12 +36,13 @@ const expiresAt = "2026-09-10T01:00:00Z";
 const assignment: RemoteWorkAssignment = { id: "assignment", attempt: 1, workspaceId: "tenant", instanceId: "instance", placementId: "placement", kind: "assistant_execution", taskId: "turn", correlationId: "correlation", expiresAt, requiredCapabilities: [], agentRoute: { agentId: "codex", requiredRole: "assistant" }, source: { kind: "conversation", portability: "portable_before_claim", sessionId: "session", turnRef: "turn" }, policy: { maxDurationSeconds: 60, maxArtifactBytes: 1, evidenceUpload: "structured_only", allowedArtifactKinds: [], recoveryMode: "report_interrupted", latestResumeAt: expiresAt, permissionResponderDeadlineSeconds: 60, humanDeferralAllowed: false } };
 const message = { kind: "acp", method: "session/prompt", id: "request", params: { sessionId: "acp", prompt: [{ type: "text", text: "hello" }] } };
 
-async function fixture() {
+async function fixture(agentId = "codex") {
+  const assigned = { ...assignment, agentRoute: { ...assignment.agentRoute, agentId } };
   const clock = new FixedClock(Date.parse("2026-09-10T00:00:00Z"));
   const journal = new SupervisorJournal(root); await journal.load();
   const ready = { workspaceId: "tenant", instanceId: "instance", sessionId: "session", channelId: "session:session", assignmentId: "assignment", attempt: 1,
-    claimId: "claim", recoveryEpoch: 0, runnerIncarnation: "runner", agentId: "codex", acpSessionRef: "acp", readyRevision: 1, registeredAt: clock.nowIso() };
-  await journal.assignments.put({ assignmentId: "assignment", attempt: 1, claimId: "claim", kind: "assistant_execution", placementId: "placement", workspaceId: "tenant", agentId: "codex", state: "running", recoveryEpoch: 0, executionReady: ready,
+    claimId: "claim", recoveryEpoch: 0, runnerIncarnation: "runner", agentId, acpSessionRef: "acp", readyRevision: 1, registeredAt: clock.nowIso() };
+  await journal.assignments.put({ assignmentId: "assignment", attempt: 1, claimId: "claim", kind: "assistant_execution", placementId: "placement", workspaceId: "tenant", agentId, state: "running", recoveryEpoch: 0, executionReady: ready,
     reports: { nextSequence: 1, durableWatermark: 0 }, evidenceUpload: "structured_only", expiresAt, latestResumeAt: expiresAt, updatedAt: clock.nowIso() });
   const { registeredAt: _time, ...binding } = ready;
   const authority = { ...binding, executionId: "execution", delegationRef: "delegation", turnRef: "turn", principal: "assistant",
@@ -58,9 +64,9 @@ async function fixture() {
   let monotonic = 0;
   const assertOwned = vi.fn();
   const onAuthorityLost = vi.fn(async () => undefined);
-  const makeGate = (overrides: Record<string, unknown> = {}) => { const gate = new NativeExecutionGate({ assignment, journal, clock, runnerIncarnation: "runner", client,
+  const makeGate = (overrides: Record<string, unknown> = {}) => { const gate = new NativeExecutionGate({ assignment: assigned, journal, clock, runnerIncarnation: "runner", client,
     assertOwned, onAuthorityLost, currentRevisionFenceConnection: () => ({ connectionRef: "connection", connectionEpoch: 2 }), monotonicNow: () => monotonic, ...overrides } as never); gates.push(gate); return gate; };
-  return { journal, clock, ready, claims, client, envelope, gate: makeGate(), makeGate, onAuthorityLost, assertOwned,
+  return { assigned, journal, clock, ready, claims, client, envelope, gate: makeGate(), makeGate, onAuthorityLost, assertOwned,
     monotonicNow: () => monotonic,
     advance: (milliseconds: number) => { monotonic += milliseconds; clock.advance(milliseconds); } };
 }
@@ -631,6 +637,19 @@ describe("native session dispatch uses genuine execution admission", () => {
     expect(f.send.mock.calls.map(call => call[0].body)).toEqual([expect.objectContaining({ kind: "acp_error", id: "request" })]);
   });
 
+  it.each(["stale", "offline", "failed", "unsupported", "unknown"])("preserves actionable Skill freshness %s rejection before dispatch", async state => {
+    const f = await sessionFixture();
+    f.beforePrompt.mockRejectedValueOnce(new RemoteInstanceError("capability_unavailable", "private adapter output", { diagnostic: `skill_freshness_${state}` }));
+    await f.session.onToRuntime(f.envelope);
+    expect(f.runner.prompt).not.toHaveBeenCalled();
+    const record = f.journal.pendingRequests.get("acp:received:request")?.authorization;
+    expect(record).toMatchObject({ state: "denied", completion: { kind: "acp_error", error: { message: expect.stringContaining("Skill") } } });
+    expect(JSON.stringify(record)).not.toContain("private adapter output");
+    expect(JSON.stringify(record)).not.toContain("Required local session inputs are unavailable");
+    await f.session.onToRuntime(f.envelope);
+    expect(f.beforePrompt).toHaveBeenCalledOnce();
+  });
+
   it("persists preparation rejection before replying", async () => {
     const f = await sessionFixture(); f.beforePrompt.mockRejectedValueOnce(new Error("local input unavailable"));
     await f.session.onToRuntime(f.envelope);
@@ -963,4 +982,101 @@ it("notifies the holder of authority loss before recovery suppresses session tra
   expect(f.runner.stopForRecovery).toHaveBeenCalledExactlyOnceWith("acp");
   expect(f.journal.pendingRequests.get("acp:received:request")?.authorization?.state).toBe("dispatch_started");
   expect(f.session.isClosed).toBe(true);
+});
+
+async function nativeSkillReportingSession(f: Awaited<ReturnType<typeof fixture>>, skillRoot: string, delivery: ObservationDelivery) {
+  let lifecycle: RunnerSessionLifecycle | undefined;
+  const runner = { createSession: vi.fn(async (_input: unknown, value?: RunnerSessionLifecycle) => {
+    lifecycle = value; await value!.beforeCreate("acp");
+    return { acpSessionRef: "acp", resumed: false, capabilities: { forkSession: false, sessionResume: false } };
+  }), prompt: vi.fn(async () => undefined), cancel: vi.fn(async () => undefined), closeSession: vi.fn(async () => undefined) };
+  const session = new RelayedSession(f.assigned, { clock: f.clock, journal: f.journal, runner: runner as unknown as RunnerPort,
+    transport: { send: vi.fn(), openChannel: vi.fn() } as unknown as TransportManager,
+    instanceId: "instance", workspaceRoot: root, executionAuthority: { client: f.client, runnerIncarnation: "runner" },
+    assertExecutionOwned: f.assertOwned, reserveExecutionReference: async () => {}, recordExecutionProcessOwner: async () => {},
+    prepareInputs: async () => ({ binding: { workspaceId: "tenant", instanceId: "instance", sessionId: "session", assignmentId: "assignment", attempt: 1 },
+      cwd: root, skillInstructions: "", beforePrompt: async () => {}, prepareNativeLoad: async () => {}, admitNativeLoad: async () => {},
+      readOnlyRoots: [skillRoot], nativeSkills: [{ skillId: "7db42743-32df-4990-ad5d-6f5433f872fc", version: "1.0.1" }] }),
+    registerReady: async () => f.ready, redeemCapabilityToken: async () => { throw new Error("unexpected capability redemption"); },
+    policy: new EvaluatorPolicyResponder(null, () => false), broker: new PermissionBroker({ clock: f.clock, deadlineSeconds: () => 60, onTimeout: async () => {} }),
+    onUsage: async () => {}, onSkillUsage: value => delivery.submit(value), onClosed: async () => {} });
+  sessions.push(session); await session.bootstrap(); await session.onToRuntime(f.envelope);
+  expect(runner.prompt).toHaveBeenCalledOnce();
+  return { session, lifecycle: lifecycle! };
+}
+
+it("joins signed OpenCode dispatch, verified context loads, durable outbox and correlated HTTPS receipts", async () => {
+  const f = await fixture("opencode");
+  const directory = await realpath(root);
+  const skillRoot = join(directory, "review");
+  await mkdir(skillRoot);
+  await writeFile(join(skillRoot, "SKILL.md"), "---\nname: Review\n---\nReview carefully.");
+  const activation = await createOpenCodeActivation(directory, [skillRoot]);
+  const callbacks = new Map<string, (value: unknown) => Promise<void>>();
+  const machine = generateInstanceKey();
+  const accepted = new Map<string, unknown>();
+  const proofs: string[] = [];
+  let wrongReceipt = true;
+  const fetchFn = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+    const { proof, ...body } = JSON.parse(String(init?.body));
+    expect(verifyInstanceProof(machine.publicKey, { method: "skill_usage_observation", audience: CORE_AUDIENCE, subject: "instance", body }, proof)).toBe(true);
+    proofs.push(proof.nonce);
+    const digest = jcsDigest(body.observation as JsonValue);
+    accepted.set(digest, body.observation);
+    const observationDigest = wrongReceipt ? "a".repeat(43) : digest;
+    wrongReceipt = false;
+    return new Response(JSON.stringify({ stored: true, observationId: `ri:skill:${digest}`, observationDigest }), { status: 202 });
+  });
+  const core = new CoreClient({ baseUrl: "https://core.example", clock: f.clock, key: () => machine,
+    credential: () => "test-native-lease", fetchFn });
+  await mkdir(join(root, "usage"));
+  const outbox = new DurableOutbox(join(root, "usage")); await outbox.load();
+  let canSend = false;
+  const delivery = new ObservationDelivery({ outbox, core, clock: f.clock, instanceId: () => "instance",
+    coreContractVersion: () => "7.5", canSend: () => canSend });
+  const native = await nativeSkillReportingSession(f, skillRoot, delivery);
+  const recordSkillLoad = vi.fn(async (load: { loadId: string; readOnlyRoots: readonly string[]; observedAt: string }) => {
+    await native.lifecycle.recordSkillLoad!({ ...load, acpSessionRef: "acp", requestId: "request" });
+  });
+  const turn = { acpSessionRef: "acp", bridgeSessionId: "native", requestId: "request",
+    admitSkillLoad: (readOnlyRoots: readonly string[]) => native.lifecycle.admitSkillLoad!({ acpSessionRef: "acp", requestId: "request", readOnlyRoots }), recordSkillLoad };
+  try {
+    const plugin = await import(pathToFileURL(join(activation.plugin.package, "server.js")).href);
+    const dispose = await plugin.default.setup({ options: activation.plugin.options,
+      skill: { list: async () => ({ data: [{ id: "native-skill", path: join(skillRoot, "SKILL.md") }] }) },
+      session: { hook: async (name: string, callback: (value: unknown) => Promise<void>) => {
+        callbacks.set(name, callback); return { dispose: async () => {} };
+      } } });
+    activation.prepareTurn(turn);
+    await callbacks.get("prompt")!({ sessionID: "native", messageID: "message", prompt: {} });
+    await expect(callbacks.get("http.request")!({ sessionID: "native", kind: "primary" })).rejects.toThrow();
+    const texts = JSON.parse(await readFile(join(activation.plugin.package, "skills.json"), "utf8")) as string[];
+    const context = { sessionID: "native", messages: [{ id: "message", role: "user", content: texts.map(text => ({ type: "text", text })) }] };
+    await callbacks.get("context")!(context);
+    await callbacks.get("http.request")!({ sessionID: "native", kind: "primary" });
+    expect(outbox.depth).toBe(1);
+    canSend = true;
+    await delivery.flush();
+    expect(outbox.depth).toBe(1);
+    await delivery.flush();
+    expect(outbox.depth).toBe(0);
+    expect(accepted.size).toBe(1);
+    expect(proofs[0]).not.toBe(proofs[1]);
+    await callbacks.get("context")!(context);
+    await delivery.flush();
+    expect(accepted.size).toBe(2);
+    expect(recordSkillLoad).toHaveBeenCalledTimes(2);
+    expect([...accepted.values()][0]).toMatchObject({ agentId: "opencode", executionId: "execution", claimId: "claim", turnId: "turn" });
+    await expect(native.lifecycle.recordSkillLoad!({ acpSessionRef: "acp", requestId: "request", loadId: "foreign-root",
+      readOnlyRoots: [join(directory, "foreign")], observedAt: f.clock.nowIso() })).rejects.toThrow();
+    expect(outbox.depth).toBe(0);
+    native.session.fenceForRecovery();
+    await expect(callbacks.get("context")!(context)).rejects.toThrow();
+    await expect(callbacks.get("http.request")!({ sessionID: "native", kind: "primary" })).rejects.toThrow();
+    expect(accepted.size).toBe(2);
+    expect(outbox.depth).toBe(0);
+    activation.finishTurn(turn);
+    await expect(callbacks.get("http.request")!({ sessionID: "native", kind: "primary" })).rejects.toThrow();
+    await dispose();
+  } finally { await activation.release(); }
 });

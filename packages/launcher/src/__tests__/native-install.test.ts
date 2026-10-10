@@ -8,7 +8,7 @@ import { bundleManifestSigningBytes, computeBundleManifestDigest, writeSecretFil
 import { buildReleaseFixture } from "@konteks/remote-release";
 import { acquireNativeRootLock, hostAgentInstallAdapter, loadNativeInstallation, OPENCODE_MIN_BINARY_BYTES, SupervisorStore, verifyInstalledNativeConnector } from "@konteks/remote-supervisor";
 import { addNativeAgent, installNative, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, removeNativeAgent, restoreNativeRecord } from "../native/install.js";
-import { startNativeConnector } from "../native/commands.js";
+import { startNativeConnector, prepareNativeForegroundPort } from "../native/commands.js";
 import { createOutput } from "../output.js";
 import { terminalFetchConsent } from "../native/consent.js";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
@@ -205,6 +205,24 @@ describe("native install composition", () => {
         holder.close((error) => (error ? reject(error) : resolve())),
       );
     }
+  });
+
+  it.each([113, 0, 1])("reconciles a foreground port only after service-manager stopped proof (%s)", async state => {
+    const f = await fixture(), holder = createServer();
+    await new Promise<void>(resolve => holder.listen(0, "127.0.0.1", resolve));
+    const taken = (holder.address() as { port: number }).port;
+    try {
+      await installNative({ ...f.options, controlPort: taken } as never);
+      const status = { command: "service-status", args: [] };
+      const definition = { status } as never;
+      const deps = { roots: f.trust, platform: f.platform, definition: async () => definition,
+        execute: async () => state };
+      const operation = prepareNativeForegroundPort({ root: f.root, output: f.options.output }, deps);
+      if (state === 1) await expect(operation).rejects.toThrow();
+      else await operation;
+      if (state === 113) expect((await readNativeRecord(f.root)).controlPort).not.toBe(taken);
+      else expect((await readNativeRecord(f.root)).controlPort).toBe(taken);
+    } finally { await new Promise<void>((resolve, reject) => holder.close(error => error ? reject(error) : resolve())); }
   });
 
   it("explains the actual port collision and starts the stopped connector on the replacement port", async () => {

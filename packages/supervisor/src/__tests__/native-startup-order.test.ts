@@ -10,6 +10,9 @@ interface StartupInternals {
   captureLeaseFence(): () => void;
   validateRelayHandshake(result: RelayRuntimeHandshakeResult): void;
   onRelayConnected(result: RelayRuntimeHandshakeResult): Promise<void>;
+  requestAutomaticSkillSync(): void;
+  skillSyncReady(): boolean;
+  syncSkills(reconcileAfterPending?: boolean): Promise<{ complete: boolean }>;
   stopping: boolean;
   nativeOwnership: { assertOwned(): void } | null;
   instanceId: string;
@@ -57,6 +60,14 @@ function fixture() {
   return { supervisor, internal, events, run, heartbeatStart, transportStart, flushAll, pull, record, setComplete: (value: boolean) => { complete = value; } };
 }
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); });
+
+it("automatic synchronization requests a follow-up catalog read when another sync is pending", async () => {
+  const f = fixture();
+  vi.spyOn(f.internal, "skillSyncReady").mockReturnValue(true);
+  const sync = vi.spyOn(f.internal, "syncSkills").mockResolvedValue({ complete: true });
+  f.internal.requestAutomaticSkillSync();
+  expect(sync).toHaveBeenCalledWith(true);
+});
 
 it("clears uncertain provisioning only after accepted signed recovery", async () => {
   const f = fixture();
@@ -186,11 +197,23 @@ it("the heartbeat lease fence includes live native root ownership", () => {
 
 it("matching transport-only handshakes reuse accepted recovery without rerunning decisions", async () => {
   const f = fixture();
+  const sync = vi.spyOn(f.internal, "requestAutomaticSkillSync").mockImplementation(() => undefined);
   f.setComplete(true);
   const result = { connectionEpoch: 2, resume: {}, reset: [], runtimeReconciliation: { state: "confirmed", manifestId: "manifest", receiptDigest: "digest", acceptedAt: f.record.acceptedAt } } as RelayRuntimeHandshakeResult;
   await f.internal.onRelayConnected(result);
   expect(f.run).not.toHaveBeenCalled();
   expect(f.events).toEqual(["replay", "reports"]);
+  expect(sync).toHaveBeenCalledOnce();
+});
+
+it("does not reconcile Skills after a relay handshake with unaccepted recovery", async () => {
+  const f = fixture();
+  f.setComplete(true);
+  const sync = vi.spyOn(f.internal, "requestAutomaticSkillSync").mockImplementation(() => undefined);
+  const result = { connectionEpoch: 2, resume: {}, reset: [], runtimeReconciliation: { state: "confirmed", manifestId: "changed", receiptDigest: "digest", acceptedAt: f.record.acceptedAt } } as RelayRuntimeHandshakeResult;
+  await f.internal.onRelayConnected(result);
+  expect(sync).not.toHaveBeenCalled();
+  expect(f.flushAll).not.toHaveBeenCalled();
 });
 
 it.each(["manifestId", "receiptDigest", "acceptedAt"] as const)("rejects relay confirmation with a changed %s", field => {

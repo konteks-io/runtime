@@ -1,10 +1,15 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, readdir, writeFile, lstat, chmod, symlink, link, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, writeFile, lstat, chmod, symlink, link, rm, rename } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { stageOrganizationSkills } from "../skills/staging.js";
 import { computeRemoteFileTreeDigest, computeRemoteSkillCatalogDigest } from "../../../common/src/contracts.js";
+
+vi.mock("node:fs/promises", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, rename: vi.fn(actual.rename) };
+});
 
 const roots: string[] = [];
 afterEach(async () => { vi.unstubAllGlobals(); for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
@@ -46,8 +51,11 @@ describe("native organization skill staging", () => {
     expect(await readFile(join(personal, "SKILL.md"), "utf8")).toBe("personal");
     expect(fetchTree).toHaveBeenCalledWith(args.catalog.skills[0]!.transfer);
     expect(assertAuthorized.mock.calls.length).toBeGreaterThanOrEqual(2);
-    expect((await lstat(staged.root)).mode & 0o777).toBe(0o700);
-    expect((await lstat(join(staged.skills[0]!.directory, "scripts/check.sh"))).mode & 0o777).toBe(0o700);
+    expect(staged.skills[0]!.fileModes["scripts/check.sh"]).toBe(0o700);
+    if (process.platform !== "win32") {
+      expect((await lstat(staged.root)).mode & 0o777).toBe(0o700);
+      expect((await lstat(join(staged.skills[0]!.directory, "scripts/check.sh"))).mode & 0o777).toBe(0o700);
+    }
     expect(staged.catalogDigest).toBe(args.catalog.catalogDigest);
     expect((await readdir(args.scratchRoot)).some(p => p.startsWith(".stage-"))).toBe(false);
   });
@@ -101,7 +109,14 @@ describe("native organization skill staging", () => {
     const staged = await stageOrganizationSkills(args);
     const file = staged.skills[0]!.skillFile;
     if (kind === "extra") await writeFile(join(staged.skills[0]!.directory, "extra"), "unapproved");
-    else if (kind === "mode") await chmod(file, 0o644);
+    else if (kind === "mode") {
+      if (process.platform === "win32") {
+        const path = join(staged.root, ".catalog.json");
+        const receipt = JSON.parse(await readFile(path, "utf8"));
+        receipt.modes.review["scripts/check.sh"] = 0o600;
+        await writeFile(path, JSON.stringify(receipt));
+      } else await chmod(file, 0o644);
+    }
     else {
       const outside = join(root, "outside"); await writeFile(outside, "outside");
       await rm(file); if (kind === "symlink") await symlink(outside, file); else await link(outside, file);
@@ -134,6 +149,33 @@ describe("native organization skill staging", () => {
     expect(third.root).not.toBe(a.root);
     expect(fetchChanged).toHaveBeenCalledTimes(1);
     expect(await readFile(join(third.skills[0]!.directory, "references/rules.md"), "utf8")).toBe("Check the artifact twice.");
+  });
+
+  it.each(["EACCES", "EPERM"])("verifies the winning catalog after Windows concurrent rename %s", async code => {
+    const { args } = await setup();
+    vi.stubGlobal("process", new Proxy(process, { get(target, key) { return key === "platform" ? "win32" : Reflect.get(target, key); } }));
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    let fetched = 0, moved!: () => void, release!: () => void;
+    const bothFetched = new Promise<void>(resolve => { release = resolve; });
+    const winnerMoved = new Promise<void>(resolve => { moved = resolve; });
+    args.fetchTree.mockImplementation(async () => { if (++fetched === 2) release(); await bothFetched; return tree(); });
+    vi.mocked(rename).mockImplementationOnce(async (from, to) => { await actual.rename(from, to); moved(); });
+    vi.mocked(rename).mockImplementationOnce(async () => { await winnerMoved; throw Object.assign(new Error("destination exists"), { code }); });
+    const [a, b] = await Promise.all([stageOrganizationSkills(args), stageOrganizationSkills(args)]);
+    expect(a.root).toBe(b.root);
+    expect(await readFile(a.skills[0]!.skillFile, "utf8")).toContain("# Review");
+    expect((await readdir(args.scratchRoot)).filter(path => path.startsWith(".stage-"))).toEqual([]);
+  });
+
+  it.each([false, true])("does not treat a Windows rename refusal as verified publication, tampered=%s", async tampered => {
+    const { args } = await setup();
+    vi.stubGlobal("process", new Proxy(process, { get(target, key) { return key === "platform" ? "win32" : Reflect.get(target, key); } }));
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    vi.mocked(rename).mockImplementationOnce(async (from, to) => {
+      if (tampered) { await actual.rename(from, to); await writeFile(join(String(to), "review", "SKILL.md"), "tampered"); }
+      throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+    });
+    await expect(stageOrganizationSkills(args)).rejects.toMatchObject({ code: "capability_unavailable" });
   });
 
   it("retains digest-bound executable metadata on Windows instead of guessing it from stat", async () => {

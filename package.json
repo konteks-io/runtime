@@ -18,12 +18,13 @@
   ],
   "scripts": {
     "build": "tsc --build",
+    "build:dist": "node scripts/build-launcher.mjs",
     "clean": "tsc --build --clean && rm -rf packages/*/dist",
     "typecheck": "tsc --build",
     "lint": "eslint packages/*/src",
     "format": "prettier --write \"packages/*/src/**/*.ts\" \"scripts/**/*.mjs\"",
     "format:check": "prettier --check \"packages/*/src/**/*.ts\" \"scripts/**/*.mjs\"",
-    "test": "node --test scripts/offline-agent-files.test.mjs scripts/offline-graft-prebuilds.test.mjs scripts/codex-acp-live-user-patch.test.mjs scripts/claude-acp-settings-patch.test.mjs scripts/claude-instruction-scope.test.mjs scripts/claude-instruction-scope.integration.test.mjs scripts/bootstrap-install.test.mjs scripts/bootstrap-progress.test.mjs && vitest run",
+    "test": "node --test scripts/vendored-skill-contracts.test.mjs scripts/offline-agent-files.test.mjs scripts/offline-graft-prebuilds.test.mjs scripts/codex-acp-live-user-patch.test.mjs scripts/claude-acp-settings-patch.test.mjs scripts/claude-instruction-scope.test.mjs scripts/claude-instruction-scope.integration.test.mjs scripts/bootstrap-install.test.mjs scripts/bootstrap-progress.test.mjs && vitest run",
     "test:mac13-resource-probe": "node --test --test-concurrency=1 scripts/mac13-resource-probe/inspect-candidate.test.mjs",
     "test:watch": "vitest",
     "test:characterization": "REMOTE_INSTANCE_CHARACTERIZE=1 vitest run --project characterization",
@@ -50,7 +51,7 @@
     "@konteks/backstage-plugin-common": "file:../packages/packages/backstage-plugin-common"
   },
   "konteksContracts": {
-    "@konteks/agent-core": "7.8.2",
-    "@konteks/backstage-plugin-common": "7.8.2"
+    "@konteks/agent-core": "7.8.3",
+    "@konteks/backstage-plugin-common": "7.8.3"
   }
 }

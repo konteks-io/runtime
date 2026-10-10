@@ -1,3 +1,4 @@
+import { RuntimeSkillSyncItemSchema } from "@konteks/backstage-plugin-common/remote-instance-internal";
 import { z } from "zod";
 import { DoctorReportSchema, PreviewStatusReportSchema, RemoteInstanceError, SupervisorStatusSchema, UpdateChannelReportSchema, type ControlLoginEvent, type UpdateChannelReport } from "@konteks/remote-common";
 import type { SupervisorControl } from "../control.js";
@@ -33,6 +34,61 @@ function releaseChannelLine(channel: NonNullable<UpdateChannelReport>): string {
   const where = channel.override ? `${channel.host} (override: KONTEKS_RELEASE_MANIFEST_URL)` : channel.host;
   if (channel.error) return `${where} — cannot be read, no update can arrive: ${channel.error}`;
   return `${where}${channel.lastCheckedAt ? `, checked ${channel.lastCheckedAt}` : ", not checked yet"}`;
+}
+
+const SkillListSchema = z.object({ skills: z.array(RuntimeSkillSyncItemSchema), catalogDigest: z.string(),
+  installed: z.literal("unknown"), loaded: z.literal("unknown"),
+  profiles: z.array(z.object({ agentId: z.string(), home: z.string().optional(), installed: z.enum(["unknown", "verified", "stale"]),
+    loaded: z.literal("unknown"), reason: z.literal("skill_home_unavailable").optional() }).strict()).optional() }).strict();
+function installedSkillLabel(status: "unknown" | "verified" | "stale", indonesian: boolean): string {
+  return indonesian ? { unknown: "belum diketahui", verified: "terverifikasi", stale: "perlu sinkronisasi" }[status] : status;
+}
+export async function listSkills(context: ControlContext): Promise<void> {
+  const value = await context.control.call({ op: "skills.list" }, SkillListSchema, { timeoutMs: 95_000 });
+  context.output.result(value);
+  const id = outputLocale(context.output) === "id";
+  context.output.line(id ? "Status pemuatan Skill belum terverifikasi." : "Skill load status is not yet verified.");
+  for (const profile of value.profiles ?? []) {
+    const label = profile.home ? `${profile.agentId} (${profile.home})` : profile.agentId;
+    const installed = installedSkillLabel(profile.installed, id);
+    const status = id ? `terpasang=${installed}, dimuat=belum diketahui` : `installed=${installed}, loaded=unknown`;
+    context.output.line(`${label}: ${status}${profile.reason ? ` (${profile.reason})` : ""}`);
+  }
+  for (const skill of value.skills) {
+    context.output.line(`${skill.name}  ${skill.version}  ${skill.skillId}`);
+    context.output.line(`  ${skillAudience(skill.scope, id)}`);
+    context.output.line(`  ${skillContext(skill.scope, id)}`);
+  }
+}
+
+
+type SkillScope = z.infer<typeof RuntimeSkillSyncItemSchema>["scope"];
+function skillAudience(scope: SkillScope, id: boolean): string {
+  if (!scope) return id ? "Cakupan belum diketahui" : "Unknown scope";
+  const audience = scope.audience;
+  const labels = id ? { personal: "Pribadi", systems: "Sistem", organization: "Organisasi" } : { personal: "Personal", systems: "Systems", organization: "Organization" };
+  switch (audience.kind) {
+    case "personal": return `${labels.personal}: ${audience.ownerUserRef}`;
+    case "systems": return `${labels.systems}: ${audience.systemRefs.join(", ")}`;
+    case "organization": return `${labels.organization}: ${scope.tenantId}`;
+  }
+}
+function skillContext(scope: SkillScope, id: boolean): string {
+  if (!scope) return id ? "Konteks belum diketahui" : "Unknown context";
+  if (scope.context.kind === "global") return id ? "Semua konteks yang diizinkan" : "All authorized contexts";
+  return `${id ? "Inisiatif" : "Initiatives"}: ${scope.context.initiativeRefs.join(", ")}`;
+}
+
+const SkillSyncSchema = z.object({ complete: z.boolean(), loaded: z.literal("unknown"),
+  skills: z.array(RuntimeSkillSyncItemSchema), profiles: z.array(z.object({ home: z.string(), paths: z.array(z.string()),
+    status: z.enum(["installed", "failed"]), reason: z.string().optional(), agentId: z.string().optional() }).strict()) }).strict();
+export async function syncSkills(context: ControlContext): Promise<void> {
+  const value = await context.control.call({ op: "skills.sync" }, SkillSyncSchema, { timeoutMs: 95_000 });
+  context.output.result(value);
+  const id = outputLocale(context.output) === "id";
+  context.output.line(id ? "Status pemuatan Skill belum terverifikasi." : "Skill load status is not yet verified.");
+  for (const profile of value.profiles) context.output.line(`${profile.agentId ?? profile.home}: ${profile.status}${profile.reason ? ` (${profile.reason})` : ""}`);
+  if (!value.complete) throw new AlreadyToldError("capability_unavailable", id ? "Sinkronisasi Skill selesai sebagian." : "Skill synchronization partially failed.");
 }
 
 export async function status(context: ControlContext): Promise<void> {

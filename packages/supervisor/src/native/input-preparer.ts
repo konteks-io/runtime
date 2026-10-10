@@ -21,6 +21,7 @@ import {
 import {
   prepareDirectSessionInputs,
   prepareOrganizationSkillSession,
+  safeSkillFreshnessRejection,
   type PreparedSessionInputs,
 } from "../skills/session-inputs.js";
 import { continuedSession, isDirectAssignment } from "../work/continued-session.js";
@@ -609,6 +610,7 @@ class InputPreparation {
       ...prepared,
       skillInstructions: skillInstructions(current, inputs.selection.repository, prepared.skillInstructions),
       beforePrompt: this.beforePrompt(inputs, source, prepared),
+      ...this.nativeLoadChecks(inputs, source, prepared),
       ...this.deliveryOutput(inputs, source, outputHead),
       ...(wiringOf.task ? { toolWiring: wiringOf.task } : {}),
     };
@@ -756,7 +758,16 @@ class InputPreparation {
     };
   }
 
-  private beforePrompt(inputs: AuthorizedInputs, source: SourceWorkspace, prepared: PreparedSessionInputs): () => Promise<void> {
+  private nativeLoadChecks(inputs: AuthorizedInputs, source: SourceWorkspace, prepared: PreparedSessionInputs): Partial<PreparedSessionInputs> {
+    const { prepareNativeLoad, admitNativeLoad } = prepared;
+    if (!prepareNativeLoad || !admitNativeLoad) return {};
+    return {
+      prepareNativeLoad: this.beforePrompt(inputs, source, prepared, prepareNativeLoad),
+      admitNativeLoad: roots => this.beforePrompt(inputs, source, prepared, () => admitNativeLoad(roots))(),
+    };
+  }
+
+  private beforePrompt(inputs: AuthorizedInputs, source: SourceWorkspace, prepared: PreparedSessionInputs, verify = prepared.beforePrompt): () => Promise<void> {
     let prompting = false;
     return () =>
       this.mutate(async () => {
@@ -764,9 +775,9 @@ class InputPreparation {
         prompting = true;
         try {
           await source.verify();
-          await prepared.beforePrompt();
-          // The one Core recheck between the envelope and the prompt.
-          // After local verification, so a local failure costs no call.
+          await verify();
+          // Recheck Core after local verification and before advancing
+          // this admission stage. A local failure costs no authority call.
           await inputs.authorize();
           await source.verify();
         } catch (error) {
@@ -774,7 +785,7 @@ class InputPreparation {
           this.options.logger?.warn({ event: "native.inputs.recheck_failed", assignmentId: this.assignment.id,
             attempt: this.assignment.attempt, ...failureFields(error, "local_verification_failed") },
           "Inputs could not be rechecked before the prompt");
-          throw unavailable();
+          throw safeSkillFreshnessRejection(error) ?? unavailable();
         } finally {
           prompting = false;
         }

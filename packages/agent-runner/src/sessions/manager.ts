@@ -17,7 +17,7 @@ import { AcpNativeObservationSchema, RemoteInstanceError, type AgentTurnUsageObs
 import type { BridgeProcess } from "../bridge/process.js";
 import { classifyBridgeError } from "../bridge/process.js";
 import type { RunnerEventBus } from "../events.js";
-import type { HostPromptPrelude, HostPromptSession, HostTurnError } from "../host/host-agent.js";
+import type { HostPromptPrelude, HostPromptSession, HostPromptTurn, HostTurnError } from "../host/host-agent.js";
 import { konteksAgentTitledMetadata, konteksCodingSessionTitle, konteksSessionMetadata, type KonteksSessionLabel } from "./title.js";
 import type { MeasuredTurn } from "./usage-label.js";
 import {
@@ -82,6 +82,8 @@ interface CreateSessionArgs {
     recordProcessOwner(owner: RetainedProcessOwner): Promise<void>;
     replaceProcessOwner?(previous: RetainedProcessOwner, replacement: RetainedProcessOwner): Promise<void>;
     assertCurrent(): void;
+    admitSkillLoad?(authority: { acpSessionRef: string; requestId: string; readOnlyRoots: readonly string[] }): Promise<void>;
+    recordSkillLoad?(load: { acpSessionRef: string; requestId: string; loadId: string; readOnlyRoots: readonly string[]; observedAt: string }): Promise<void>;
   };
 }
 
@@ -121,6 +123,8 @@ interface SessionRecord {
   recoveryStopSettled?: boolean;
   completedClose?: Promise<void>;
   assertCurrent?: () => void;
+  admitSkillLoad?: NonNullable<CreateSessionArgs["lifecycle"]>["admitSkillLoad"];
+  recordSkillLoad?: NonNullable<CreateSessionArgs["lifecycle"]>["recordSkillLoad"];
   /** Native turns started by a connector-sent prompt (bounded, oldest evicted). */
   connectorTurns?: Set<string>;
   /** The session's current `model` value, as the agent last reported it. */
@@ -166,7 +170,9 @@ export interface SessionManagerOptions {
    * re-checks, and on Windows refreshes, its working copy's instructions).
    * Returns nothing when there is none, so the prompt is sent at once.
    */
-  beforePrompt?: (bridge: BridgeProcess) => Promise<void> | undefined;
+  beforePrompt?: (bridge: BridgeProcess, turn: HostPromptTurn) => Promise<void> | undefined;
+  /** Synchronous local turn invalidation; runs on preparation and dispatch failures too. */
+  afterPrompt?: (bridge: BridgeProcess, turn: HostPromptTurn) => void;
   events: RunnerEventBus;
   /** Durable map acpSessionRef → bridge session id inside the credential volume (survives restart). */
   refStore: SessionRefStore;
@@ -641,7 +647,7 @@ export class SessionManager {
     const { bridgeSessionId } = opened;
     if (this.sessions.has(acpSessionRef) || this.byBridgeId.has(bridgeSessionId)) throw new RemoteInstanceError("recovery_required", "bridge session already has a local owner");
     const modelValue = currentModel(opened.response.configOptions);
-    const record: SessionRecord = { bridge, acpSessionRef, bridgeSessionId, context: args.context, cwd: args.cwd, pendingClientRequests: new Map(), activeTurns: 0, operations: new Set(), operationFailed: false, completedTurn: false, continuationSealed: false, recoveryStopping: false, recoveryStop: null, ...(args.lifecycle ? { assertCurrent: args.lifecycle.assertCurrent } : {}),
+    const record: SessionRecord = { bridge, acpSessionRef, bridgeSessionId, context: args.context, cwd: args.cwd, pendingClientRequests: new Map(), activeTurns: 0, operations: new Set(), operationFailed: false, completedTurn: false, continuationSealed: false, recoveryStopping: false, recoveryStop: null, ...(args.lifecycle ? { assertCurrent: args.lifecycle.assertCurrent, admitSkillLoad: args.lifecycle.admitSkillLoad, recordSkillLoad: args.lifecycle.recordSkillLoad } : {}),
       ...(modelValue === undefined ? {} : { modelValue }),
       // A new session has spent nothing; a resumed one's total is unknown until the agent reports it.
       ...(opened.newSession ? { sessionCostUsd: 0 } : {}) };
@@ -1113,7 +1119,26 @@ export class SessionManager {
     if (this.refusedPrompt(record, requestId, params.prompt)) return;
     const publishMeasured = this.beginTurn(record, bridge);
     const send = () => this.sendPrompt(record, bridge, params);
-    const prepared = this.options.beforePrompt?.(bridge);
+    let current = true;
+    const turn = Object.freeze({ acpSessionRef, bridgeSessionId: record.bridgeSessionId!, requestId,
+      ...(record.admitSkillLoad ? { admitSkillLoad: async (readOnlyRoots: readonly string[]) => {
+        const admit = record.admitSkillLoad!;
+        this.requireBridge(record);
+        if (!current) throw new RemoteInstanceError("capability_unavailable", "Skill load turn has settled.");
+        await admit({ acpSessionRef, requestId, readOnlyRoots });
+        this.requireBridge(record);
+        if (!current) throw new RemoteInstanceError("capability_unavailable", "Skill load turn has settled.");
+      } } : {}),
+      ...(record.recordSkillLoad ? { recordSkillLoad: async (load: { loadId: string; readOnlyRoots: readonly string[]; observedAt: string }) => {
+        this.requireBridge(record);
+        if (!current) throw new RemoteInstanceError("capability_unavailable", "Skill load turn has settled.");
+        await record.recordSkillLoad!({ ...load, acpSessionRef, requestId });
+        this.requireBridge(record);
+        if (!current) throw new RemoteInstanceError("capability_unavailable", "Skill load turn has settled.");
+      } } : {}),
+    });
+    const prepare = this.options.beforePrompt;
+    const prepared = prepare ? Promise.resolve().then(() => prepare(bridge, turn)) : undefined;
     const operation = (prepared ? prepared.then(send) : send())
       .then(result => this.settlePrompt(record, requestId, result, publishMeasured))
       .catch((error: unknown) => {
@@ -1124,7 +1149,9 @@ export class SessionManager {
         throw error;
       })
       .finally(() => {
+        current = false;
         record.activeTurns = Math.max(0, record.activeTurns - 1);
+        this.options.afterPrompt?.(bridge, turn);
       });
     this.track(record, operation);
   }
@@ -1633,6 +1660,8 @@ function adoptSuccessor(record: SessionRecord, args: CreateSessionArgs): void {
   record.cwd = args.cwd;
   if (args.lifecycle) record.assertCurrent = args.lifecycle.assertCurrent;
   else delete record.assertCurrent;
+  record.admitSkillLoad = args.lifecycle?.admitSkillLoad;
+  record.recordSkillLoad = args.lifecycle?.recordSkillLoad;
   record.completedTurn = false;
   record.continuationSealed = false;
 }

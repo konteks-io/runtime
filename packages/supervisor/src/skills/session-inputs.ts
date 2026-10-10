@@ -1,6 +1,6 @@
 import { lstat, realpath } from "node:fs/promises";
 import { isAbsolute } from "node:path";
-import { RemoteInstanceError, RemoteSkillCatalogSchema, type RemoteDeliveryAcceptanceReceipt, type RemoteTransferBinding, type SessionToCoreMessage } from "@konteks/remote-common";
+import { RemoteInstanceError, RemoteSkillCatalogSchema, skillFreshnessFailure, type SkillFreshnessEvidence, type RemoteDeliveryAcceptanceReceipt, type RemoteTransferBinding, type SessionToCoreMessage } from "@konteks/remote-common";
 import { stageOrganizationSkills, type StageOrganizationSkillsOptions, type StagedOrganizationSkills } from "./staging.js";
 
 /** Local-only preparation result: paths/instructions never enter relay frames. */
@@ -10,7 +10,13 @@ export interface PreparedSessionInputs {
   /** Verified selected organization-skill directories; read authority only, local to this session. */
   readOnlyRoots?: readonly string[];
   skillInstructions: string;
+  /** Immutable selected versions corresponding to readOnlyRoots in the same order. */
+  nativeSkills?: readonly { skillId: string; version: string }[];
   beforePrompt: () => Promise<void>;
+  /** Staging only: native model transport still requires admitNativeLoad. */
+  prepareNativeLoad?: () => Promise<void>;
+  /** Host-verified content roots, never model-supplied paths. */
+  admitNativeLoad?: (roots: readonly string[]) => Promise<void>;
   /** Delivery-only terminal barrier. Public ACP completion waits for its durable cloud receipt. */
   acceptDeliveryOutput?: (authority: { claimId: string; invocationRef: string; completion: SessionToCoreMessage }) => Promise<RemoteDeliveryAcceptanceReceipt>;
   /** Restart/reconnect path: never captures new bytes without the original runner completion. */
@@ -59,26 +65,79 @@ export async function prepareDirectSessionInputs(options: { cwd: string; binding
 }
 
 /** Caller resolves the approved source checkout and authoritative skill selection. */
-export async function prepareOrganizationSkillSession(options: StageOrganizationSkillsOptions & { cwd: string }): Promise<PreparedSessionInputs> {
+export async function prepareOrganizationSkillSession(options: StageOrganizationSkillsOptions & { cwd: string; skillFreshness?: (skillId: string) => Promise<SkillFreshnessEvidence> }): Promise<PreparedSessionInputs> {
   try {
     const cwd = await checkedDirectory(options.cwd);
+    const catalog = RemoteSkillCatalogSchema.parse(options.catalog);
     const snapshot = {
       ...options,
-      catalog: RemoteSkillCatalogSchema.parse(options.catalog),
+      ...(catalog.executionContext ? { executionContext: catalog.executionContext } : {}),
+      catalog,
       authority: { binding: { ...options.authority.binding }, catalogDigest: options.authority.catalogDigest },
     };
     const staged = await stageOrganizationSkills(snapshot);
+    const roots = Object.freeze(staged.skills.map(skill => skill.directory));
+    const verify = async () => {
+      try {
+        if (await checkedDirectory(options.cwd) !== cwd) throw new Error("source moved");
+        const verified = await stageOrganizationSkills(snapshot);
+        if (verified.root !== staged.root) throw new Error("skill root moved");
+      } catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
+    };
     return {
       binding: { ...snapshot.authority.binding }, cwd,
-      readOnlyRoots: Object.freeze(staged.skills.map(skill => skill.directory)),
+      readOnlyRoots: roots,
+      nativeSkills: Object.freeze(staged.skills.map(skill => Object.freeze({ skillId: skill.skillId, version: skill.version }))),
       skillInstructions: organizationSkillInstructions(staged),
       beforePrompt: async () => {
-        try {
-          if (await checkedDirectory(options.cwd) !== cwd) throw new Error("source moved");
-          const verified = await stageOrganizationSkills(snapshot);
-          if (verified.root !== staged.root) throw new Error("skill root moved");
-        } catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
+        await assertRequiredSkillFreshness(snapshot.catalog, options.skillFreshness);
+        await verify();
+      },
+      prepareNativeLoad: verify,
+      admitNativeLoad: async observed => {
+        if (observed.length !== roots.length || roots.some((root, index) => observed[index] !== root)) throw freshnessError("failed");
+        await verify();
       },
     };
   } catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
+}
+
+/** Selected managed Skills require fresh, agent-bound evidence before every turn. */
+async function assertRequiredSkillFreshness(catalog: ReturnType<typeof RemoteSkillCatalogSchema.parse>, evidence?: (skillId: string) => Promise<SkillFreshnessEvidence>): Promise<void> {
+  for (const skill of catalog.skills) {
+    const proof = await observedSkillProof(skill.skillId, evidence);
+    const failure = skillFreshnessFailure(proof) ?? (matchesDesiredSkill(proof, skill) ? null : "stale");
+    if (failure) throw freshnessError(failure);
+  }
+}
+
+function matchesDesiredSkill(proof: SkillFreshnessEvidence | undefined, skill: ReturnType<typeof RemoteSkillCatalogSchema.parse>["skills"][number]): boolean {
+  return proof?.desiredDigest === skill.transfer.treeDigest && proof?.desiredVersion === skill.version;
+}
+
+type SkillFreshnessFailure = NonNullable<ReturnType<typeof skillFreshnessFailure>>;
+
+const freshnessMessages: Record<SkillFreshnessFailure, string> = {
+  stale: "Required Skills are stale. Sync this coding-agent profile and replace its cached execution context before retrying.",
+  offline: "Required Skill freshness cannot be checked while offline. Reconnect this runtime and sync before retrying.",
+  failed: "Required Skill verification failed. Inspect this coding-agent profile and retry synchronization before starting a turn.",
+  unsupported: "This coding-agent adapter cannot prove required Skill loads. Select a supported coding-agent profile.",
+  unknown: "Required Skill load proof is unavailable. Synchronize and verify this coding-agent profile before starting a turn.",
+};
+
+function freshnessError(failure: SkillFreshnessFailure): RemoteInstanceError {
+  return new RemoteInstanceError("capability_unavailable", freshnessMessages[failure], { diagnostic: `skill_freshness_${failure}` });
+}
+
+async function observedSkillProof(skillId: string, evidence?: (skillId: string) => Promise<SkillFreshnessEvidence>): Promise<SkillFreshnessEvidence | undefined> {
+  try { return await evidence?.(skillId); }
+  catch { throw freshnessError("failed"); }
+}
+
+/** Rebuild known freshness refusals from fixed copy; never relay adapter error text. */
+export function safeSkillFreshnessRejection(error: unknown): RemoteInstanceError | undefined {
+  if (!(error instanceof RemoteInstanceError) || error.code !== "capability_unavailable") return undefined;
+  const failure = error.diagnostic?.replace(/^skill_freshness_/, "");
+  if (!failure || error.diagnostic !== `skill_freshness_${failure}` || !Object.hasOwn(freshnessMessages, failure)) return undefined;
+  return freshnessError(failure as SkillFreshnessFailure);
 }

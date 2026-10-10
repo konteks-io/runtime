@@ -72,6 +72,8 @@ export interface RunnerSessionLifecycle {
   /** Pre-ready only: atomically replace one confirmed-stopped bootstrap owner. */
   replaceProcessOwner?(previous: RetainedProcessOwner, replacement: RetainedProcessOwner): Promise<void>;
   assertCurrent(): void;
+  admitSkillLoad?(authority: { acpSessionRef: string; requestId: string; readOnlyRoots: readonly string[] }): Promise<void>;
+  recordSkillLoad?(load: { acpSessionRef: string; requestId: string; loadId: string; readOnlyRoots: readonly string[]; observedAt: string }): Promise<void>;
 }
 
 /** The supervisor depends on behavior, not an appliance HTTP endpoint. */

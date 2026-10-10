@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { AgentTurnUsageObservationSchema, createLogger, jcsDigest,
+import { AgentTurnUsageObservationSchema, AgentSkillReadObservationSchema, coreContractAtLeast, createLogger, jcsDigest,
   RemoteInstanceError, type Clock, type Logger, type JsonValue } from "@konteks/remote-common";
 import type { CoreClient } from "../core/client.js";
 import type { DurableOutbox } from "../state/outbox.js";
@@ -12,7 +12,7 @@ export class ObservationDelivery {
   private timer: ReturnType<typeof setInterval> | null = null;
   private readonly logger: Logger;
   constructor(private readonly options: { outbox: DurableOutbox; core: Pick<CoreClient, "submitObservation">;
-    instanceId: () => string; clock: Clock; canSend: () => boolean; logger?: Logger }) {
+    instanceId: () => string; coreContractVersion?: () => string | undefined; clock: Clock; canSend: () => boolean; logger?: Logger }) {
     this.logger = options.logger ?? createLogger({ name: "observations" });
   }
   start(): void {
@@ -27,7 +27,8 @@ export class ObservationDelivery {
     await this.flushing;
   }
   async submit(body: unknown): Promise<void> {
-    const observation = AgentTurnUsageObservationSchema.parse(body);
+    const observation = AgentTurnUsageObservationSchema.or(AgentSkillReadObservationSchema).parse(body);
+    if (!this.supportsObservation(observation)) throw new RemoteInstanceError("capability_unavailable", "Core contract does not support completed Skill load receipts.");
     if (observation.instanceId !== this.options.instanceId()) throw new Error("Observation instance mismatch");
     await this.options.outbox.enqueue({ id: randomUUID(), channel: "observation",
       key: `observation:${jcsDigest(observation as unknown as JsonValue)}`, group: "observation", order: this.options.clock.now(),
@@ -40,13 +41,17 @@ export class ObservationDelivery {
     this.flushing ??= this.flushInternal().finally(() => { this.flushing = null; });
     return this.flushing;
   }
+  private supportsObservation(body: unknown): boolean {
+    const skill = AgentSkillReadObservationSchema.safeParse(body);
+    return !skill.success || coreContractAtLeast(this.options.coreContractVersion?.(), "7.5");
+  }
   private async flushInternal(): Promise<void> {
     const pending = this.options.outbox.all("observation").sort((a,b) =>
       (a.lastAttemptAt ?? "").localeCompare(b.lastAttemptAt ?? "") || a.order - b.order).slice(0, 8);
     for (const item of pending) {
       if (!this.options.canSend()) return;
       const body = item.body as { instanceId?: string; assignmentId?: string; attempt?: number };
-      if (body.instanceId !== this.options.instanceId()) continue;
+      if (body.instanceId !== this.options.instanceId() || !this.supportsObservation(item.body)) continue;
       const started = this.options.clock.now();
       try {
         await this.options.outbox.markAttempt(item.id, this.options.clock.nowIso());

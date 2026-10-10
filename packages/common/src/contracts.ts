@@ -455,3 +455,9 @@ export type {
   SupportedAgentEntry,
   ConnectorCommandsManifest,
 } from "@konteks/backstage-plugin-common";
+
+export { skillScopeAllows, skillFreshnessFailure } from "@konteks/backstage-plugin-common/remote-instance-internal";
+export type { SkillExecutionContext, SkillFreshnessEvidence } from "@konteks/backstage-plugin-common/remote-instance-internal";
+
+export { AgentSkillReadObservationSchema, RemoteSkillReadObservationRequestSchema, RemoteSkillReadObservationReceiptSchema } from "@konteks/backstage-plugin-common/remote-instance-internal";
+export type { AgentSkillReadObservation } from "@konteks/backstage-plugin-common/remote-instance-internal";

@@ -2,7 +2,7 @@ import { constants, type Stats } from "node:fs";
 import { createHash } from "node:crypto";
 import { lstat, open, realpath, type FileHandle } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join, parse, resolve } from "node:path";
+import { isAbsolute, join, parse, resolve } from "node:path";
 import { z } from "zod";
 import { isRetiredAgentId } from "@konteks/backstage-plugin-common";
 import { RemoteInstanceError } from "@konteks/remote-common";
@@ -50,6 +50,9 @@ export const NativeRuntimeRecordSchema = z.object({
   codexSocket: z.string().min(1).max(4096).optional(),
   /** The operator's own installed Claude Code CLI, located at install time. */
   claudeExecutable: z.string().min(1).max(4096).optional(),
+  /** Local installer-owned paths; these never come from a cloud catalog. */
+  claudeConfigDir: z.string().min(1).max(4096).refine(value => isAbsolute(value) && !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(value)).optional(),
+  agentSkillHomes: z.array(z.string().min(1).max(4096).refine(value => isAbsolute(value) && !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(value))).optional(),
   /** The person's own installed DeepSeek Harness package root, located at install time. */
   dshRoot: z.string().min(1).max(4096).optional(),
   /** The person's Node that runs it (the connector cannot run another script). */
@@ -220,6 +223,8 @@ class InstallationLoader {
       RUNNER_CREDENTIAL_DIR: credentials, RUNNER_WORKSPACE_DIR: workspace,
       ...(codexHome ? { RUNNER_NATIVE_CODEX_HOME: codexHome } : {}),
       ...(claudeExecutable ? { RUNNER_NATIVE_CLAUDE_EXECUTABLE: claudeExecutable } : {}),
+      ...(claudeExecutable && record.claudeConfigDir ? { RUNNER_NATIVE_CLAUDE_CONFIG_DIR: record.claudeConfigDir } : {}),
+      ...(record.agentSkillHomes ? { RUNNER_NATIVE_SKILL_HOMES: record.agentSkillHomes } : {}),
       // The supervisor owns this shared service lifecycle. Its default socket
       // is per connector; only the official CODEX_HOME remains shared.
       ...await codexSocketSetting(root, codexHome, profile.codexLocalProxy, record.codexSocket),
@@ -271,7 +276,8 @@ function antigravityUnavailable(root: string, record: NativeRuntimeRecord, error
     entry.relocate = async () => {
       const updated = await updateNativeAntigravity(root, record, { selfCheck: config => host.selfCheck(config) });
       entry.fetched = updated.fetched;
-      return updated.config;
+      return RunnerConfigSchema.parse({ ...updated.config,
+        ...(record.agentSkillHomes ? { RUNNER_NATIVE_SKILL_HOMES: record.agentSkillHomes } : {}) });
     };
   }
   return entry;
@@ -350,6 +356,7 @@ export async function nativeHostRunnerConfig(root: string, record: NativeRuntime
   return RunnerConfigSchema.parse({
     RUNNER_AGENT_ID: agent, RUNNER_AUTH_MODE: "agent_local_subscription",
     RUNNER_CREDENTIAL_DIR: credentials, RUNNER_WORKSPACE_DIR: workspace,
+    ...(record.agentSkillHomes ? { RUNNER_NATIVE_SKILL_HOMES: record.agentSkillHomes } : {}),
     ...await host.runnerSettings(record, { root }),
   });
 }

@@ -196,6 +196,8 @@ describe("channel mux", () => {
       expect(restarted.emitted.map(frame => [(frame as ToCoreRelayFrame).seq, (frame as ToCoreRelayFrame).connectionEpoch]))
         .toEqual(Array.from({ length: burst }, (_, index) => [index + 1, 2]));
       expect(restarted.mux.send("s", "session", { kind: "session_closed", assignmentId: "next", reason: "completed" })).toBe(burst + 1);
+      // Emission follows the durable write; do not remove its store while it is pending.
+      await vi.waitFor(() => expect(restarted.emitted).toHaveLength(burst + 1));
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

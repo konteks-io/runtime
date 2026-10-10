@@ -127,6 +127,7 @@ interface OrchestratorDeps {
   /** Shared-owner status check for an old Codex reference lacking a transport descriptor. */
   inspectLegacyCodexThread?: (reference: string) => Promise<{ unloaded: boolean; ownerGeneration: string }>;
   onUsage: (observation: AgentTurnUsageObservation) => Promise<void>;
+  onSkillUsage?: (observation: import("@konteks/remote-common").AgentSkillReadObservation) => Promise<void>;
   searchController?: SearchControllerBoundary;
   /** Present on a runtime tagged `onboard`; absent, both kinds are refused. */
   onboardCarrier?: Pick<OnboardWorkCarrier, "execute">;
@@ -921,6 +922,7 @@ export class WorkOrchestrator {
       ...this.executionRecordDeps(dispatch),
       reserveChannel: (channelId, owner) => this.reserveChannel(channelId, owner),
       onUsage: this.deps.onUsage,
+      ...(this.deps.onSkillUsage ? { onSkillUsage: this.deps.onSkillUsage } : {}),
       onExecutionAuthorityLost: () => this.recoverLostExecutionAuthority(assignment.id, assignment.attempt),
       onClosed: async (closed, reason) => this.onSessionClosed(closed, reason, dispatch.assertAuthority),
     };

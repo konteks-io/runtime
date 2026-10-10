@@ -73,7 +73,7 @@ function tree(files: Record<string, string>) {
     entries,
   };
 }
-async function fixture(sourceFiles: Record<string, string> = { "src/app.txt": "original" }) {
+async function fixture(sourceFiles: Record<string, string> = { "src/app.txt": "original" }, selectSkills = true) {
   const root = await mkdtemp(join(tmpdir(), "konteks-native-input-"));
   roots.push(root);
   const keys = buildReleaseFixture(),
@@ -99,7 +99,7 @@ async function fixture(sourceFiles: Record<string, string> = { "src/app.txt": "o
   const catalog = {
     version: 1,
     binding,
-    skills: [
+    skills: selectSkills ? [
       {
         skillId: "review",
         version: "1",
@@ -108,7 +108,7 @@ async function fixture(sourceFiles: Record<string, string> = { "src/app.txt": "o
         required: true,
         transfer: manifest("skill", "organization_skill", skillTree),
       },
-    ],
+    ] : [],
   };
   const selection = {
     version: 1,
@@ -179,7 +179,7 @@ async function fixture(sourceFiles: Record<string, string> = { "src/app.txt": "o
 
 describe("native authorized input composition", () => {
   it("initializes Git for a repository source and preserves its baseline and edits on restart", async () => {
-    const f = await fixture(),
+    const f = await fixture(undefined, false),
       git = await testGitTool();
     f.selection.source.revision = "a".repeat(40);
     const target: RemoteWorkAssignment = {
@@ -240,7 +240,7 @@ describe("native authorized input composition", () => {
     );
     expect(prepared.binding).toEqual(binding);
     expect(await readdir(prepared.cwd)).toEqual(["src"]);
-    await prepared.beforePrompt();
+    await expect(prepared.beforePrompt()).rejects.toMatchObject({ diagnostic: "skill_freshness_unknown" });
   });
   it("preserves local edits on reprepare/restart and never refetches an existing source", async () => {
     const f = await fixture();
@@ -251,14 +251,14 @@ describe("native authorized input composition", () => {
     expect(resumed.cwd).toBe(first.cwd);
     expect(await readFile(join(resumed.cwd, "src/app.txt"), "utf8")).toBe("local work");
     expect(f.fetchFn.mock.calls.every(([url]) => String(url).endsWith("/prepare"))).toBe(true);
-    await resumed.beforePrompt();
+    await expect(resumed.beforePrompt()).rejects.toMatchObject({ diagnostic: "skill_freshness_unknown" });
   });
   it("rechecks remote and local claim authority before prompts, including cached inputs", async () => {
-    const f = await fixture(),
+    const f = await fixture(undefined, false),
       prepared = await createNativeInputPreparer(f.options)(assignment);
     f.revoke();
     await expect(prepared.beforePrompt()).rejects.toMatchObject({ code: "capability_unavailable" });
-    const g = await fixture(),
+    const g = await fixture(undefined, false),
       other = await createNativeInputPreparer(g.options)(assignment);
     g.unclaim();
     await expect(other.beforePrompt()).rejects.toThrow();
@@ -306,7 +306,7 @@ describe("native authorized input composition", () => {
     await expect(prepared.beforePrompt()).rejects.toThrow();
   });
   it("supports an explicitly authorized empty conversation source", async () => {
-    const f = await fixture({});
+    const f = await fixture({}, false);
     const prepared = await createNativeInputPreparer(f.options)(assignment);
     expect(await readdir(prepared.cwd)).toEqual([]);
     await prepared.beforePrompt();
@@ -343,7 +343,7 @@ describe("native authorized input composition", () => {
   });
 
   it("renews the authorization window without replacing files or the selection", async () => {
-    const f = await fixture(),
+    const f = await fixture(undefined, false),
       prepared = await createNativeInputPreparer(f.options)(assignment);
     f.clock.advance(300_001);
     await prepared.beforePrompt();
@@ -362,7 +362,7 @@ describe("native authorized input composition", () => {
     expect(await readFile(receipt, "utf8")).toBe("{}");
   });
   it("wires repository tools alongside the rest of bootstrap, once per worktree, and logs every stage", async () => {
-    const f = await fixture(),
+    const f = await fixture(undefined, false),
       git = await testGitTool();
     // A real repository, served as the signed bundle Core sends.
     const seed = join(f.root, "seed");
