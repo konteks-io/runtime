@@ -142,6 +142,9 @@ describe("streamed activity redaction", () => {
     expect(titled("/opt/homebrew/bin/uv --cache-dir /Users/me/.cache/uv pip install --python /Users/me/work/.venv/bin/python pytest").title)
       .toBe("…/uv --cache-dir …/uv pip install --python [workspace]/.venv/bin/python pytest");
     expect(titled("ls /Users/me").title).toBe("ls [local-path]");
+    const spaced = "/Users/me/Library/Application Support/konteks-remote/workspaces/claude-code/session-1/source";
+    const inSpacedRoot = redactActivity(boundPublicToolTitle({ sessionUpdate: "tool_call", toolCallId: "cc-1", title: `cd "${spaced}" && git commit -m 'x'`, kind: "execute" }, spaced), spaced) as { title: string };
+    expect(inSpacedRoot.title).toBe(`cd "[workspace]" && git commit -m 'x'`);
     expect(titled('cat "C:\\Users\\me\\work\\notes.txt"').title).toBe('cat "…/notes.txt"');
     expect(titled("echo https://example.com/a/b/c").title).toBe("echo https://example.com/a/b/c");
   });
