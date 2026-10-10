@@ -27,6 +27,8 @@ import {
 export interface PreviewForwarderOptions {
   /** The running preview's loopback origin (`http://127.0.0.1:<port>`), or null when none runs. */
   origin: () => string | null;
+  /** While none runs because the last start failed: the person's reason (what is wrong, what to do). */
+  failure?: () => string | null;
   send: (chunk: PreviewToCoreChunk) => void;
   /**
    * Flow control: resolves true once the channel may take more response
@@ -95,6 +97,18 @@ interface PreviewForwarderCounters {
   oversized: number;
   idleClosed: number;
   upstreamFailures: number;
+}
+
+/**
+ * How a viewer is told a preview failed to start, followed by the reason.
+ * Konteks may recognise the phrase (a 503, plain text, no-store); unlike
+ * "No preview is running" it means nothing will appear until something changes.
+ */
+export const COULD_NOT_START_PREFIX = "Preview could not start: ";
+
+/** The plain 503 body for a session whose preview cannot be served: why it failed when it did, else that none runs. */
+export function notRunningMessage(failure: string | null, fallback: string): string {
+  return failure ? `${COULD_NOT_START_PREFIX}${failure}` : fallback;
 }
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
@@ -197,7 +211,7 @@ export class PreviewForwarder {
     const origin = this.loopbackOrigin();
     if (origin === null) {
       this.counters.refusedNoPreview += 1;
-      this.reply(chunk.streamId, 503, "No preview is running for this session. Ask the agent to start one with preview_start.");
+      this.reply(chunk.streamId, 503, notRunningMessage(this.options.failure?.() ?? null, "No preview is running for this session. Ask the agent to start one with preview_start."));
       return null;
     }
     if (this.streams.size >= this.limits.maxConcurrentStreams) {
@@ -242,7 +256,7 @@ export class PreviewForwarder {
     if (origin === null) {
       this.streams.delete(streamId);
       this.counters.refusedNoPreview += 1;
-      return this.reply(streamId, 503, "No preview is running for this session.");
+      return this.reply(streamId, 503, notRunningMessage(this.options.failure?.() ?? null, "No preview is running for this session."));
     }
     const response = await this.dial(streamId, stream, origin);
     if (response === null) return;

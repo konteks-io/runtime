@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { CONVERSATION_HAS_NO_APP, inferPreviewPlan, parsePreviewYaml, resolvePreviewPlan, frameworkFlags, substitutePreviewVariables, type PreviewPlanResult } from "../preview/config.js";
-import { buildPreviewEnv, PreviewProcessManager, PreviewProcessRegistry, allocatePreviewPort, type PreviewChild } from "../preview/process-manager.js";
+import { CONVERSATION_HAS_NO_APP, NOTHING_TO_SERVE_REASON, inferPreviewPlan, parsePreviewYaml, resolvePreviewPlan, frameworkFlags, substitutePreviewVariables, type PreviewPlanResult } from "../preview/config.js";
+import { buildPreviewEnv, pendingViewerRetry, PreviewProcessManager, PreviewProcessRegistry, allocatePreviewPort, type PreviewChild } from "../preview/process-manager.js";
 import { resolvePreviewPath } from "../preview/user-path.js";
 import type { PreviewProcessOwner } from "../preview/process-owner.js";
 
@@ -98,6 +98,24 @@ describe("preview configuration: .konteks/preview.yaml, else a sensible inferred
     const partial = await resolvePreviewPlan(dir, files({ ".konteks/preview.yaml": "serve:\n  prepare: npm run db:migrate\n", "package.json": JSON.stringify({ scripts: { dev: "vite" } }), "node_modules/x": "" }));
     expect(partial).toMatchObject({ ok: true, plan: { prepare: "npm run db:migrate", source: "inferred" } });
     expect(parsePreviewYaml("serve:\n  command: a\n   install: b")).toMatchObject({ ok: false });
+  });
+
+  it("reads serve.openPath, the page a viewer lands on, and notes a bad one without dropping the rest", async () => {
+    const valid = await resolvePreviewPlan(dir, files({ ".konteks/preview.yaml": "serve:\n  command: uvicorn app:app --port $PORT\n  openPath: /docs\n" }));
+    expect(valid).toMatchObject({ ok: true, plan: { command: "uvicorn app:app --port $PORT", openPath: "/docs", healthPath: "/" } });
+    expect(valid.ok && valid.plan.notes).toEqual([]);
+    expect(parsePreviewYaml("serve:\n  openPath: '/api/docs?tab=try'\n")).toMatchObject({ ok: true, plan: { openPath: "/api/docs?tab=try" } });
+    // Applies over an inferred command too.
+    const inferred = await resolvePreviewPlan(dir, files({ ".konteks/preview.yaml": "serve:\n  openPath: /swagger\n", "package.json": JSON.stringify({ scripts: { dev: "vite" } }), "node_modules/x": "" }));
+    expect(inferred).toMatchObject({ ok: true, plan: { source: "inferred", openPath: "/swagger" } });
+
+    for (const bad of ["docs", "https://evil.example/docs", "//evil.example/docs", "/\\evil", "/a/../../etc", "/docs#top", "/has space", `/${"a".repeat(200)}`]) {
+      const parsed = parsePreviewYaml(`serve:\n  command: npm start\n  openPath: ${JSON.stringify(bad)}\n`);
+      expect(parsed, bad).toMatchObject({ ok: true, plan: { command: "npm start" } });
+      expect(parsed.ok && parsed.plan.openPath, bad).toBeUndefined();
+      expect(parsed.ok && parsed.notes.join("\n"), bad).toContain("serve.openPath must be a path on the preview starting with /");
+    }
+    expect(parsePreviewYaml(`serve:\n  openPath: /${"a".repeat(199)}\n`)).toMatchObject({ ok: true, plan: { openPath: `/${"a".repeat(199)}` } });
   });
 
   it("substitutes the assigned host and port on every OS spelling", () => {
@@ -195,6 +213,49 @@ describe("supervised preview process manager", () => {
     expect(failed).toMatchObject({ state: "failed", message: expect.stringContaining("install step (npm install) exited with code 1") });
     expect(failed.logTail).toContain("npm ERR! network");
     expect(f.instance.health().lastFailure?.message).toContain("install step");
+  });
+
+  it("keeps each session's last failed start with the person's reason until one runs, and lands on serve.openPath", async () => {
+    const nothing = manager({}, { ok: false, message: "package.json has no dev, start or serve script.", reason: NOTHING_TO_SERVE_REASON, notes: [] });
+    await nothing.instance.start("s", "/w", "viewer");
+    const failed = await nothing.instance.waitForSettled("s", 2_000);
+    expect(failed).toMatchObject({ state: "failed", reason: NOTHING_TO_SERVE_REASON, openPath: "/" });
+    expect(NOTHING_TO_SERVE_REASON).toBe("This change has nothing a browser can open (no serve command). Ask the agent to make it runnable.");
+    expect(nothing.instance.lastFailureFor("s")).toMatchObject({ sessionId: "s", reason: NOTHING_TO_SERVE_REASON });
+
+    const f = manager({}, { ok: true, plan: { command: "npm run dev", install: "npm install", healthPath: "/health", openPath: "/docs", env: {}, source: "preview_yaml", explanation: "x", notes: [] } });
+    await f.instance.start("s1", "/w");
+    await vi.waitFor(() => expect(f.children).toHaveLength(1));
+    f.children[0]!.exit(1);
+    expect(await f.instance.waitForSettled("s1", 2_000)).toMatchObject({ state: "failed", reason: "Installing the project's dependencies failed with exit code 1. Ask the agent to fix it, then reload this page." });
+    f.advance(1_000);
+    await f.instance.start("s2", "/w2");
+    await vi.waitFor(() => expect(f.children).toHaveLength(2));
+    f.children[1]!.exit(0);
+    await vi.waitFor(() => expect(f.children).toHaveLength(3));
+    f.children[2]!.exit(2);
+    expect(await f.instance.waitForSettled("s2", 2_000)).toMatchObject({ state: "failed", reason: expect.stringContaining("The app stopped before it answered (exit code 2)") });
+    expect(f.instance.recentFailures().map(failure => failure.sessionId)).toEqual(["s2", "s1"]);
+
+    // A later start that runs clears the session's failure and opens on serve.openPath.
+    f.setUp(true);
+    await f.instance.start("s1", "/w");
+    await vi.waitFor(() => expect(f.children).toHaveLength(4));
+    f.children[3]!.exit(0);
+    const running = await f.instance.waitForSettled("s1", 2_000);
+    expect(running).toMatchObject({ state: "running", openPath: "/docs", reason: null, message: expect.stringContaining("Open http://127.0.0.1:43100/docs") });
+    expect(f.instance.lastFailureFor("s1")).toBeNull();
+    expect(f.instance.recentFailures().map(failure => failure.sessionId)).toEqual(["s2"]);
+  });
+
+  it("tells a viewer why while a failed viewer start waits for its retry, and lets the retry go ahead after", () => {
+    const failure = { sessionId: "s", at: new Date(10_000).toISOString(), reason: "why" };
+    expect(pendingViewerRetry(9_000, failure, 20_000, 60_000)).toBe("why");
+    // Retry window over, no viewer start yet, or a failure older than the viewer's start: a start may go ahead.
+    expect(pendingViewerRetry(9_000, failure, 69_000, 60_000)).toBeNull();
+    expect(pendingViewerRetry(undefined, failure, 20_000, 60_000)).toBeNull();
+    expect(pendingViewerRetry(11_000, failure, 20_000, 60_000)).toBeNull();
+    expect(pendingViewerRetry(9_000, null, 20_000, 60_000)).toBeNull();
   });
 
   it("does not count a conversation's missing app as a preview failure (09-30)", async () => {

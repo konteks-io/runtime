@@ -3,7 +3,7 @@ import { request as httpRequest } from "node:http";
 import { createServer } from "node:net";
 import { createLogger, supportsProcessGroups, type Logger } from "@konteks/remote-common";
 import { blockedCommandPattern, DEFAULT_BASH_BLOCKLIST } from "../session/workspace-tool-policy.js";
-import { CONVERSATION_HAS_NO_APP, resolvePreviewPlan, substitutePreviewVariables, type PreviewPlan, type PreviewPlanResult } from "./config.js";
+import { CONVERSATION_HAS_NO_APP, NOTHING_TO_SERVE_REASON, resolvePreviewPlan, substitutePreviewVariables, type PreviewPlan, type PreviewPlanResult } from "./config.js";
 import { resolvePreviewPath } from "./user-path.js";
 import { capturePreviewProcessOwner, stopPreviewProcessOwner, cleanupRequired, PreviewProcessRegistry, type PreviewProcessOwner } from "./process-owner.js";
 export { PreviewProcessRegistry } from "./process-owner.js";
@@ -48,6 +48,17 @@ export interface PreviewStatus {
   logTail: string[];
   /** Who started it; null when none has been started. */
   startedBy: PreviewStarter | null;
+  /** The page a viewer lands on (`serve.openPath`), `/` by default. */
+  openPath: string;
+  /** While failed: why, and what to do, in one or two plain sentences for the person who opened it. */
+  reason: string | null;
+}
+
+/** A session's last attempt that did not start, kept until one runs. */
+export interface PreviewFailure {
+  sessionId: string;
+  at: string;
+  reason: string;
 }
 
 export interface PreviewChild {
@@ -93,6 +104,8 @@ const LOG_LINES = 200;
 const LOG_TAIL = 40;
 const LOG_LINE_CHARS = 400;
 const RETAINED_ENDED = 32;
+const RETAINED_FAILURES = 32;
+const UNEXPECTED_REASON = "Something unexpected stopped the preview from starting. Reload this page to try again.";
 
 /**
  * The only variables a preview inherits from the connector's environment:
@@ -160,6 +173,7 @@ interface Entry {
   cleanupFailed: boolean;
   logs: string[];
   message: string;
+  reason: string | null;
   notes: string[];
   startedAt: number | null;
   readyAt: number | null;
@@ -188,6 +202,8 @@ export class PreviewProcessManager {
   private generation = 0;
   private closed = false;
   private lastFailure: { at: number; message: string } | null = null;
+  /** Each session's last attempt that did not start (oldest first), until one runs. */
+  private readonly failures = new Map<string, { at: number; reason: string }>();
 
   constructor(private readonly options: PreviewProcessManagerOptions = {}) {
     this.logger = options.logger ?? createLogger({ name: "preview" });
@@ -209,7 +225,7 @@ export class PreviewProcessManager {
    * it to answer or fail.
    */
   async start(sessionId: string, cwd: string, startedBy: PreviewStarter = "agent"): Promise<PreviewStatus> {
-    if (this.closed) return this.refusal(sessionId, "The connector is stopping; previews cannot start now.");
+    if (this.closed) return this.refusal(sessionId, "The connector is stopping; previews cannot start now.", "The connector on this computer is stopping. Try again once it is back.");
     const current = this.entries.get(sessionId);
     if (current && reusable(current, cwd)) {
       current.lastActivityAt = this.now();
@@ -219,16 +235,17 @@ export class PreviewProcessManager {
     if (this.entries.has(sessionId)) return this.start(sessionId, cwd, startedBy);
     const active = [...this.entries.values()].filter(entry => activeState(entry.state) || entry.child !== null || entry.stopping !== null);
     if (active.length >= this.maxRunning) {
-      return this.refusal(sessionId, `${active.length} previews are already running on this computer (the limit is ${this.maxRunning}, to keep it responsive). Stop one with preview_stop, or wait until one stops after ${Math.round(this.idleMs / 60_000)} idle minutes.`);
+      return this.refusal(sessionId, `${active.length} previews are already running on this computer (the limit is ${this.maxRunning}, to keep it responsive). Stop one with preview_stop, or wait until one stops after ${Math.round(this.idleMs / 60_000)} idle minutes.`,
+        `This computer already runs ${active.length} previews, its limit. Stop one, or try again once one stops after ${Math.round(this.idleMs / 60_000)} idle minutes.`);
     }
     const entry: Entry = {
       sessionId, cwd, startedBy, generation: ++this.generation, state: "starting", phase: null, plan: null, port: null, host: null, child: null, cleanupFailed: false,
-      logs: [], message: "Starting: reading how to serve this working copy.", notes: [], startedAt: this.now(), readyAt: null,
+      logs: [], message: "Starting: reading how to serve this working copy.", reason: null, notes: [], startedAt: this.now(), readyAt: null,
       lastActivityAt: this.now(), settled: Promise.resolve(), stopping: null,
     };
     this.entries.set(sessionId, entry);
     entry.settled = this.launch(entry).catch(error => {
-      return this.fail(entry, `The preview could not start: ${error instanceof Error ? error.message.slice(0, 300) : "unexpected error"}.`);
+      return this.fail(entry, `The preview could not start: ${error instanceof Error ? error.message.slice(0, 300) : "unexpected error"}.`, UNEXPECTED_REASON);
     });
     return this.view(entry);
   }
@@ -248,13 +265,25 @@ export class PreviewProcessManager {
     const entry = this.entries.get(sessionId) ?? [...this.ended].reverse().find(candidate => candidate.sessionId === sessionId);
     if (!entry) {
       return { sessionId, state: "not_started", phase: null, url: null, port: null, command: null, install: null, prepare: null, source: null, explanation: null, notes: [],
-        message: "No preview has been started for this session. Call preview_start.", startedAt: null, readyAt: null, idleStopMinutes: Math.round(this.idleMs / 60_000), logTail: [], startedBy: null };
+        message: "No preview has been started for this session. Call preview_start.", startedAt: null, readyAt: null, idleStopMinutes: Math.round(this.idleMs / 60_000), logTail: [], startedBy: null,
+        openPath: "/", reason: null };
     }
     return this.view(entry);
   }
 
   list(): PreviewStatus[] {
     return [...this.entries.values()].map(entry => this.view(entry));
+  }
+
+  /** This session's last attempt that did not start, until one runs; null when none failed. */
+  lastFailureFor(sessionId: string): PreviewFailure | null {
+    const failure = this.failures.get(sessionId);
+    return failure ? { sessionId, at: new Date(failure.at).toISOString(), reason: failure.reason } : null;
+  }
+
+  /** Every session's last attempt that did not start, newest first. */
+  recentFailures(): PreviewFailure[] {
+    return [...this.failures.keys()].reverse().map(sessionId => this.lastFailureFor(sessionId)!);
   }
 
   /** The loopback origin the forwarder may dial for this session, only while it answers. */
@@ -345,14 +374,14 @@ export class PreviewProcessManager {
     if (!this.isCurrent(entry)) return null;
     if (!planned.ok) {
       entry.notes = planned.notes;
-      await this.fail(entry, planned.message);
+      await this.fail(entry, planned.message, planned.reason ?? NOTHING_TO_SERVE_REASON);
       return null;
     }
     entry.plan = planned.plan;
     entry.notes = planned.plan.notes;
     const refused = refusedPhase(planned.plan);
     if (refused !== undefined) {
-      await this.fail(entry, refused);
+      await this.fail(entry, refused.message, `This computer's command policy does not allow the preview's ${refused.phase} command. Ask the agent to change it in .konteks/preview.yaml.`);
       return null;
     }
     return planned.plan;
@@ -379,7 +408,8 @@ export class PreviewProcessManager {
       const code = await this.runPhase(entry, substitutePreviewVariables(command, values), env);
       if (!this.isCurrent(entry)) return false;
       if (code !== 0) {
-        await this.fail(entry, `The ${phase} step (${command}) ${code === null ? "timed out" : `exited with code ${code}`}. See the log lines.`);
+        const failed = setupFailure(phase, command, code);
+        await this.fail(entry, failed.message, failed.reason);
         return false;
       }
     }
@@ -394,7 +424,7 @@ export class PreviewProcessManager {
     child.once("exit", (code, signal) => {
       watch.exited = { code, signal };
       if (this.entries.get(entry.sessionId) !== entry || entry.stopping) return;
-      if (entry.state === "running") void this.fail(entry, `The dev server stopped unexpectedly (${describeExit(code, signal)}). Call preview_stop to retry cleanup, then preview_start.`);
+      if (entry.state === "running") void this.fail(entry, `The dev server stopped unexpectedly (${describeExit(code, signal)}). Call preview_stop to retry cleanup, then preview_start.`, `The app stopped unexpectedly (${describeExit(code, signal)}). Reload this page to start it again.`);
     });
     child.once("error", error => {
       watch.exited ??= { code: null, signal: null };
@@ -412,10 +442,11 @@ export class PreviewProcessManager {
     const interval = this.options.probeIntervalMs ?? 500;
     while (this.isCurrent(entry)) {
       const ended = watch.exited;
-      if (ended) return this.fail(entry, `The dev server exited before it answered (${describeExit(ended.code, ended.signal)}). See the log lines.`);
+      if (ended) return this.fail(entry, `The dev server exited before it answered (${describeExit(ended.code, ended.signal)}). See the log lines.`, `The app stopped before it answered (${describeExit(ended.code, ended.signal)}). Ask the agent to check that it starts, then reload this page.`);
       if (await this.answered(entry, plan, port, watch)) return;
       if (this.now() >= deadline) {
-        return this.fail(entry, `The dev server did not answer on ${PREVIEW_HOST}:${port} within ${Math.round(readiness / 1000)} s. If it listens on a fixed port or host, set serve.command in .konteks/preview.yaml to use $HOST and $PORT.`);
+        return this.fail(entry, `The dev server did not answer on ${PREVIEW_HOST}:${port} within ${Math.round(readiness / 1000)} s. If it listens on a fixed port or host, set serve.command in .konteks/preview.yaml to use $HOST and $PORT.`,
+          `The app did not answer within ${Math.round(readiness / 1000)} s. Ask the agent to make it listen on the host and port the connector gives it ($HOST and $PORT).`);
       }
       await new Promise(resolve => setTimeout(resolve, interval));
     }
@@ -437,7 +468,9 @@ export class PreviewProcessManager {
     entry.host = host;
     entry.state = "running";
     entry.readyAt = this.now();
-    entry.message = `Running. Open http://${PREVIEW_HOST}:${port}${plan.healthPath === "/" ? "" : plan.healthPath} on this computer, or open the preview from the session in Konteks.`;
+    const openPath = plan.openPath ?? "/";
+    entry.message = `Running. Open http://${PREVIEW_HOST}:${port}${openPath === "/" ? "" : openPath} on this computer, or open the preview from the session in Konteks.`;
+    this.failures.delete(entry.sessionId);
     this.logger.info({ event: "preview.ready", source: plan.source, startupMs: entry.readyAt - (entry.startedAt ?? entry.readyAt) }, "preview answered its health probe");
   }
 
@@ -530,35 +563,55 @@ export class PreviewProcessManager {
     entry.state = "failed";
     entry.phase = null;
     entry.message = "Preview cleanup is unconfirmed. It still occupies a preview slot; call preview_stop to retry. " + (error instanceof Error ? error.message.slice(0, 200) : "");
+    entry.reason = "The last preview on this computer could not be stopped. Ask the agent to stop it, then reload this page.";
     this.lastFailure = { at: this.now(), message: entry.message.slice(0, 200) };
+    this.noteSessionFailure(entry.sessionId, entry.reason);
     this.options.onUnavailable?.(entry.sessionId);
     this.logger.warn({ event: "preview.kill_failed", err: error }, "preview ownership retained; cleanup remains unconfirmed");
   }
 
-  private async fail(entry: Entry, message: string): Promise<void> {
+  /** `message` is the agent's (what to change); `reason` the person's (what is wrong and what to do). */
+  private async fail(entry: Entry, message: string, reason: string): Promise<void> {
     if (this.entries.get(entry.sessionId) !== entry) return;
+    const phase = entry.phase;
     entry.state = "failed";
     entry.phase = null;
     entry.message = message;
+    entry.reason = reason;
     this.options.onUnavailable?.(entry.sessionId);
-    this.recordFailure(entry, message);
+    this.recordFailure(entry, phase, message, reason);
     // Whatever is left of the process tree goes with the failure.
     try { await this.kill(entry); } catch { return; }
     if (entry.stopping) return;
     this.options.onStopped?.(entry.sessionId);
   }
 
-  private recordFailure(entry: Entry, message: string): void {
+  private recordFailure(entry: Entry, phase: PreviewPhase | null, message: string, reason: string): void {
+    this.noteSessionFailure(entry.sessionId, reason);
     // A conversation with no app of its own is an answer, not a broken preview:
     // doctor would otherwise warn about it.
     const expected = message === CONVERSATION_HAS_NO_APP;
     if (!expected) this.lastFailure = { at: this.now(), message: message.slice(0, 200) };
     if (expected) this.logger.info({ event: "preview.no_app_in_conversation" }, "a conversation has no app of its own to preview");
-    else this.logger.warn({ event: "preview.failed", source: entry.plan?.source ?? null }, "preview did not start");
+    // The reason names no path beyond .konteks/preview.yaml and no command text.
+    else this.logger.warn({ event: "preview.failed", source: entry.plan?.source ?? null, phase, reason }, "preview did not start");
   }
 
-  private refusal(sessionId: string, message: string): PreviewStatus {
-    return { ...this.status(sessionId), state: this.entries.get(sessionId)?.state ?? "failed", message };
+  private noteSessionFailure(sessionId: string, reason: string): void {
+    this.failures.delete(sessionId);
+    this.failures.set(sessionId, { at: this.now(), reason });
+    for (const oldest of this.failures.keys()) {
+      if (this.failures.size <= RETAINED_FAILURES) break;
+      this.failures.delete(oldest);
+    }
+  }
+
+  /** A start refused before it began (connector stopping, the cap): the current state, the agent's message and the person's reason. */
+  private refusal(sessionId: string, message: string, reason: string): PreviewStatus {
+    this.noteSessionFailure(sessionId, reason);
+    this.logger.info({ event: "preview.start_refused", reason }, "a preview start was refused");
+    const state = this.entries.get(sessionId)?.state ?? "failed";
+    return { ...this.status(sessionId), state, message, reason: state === "failed" ? reason : null };
   }
 
   private retain(entry: Entry): void {
@@ -589,8 +642,29 @@ export class PreviewProcessManager {
       idleStopMinutes: Math.round(this.idleMs / 60_000),
       logTail: entry.logs.slice(-LOG_TAIL),
       startedBy: entry.startedBy,
+      openPath: entry.plan?.openPath ?? "/",
+      reason: entry.state === "failed" ? entry.reason : null,
     };
   }
+}
+
+/**
+ * While a viewer's last start is younger than `retryMs` and failed after it
+ * began: that failure's reason (the viewer is told why, and it is not retried
+ * on every refresh). Null when a start may go ahead.
+ */
+export function pendingViewerRetry(lastViewerStart: number | undefined, failure: PreviewFailure | null, now: number, retryMs: number): string | null {
+  if (lastViewerStart === undefined || now - lastViewerStart >= retryMs || failure === null) return null;
+  return Date.parse(failure.at) >= lastViewerStart ? failure.reason : null;
+}
+
+/** A failed install or prepare step: the agent's message and the person's reason. */
+function setupFailure(phase: "install" | "prepare", command: string, code: number | null): { message: string; reason: string } {
+  const step = phase === "install" ? "Installing the project's dependencies" : "The project's prepare step";
+  return {
+    message: `The ${phase} step (${command}) ${code === null ? "timed out" : `exited with code ${code}`}. See the log lines.`,
+    reason: `${step} ${code === null ? "timed out" : `failed with exit code ${code}`}. Ask the agent to fix it, then reload this page.`,
+  };
 }
 
 type ServeWatch = { exited: { code: number | null; signal: NodeJS.Signals | null } | null };
@@ -599,12 +673,12 @@ function reusable(entry: Entry, cwd: string): boolean {
   return activeState(entry.state) && entry.cwd === cwd && !entry.stopping && !entry.cleanupFailed;
 }
 
-/** The first install, prepare or serve command the command policy refuses, as the person reads it. */
-function refusedPhase(plan: PreviewPlan): string | undefined {
+/** The first install, prepare or serve command the command policy refuses, and the agent's message for it. */
+function refusedPhase(plan: PreviewPlan): { phase: PreviewPhase; message: string } | undefined {
   for (const [phase, command] of [["install", plan.install], ["prepare", plan.prepare], ["serve", plan.command]] as const) {
     if (command === undefined) continue;
     const hit = blockedCommandPattern(command, DEFAULT_BASH_BLOCKLIST);
-    if (hit) return `The ${phase} command is refused by this computer's command policy ("${hit.trim()}"). Change it in .konteks/preview.yaml.`;
+    if (hit) return { phase, message: `The ${phase} command is refused by this computer's command policy ("${hit.trim()}"). Change it in .konteks/preview.yaml.` };
   }
   return undefined;
 }
