@@ -211,6 +211,19 @@ describe("native control commands", () => {
     expect(f.text()).toContain("Customize → Runtimes");
   });
 
+  it("lists each session's last failed start with its reason, and the landing page of a running one", async () => {
+    const f = fake();
+    const reason = "This change has nothing a browser can open (no serve command). Ask the agent to make it runnable.";
+    f.context.control.call = (async (_request: ControlRequest, schema: { parse: (value: unknown) => unknown }) => schema.parse({
+      ...PREVIEWS,
+      previews: [{ ...PREVIEWS.previews[0]!, openPath: "/docs", reason: null }, { sessionId: "sess-2", state: "failed", url: null, port: null, command: null, source: null, explanation: null, message: "package.json has no dev, start or serve script.", startedAt: null, readyAt: null, startedBy: "viewer", openPath: "/", reason, viewerConnected: false }],
+      failures: [{ sessionId: "sess-2", at: "2026-10-10T08:00:00.000Z", reason }],
+    })) as typeof f.context.control.call;
+    await previewStatus(f.context);
+    expect(f.text()).toContain("sess-1: running at http://127.0.0.1:43100/docs (a viewer is connected)");
+    expect(f.text()).toContain(`Last failed start per session:\n  sess-2 (2026-10-10T08:00:00.000Z): ${reason}`);
+  });
+
   it("names Google Antigravity's download state in the agent list, with the command that changes it", async () => {
     let text = "";
     const sink = new Writable({ write(chunk, _encoding, done) { text += chunk.toString(); done(); } });

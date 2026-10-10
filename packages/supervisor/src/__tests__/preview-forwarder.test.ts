@@ -3,7 +3,7 @@ import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WebSocketServer } from "ws";
 import type { PreviewToCoreChunk, RelayChannel } from "@konteks/remote-common";
-import { PreviewForwarder } from "../preview/forwarder.js";
+import { COULD_NOT_START_PREFIX, PreviewForwarder } from "../preview/forwarder.js";
 import { PreviewChannel, STARTING_MESSAGE, sessionIdOf } from "../preview/preview-channel.js";
 import type { OutboundMessage } from "../transport/transport.js";
 
@@ -189,7 +189,7 @@ describe("preview forwarder (loopback only, preview policy on this hop)", () => 
 });
 
 describe("preview channel on the supervisor", () => {
-  function channel(options: { origin?: string | null; canOpen?: boolean; autoStart?: (sessionId: string) => Promise<boolean> } = {}) {
+  function channel(options: { origin?: string | null; canOpen?: boolean; autoStart?: (sessionId: string) => Promise<boolean | { reason: string }>; failureFor?: (sessionId: string) => string | null } = {}) {
     const sent: OutboundMessage[] = [];
     const opened: Array<[string, RelayChannel]> = [];
     const closed: string[] = [];
@@ -202,6 +202,7 @@ describe("preview channel on the supervisor", () => {
         originFor: () => options.origin === undefined ? origin : options.origin,
         touch: id => void touched.push(id),
         ...(options.autoStart ? { autoStart: options.autoStart } : {}),
+        ...(options.failureFor ? { failureFor: options.failureFor } : {}),
       },
     });
     return { instance, sent, opened, closed, touched, setCanOpen: (value: boolean) => { canOpen = value; } };
@@ -243,7 +244,7 @@ describe("preview channel on the supervisor", () => {
     f.setCanOpen(true);
     f.instance.onToRuntime("preview:s", { streamId: "m", kind: "request", method: "TRACE", path: "/", headers: {}, final: true });
     expect(bodies(f.sent)[1]).toMatchObject({ streamId: "m", status: 400 });
-    expect(f.instance.counters).toEqual({ malformed: 1, refusedDraining: 1, autoStarted: 0 });
+    expect(f.instance.counters).toEqual({ malformed: 1, refusedDraining: 1, autoStarted: 0, couldNotStart: 0 });
   });
 
   it("starts the preview for a viewer's first request when nothing runs, and says it is starting", async () => {
@@ -271,6 +272,27 @@ describe("preview channel on the supervisor", () => {
     autoStart.mockClear();
     f.instance.onToRuntime("preview:sess-4", { streamId: "p", kind: "request", method: "POST", path: "/x", headers: {}, body: b64("part"), final: false });
     expect(autoStart).not.toHaveBeenCalled();
+  });
+
+  it("says why a preview could not start instead of \"nothing yet\", for a viewer's page and a multi-part body alike", async () => {
+    const reason = "This change has nothing a browser can open (no serve command). Ask the agent to make it runnable.";
+    const autoStart = vi.fn(async () => ({ reason }));
+    const f = channel({ origin: null, autoStart, failureFor: () => reason });
+    f.instance.onToRuntime("preview:sess-5", { streamId: "f", kind: "request", method: "GET", path: "/", headers: { accept: "text/html" }, final: true });
+    await vi.waitFor(() => expect(f.sent).toHaveLength(1));
+    const reply = bodies(f.sent)[0] as Extract<PreviewToCoreChunk, { kind: "response" }>;
+    expect(reply).toMatchObject({ streamId: "f", status: 503, final: true, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
+    expect(Buffer.from(reply.body ?? "", "base64url").toString()).toBe(`Preview could not start: ${reason}`);
+    expect(COULD_NOT_START_PREFIX).toBe("Preview could not start: ");
+    expect(f.instance.counters).toMatchObject({ autoStarted: 0, couldNotStart: 1 });
+
+    // A body in several parts never auto-starts; the forwarder gives the same reason.
+    f.instance.onToRuntime("preview:sess-5", { streamId: "g", kind: "request", method: "POST", path: "/x", headers: {}, body: b64("part"), final: false });
+    await vi.waitFor(() => expect(f.sent).toHaveLength(2));
+    const plain = bodies(f.sent)[1] as Extract<PreviewToCoreChunk, { kind: "response" }>;
+    expect(plain.status).toBe(503);
+    expect(Buffer.from(plain.body ?? "", "base64url").toString()).toBe(`Preview could not start: ${reason}`);
+    expect(autoStart).toHaveBeenCalledTimes(1);
   });
 
   it("reads the session id only from a well-formed preview channel id", () => {

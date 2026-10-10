@@ -88,11 +88,18 @@ export async function previewStatus(context: ControlContext): Promise<void> {
     for (const line of previewLines(preview)) context.output.line(line);
   }
   if (value.lastFailure) context.output.line(`Last failure (${value.lastFailure.at}): ${value.lastFailure.message}`);
+  for (const line of failureLines(value.failures ?? [])) context.output.line(line);
+}
+
+/** Each session's last failed start, with the reason its viewer was given. */
+function failureLines(failures: NonNullable<z.infer<typeof PreviewStatusReportSchema>["failures"]>): string[] {
+  if (failures.length === 0) return [];
+  return ["Last failed start per session:", ...failures.map(failure => `  ${failure.sessionId} (${failure.at}): ${failure.reason}`)];
 }
 
 function previewLines(preview: z.infer<typeof PreviewStatusReportSchema>["previews"][number]): string[] {
   return [
-    `${preview.sessionId}: ${preview.state}${preview.url ? ` at ${preview.url}` : ""}${preview.startedBy === "viewer" ? " (started by a viewer)" : ""}${preview.viewerConnected ? " (a viewer is connected)" : ""}`,
+    `${preview.sessionId}: ${preview.state}${preview.url ? ` at ${preview.url}${preview.openPath && preview.openPath !== "/" ? preview.openPath : ""}` : ""}${preview.startedBy === "viewer" ? " (started by a viewer)" : ""}${preview.viewerConnected ? " (a viewer is connected)" : ""}`,
     ...(preview.command ? [`  command: ${preview.command}${preview.explanation ? ` — ${preview.explanation}` : ""}`] : []),
     `  ${preview.message}`,
   ];

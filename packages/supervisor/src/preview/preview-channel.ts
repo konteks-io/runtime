@@ -1,6 +1,6 @@
 import { PreviewToRuntimeChunkSchema, createLogger, type Logger, type PreviewToCoreChunk, type PreviewToRuntimeChunk, type RelayChannel } from "@konteks/remote-common";
 import type { OutboundMessage } from "../transport/transport.js";
-import { PreviewForwarder, type PreviewForwarderOptions } from "./forwarder.js";
+import { COULD_NOT_START_PREFIX, PreviewForwarder, type PreviewForwarderOptions } from "./forwarder.js";
 
 /**
  * The supervisor's side of the governed `preview` relay channel.
@@ -23,9 +23,13 @@ interface PreviewChannelDeps {
     /**
      * A viewer asked for a preview that is not running. Start it (same process
      * manager, inference and caps as preview_start) when this session's
-     * worktree exists and a preview is permitted; true while one is starting.
+     * worktree exists and a preview is permitted; true while one is starting,
+     * `{ reason }` when it cannot start (it failed and is not retried yet, or
+     * there is nothing to serve), false when a start is not possible here.
      */
-    autoStart?(sessionId: string): Promise<boolean>;
+    autoStart?(sessionId: string): Promise<boolean | { reason: string }>;
+    /** The person's reason the session's last start failed, while it is failed; null otherwise. */
+    failureFor?(sessionId: string): string | null;
   };
   /** True while the channel may take more to_core bytes (the mux's unacked window). */
   hasCapacity?: (channelId: string) => boolean;
@@ -45,7 +49,7 @@ export class PreviewChannel {
   private readonly forwarders = new Map<string, PreviewForwarder>();
   private readonly logger: Logger;
   private disposed = false;
-  readonly counters = { malformed: 0, refusedDraining: 0, autoStarted: 0 };
+  readonly counters = { malformed: 0, refusedDraining: 0, autoStarted: 0, couldNotStart: 0 };
 
   constructor(private readonly deps: PreviewChannelDeps) {
     this.logger = deps.logger ?? createLogger({ name: "preview-channel" });
@@ -88,15 +92,21 @@ export class PreviewChannel {
   }
 
   private async startForViewer(channelId: string, sessionId: string, chunk: Extract<PreviewToRuntimeChunk, { kind: "request" }>): Promise<void> {
-    let starting = false;
+    let started: boolean | { reason: string } = false;
     try {
-      starting = await this.deps.previews.autoStart!(sessionId);
+      started = await this.deps.previews.autoStart!(sessionId);
     } catch (error) {
       this.logger.warn({ event: "preview.auto_start_failed", err: error }, "a viewer's preview could not be started");
     }
-    if (starting) {
+    if (started === true) {
       this.counters.autoStarted += 1;
       this.reply(channelId, chunk.streamId, 503, STARTING_MESSAGE);
+      return;
+    }
+    if (typeof started === "object") {
+      // Nothing will appear until something changes: say why, not "nothing yet".
+      this.counters.couldNotStart += 1;
+      this.reply(channelId, chunk.streamId, 503, `${COULD_NOT_START_PREFIX}${started.reason}`);
       return;
     }
     // Not permitted or not possible here: the forwarder answers as it always has.
@@ -147,6 +157,7 @@ export class PreviewChannel {
     forwarder = new PreviewForwarder({
       ...this.deps.forwarder,
       origin: () => this.deps.previews.originFor(sessionId),
+      failure: () => this.deps.previews.failureFor?.(sessionId) ?? null,
       send: chunk => this.send(channelId, chunk),
       onActivity: () => this.deps.previews.touch(sessionId),
       ...(this.deps.hasCapacity ? { waitForCapacity: () => this.waitForCapacity(channelId) } : {}),
