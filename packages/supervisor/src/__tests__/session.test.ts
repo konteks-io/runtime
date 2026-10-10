@@ -770,6 +770,30 @@ describe("relayed session", () => {
       } finally { await f.session.close("cancelled"); }
     });
 
+    // 10-10 (E33): a refused `git commit` read "Failed" and the agent said the commit "was declined".
+    it("says in plain words why a command is refused, on its step, before answering", async () => {
+      const own = join(dir, "refused-command");
+      await mkdir(own);
+      const f = await build({ workspaceRoot: dir,
+        prepareInputs: async target => ({ binding: { workspaceId: target.workspaceId, sessionId: "s", assignmentId: target.id,
+          instanceId: target.instanceId, attempt: target.attempt }, cwd: own, skillInstructions: "", beforePrompt: async () => undefined }),
+        policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true),
+      });
+      try {
+        await f.session.bootstrap();
+        const answer = vi.spyOn(f.runner, "answer").mockImplementation(async () => ({ delivered: true }));
+        const params: RequestPermissionRequest = { sessionId: "acp-1", toolCall: { toolCallId: "commit", kind: "execute", title: "Create the initial commit", rawInput: { command: "git commit -m 'Add csvql'" } },
+          options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" }] };
+        const sentBefore = f.sent.length;
+        await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: "commit", params });
+        expect(answer).toHaveBeenCalledWith("acp-1", "commit", { outcome: { outcome: "selected", optionId: "reject" } });
+        expect(f.sent.slice(sentBefore)).toContainEqual(expect.objectContaining({ body: expect.objectContaining({ kind: "acp", method: "session/update",
+          params: expect.objectContaining({ update: { sessionUpdate: "tool_call_update", toolCallId: "commit", content: [{ type: "content", content: { type: "text",
+            text: "Konteks doesn't let agents run `git commit` on this computer. Run it yourself if you want it." } }] } }),
+        }) }));
+      } finally { await f.session.close("cancelled"); }
+    });
+
     it("threads a question it defers to a person onto the direct session", async () => {
       const registered: DeferredPermissionBody[] = [];
       const f = await build({ registerDeferral: async body => { registered.push(body); return null as never; } }, directWork);

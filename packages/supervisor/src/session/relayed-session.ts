@@ -1617,11 +1617,8 @@ export class RelayedSession {
    * the agent when it continues the stopped turn.
    */
   private async denyByPolicy(ref: string, requestId: string, request: RequestPermissionRequest, decision: Extract<PolicyDecision, { kind: "deny" }>): Promise<void> {
-    if (decision.message) {
-      const reason = decision.refusal?.reason;
-      if (reason === "outside_workspace" || reason === "outside_read_roots" || reason === "unresolved_read" || reason === "unresolved_write") {
-        await this.noteRefusedToolCall(ref, request.toolCall.toolCallId, decision.message);
-      }
+    if (decision.message && NOTED_REFUSALS.has(decision.refusal?.reason ?? "")) {
+      await this.noteRefusedToolCall(ref, request.toolCall.toolCallId, decision.message);
     }
     await this.answerPermission(ref, requestId, decision.optionId === null ? cancelledPermission() : selectedOption(decision.optionId));
   }
@@ -2037,6 +2034,12 @@ export class RelayedSession {
 }
 
 /** Close reasons that cancel the agent's running turn first. */
+/**
+ * Refusals the person reads on the refused step. A refused command says why
+ * too: the agent only hears "declined", and told the person their commit
+ * "was declined" (10-10, E33).
+ */
+const NOTED_REFUSALS: ReadonlySet<string> = new Set(["outside_workspace", "outside_read_roots", "unresolved_read", "unresolved_write", "bash_blocklist"]);
 const CANCELLING_CLOSE_REASONS: ReadonlySet<string> = new Set(["relay_replay_gap", "lease_lost", "drain", "cancelled"]);
 
 function cancelledPermission(): { outcome: { outcome: string; optionId?: string } } {
