@@ -268,6 +268,21 @@ describe("closed native runtime installation", () => {
     await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, agents: ["dsh"], dshRoot: supported, dshNode: node }));
     const hostOnly = await loadNativeInstallation(root, f.options);
     await expect(verifyInstalledNativeBridges(hostOnly.release, hostOnly.runners, f.options.platform)).resolves.toBeUndefined();
+    // 10-09: the recorded copy sat in npm's npx cache and npm cleared it. The
+    // copy the person installs again is found where it is, with no `agent add`.
+    const vanished = await dsh("0.1.7-rc.2-npx");
+    await rm(vanished, { recursive: true });
+    await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, agents: ["codex", "dsh"], dshRoot: vanished, dshNode: node }));
+    const previousOverride = process.env.DSH_EXECUTABLE;
+    process.env.DSH_EXECUTABLE = join(supported, "lib", "bin.js");
+    try {
+      const relocated = await loadNativeInstallation(root, f.options);
+      expect(relocated.runners.map(entry => entry.RUNNER_AGENT_ID)).toEqual(["codex", "dsh"]);
+      expect(relocated.runners[1]).toMatchObject({ RUNNER_NATIVE_DSH_ROOT: supported, RUNNER_BRIDGE_VERSION: "0.1.7-rc.2" });
+    } finally {
+      if (previousOverride === undefined) delete process.env.DSH_EXECUTABLE;
+      else process.env.DSH_EXECUTABLE = previousOverride;
+    }
     // An upgrade out of the tested range never runs silently: dsh is left out
     // with the install hint (retried by the supervisor), and Codex still loads
     // (start isolation).

@@ -82,8 +82,17 @@ const dshInstallAdapter: HostAgentInstallAdapter = {
   agentId: "dsh",
   offered: true,
   locate: env => locateNativeDsh(env),
+  // The recorded copy first. When it no longer verifies, the documented places
+  // are searched again, as for OpenCode: an `npx` copy lives in npm's cache,
+  // which npm may clear at any time (10-09: the recorded `_npx` copy vanished
+  // and DeepSeek Harness read "Not installed" for good, even after the global
+  // install its own message asked for). With nothing found the recorded
+  // refusal stands.
   async runnerSettings(record) {
-    const dsh = record.dshRoot === undefined ? await resolveNativeDshInstallation() : await verifyNativeDshRoot(record.dshRoot);
+    const recorded = record.dshRoot;
+    const dsh = recorded === undefined
+      ? await resolveNativeDshInstallation()
+      : await verifyNativeDshRoot(recorded).catch(async (error: unknown) => resolveNativeDshInstallation().catch(() => { throw error; }));
     const node = await resolveNativeDshNode(dsh, record.dshNode === undefined ? process.env : { DSH_NODE: record.dshNode });
     return {
       RUNNER_NATIVE_DSH_ROOT: dsh.root, RUNNER_NATIVE_DSH_ENTRY: dsh.entry, RUNNER_NATIVE_DSH_NODE: node,
