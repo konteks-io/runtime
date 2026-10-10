@@ -166,18 +166,64 @@ function placeholderTitle(currentTitle: string | undefined, fallback: string | u
  * DeepSeek Harness reports every tool call as ACP `other`, titled with its own
  * tool name from a closed set. Give those their ACP kind for activity, and
  * promote the federated `platform__*` name behind an MCP title as for Claude.
+ * The bare tool name told a person nothing ("edit · Failed", five "bash ·
+ * Done" in a row, 10-10), so a step reads as what it touches, the way Claude
+ * Code's and OpenCode's do: the command it runs, the file it reads or edits.
  * An arbitrary title still never becomes a name.
  */
 function dshCanonicalizer(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): unknown {
   const title = typeof candidate.title === "string" ? candidate.title : undefined;
   const name = platformMcpToolName(title) ?? prior?.name;
   const kind = dshKind(title, prior);
-  if (name === undefined && kind === undefined) return candidate;
+  const plainTitle = dshStepTitle(title, plainRecord(candidate.rawInput));
+  if (name === undefined && kind === undefined && plainTitle === undefined) return candidate;
   return {
     ...candidate,
     ...(typeof candidate.name !== "string" ? definedName(name) : {}),
     ...filledKind(candidate, kind),
+    ...definedTitle(plainTitle),
   };
+}
+
+function definedTitle(title: string | undefined): { title?: string } {
+  return title === undefined ? {} : { title };
+}
+
+type DshInput = Record<string, unknown>;
+
+/** Each dsh tool's step, in words, from its own input; undefined when the input names nothing. */
+const DSH_STEP_TITLES: Readonly<Record<string, (input: DshInput) => string | undefined>> = Object.freeze({
+  bash: input => trimmed(input.command),
+  pwsh: input => trimmed(input.command),
+  read: input => worded("Read", shownPath(input)),
+  read_image: input => worded("Read", shownPath(input)),
+  write: input => worded("Write", shownPath(input)),
+  edit: input => worded("Edit", shownPath(input)),
+  str_replace_editor: input => worded("Edit", shownPath(input)),
+  grep: input => worded("Search for", trimmed(input.pattern)),
+  glob: input => worded("Find", trimmed(input.pattern)),
+  web_fetch: input => worded("Fetch", trimmed(input.url)),
+  web_search: input => worded("Search the web for", trimmed(Array.isArray(input.queries) ? input.queries[0] : undefined)),
+});
+
+function dshStepTitle(tool: string | undefined, input: DshInput | undefined): string | undefined {
+  const step = tool !== undefined && Object.hasOwn(DSH_STEP_TITLES, tool) ? DSH_STEP_TITLES[tool] : undefined;
+  return step === undefined || input === undefined ? undefined : step(input);
+}
+
+function trimmed(value: unknown): string | undefined {
+  return nonBlank(value)?.trim();
+}
+
+function worded(verb: string, object: string | undefined): string | undefined {
+  return object === undefined ? undefined : `${verb} ${object}`;
+}
+
+/** A workspace path as given; an absolute one by its file name, never the computer's folders. */
+function shownPath(input: DshInput): string | undefined {
+  const path = trimmed(input.file_path) ?? trimmed(input.path);
+  if (path === undefined || !/^(?:\/|[A-Za-z]:[\\/]|~)/.test(path)) return path;
+  return path.split(/[\\/]/).filter(part => part.length > 0).pop();
 }
 
 function dshKind(title: string | undefined, prior: CanonicalAcpToolIdentity | undefined): string | undefined {
