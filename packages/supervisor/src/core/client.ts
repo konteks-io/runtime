@@ -374,6 +374,10 @@ export class CoreClient {
       baseUrl: options.baseUrl,
       ...(options.fetchFn ? { fetchFn: options.fetchFn } : {}),
       onServerTime: (serverTime: number, roundTrip: number) => options.clock.observeCoreTime(serverTime, roundTrip),
+      // The HTTP clients log retries with the caller's logger: with their own
+      // default one, `konteks-remote update` printed two raw JSON lines under
+      // "Updated to …" although its client was given a silent logger (E30).
+      logger: this.logger,
     };
     this.proofHttp = new JsonClient(transport);
     this.http = new JsonClient({
