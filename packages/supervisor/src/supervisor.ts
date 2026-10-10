@@ -37,6 +37,7 @@ import {
   type PreviewStatusReport,
   type RuntimeAgentLoginDeliveryRequest,
   coreContractAtLeast,
+  REMOTE_PREVIEW_APP_CREDENTIALS_MIN_CORE_CONTRACT_VERSION,
 } from "@konteks/remote-common";
 import { EmbeddedReleaseRootSchema, NATIVE_MANIFEST_URL, isHostAgentId, nativeManifestUrl, connectorCommandsManifest, selectNativeModelCapabilityMappings, verifyNativeRelease, type VerifiedNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 import { chromeInstalled, readAntigravityAdminObservation, type RunnerConfig } from "@konteks/remote-agent-runner";
@@ -941,6 +942,7 @@ export class Supervisor {
         failureFor: sessionId => this.previews.status(sessionId).state === "failed" ? this.previews.lastFailureFor(sessionId)?.reason ?? null : null,
       },
       hasCapacity: channelId => this.mux.unackedBytes(channelId) < previewWindowBytes,
+      coreAcceptsSetCookies: () => coreContractAtLeast(this.coreContractVersion, REMOTE_PREVIEW_APP_CREDENTIALS_MIN_CORE_CONTRACT_VERSION),
       logger: this.logger,
     });
   }

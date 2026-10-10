@@ -427,6 +427,10 @@ export {
   sanitizePreviewHeaders,
   validatePreviewPath,
   rewritePreviewLocation,
+  // D46: the previewed app's own cookies and Authorization.
+  REMOTE_PREVIEW_APP_CREDENTIALS_CAPABILITY,
+  REMOTE_PREVIEW_APP_CREDENTIALS_MIN_CORE_CONTRACT_VERSION,
+  previewAppSetCookies,
 } from "@konteks/backstage-plugin-common/remote-instance-internal";
 export type {
   PreviewToRuntimeChunk,

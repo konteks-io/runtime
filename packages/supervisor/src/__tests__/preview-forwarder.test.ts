@@ -93,16 +93,50 @@ describe("preview forwarder (loopback only, preview policy on this hop)", () => 
     expect(remote.instance.counters.refusedNoPreview).toBe(1);
   });
 
-  it("refuses a dot-segment path and a forbidden header before dialing", () => {
+  it("refuses a dot-segment path, a forbidden header and a Konteks cookie before dialing", () => {
     const requests = vi.fn();
     handler = (_request, response) => { requests(); response.end(); };
     const { instance, sent } = forwarder();
     instance.handle({ streamId: "dots", kind: "request", method: "GET", path: "/a/%2e%2e/secret", headers: {}, final: true });
-    instance.handle({ streamId: "cookie", kind: "request", method: "GET", path: "/", headers: { cookie: "session=1" } as never, final: true });
+    instance.handle({ streamId: "host", kind: "request", method: "GET", path: "/", headers: { host: "evil.example" } as never, final: true });
+    instance.handle({ streamId: "konteks", kind: "request", method: "GET", path: "/", headers: { cookie: "sid=1; konteks_preview=t" }, final: true });
     expect(responseOf(sent, "dots").status).toBe(400);
-    expect(responseOf(sent, "cookie").status).toBe(400);
-    expect(instance.counters).toMatchObject({ rejectedPaths: 1, rejectedHeaders: 1 });
+    expect(responseOf(sent, "host").status).toBe(400);
+    expect(responseOf(sent, "konteks").status).toBe(400);
+    expect(responseOf(sent, "konteks").body).toContain("konteks_cookie");
+    expect(instance.counters).toMatchObject({ rejectedPaths: 1, rejectedHeaders: 2 });
     expect(requests).not.toHaveBeenCalled();
+  });
+
+  it("hands the app its own cookie and Authorization, and returns its set-cookie host-only to a Core that takes it (D46)", async () => {
+    handler = (request, response) => {
+      response.setHeader("set-cookie", [
+        "sid=new; Domain=127.0.0.1; Path=/; HttpOnly",
+        "konteks_preview=forged; Path=/",
+        "theme=dark; SameSite=Strict",
+      ]);
+      response.end(`${request.headers.cookie} | ${request.headers.authorization}`);
+    };
+    const { instance, sent } = forwarder({ forwardSetCookies: () => true });
+    instance.handle({ streamId: "app", kind: "request", method: "GET", path: "/api/session", headers: { cookie: "sid=old; theme=light", authorization: "Bearer app" }, final: true });
+    await final(sent, "app");
+    expect(responseOf(sent, "app").body).toBe("sid=old; theme=light | Bearer app");
+    const head = sent.find(chunk => chunk.streamId === "app" && chunk.kind === "response");
+    expect(head).toMatchObject({ setCookie: ["sid=new; Path=/; HttpOnly; SameSite=Lax", "theme=dark; SameSite=Strict"] });
+    expect(sent.filter(chunk => chunk.streamId === "app" && "setCookie" in chunk)).toHaveLength(1);
+  });
+
+  it("drops the app's set-cookie for a Core that would refuse it", async () => {
+    handler = (_request, response) => {
+      response.setHeader("set-cookie", "sid=new");
+      response.end("ok");
+    };
+    for (const options of [{}, { forwardSetCookies: () => false }]) {
+      const { instance, sent } = forwarder(options);
+      instance.handle({ streamId: "old", kind: "request", method: "GET", path: "/", headers: {}, final: true });
+      await final(sent, "old");
+      expect(sent.some(chunk => "setCookie" in chunk)).toBe(false);
+    }
   });
 
   it("rewrites a redirect to its own loopback origin to origin-form and turns any other absolute redirect into 502", async () => {
@@ -170,6 +204,21 @@ describe("preview forwarder (loopback only, preview policy on this hop)", () => 
       instance.handle({ streamId: "ws", kind: "close", code: 1000, final: true });
       await vi.waitFor(() => expect(closed).toHaveBeenCalledWith(1000));
       expect(instance.activeStreams).toBe(0);
+    } finally {
+      wss.close();
+    }
+  });
+
+  it("opens the app's WebSocket with its own cookie", async () => {
+    const wss = new WebSocketServer({ server });
+    const cookies: Array<string | undefined> = [];
+    wss.on("connection", (_socket, request) => void cookies.push(request.headers.cookie));
+    try {
+      const { instance, sent } = forwarder();
+      instance.handle({ streamId: "wsc", kind: "request", method: "GET", path: "/socket", headers: { "sec-websocket-version": "13", cookie: "sid=abc" }, final: true });
+      await vi.waitFor(() => expect(sent.find(chunk => chunk.streamId === "wsc" && chunk.kind === "response")).toMatchObject({ status: 101 }));
+      expect(cookies).toEqual(["sid=abc"]);
+      instance.handle({ streamId: "wsc", kind: "close", code: 1000, final: true });
     } finally {
       wss.close();
     }

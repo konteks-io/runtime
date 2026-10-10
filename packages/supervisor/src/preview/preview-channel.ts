@@ -33,6 +33,8 @@ interface PreviewChannelDeps {
   };
   /** True while the channel may take more to_core bytes (the mux's unacked window). */
   hasCapacity?: (channelId: string) => boolean;
+  /** Whether Core takes the app's `set-cookie` back (D46); absent, it is dropped. */
+  coreAcceptsSetCookies?: () => boolean;
   forwarder?: Partial<Pick<PreviewForwarderOptions, "createWebSocket" | "requestFn" | "now" | "limits">>;
   logger?: Logger;
 }
@@ -160,6 +162,7 @@ export class PreviewChannel {
       failure: () => this.deps.previews.failureFor?.(sessionId) ?? null,
       send: chunk => this.send(channelId, chunk),
       onActivity: () => this.deps.previews.touch(sessionId),
+      forwardSetCookies: () => this.deps.coreAcceptsSetCookies?.() === true,
       ...(this.deps.hasCapacity ? { waitForCapacity: () => this.waitForCapacity(channelId) } : {}),
       logger: this.logger,
     });
