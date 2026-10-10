@@ -46,12 +46,38 @@ export const PUBLIC_TOOL_TITLE_MAX = 600;
  * the tool's own end never reached the page (10-09). Cut the public title
  * instead; the call keeps its identity and status.
  */
-export function boundPublicToolTitle(value: unknown): unknown {
+export function boundPublicToolTitle(value: unknown, workspaceRoot?: string): unknown {
   const update = plainRecord(value);
   if (update?.sessionUpdate !== "tool_call" && update?.sessionUpdate !== "tool_call_update") return value;
-  const title = update.title;
-  if (typeof title !== "string" || title.length <= PUBLIC_TOOL_TITLE_MAX) return value;
-  return { ...update, title: `${[...title].slice(0, PUBLIC_TOOL_TITLE_MAX - 1).join("").trimEnd()}…` };
+  if (typeof update.title !== "string") return value;
+  const title = boundTitle(workspaceRoot === undefined ? update.title : readablePaths(update.title, workspaceRoot));
+  return title === update.title ? value : { ...update, title };
+}
+
+function boundTitle(title: string): string {
+  return title.length <= PUBLIC_TOOL_TITLE_MAX ? title : `${[...title].slice(0, PUBLIC_TOOL_TITLE_MAX - 1).join("").trimEnd()}…`;
+}
+
+/** An absolute path in a command, as the redaction below would otherwise mask it whole. */
+const TITLE_ABSOLUTE_PATH = /(^|[\s"'=(])((?:\/(?!\/)|[A-Za-z]:[\\/])[^\s"'<>`)\]}*]+)/g;
+
+/**
+ * A step names the files it runs and touches by their last part: Codex titles
+ * a command with its whole text, and every absolute path in it was masked, so
+ * a step read "[local-path] --cache-dir [local-path] pip install --python
+ * [local-path] pytest" (10-10). A path inside the workspace is left to the
+ * redaction, which names it relative to the workspace. A path of one or two
+ * parts (`/Users/me`, a home folder) still goes to the mask: its last part
+ * could be a name.
+ */
+function readablePaths(title: string, workspaceRoot: string): string {
+  const root = workspaceRoot.replace(/[\\/]$/, "");
+  return title.replace(TITLE_ABSOLUTE_PATH, (whole, before: string, path: string) => {
+    // The workspace's own paths stay, named relative to it by the redaction.
+    if (root.length > 1 && (path === root || path.startsWith(`${root}/`) || path.startsWith(`${root}\\`))) return whole;
+    const parts = path.split(/[\\/]/).filter(part => part.length > 0 && !/^[A-Za-z]:$/.test(part));
+    return parts.length < 3 ? whole : `${before}…/${parts[parts.length - 1]}`;
+  });
 }
 
 /**

@@ -858,7 +858,7 @@ export class RelayedSession {
       toolCallId === undefined ? undefined : this.toolActivityIdentity.get(toolCallId),
     ) as Record<string, unknown>;
     return {
-      canonicalMessage: { ...message, params: { ...message.params, update: boundPublicToolTitle(omitPrivateAcpToolPayload(canonicalUpdate)) } },
+      canonicalMessage: { ...message, params: { ...message.params, update: boundPublicToolTitle(omitPrivateAcpToolPayload(canonicalUpdate), this.sessionCwd()) } },
       canonicalIdentity: toolCallId === undefined ? undefined : toolIdentity(toolCallId, canonicalUpdate),
     };
   }

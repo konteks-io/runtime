@@ -137,6 +137,15 @@ describe("streamed activity redaction", () => {
       .toEqual({ sessionUpdate: "tool_call_update", toolCallId: `dsh-${tool}`, status: "failed", kind });
   });
 
+  it("shows a command's paths by their last part instead of a mask, but never a home folder", () => {
+    const titled = (title: string) => redactActivity(boundPublicToolTitle({ sessionUpdate: "tool_call", toolCallId: "codex-1", title, kind: "execute" }, "/Users/me/work"), "/Users/me/work") as { title: string };
+    expect(titled("/opt/homebrew/bin/uv --cache-dir /Users/me/.cache/uv pip install --python /Users/me/work/.venv/bin/python pytest").title)
+      .toBe("…/uv --cache-dir …/uv pip install --python [workspace]/.venv/bin/python pytest");
+    expect(titled("ls /Users/me").title).toBe("ls [local-path]");
+    expect(titled('cat "C:\\Users\\me\\work\\notes.txt"').title).toBe('cat "…/notes.txt"');
+    expect(titled("echo https://example.com/a/b/c").title).toBe("echo https://example.com/a/b/c");
+  });
+
   it("keeps DeepSeek Harness' own title when the step's input names nothing", () => {
     expect(canonicalizeAcpToolActivity({ sessionUpdate: "tool_call", toolCallId: "dsh-todo", title: "todo", kind: "other", rawInput: { items: [] } }, "dsh"))
       .toMatchObject({ title: "todo" });

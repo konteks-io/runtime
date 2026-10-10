@@ -815,12 +815,12 @@ describe("relayed session", () => {
       expect(f.quarantine).not.toHaveBeenCalled();
     });
 
-    it("gives dsh tool calls their ACP kind and the platform tool name in relayed activity", async () => {
+    it("gives dsh tool calls their ACP kind, a title from what they run, and the platform tool name in relayed activity", async () => {
       const f = await dshSession();
       await f.toolCall("t-1", "bash", { command: "ls" });
       await f.toolCall("t-2", "mcp__konteks-platform__platform__builtin__echo", { text: "ping" });
       const updates = f.sent.map(message => message.body as { method?: string; params?: { update?: Record<string, unknown> } }).filter(body => body.method === "session/update").map(body => body.params!.update!);
-      expect(updates[0]).toMatchObject({ toolCallId: "t-1", kind: "execute", title: "bash" });
+      expect(updates[0]).toMatchObject({ toolCallId: "t-1", kind: "execute", title: "ls" });
       expect(updates[1]).toMatchObject({ toolCallId: "t-2", name: "platform__builtin__echo" });
     });
 
