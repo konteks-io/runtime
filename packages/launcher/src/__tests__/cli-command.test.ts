@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { RemoteInstanceError } from "@konteks/remote-common";
 import { commandHintText, resolveCliCommand, shellWord } from "../cli-command.js";
 import { createOutput } from "../output.js";
+import { AGAIN, runnableStep, type OnboardStep } from "../native/onboard-session.js";
 
 function sink(): { stream: PassThrough; text: () => string } {
   const stream = new PassThrough();
@@ -125,5 +126,50 @@ describe("createOutput names the command the way this computer runs it", () => {
     expect(JSON.parse(out.text())).toEqual({ next: "konteks-remote agent add dsh" });
     expect(err.text()).toContain("run konteks-remote doctor");
     expect(out.text() + err.text()).not.toContain("Application Support");
+  });
+});
+
+describe("onboarding steps name the command the way this computer runs it", () => {
+  const executable = "/Users/a/Library/Application Support/konteks-remote/bin/konteks-remote";
+  const command = shellWord(executable);
+
+  it("rewrites the instructions the agent runs and keeps every structural field", () => {
+    const step: OnboardStep = {
+      step: "agents",
+      note: "DeepSeek Harness is on this computer but not added yet: konteks-remote agent add dsh",
+      ask: { question: "Run `konteks-remote doctor` first?", kind: "confirm", choices: ["yes", "no"] },
+      run: AGAIN,
+      done: {
+        summary: "No coding agent was found on this machine; install one and run konteks-remote auth login.",
+        links: { site: "https://konteks.example/s/konteks-remote" },
+        remedies: ["DeepSeek Harness needs your DeepSeek API key: konteks-remote auth login dsh", "To keep the runtime available after logout: loginctl enable-linger $USER"],
+      },
+    };
+    const shown = runnableStep(step, command, executable);
+    expect(shown.step).toBe("agents");
+    expect(shown.note).toBe(`DeepSeek Harness is on this computer but not added yet: ${command} agent add dsh`);
+    expect(shown.ask).toEqual({ question: `Run \`${command} doctor\` first?`, kind: "confirm", choices: ["yes", "no"] });
+    expect(shown.run).toEqual({ argv: [executable, "onboard", "--json"] });
+    expect(shown.done?.summary).toBe(`No coding agent was found on this machine; install one and run ${command} auth login.`);
+    expect(shown.done?.links).toEqual(step.done!.links);
+    expect(shown.done?.remedies).toEqual([`DeepSeek Harness needs your DeepSeek API key: ${command} auth login dsh`, step.done!.remedies![1]]);
+    expect(AGAIN.argv).toEqual(["konteks-remote", "onboard", "--json"]);
+    expect(JSON.parse(JSON.stringify(shown))).toEqual(shown);
+  });
+
+  it("returns the step untouched where konteks-remote is on PATH", () => {
+    const step: OnboardStep = { step: "start", note: "To start it: konteks-remote start", run: { argv: ["konteks-remote", "start"] } };
+    expect(runnableStep(step, "konteks-remote", "konteks-remote")).toBe(step);
+  });
+
+  it("prints a step's JSON line without rewriting it again", () => {
+    const out = sink();
+    const shown = runnableStep({ step: "agents", note: "To add it: konteks-remote agent add dsh", run: AGAIN }, command, executable);
+    const output = createOutput({ json: false, stdout: out.stream, locale: "en", command });
+    output.line(JSON.stringify(shown, null, 2));
+    expect(JSON.parse(out.text())).toEqual(shown);
+    const raw = sink();
+    createOutput({ json: false, stdout: raw.stream, locale: "en", command }).line(JSON.stringify({ note: "run konteks-remote doctor" }));
+    expect(JSON.parse(raw.text())).toEqual({ note: "run konteks-remote doctor" });
   });
 });

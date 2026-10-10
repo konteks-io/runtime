@@ -65,7 +65,9 @@ export function createOutput(options: OutputOptions): Output {
   const stderr = options.stderr ?? process.stderr;
   const progress = foregroundProgress(options, stdout, stderr, locale);
   const command = options.command ?? cliCommand;
-  const human = (text: string) => commandHintText(redactText(text), command);
+  // A JSON document printed as a line (onboarding's first step) already names
+  // the command in its strings; rewriting it would break its quoting.
+  const human = (text: string) => (isJsonDocument(text) ? redactText(text) : commandHintText(redactText(text), command));
   return {
     json: options.json,
     setupLocale: locale,
@@ -113,6 +115,16 @@ export function createOutput(options: OutputOptions): Output {
       else stderr.write(`${human(setupText("unknownError", { detail: message }, locale))}\n`);
     },
   };
+}
+
+function isJsonDocument(text: string): boolean {
+  if (!/^\s*[[{]/.test(text)) return false;
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 const AGENT_NAMES: Record<string, string> = { "claude-code": "Claude Code", codex: "Codex", dsh: "DeepSeek Harness", opencode: "OpenCode 2", antigravity: "Google Antigravity" };

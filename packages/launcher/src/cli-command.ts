@@ -40,18 +40,23 @@ export function shellWord(value: string): string {
 
 /**
  * `konteks-remote` when the first one on PATH is this very executable,
- * otherwise this executable's path as a shell word. Windows and source runs
- * keep the name: the MSI puts its launcher on PATH and runs the release's own
- * executable as a child, and a source run has no installed command to name.
+ * otherwise this executable's path. Windows and source runs keep the name:
+ * the MSI puts its launcher on PATH and runs the release's own executable as
+ * a child, and a source run has no installed command to name.
  */
-export function resolveCliCommand(input: CliCommandInput): string {
+export function resolveCliExecutable(input: CliCommandInput): string {
   if (input.platform === "win32") return CLI_NAME;
   if (input.argv1 && resolve(input.argv1) !== resolve(input.execPath)) return CLI_NAME;
   const realpath = input.realpath ?? realpathSync;
   const self = tryRealpath(realpath, input.execPath);
   if (self === undefined) return CLI_NAME;
   const found = firstOnPath(input.path, input.isExecutable ?? isExecutableFile, realpath);
-  return found === self ? CLI_NAME : shellWord(input.execPath);
+  return found === self ? CLI_NAME : input.execPath;
+}
+
+/** The same command as a shell word, for text a person or an agent types into a shell. */
+export function resolveCliCommand(input: CliCommandInput): string {
+  return shellWord(resolveCliExecutable(input));
 }
 
 function tryRealpath(realpath: (path: string) => string, path: string): string | undefined {
@@ -74,10 +79,15 @@ function firstOnPath(path: string | undefined, isExecutable: (path: string) => b
 
 let cached: string | undefined;
 
-/** This process's command, resolved once. */
-export function cliCommand(): string {
-  cached ??= resolveCliCommand({ platform: process.platform, execPath: process.execPath, argv1: process.argv[1], path: process.env.PATH });
+/** This process's executable as an argv entry, resolved once. */
+export function cliExecutable(): string {
+  cached ??= resolveCliExecutable({ platform: process.platform, execPath: process.execPath, argv1: process.argv[1], path: process.env.PATH });
   return cached;
+}
+
+/** This process's command as a shell word. */
+export function cliCommand(): string {
+  return shellWord(cliExecutable());
 }
 
 /** Human text with each `konteks-remote <command>` hint in the form that runs on this computer. */
