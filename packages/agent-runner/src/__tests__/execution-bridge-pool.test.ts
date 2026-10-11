@@ -39,7 +39,7 @@ const modelOption = {
 const modelOptions = [modelOption];
 
 async function fixture(options: { limit?: number; ttlMs?: number; now?: () => Date; modelCapabilityTtlMs?: number; probe?: () => Promise<IdentityProbe>;
-  newSessionFails?: () => boolean | Error; closeSession?: () => Promise<object> } = {}) {
+  newSessionFails?: () => boolean | Error; closeSession?: () => Promise<object>; reclaimIdleExecution?: () => Promise<boolean> } = {}) {
   const root = await mkdtemp(join(tmpdir(), "execution-pool-")); roots.push(root);
   const owners: Owner[] = [];
   let sessions = 0;
@@ -84,6 +84,7 @@ async function fixture(options: { limit?: number; ttlMs?: number; now?: () => Da
     ...(options.ttlMs === undefined ? {} : { idleExecutionBridgeTtlMs: options.ttlMs }),
     ...(options.now ? { now: options.now } : {}),
     ...(options.modelCapabilityTtlMs === undefined ? {} : { modelCapabilityTtlMs: options.modelCapabilityTtlMs }),
+    ...(options.reclaimIdleExecution ? { reclaimIdleExecution: options.reclaimIdleExecution } : {}),
   });
   runtimes.push(runtime);
   await runtime.ensureBridge();
@@ -142,6 +143,54 @@ it("returns the capacity slot on the idle release exactly as a stop-proven final
   await f.runtime.sessions.create(f.input);
   await expect(f.runtime.sessions.create(f.input)).rejects.toThrow();
   await expect(f.runtime.stopExecutionBridge("never-owned")).rejects.toThrow(/Unknown native execution bridge owner/);
+});
+
+// D62: with parallel deliveries every slot was held by finished sessions
+// waiting out the supervisor's 30-minute idle reaper, and each new review was
+// refused (`recovery_required`, which ends the assignment).
+it("frees an idle completed session's slot for a new session instead of refusing it", async () => {
+  let reclaim = async () => false;
+  const f = await fixture({ limit: 1, reclaimIdleExecution: () => reclaim() });
+  const first = await f.runtime.sessions.create(f.input);
+  f.runtime.sessions.prompt(first.acpSessionRef, "turn-first", { prompt: [] });
+  await f.runtime.sessions.sealCompletedTurn(first.acpSessionRef);
+  const asked = vi.fn(async () => {
+    await f.runtime.sessions.releaseSealed(first.acpSessionRef);
+    await f.runtime.releaseExecutionBridge(first.acpSessionRef);
+    return true;
+  });
+  reclaim = asked;
+  const second = await f.runtime.sessions.create(f.input);
+  expect(second.acpSessionRef).not.toBe(first.acpSessionRef);
+  expect(asked).toHaveBeenCalledOnce();
+  // The freed process served the new session: no further spawn.
+  expect(f.spawn).toHaveBeenCalledTimes(2);
+});
+
+it("waits for a busy slot while its claim is current, and stops waiting when it is not", async () => {
+  const f = await fixture({ limit: 1, reclaimIdleExecution: async () => false });
+  const first = await f.runtime.sessions.create(f.input);
+  const waiting = f.runtime.sessions.create(f.input);
+  let settled = false;
+  void waiting.then(() => { settled = true; }, () => { settled = true; });
+  await new Promise(resolve => setTimeout(resolve, 600));
+  expect(settled).toBe(false);
+  await completeAndRelease(f, first.acpSessionRef);
+  await expect(waiting).resolves.toMatchObject({ acpSessionRef: expect.any(String) });
+
+  let current = true;
+  const fenced = { ...f.input, lifecycle: { ...f.input.lifecycle, assertCurrent: () => {
+    if (!current) throw new Error("session generation is fenced");
+  } } };
+  const ended = f.runtime.sessions.create(fenced);
+  current = false;
+  await expect(ended).rejects.toThrow("session generation is fenced");
+});
+
+it("still refuses a full ceiling at once without a supervisor that can free one", async () => {
+  const f = await fixture({ limit: 1 });
+  await f.runtime.sessions.create(f.input);
+  await expect(f.runtime.sessions.create(f.input)).rejects.toMatchObject({ code: "recovery_required", diagnostic: "execution_capacity_full" });
 });
 
 it("still stops the process on a recovery stop and keeps nothing resident", async () => {

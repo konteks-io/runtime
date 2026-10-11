@@ -4,6 +4,7 @@ import { CoreResponseError, RemoteInstanceError, SupervisorStatusSchema, SystemC
 import { NativeEnrollment, SupervisorStore } from "@konteks/remote-supervisor";
 import type { Output } from "../output.js";
 import { SupervisorControl } from "../control.js";
+import { CLI_NAME, cliCommand, cliExecutable, commandHintText } from "../cli-command.js";
 import { readNativeRecord, type completeNativeEnrollment } from "./install.js";
 import { inspectRepository, type commitFirstFiles, type initializeRepository, type planFirstCommit, type pushToManagedRemote } from "./repository-inspect.js";
 import type { StagingStatus } from "./enrollment-staging.js";
@@ -94,7 +95,39 @@ export interface OnboardContext {
   deps?: OnboardDeps;
 }
 
-export const AGAIN = { argv: ["konteks-remote", "onboard", "--json"] };
+export const AGAIN = { argv: [CLI_NAME, "onboard", "--json"] };
+
+/**
+ * The step as the person's agent receives it: the agent runs its commands
+ * verbatim, in a shell where `konteks-remote` may not be on PATH (the
+ * user-local install writes no profile). Each instruction names the command
+ * the way this computer runs it: the text as a shell word, `run.argv` as the
+ * executable. Ids, kinds, links and answers are kept as they are.
+ */
+export function runnableStep(step: OnboardStep, command: string = cliCommand(), executable: string = cliExecutable()): OnboardStep {
+  return command === CLI_NAME && executable === CLI_NAME ? step : rewrittenStep(step, command, executable);
+}
+
+function rewrittenStep(step: OnboardStep, command: string, executable: string): OnboardStep {
+  const text = (value: string) => commandHintText(value, command);
+  const { note, ask, run, done } = step;
+  return {
+    ...step,
+    ...(note !== undefined ? { note: text(note) } : {}),
+    ...(ask ? { ask: { ...ask, question: text(ask.question) } } : {}),
+    ...(run ? { run: { argv: runnableArgv(run.argv, executable) } } : {}),
+    ...(done ? { done: runnableDone(done, text) } : {}),
+  };
+}
+
+function runnableArgv(argv: string[], executable: string): string[] {
+  return argv.map((part, index) => (index === 0 && part === CLI_NAME ? executable : part));
+}
+
+function runnableDone(done: NonNullable<OnboardStep["done"]>, text: (value: string) => string): NonNullable<OnboardStep["done"]> {
+  return { ...done, summary: text(done.summary), ...(done.remedies ? { remedies: done.remedies.map(text) } : {}) };
+}
+
 export const RECONNECT_ASK = { question: "Give this machine your access again? Konteks sends a code to your email to check it is you.", kind: "confirm" } as const;
 export const EMAIL_ASK = { question: "What email address should this machine belong to?", kind: "email" } as const;
 /** The owner token is refreshed this long before it expires. */

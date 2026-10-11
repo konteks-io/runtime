@@ -534,11 +534,17 @@ export const PreviewStatusReportSchema = z
           readyAt: z.string().nullable(),
           /** Who started it: the agent (preview_start) or a viewer opening it in Konteks. Absent from an older connector. */
           startedBy: z.enum(["agent", "viewer"]).nullable().optional(),
+          /** The page a viewer lands on (`serve.openPath`), `/` by default. Absent from an older connector. */
+          openPath: z.string().optional(),
+          /** While failed: the person's reason and what to do. Absent from an older connector. */
+          reason: z.string().nullable().optional(),
           viewerConnected: z.boolean(),
         })
         .strict(),
     ),
     lastFailure: z.object({ at: z.string(), message: z.string() }).strict().nullable(),
+    /** Each session's last start that failed (newest first), until one runs. Absent from an older connector. */
+    failures: z.array(z.object({ sessionId: z.string(), at: z.string(), reason: z.string() }).strict()).optional(),
   })
   .strict();
 export type PreviewStatusReport = z.infer<typeof PreviewStatusReportSchema>;

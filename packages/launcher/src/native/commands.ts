@@ -15,7 +15,7 @@ import { closeAgentSetup, ensurePersonalAgent, isPersonalAgent, PERSONAL_AGENTS,
 import { confirm } from "../prompt.js";
 import { spawnEnrollmentStaging } from "./enrollment-staging.js";
 import { onboardCoreUrl, onboardFailureStep, runOnboard } from "./onboard.js";
-import type { OnboardStep } from "./onboard-session.js";
+import { runnableStep, type OnboardStep } from "./onboard-session.js";
 import { describeServiceFailure, encodeServiceDefinition, nativePlatform, nativeServiceDefinition, NativeServiceCommandError, parseLoadedService, parseServiceExits, serviceRun, startNativeServiceDefinition, type HostOs, type NativeServiceCommand, type NativeServiceDefinition, type NativeServiceExecute, type NativeServiceRun } from "./service.js";
 import { outputLocale,
   setupDetail,
@@ -739,10 +739,10 @@ async function onboardStep(input: { root: string; output: NativeCommandContext["
     ...(coreUrl ? { coreUrl } : {}),
   };
   try {
-    return await runOnboard(context);
+    return runnableStep(await runOnboard(context));
   } catch (error) {
     // Never leave the protocol the agent was taught: a failure is a step too.
-    return await onboardFailureStep(context, error);
+    return runnableStep(await onboardFailureStep(context, error));
   }
 }
 

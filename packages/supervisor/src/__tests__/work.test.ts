@@ -374,7 +374,7 @@ describe("report sender state machine", () => {
     expect(outbox.depth).toBe(0);
   });
 
-  it("heals a claim halted over a refused terminal before this fix existed, once per process", async () => {
+  it("heals a claim halted over a refused terminal, again with backoff until Core settles it", async () => {
     const confirmStopped = vi.fn(async () => undefined);
     const { sender, sent, journal, outbox } = await senderHarness(() => true, { confirmStopped, sleep: async () => undefined });
     await journal.assignments.update("a:1", current => ({ ...current!, state: "recovery_required", recoveryReason: "assignment_conflict",
@@ -385,13 +385,20 @@ describe("report sender state machine", () => {
     expect(resubmitted).toMatchObject({ terminal: true, reportSequence: 1, acpSessionRef: "acp",
       result: { class: "interrupted", reason: "not_resumable" } });
     expect(journal.assignments.get("a:1")?.state).toBe("terminal_pending_report");
-    // Refused again as a genuine conflict: the claim halts and is not retried in this process.
+    // Refused again (the execution still live): the claim halts, and is not retried before its backoff.
     await sender.onAck({ assignmentId: "a", attempt: 1, claimId: "c", acknowledged: { reportId: resubmitted.reportId, reportSequence: 1 }, durableWatermark: 0, outcome: "payload_conflict" });
     expect(journal.assignments.get("a:1")).toMatchObject({ state: "recovery_required", recoveryReason: "assignment_conflict" });
     const before = sent.length;
     await sender.healHaltedConflicts();
     expect(sent.length).toBe(before);
     expect(outbox.depth).toBe(0);
+    // 10-09: Core settled the claim later (a person's Stop); the session waiting on it asks now, and Core's terminal settles it.
+    await sender.healNow("a", 1);
+    await Promise.all(sender.pendingResubmissions());
+    const again = reports(sent).at(-1)!;
+    expect(sent.length).toBeGreaterThan(before);
+    await sender.onAck({ assignmentId: "a", attempt: 1, claimId: "c", acknowledged: { reportId: again.reportId, reportSequence: 1 }, durableWatermark: 1, terminalSequence: 1, outcome: "terminal_winner_exists" });
+    expect(journal.assignments.get("a:1")?.state).toBe("completed");
   });
 
   it("operation_conflict on a report already stop-confirmed halts the claim instead of looping", async () => {

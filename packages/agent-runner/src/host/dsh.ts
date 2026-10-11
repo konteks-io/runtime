@@ -6,6 +6,7 @@ import type { RunnerConfig } from "../config.js";
 import { readDshApiKey, removeDshApiKey, startDshKeyLogin } from "../auth/dsh-key.js";
 import { dshRuntimePaths, renderDshKonteksProfile, writeDshKonteksProfile } from "../bridge/dsh-profile.js";
 import { dshControlReadPaths, prepareDshControlReadProfile, prepareDshReadProfile } from "../bridge/dsh-read-profile.js";
+import { sweepDshDiscoverySessions } from "../bridge/dsh-session-sweep.js";
 import type { HostAgentRunnerAdapter } from "./host-agent.js";
 
 /** Same file as `FINGERPRINT_KEY_FILE` in auth/identity.ts (kept literal to avoid an import cycle). */
@@ -64,8 +65,11 @@ export const dshRunnerAdapter: HostAgentRunnerAdapter = {
   // Every dsh process reads the overlay at boot, so a changed copy heals on
   // the next spawn instead of leaving it unguarded.
   prepareToSpawn: async config => {
-    await writeDshKonteksProfile(dshRuntimePaths(config.RUNNER_CREDENTIAL_DIR).konteksDir);
+    const { dshHome, konteksDir } = dshRuntimePaths(config.RUNNER_CREDENTIAL_DIR);
+    await writeDshKonteksProfile(konteksDir);
     await prepareDshControlReadProfile(config.RUNNER_CREDENTIAL_DIR);
+    // Before dsh boots: the model checks' leftover sessions, which stop it booting once they pile up.
+    await sweepDshDiscoverySessions(dshHome);
   },
   bindWorkingCopy: async (config, family, cwd, readOnlyRoots, environment) => {
     const { entry } = launcher(config, family);

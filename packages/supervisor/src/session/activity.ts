@@ -46,12 +46,42 @@ export const PUBLIC_TOOL_TITLE_MAX = 600;
  * the tool's own end never reached the page (10-09). Cut the public title
  * instead; the call keeps its identity and status.
  */
-export function boundPublicToolTitle(value: unknown): unknown {
+export function boundPublicToolTitle(value: unknown, workspaceRoot?: string): unknown {
   const update = plainRecord(value);
   if (update?.sessionUpdate !== "tool_call" && update?.sessionUpdate !== "tool_call_update") return value;
-  const title = update.title;
-  if (typeof title !== "string" || title.length <= PUBLIC_TOOL_TITLE_MAX) return value;
-  return { ...update, title: `${[...title].slice(0, PUBLIC_TOOL_TITLE_MAX - 1).join("").trimEnd()}…` };
+  if (typeof update.title !== "string") return value;
+  const title = boundTitle(workspaceRoot === undefined ? update.title : readablePaths(update.title, workspaceRoot));
+  return title === update.title ? value : { ...update, title };
+}
+
+function boundTitle(title: string): string {
+  return title.length <= PUBLIC_TOOL_TITLE_MAX ? title : `${[...title].slice(0, PUBLIC_TOOL_TITLE_MAX - 1).join("").trimEnd()}…`;
+}
+
+/** An absolute path in a command, as the redaction below would otherwise mask it whole. */
+const TITLE_ABSOLUTE_PATH = /(^|[\s"'=(])((?:\/(?!\/)|[A-Za-z]:[\\/])[^\s"'<>`)\]}*]+)/g;
+
+/**
+ * A step names the files it runs and touches by their last part: Codex titles
+ * a command with its whole text, and every absolute path in it was masked, so
+ * a step read "[local-path] --cache-dir [local-path] pip install --python
+ * [local-path] pytest" (10-10). A path inside the workspace is left to the
+ * redaction, which names it relative to the workspace. A path of one or two
+ * parts (`/Users/me`, a home folder) still goes to the mask: its last part
+ * could be a name.
+ */
+function readablePaths(title: string, workspaceRoot: string): string {
+  const root = workspaceRoot.replace(/[\\/]$/, "");
+  // The workspace is named first, whole: its path can hold a space ("Application
+  // Support"), where a path match stops, so it read "…/Application Support/…"
+  // instead of "[workspace]" (10-10).
+  const named = nameWorkspaceIn(title, root);
+  return named.replace(TITLE_ABSOLUTE_PATH, (whole, before: string, path: string) => {
+    // The workspace's own paths stay, named relative to it by the redaction.
+    if (root.length > 1 && (path === root || path.startsWith(`${root}/`) || path.startsWith(`${root}\\`))) return whole;
+    const parts = path.split(/[\\/]/).filter(part => part.length > 0 && !/^[A-Za-z]:$/.test(part));
+    return parts.length < 3 ? whole : `${before}…/${parts[parts.length - 1]}`;
+  });
 }
 
 /**
@@ -71,6 +101,11 @@ export function toolLifecycleOnly(message: unknown): unknown {
 const TOOL_LIFECYCLE_FIELDS: ReadonlySet<string> = new Set(["sessionUpdate", "toolCallId", "status", "kind", "name", "title"]);
 
 type ToolCanonicalizer = (candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined) => unknown;
+
+function nameWorkspaceIn(title: string, root: string): string {
+  if (root.length <= 1 || !title.includes(root)) return title;
+  return title.split(`${root}/`).join("[workspace]/").split(`${root}\\`).join("[workspace]/").split(root).join("[workspace]");
+}
 
 /**
  * Promote a bridge-specific tool identity into ACP's ordinary public fields
@@ -166,18 +201,64 @@ function placeholderTitle(currentTitle: string | undefined, fallback: string | u
  * DeepSeek Harness reports every tool call as ACP `other`, titled with its own
  * tool name from a closed set. Give those their ACP kind for activity, and
  * promote the federated `platform__*` name behind an MCP title as for Claude.
+ * The bare tool name told a person nothing ("edit · Failed", five "bash ·
+ * Done" in a row, 10-10), so a step reads as what it touches, the way Claude
+ * Code's and OpenCode's do: the command it runs, the file it reads or edits.
  * An arbitrary title still never becomes a name.
  */
 function dshCanonicalizer(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): unknown {
   const title = typeof candidate.title === "string" ? candidate.title : undefined;
   const name = platformMcpToolName(title) ?? prior?.name;
   const kind = dshKind(title, prior);
-  if (name === undefined && kind === undefined) return candidate;
+  const plainTitle = dshStepTitle(title, plainRecord(candidate.rawInput));
+  if (name === undefined && kind === undefined && plainTitle === undefined) return candidate;
   return {
     ...candidate,
     ...(typeof candidate.name !== "string" ? definedName(name) : {}),
     ...filledKind(candidate, kind),
+    ...definedTitle(plainTitle),
   };
+}
+
+function definedTitle(title: string | undefined): { title?: string } {
+  return title === undefined ? {} : { title };
+}
+
+type DshInput = Record<string, unknown>;
+
+/** Each dsh tool's step, in words, from its own input; undefined when the input names nothing. */
+const DSH_STEP_TITLES: Readonly<Record<string, (input: DshInput) => string | undefined>> = Object.freeze({
+  bash: input => trimmed(input.command),
+  pwsh: input => trimmed(input.command),
+  read: input => worded("Read", shownPath(input)),
+  read_image: input => worded("Read", shownPath(input)),
+  write: input => worded("Write", shownPath(input)),
+  edit: input => worded("Edit", shownPath(input)),
+  str_replace_editor: input => worded("Edit", shownPath(input)),
+  grep: input => worded("Search for", trimmed(input.pattern)),
+  glob: input => worded("Find", trimmed(input.pattern)),
+  web_fetch: input => worded("Fetch", trimmed(input.url)),
+  web_search: input => worded("Search the web for", trimmed(Array.isArray(input.queries) ? input.queries[0] : undefined)),
+});
+
+function dshStepTitle(tool: string | undefined, input: DshInput | undefined): string | undefined {
+  const step = tool !== undefined && Object.hasOwn(DSH_STEP_TITLES, tool) ? DSH_STEP_TITLES[tool] : undefined;
+  return step === undefined || input === undefined ? undefined : step(input);
+}
+
+function trimmed(value: unknown): string | undefined {
+  return nonBlank(value)?.trim();
+}
+
+function worded(verb: string, object: string | undefined): string | undefined {
+  return object === undefined ? undefined : `${verb} ${object}`;
+}
+
+/** A workspace path as given; an absolute one by its file name, never the computer's folders. */
+function shownPath(input: DshInput): string | undefined {
+  const path = trimmed(input.file_path) ?? trimmed(input.path);
+  if (path === undefined || !/^(?:\/|[A-Za-z]:[\\/]|~)/.test(path)) return path;
+  return path.split(/[\\/]/).filter(part => part.length > 0).pop();
 }
 
 function dshKind(title: string | undefined, prior: CanonicalAcpToolIdentity | undefined): string | undefined {
@@ -292,7 +373,22 @@ const CODEX_FINDING_TITLE = /^(?:List files|Search files|Search for |Search in |
  */
 function codexCanonicalizer(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): unknown {
   if (candidate.sessionUpdate !== "tool_call_update" || candidate.status !== "failed") return candidate;
-  return codexFinds(candidate, prior) && foundNothing(candidate.rawOutput) ? { ...candidate, status: "completed" } : candidate;
+  const nothingFound = (codexFinds(candidate, prior) && foundNothing(candidate.rawOutput)) || lastSearchFoundNothing(candidate, prior);
+  return nothingFound ? { ...candidate, status: "completed" } : candidate;
+}
+
+/** A command whose last step is a search: `cat a; rg --files -g AGENTS.md`, or `… | grep x`. */
+const ENDS_IN_SEARCH = /(?:^|[;|&]\s*)(?:rg|grep|egrep|fgrep)\s[^;|&]*$/;
+
+/**
+ * The same AGENTS.md lookup at the end of a longer command (`cat …; cat …;
+ * rg --files -g AGENTS.md …`) read "Failed" although every step worked
+ * (10-09): rg and grep exit 1 only when nothing matched (2 on an error), and
+ * the command's exit is its last step's.
+ */
+function lastSearchFoundNothing(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): boolean {
+  const title = (nonBlank(candidate.title) ?? prior?.title)?.replace(/^["']|["']$/g, "");
+  return title !== undefined && ENDS_IN_SEARCH.test(title) && plainRecord(candidate.rawOutput)?.exit_code === 1;
 }
 
 function codexFinds(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): boolean {
@@ -397,6 +493,14 @@ interface ActivityTextOptions {
    * chunk it streamed in.
    */
   afterMaskedPath?: boolean;
+  /**
+   * The previous chunk's path ended on "Application" (with or without the
+   * space): a chunk opening "Support/…" is that path's macOS app-data folder,
+   * not a new word.
+   */
+  continuesApplication?: boolean;
+  /** The previous chunk ended on a backtick or `[`: a host path may open this one. */
+  afterQuote?: boolean;
 }
 
 const PATH_MASK = "[local-path]";
@@ -427,7 +531,7 @@ function nameWorkspace(text: string, workspaceRoot: string): string {
 }
 
 const PATH_TOKEN_START = /^(?:\/(?![/*])|[A-Za-z]:(?:[\\/]|$)|\\\\)/;
-const TOKEN_DELIMITER = /[\s"'<>`)\]}=(]/;
+const TOKEN_DELIMITER = /[\s"'<>`)[\]}=(]/;
 
 /**
  * Whether streamed text ends inside a local-path token, given whether the
@@ -439,40 +543,92 @@ export function endsInsidePath(text: string, previousEndedInPath: boolean, start
     if (TOKEN_DELIMITER.test(text[index]!)) { start = index; break; }
   }
   if (start === -1) return previousEndedInPath || (startsAtBoundary && PATH_TOKEN_START.test(text));
-  return PATH_TOKEN_START.test(text.slice(start + 1));
+  // After `<` it is a tag: a chunk ending "</" made the next chunk's "h2>" a
+  // path's continuation ("<h2>Title</[local-path]>", 10-09).
+  return text[start] !== "<" && PATH_TOKEN_START.test(text.slice(start + 1));
 }
+
+/** What follows an "Application" path end when the path is macOS's app-data folder. */
+const APPLICATION_SUPPORT_TAIL = /^ ?Support(?=[\\/])/;
 
 /** What a stream remembers of its last text chunk: raw text, whether it ended in a path, and what it became. */
 export interface ChunkTrail {
   text: string;
   inPath: boolean;
   output: string;
+  /** Its path ended on "/Application", maybe with the space after it. */
+  endsOnApplication?: boolean;
 }
 
 /** How the next streamed chunk reads, given the stream's last one. */
 export function chunkOptions(previous: ChunkTrail | undefined): Required<ActivityTextOptions> {
-  const continuesPath = previous?.inPath ?? false;
+  return trailOptions(previous ?? { text: "", inPath: false, output: "" }, previous === undefined);
+}
+
+function trailOptions(previous: ChunkTrail, first: boolean): Required<ActivityTextOptions> {
+  const continuesApplication = previous.endsOnApplication === true;
   return {
-    startsAtBoundary: continuesAtBoundary(previous?.text),
-    continuesPath,
-    afterMaskedPath: continuesPath && endsWithPathMask(previous?.output ?? ""),
+    startsAtBoundary: first || continuesAtBoundary(previous.text),
+    continuesPath: previous.inPath,
+    // The space after "Application" may already have gone out after the mask.
+    afterMaskedPath: (previous.inPath || continuesApplication) && /\[local-path\] ?$/.test(previous.output),
+    continuesApplication,
+    afterQuote: /[`[]$/.test(previous.text),
   };
 }
 
 /** The trail after a chunk. One that was all continuation leaves the previous mask the one to continue. */
 export function nextTrail(previous: ChunkTrail | undefined, text: string, options: Required<ActivityTextOptions>, output: string): ChunkTrail {
-  return { text, inPath: endsInsidePath(text, options.continuesPath, options.startsAtBoundary), output: output || (previous?.output ?? "") };
+  // A path that opens right after a backtick or bracket is a token start too.
+  const atBoundary = options.startsAtBoundary || options.afterQuote;
+  const inPath = allApplicationSupport(text, options) || endsInsidePath(text, options.continuesPath, atBoundary);
+  const endsOnApplication = endsOnApplicationPath(text, options.continuesPath, atBoundary);
+  return { text, inPath, output: output || (previous?.output ?? ""), ...(endsOnApplication ? { endsOnApplication } : {}) };
 }
+
+/** A chunk that is all "Support/…" after an "Application" end is still inside that path. */
+function allApplicationSupport(text: string, options: Required<ActivityTextOptions>): boolean {
+  return options.continuesApplication && APPLICATION_SUPPORT_TAIL.test(text) && !TOKEN_DELIMITER.test(text.replace(/^ /, ""));
+}
+
+/** Whether a chunk's path ends on "/Application", maybe with the space after it. */
+function endsOnApplicationPath(text: string, continuesPath: boolean, atBoundary: boolean): boolean {
+  const head = text.match(/^(.*\/Application) ?$/s)?.[1];
+  return head !== undefined && endsInsidePath(head, continuesPath, atBoundary);
+}
+
 
 /** Whether text following `previous` starts a new token for path detection. */
 export function continuesAtBoundary(previous: string | undefined): boolean {
   return previous === undefined || previous.length === 0 || /[\s"'=(]$/.test(previous);
 }
 
+/** The chunk's opening continuation of the previous chunk's path, masked once. */
+function continuedText(text: string, options: ActivityTextOptions): string {
+  if (options.continuesApplication && APPLICATION_SUPPORT_TAIL.test(text)) {
+    return text.replace(/^ ?Support[\\/][^\s"'<>`)\]}*]*/, options.afterMaskedPath ? "" : PATH_MASK);
+  }
+  if (options.continuesPath) return text.replace(/^(?=[\w.~\\/-])[^\s"'<>`)\]}*]+/, options.afterMaskedPath ? "" : PATH_MASK);
+  return text;
+}
+
+/** Where on this computer a quoted absolute path is surely private: under a home or system root. */
+const HOST_ROOT = "(?:Users|home|root|private|var|tmp|opt|etc|Volumes|mnt|Library)/";
+
+/**
+ * A path an agent quotes in Markdown code or a link went out whole, user name
+ * included (`/Users/…`, [/Users/…], 10-09). A quoted path under a host root
+ * is masked; one that is not (`/storefront/app/…`, an agent's root-anchored
+ * slip that a refusal quotes back to it) stays readable.
+ */
+function maskQuotedHostPaths(text: string, afterQuote: boolean): string {
+  const quoted = new RegExp(`(${afterQuote ? "^|" : ""}[\`[])\\/(?=${HOST_ROOT})[^\\s"'<>\`)\\]}*]+`, "g");
+  return text.replace(quoted, "$1[local-path]");
+}
+
 function publicText(value: string, workspaceRoot: string, options: ActivityTextOptions): string {
   const startsAtBoundary = options.startsAtBoundary ?? true;
-  let text = redactText(value);
-  if (options.continuesPath) text = text.replace(/^(?=[\w.~\\/-])[^\s"'<>`)\]}*]+/, options.afterMaskedPath ? "" : PATH_MASK);
+  let text = continuedText(redactText(value), options);
   // A chunk opening `:/…` or `:\…` continues a drive path whose letter was
   // emitted in the previous chunk. `://` is excluded because that is a URL
   // scheme, and a chunk ending exactly at the separator defers rather than
@@ -494,5 +650,5 @@ function publicText(value: string, workspaceRoot: string, options: ActivityTextO
     // part of one: `sudo ls /**` (a root slash and Markdown bold) is not a
     // private path, and redacting it broke the bold.
     .replace(/(^|[\s"'=(])\/(?!\/)(?=[\w.~-])[^\s"'<>`)\]}*]+/g, "$1[local-path]");
-  return releaseHeldSpaces(startsAtBoundary ? out : out.slice(1));
+  return maskQuotedHostPaths(releaseHeldSpaces(startsAtBoundary ? out : out.slice(1)), options.afterQuote ?? false);
 }

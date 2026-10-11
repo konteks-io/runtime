@@ -3,6 +3,7 @@ import { WebSocket as NodeWebSocket } from "ws";
 import {
   PREVIEW_LIMITS,
   createLogger,
+  previewAppSetCookies,
   rewritePreviewLocation,
   sanitizePreviewHeaders,
   validatePreviewHeaders,
@@ -23,10 +24,17 @@ import {
  * the process manager and must be a loopback address. It never follows a
  * redirect, validates what arrives (receiver mode) and sanitizes what it
  * emits (sender mode), and caps bodies, frames, streams and idle time.
+ *
+ * The app's own session passes (D46): Core sends its `cookie` (never a
+ * Konteks cookie, which is refused here too) and `authorization`, and the
+ * app's `set-cookie` goes back as `setCookie`, host-only and never naming a
+ * Konteks cookie, to a Core that accepts it.
  */
 export interface PreviewForwarderOptions {
   /** The running preview's loopback origin (`http://127.0.0.1:<port>`), or null when none runs. */
   origin: () => string | null;
+  /** While none runs because the last start failed: the person's reason (what is wrong, what to do). */
+  failure?: () => string | null;
   send: (chunk: PreviewToCoreChunk) => void;
   /**
    * Flow control: resolves true once the channel may take more response
@@ -35,7 +43,13 @@ export interface PreviewForwarderOptions {
   waitForCapacity?: () => Promise<boolean>;
   /** Viewer traffic keeps the preview from being stopped as idle. */
   onActivity?: () => void;
-  createWebSocket?: (url: string, protocols: string[] | undefined) => NodeWebSocket;
+  /**
+   * Whether Core takes a response's `setCookie` (its contract is at least
+   * `REMOTE_PREVIEW_APP_CREDENTIALS_MIN_CORE_CONTRACT_VERSION`). Absent or
+   * false, the app's `set-cookie` is dropped: an older Core refuses the chunk.
+   */
+  forwardSetCookies?: () => boolean;
+  createWebSocket?: (url: string, protocols: string[] | undefined, headers: Record<string, string>) => NodeWebSocket;
   requestFn?: typeof httpRequest;
   logger?: Logger;
   now?: () => number;
@@ -76,6 +90,8 @@ interface HttpStream {
   cancelled: boolean;
   executing: boolean;
   lastActivityAt: number;
+  /** When the first chunk of the request arrived, for the timing log. */
+  receivedAt: number;
 }
 
 interface WsStream {
@@ -97,7 +113,26 @@ interface PreviewForwarderCounters {
   upstreamFailures: number;
 }
 
+/**
+ * How a viewer is told a preview failed to start, followed by the reason.
+ * Konteks may recognise the phrase (a 503, plain text, no-store); unlike
+ * "No preview is running" it means nothing will appear until something changes.
+ */
+export const COULD_NOT_START_PREFIX = "Preview could not start: ";
+
+/** The plain 503 body for a session whose preview cannot be served: why it failed when it did, else that none runs. */
+export function notRunningMessage(failure: string | null, fallback: string): string {
+  return failure ? `${COULD_NOT_START_PREFIX}${failure}` : fallback;
+}
+
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
+/** A request that spends this long on this computer is logged with its stages. */
+const SLOW_REQUEST_MS = 250;
+
+/** The dev server's response has fully arrived and nothing of it is left to read. */
+function responseEnded(response: IncomingMessage): boolean {
+  return response.complete && response.readableLength === 0;
+}
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
 export class PreviewForwarder {
@@ -170,7 +205,7 @@ export class PreviewForwarder {
       this.openWebSocket(chunk.streamId, admitted.origin, admitted.path, admitted.headers);
       return;
     }
-    const stream: HttpStream = { kind: "http", chunks: [], bytes: 0, method: chunk.method, path: admitted.path, headers: admitted.headers, cancel: () => { stream.cancelled = true; }, cancelled: false, executing: false, lastActivityAt: this.now() };
+    const stream: HttpStream = { kind: "http", chunks: [], bytes: 0, method: chunk.method, path: admitted.path, headers: admitted.headers, cancel: () => { stream.cancelled = true; }, cancelled: false, executing: false, lastActivityAt: this.now(), receivedAt: this.now() };
     this.streams.set(chunk.streamId, stream);
     this.receiveBody(chunk, stream);
   }
@@ -197,7 +232,7 @@ export class PreviewForwarder {
     const origin = this.loopbackOrigin();
     if (origin === null) {
       this.counters.refusedNoPreview += 1;
-      this.reply(chunk.streamId, 503, "No preview is running for this session. Ask the agent to start one with preview_start.");
+      this.reply(chunk.streamId, 503, notRunningMessage(this.options.failure?.() ?? null, "No preview is running for this session. Ask the agent to start one with preview_start."));
       return null;
     }
     if (this.streams.size >= this.limits.maxConcurrentStreams) {
@@ -242,14 +277,44 @@ export class PreviewForwarder {
     if (origin === null) {
       this.streams.delete(streamId);
       this.counters.refusedNoPreview += 1;
-      return this.reply(streamId, 503, "No preview is running for this session.");
+      return this.reply(streamId, 503, notRunningMessage(this.options.failure?.() ?? null, "No preview is running for this session."));
     }
+    const dialAt = this.now();
     const response = await this.dial(streamId, stream, origin);
     if (response === null) return;
+    const headersAt = this.now();
     const status = response.statusCode ?? 502;
     const headers = this.responseHeaders(streamId, response, status, origin);
     if (headers === null) return;
-    await this.relayBody(streamId, stream, response, new ResponseSink(this.options.send, streamId, status, headers));
+    const sink = new ResponseSink(this.options.send, streamId, status, headers, this.appSetCookies(response));
+    await this.relayBody(streamId, stream, response, sink);
+    this.logTiming(streamId, stream, { dialAt, headersAt, status, frames: sink.frames });
+  }
+
+  /**
+   * A request that took long on this computer, by stage: waiting for its
+   * body, the dev server's answer (first byte), and sending the body back to
+   * the relay. The stream id is the one Core and the relay log (D52).
+   */
+  private logTiming(streamId: string, stream: HttpStream, at: { dialAt: number; headersAt: number; status: number; frames: number }): void {
+    const endedAt = this.now();
+    if (endedAt - stream.receivedAt < SLOW_REQUEST_MS) return;
+    this.logger.info({
+      event: "preview.forward.slow",
+      streamId,
+      method: stream.method,
+      status: at.status,
+      frames: at.frames,
+      requestMs: at.dialAt - stream.receivedAt,
+      firstByteMs: at.headersAt - at.dialAt,
+      bodyMs: endedAt - at.headersAt,
+      totalMs: endedAt - stream.receivedAt,
+    }, "a preview request was slow on this computer");
+  }
+
+  /** The app's own `set-cookie` values for a Core that takes them (D46); none otherwise. */
+  private appSetCookies(response: IncomingMessage): string[] {
+    return this.options.forwardSetCookies?.() === true ? previewAppSetCookies(response.headers["set-cookie"]) : [];
   }
 
   /** Sends the buffered request to the preview; null when it could not be sent or was cancelled meanwhile. */
@@ -304,7 +369,7 @@ export class PreviewForwarder {
 
   private async relayBody(streamId: string, stream: HttpStream, response: IncomingMessage, sink: ResponseSink): Promise<void> {
     try {
-      if (await this.relayChunks(streamId, stream, response, sink)) sink.emit(undefined, true);
+      if (await this.relayChunks(streamId, stream, response, sink) && !sink.finalSent) sink.emit(undefined, true);
     } catch (error) {
       if (!stream.cancelled) this.streamFailed(streamId, sink, error);
     } finally {
@@ -323,7 +388,7 @@ export class PreviewForwarder {
         this.oversizedResponse(streamId, stream, sink);
         return false;
       }
-      if (!await this.sendPieces(streamId, stream, value, sink)) return false;
+      if (!await this.sendPieces(streamId, stream, value, sink, responseEnded(response))) return false;
     }
     return this.streams.has(streamId);
   }
@@ -336,7 +401,12 @@ export class PreviewForwarder {
     this.options.send({ streamId, kind: "close", code: 1009, final: true });
   }
 
-  private async sendPieces(streamId: string, stream: HttpStream, value: Buffer, sink: ResponseSink): Promise<boolean> {
+  /**
+   * Sends one body piece in bounded chunks. When the response has already
+   * ended, the last chunk carries `final` itself: one frame fewer per
+   * response, and every frame is a hop through the relay (D52).
+   */
+  private async sendPieces(streamId: string, stream: HttpStream, value: Buffer, sink: ResponseSink, ended: boolean): Promise<boolean> {
     for (let offset = 0; offset < value.byteLength; offset += this.limits.maxChunkBytes) {
       if (this.options.waitForCapacity && !(await this.options.waitForCapacity())) {
         stream.cancel();
@@ -344,7 +414,8 @@ export class PreviewForwarder {
         return false;
       }
       if (!this.streams.has(streamId)) { stream.cancel(); return false; }
-      sink.emit(value.subarray(offset, Math.min(offset + this.limits.maxChunkBytes, value.byteLength)).toString("base64url"), false);
+      const end = Math.min(offset + this.limits.maxChunkBytes, value.byteLength);
+      sink.emit(value.subarray(offset, end).toString("base64url"), ended && end === value.byteLength);
       stream.lastActivityAt = this.now();
     }
     return true;
@@ -362,7 +433,7 @@ export class PreviewForwarder {
     const target = `${origin.replace(/^http/, "ws")}${path}`;
     let socket: NodeWebSocket;
     try {
-      socket = (this.options.createWebSocket ?? ((url, subprotocols) => new NodeWebSocket(url, subprotocols, { perMessageDeflate: false, followRedirects: false, maxPayload: this.limits.maxWsFrameBytes })))(target, protocols);
+      socket = (this.options.createWebSocket ?? ((url, subprotocols, appHeaders) => new NodeWebSocket(url, subprotocols, { headers: appHeaders, perMessageDeflate: false, followRedirects: false, maxPayload: this.limits.maxWsFrameBytes })))(target, protocols, appCredentials(headers));
     } catch {
       this.counters.upstreamFailures += 1;
       return this.reply(streamId, 502, "The preview dev server refused the WebSocket.");
@@ -503,6 +574,14 @@ function plainLoopbackUrl(url: URL): boolean {
   return url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname) && url.port !== "" && url.pathname === "/" && !url.username && !url.password;
 }
 
+/** The app's own `cookie` and `authorization`, for a WebSocket the app may authenticate. */
+function appCredentials(headers: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (headers.cookie !== undefined) out.cookie = headers.cookie;
+  if (headers.authorization !== undefined) out.authorization = headers.authorization;
+  return out;
+}
+
 function outgoingHeaders(stream: HttpStream, url: URL, body: Buffer | undefined): Record<string, string> {
   const outgoing: Record<string, string> = { ...stream.headers, host: url.host };
   if (body) outgoing["content-length"] = String(body.byteLength);
@@ -536,17 +615,23 @@ function sendToSocket(socket: NodeWebSocket, opcode: WsFrameChunk["opcode"], pay
 /** One HTTP response to the viewer: the status and headers go with the first piece only. */
 class ResponseSink {
   headSent = false;
+  finalSent = false;
+  frames = 0;
 
   constructor(
     private readonly send: PreviewForwarderOptions["send"],
     private readonly streamId: string,
     private readonly status: number,
     private readonly headers: Record<string, string>,
+    private readonly setCookie: string[] = [],
   ) {}
 
   emit(piece: string | undefined, final: boolean): void {
-    this.send({ streamId: this.streamId, kind: "response", status: this.status, headers: (this.headSent ? {} : this.headers) as never, ...(piece === undefined ? {} : { body: piece }), final });
+    const head = !this.headSent && this.setCookie.length > 0 ? { setCookie: this.setCookie } : {};
+    this.send({ streamId: this.streamId, kind: "response", status: this.status, headers: (this.headSent ? {} : this.headers) as never, ...head, ...(piece === undefined ? {} : { body: piece }), final });
     this.headSent = true;
+    this.finalSent = final;
+    this.frames += 1;
   }
 }
 

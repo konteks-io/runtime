@@ -440,6 +440,29 @@ it("releases a completed session idle past the reaper window and keeps a recent 
   expect(f.internal.channelOwners.has("session:session")).toBe(false);
 });
 
+// D62: parallel deliveries' reviews were refused while finished sessions
+// held every execution slot, each waiting out the reaper's 30 minutes.
+it("frees the agent's idle completed session at once when a new session needs its slot", async () => {
+  const f = await fixture();
+  const internal = f.internal as unknown as { reclaimIdleCompletedSession(agentId: string): Promise<boolean> };
+  // Only the same agent's slots are full; another agent's session is never released for it.
+  await expect(internal.reclaimIdleCompletedSession("codex")).resolves.toBe(false);
+  expect(f.runner.releaseSealedSession).not.toHaveBeenCalled();
+  // Settled four seconds ago: well inside the reaper window, freed anyway.
+  await expect(internal.reclaimIdleCompletedSession("claude-code")).resolves.toBe(true);
+  expect(f.runner.releaseSealedSession).toHaveBeenCalledWith("ref");
+  expect(f.journal.execution.execution(prior)).toMatchObject({ phase: "acp_settled" });
+  expect(f.internal.channelOwners.has("session:session")).toBe(false);
+  await expect(internal.reclaimIdleCompletedSession("claude-code")).resolves.toBe(false);
+});
+
+it("never frees a completed session whose terminal report is not yet persisted", async () => {
+  const f = await fixture({ terminal: false });
+  const internal = f.internal as unknown as { reclaimIdleCompletedSession(agentId: string): Promise<boolean> };
+  await expect(internal.reclaimIdleCompletedSession("claude-code")).resolves.toBe(false);
+  expect(f.runner.releaseSealedSession).not.toHaveBeenCalled();
+});
+
 it("explains an unqualified stopped predecessor and preserves its fence", async () => {
   const f = await fixture({ terminal: false });
   await f.journal.execution.markStopping(prior, clock.nowIso(), current);

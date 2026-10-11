@@ -214,7 +214,7 @@ function executeEvaluation(context: ToolPolicyContext, blocklist: readonly strin
   const command = typeof context.input.command === "string" ? context.input.command : "";
   const hit = blockedCommandPattern(command, blocklist);
   return hit
-    ? { allowed: false, denyMessage: `bash_blocklist: "${hit.trim()}" is not allowed on this connector`,
+    ? { allowed: false, denyMessage: `Konteks doesn't let agents run \`${hit.trim()}\` on this computer. Run it yourself if you want it.`,
         refusal: { reason: "bash_blocklist", pattern: hit.trim() } }
     : { allowed: true };
 }

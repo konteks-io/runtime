@@ -46,6 +46,9 @@ interface ReportSenderOptions {
 
 const RESUBMIT_BASE_DELAY_MS = 500;
 const RESUBMIT_MAX_DELAY_MS = 30_000;
+/** A halted claim heals again after 1 min, then 2, 4… up to 30 min, until Core settles it. */
+const HEAL_BASE_DELAY_MS = 60_000;
+const HEAL_MAX_DELAY_MS = 30 * 60_000;
 const STOP_CONFIRMED_RESULT = { class: "interrupted" as const, reason: "not_resumable" as const };
 
 type ReportDraft = Omit<AssignmentReport, "reportId" | "reportSequence" | "payloadDigest" | "reportedAt" | "assignmentId" | "attempt" | "claimId">;
@@ -107,6 +110,14 @@ function acceptedEntry(current: JournalEntry | undefined, ack: ReportAck, termin
 }
 
 /** The claim without its refused terminal report: the sequence it held is free again. */
+/** A claim halted over a terminal report Core never made durable: that report's sequence; null otherwise. */
+function refusedTerminalOfHaltedClaim(entry: JournalEntry): number | null {
+  const terminalSequence = entry.reports.terminalSequence;
+  const halted = entry.state === "recovery_required" && entry.recoveryReason === "assignment_conflict" && entry.kind !== "planning";
+  if (!halted || terminalSequence === undefined || entry.reports.durableWatermark >= terminalSequence) return null;
+  return terminalSequence;
+}
+
 function withoutTerminal(current: JournalEntry, nextSequence: number, now: string): JournalEntry {
   const { terminalSequence: _sequence, terminalResult: _result, ...reports } = current.reports;
   const { terminalResultHash: _hash, ...rest } = current;
@@ -148,7 +159,13 @@ export class ReportSender {
   private retryFlight: Promise<void> | null = null;
   private readonly resubmits = new Map<string, Promise<void>>();
   /** Halted claims this process already tried to heal; never twice per process. */
-  private readonly healed = new Set<string>();
+  /**
+   * When each halted claim may heal again. Once per process was not enough: a
+   * heal Core refused while the execution was still live never ran again, and
+   * after Core settled the claim (a person's Stop) the session stayed blocked
+   * for good, every new message refused (10-09).
+   */
+  private readonly healAgainAt = new Map<string, { at: number; failures: number }>();
 
   constructor(private readonly options: ReportSenderOptions) {
     this.logger = options.logger ?? createLogger({ name: "report-sender" });
@@ -465,6 +482,14 @@ export class ReportSender {
    * stored nothing for an operation_conflict refusal; for a genuine integrity
    * conflict it refuses again and the claim halts as before.
    */
+  /** A successor is waiting on this claim: heal it now rather than at its next turn. */
+  healNow(assignmentId: string, attempt: number): Promise<void> {
+    const key = `${assignmentId}:${attempt}`;
+    const next = this.healAgainAt.get(key);
+    if (next) this.healAgainAt.set(key, { ...next, at: 0 });
+    return this.healHaltedConflicts();
+  }
+
   async healHaltedConflicts(): Promise<void> {
     if (!this.options.confirmStopped || !this.options.canSend()) return;
     for (const entry of this.options.journal.assignments.all()) {
@@ -476,15 +501,16 @@ export class ReportSender {
   /** The refused terminal sequence of a claim halted over it and not yet healed in this process; null otherwise. */
   private healableTerminal(entry: JournalEntry): number | null {
     const key = `${entry.assignmentId}:${entry.attempt}`;
-    const terminalSequence = entry.reports.terminalSequence;
-    const halted = entry.state === "recovery_required" && entry.recoveryReason === "assignment_conflict" && entry.kind !== "planning";
-    if (!halted || terminalSequence === undefined || entry.reports.durableWatermark >= terminalSequence) return null;
-    return this.healed.has(key) || this.resubmits.has(key) ? null : terminalSequence;
+    const terminalSequence = refusedTerminalOfHaltedClaim(entry);
+    if (terminalSequence === null) return null;
+    const waiting = (this.healAgainAt.get(key)?.at ?? 0) > Date.now();
+    return waiting || this.resubmits.has(key) ? null : terminalSequence;
   }
 
   private async heal(entry: JournalEntry, terminalSequence: number): Promise<void> {
     const key = `${entry.assignmentId}:${entry.attempt}`;
-    this.healed.add(key);
+    const failures = (this.healAgainAt.get(key)?.failures ?? -1) + 1;
+    this.healAgainAt.set(key, { at: Date.now() + Math.min(HEAL_MAX_DELAY_MS, HEAL_BASE_DELAY_MS * 2 ** Math.min(failures, 16)), failures });
     await this.options.outbox.removeGroup(reportGroup(entry.assignmentId, entry.attempt, entry.claimId));
     await this.options.journal.assignments.update(key, current => {
       if (!current || current.claimId !== entry.claimId || current.state !== "recovery_required") throw new Error("Halted claim changed before healing");

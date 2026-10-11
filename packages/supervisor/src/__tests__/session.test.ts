@@ -765,7 +765,31 @@ describe("relayed session", () => {
         expect(sequence).toEqual(["note", "answer"]);
         expect(f.sent.slice(sentBefore)).toContainEqual(expect.objectContaining({ body: expect.objectContaining({ kind: "acp", method: "session/update",
           params: expect.objectContaining({ update: { sessionUpdate: "tool_call_update", toolCallId: "unresolved-write", content: [{ type: "content", content: { type: "text",
-            text: "Konteks refused this file change: the call names no path to judge. Name every affected path inside the working copy and try again." } }] } }),
+            text: "Konteks refused this file change: the call names no path to judge. Name every affected path inside the working copy and try again.", annotations: { audience: ["user"] } } }] } }),
+        }) }));
+      } finally { await f.session.close("cancelled"); }
+    });
+
+    // 10-10 (E33): a refused `git commit` read "Failed" and the agent said the commit "was declined".
+    it("says in plain words why a command is refused, on its step, before answering", async () => {
+      const own = join(dir, "refused-command");
+      await mkdir(own);
+      const f = await build({ workspaceRoot: dir,
+        prepareInputs: async target => ({ binding: { workspaceId: target.workspaceId, sessionId: "s", assignmentId: target.id,
+          instanceId: target.instanceId, attempt: target.attempt }, cwd: own, skillInstructions: "", beforePrompt: async () => undefined }),
+        policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true),
+      });
+      try {
+        await f.session.bootstrap();
+        const answer = vi.spyOn(f.runner, "answer").mockImplementation(async () => ({ delivered: true }));
+        const params: RequestPermissionRequest = { sessionId: "acp-1", toolCall: { toolCallId: "commit", kind: "execute", title: "Create the initial commit", rawInput: { command: "git commit -m 'Add csvql'" } },
+          options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" }] };
+        const sentBefore = f.sent.length;
+        await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: "commit", params });
+        expect(answer).toHaveBeenCalledWith("acp-1", "commit", { outcome: { outcome: "selected", optionId: "reject" } });
+        expect(f.sent.slice(sentBefore)).toContainEqual(expect.objectContaining({ body: expect.objectContaining({ kind: "acp", method: "session/update",
+          params: expect.objectContaining({ update: { sessionUpdate: "tool_call_update", toolCallId: "commit", content: [{ type: "content", content: { type: "text",
+            text: "Konteks doesn't let agents run `git commit` on this computer. Run it yourself if you want it.", annotations: { audience: ["user"] } } }] } }),
         }) }));
       } finally { await f.session.close("cancelled"); }
     });
@@ -778,6 +802,23 @@ describe("relayed session", () => {
         await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: "q", params: { sessionId: "acp-1", toolCall: { toolCallId: "q", kind: "fetch", title: "Fetch a page" }, options } } as never);
         await vi.waitFor(() => expect(registered).toHaveLength(1));
         expect(registered[0]).toMatchObject({ sessionId: "s", assignmentId: "asg" });
+      } finally { await f.session.close("cancelled"); }
+    });
+
+    // 10-09 (E11): `ls -la ~/Desktop` read "Waiting" for minutes while macOS asked on the Mac.
+    it("says on a running step that the Mac is asking to open a folder, and the step runs on", async () => {
+      const probe = vi.fn(async () => "waiting" as const);
+      const f = await build({ folderAccess: { platform: "darwin", home: "/Users/person", probe, delayMs: 5 } }, directWork);
+      try {
+        await f.session.bootstrap();
+        await f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: {
+          sessionUpdate: "tool_call", toolCallId: "ls-desktop", title: "ls -la ~/Desktop", kind: "execute", status: "in_progress", rawInput: { command: "ls -la ~/Desktop" } } } } as never);
+        await vi.waitFor(() => expect(f.sent.map(message => (message.body as { params?: { update?: Record<string, unknown> } }).params?.update)
+          .filter(update => update?.toolCallId === "ls-desktop" && update.sessionUpdate === "tool_call_update")).toEqual([expect.objectContaining({
+          sessionUpdate: "tool_call_update", toolCallId: "ls-desktop", status: "in_progress", title: "ls -la ~/Desktop",
+          content: [{ type: "content", content: { type: "text", text: "Your Mac is asking whether Konteks may open your Desktop folder. Answer it on the Mac to carry on.", annotations: { audience: ["user"] } } }],
+        })]));
+        expect(probe).toHaveBeenCalledWith("/Users/person/Desktop");
       } finally { await f.session.close("cancelled"); }
     });
   });
@@ -815,12 +856,12 @@ describe("relayed session", () => {
       expect(f.quarantine).not.toHaveBeenCalled();
     });
 
-    it("gives dsh tool calls their ACP kind and the platform tool name in relayed activity", async () => {
+    it("gives dsh tool calls their ACP kind, a title from what they run, and the platform tool name in relayed activity", async () => {
       const f = await dshSession();
       await f.toolCall("t-1", "bash", { command: "ls" });
       await f.toolCall("t-2", "mcp__konteks-platform__platform__builtin__echo", { text: "ping" });
       const updates = f.sent.map(message => message.body as { method?: string; params?: { update?: Record<string, unknown> } }).filter(body => body.method === "session/update").map(body => body.params!.update!);
-      expect(updates[0]).toMatchObject({ toolCallId: "t-1", kind: "execute", title: "bash" });
+      expect(updates[0]).toMatchObject({ toolCallId: "t-1", kind: "execute", title: "ls" });
       expect(updates[1]).toMatchObject({ toolCallId: "t-2", name: "platform__builtin__echo" });
     });
 
@@ -1544,6 +1585,43 @@ describe("relayed session", () => {
     const text = bodies.slice(0, 3).map(body => body.params.update.content?.text).join("");
     expect(text).toBe("Editing [local-path] now and running the tests.");
     expect(JSON.stringify(bodies)).not.toContain("private-person");
+  });
+
+  // 10-11 (D1): "I'm working in: [local-path] Support/konteks-remote/workspaces/…/source"; the folder split across chunks.
+  it("names the session's folder as [workspace] wherever the stream splits it", async () => {
+    const cwd = join(dir, "Library", "Application Support", "konteks-remote", "workspaces", "claude-code", "session-22fd", "source");
+    await mkdir(cwd, { recursive: true });
+    const { session, sent } = await build({ prepareInputs: async target => ({ binding: { workspaceId: target.workspaceId, sessionId: "s", assignmentId: target.id,
+      instanceId: target.instanceId, attempt: target.attempt }, cwd, skillInstructions: "", beforePrompt: async () => undefined }) });
+    await session.bootstrap();
+    const update = (value: Record<string, unknown>) => session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: value } });
+    const reply = `I'm working in:\n\n\`${cwd}\`\n\nIt's empty.`;
+    const wrong: string[] = [];
+    for (let at = 1; at < reply.length; at += 1) {
+      const before = sent.length;
+      await update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: reply.slice(0, at) } });
+      await update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: reply.slice(at) } });
+      await update({ sessionUpdate: "plan", entries: [] });
+      const text = sent.slice(before).map(message => (message.body as { params: { update: { content?: { text?: string } } } }).params.update.content?.text ?? "").join("");
+      if (text !== "I'm working in:\n\n`[workspace]`\n\nIt's empty.") wrong.push(`${at}: ${text}`);
+    }
+    expect(wrong).toEqual([]);
+    expect(session.counters.malformedResponses).toBe(0);
+  });
+
+  it("sends a reply's last path before the agent's next step or the turn's end", async () => {
+    const { session, sent } = await build();
+    await session.bootstrap();
+    const before = sent.length;
+    const update = (value: Record<string, unknown>) => session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: value } });
+    await update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Reading /etc/hos" } });
+    await update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ts" } });
+    await update({ sessionUpdate: "tool_call", toolCallId: "read", title: "Read hosts", kind: "read", status: "pending" });
+    await update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Done with /tmp/x" } });
+    await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "unknown", result: { stopReason: "end_turn" } });
+    const shown = sent.slice(before).map(message => message.body as { kind: string; params?: { update?: { sessionUpdate: string; content?: { text?: string } } } })
+      .filter(body => body.kind === "acp").map(body => `${body.params?.update?.sessionUpdate}:${body.params?.update?.content?.text ?? ""}`);
+    expect(shown).toEqual(["agent_message_chunk:Reading ", "agent_message_chunk:[local-path]", "tool_call:", "agent_message_chunk:Done with ", "agent_message_chunk:[local-path]"]);
   });
 
   it("names the refused field when a redacted update still fails the relay contract", async () => {

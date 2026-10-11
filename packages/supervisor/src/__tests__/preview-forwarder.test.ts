@@ -3,7 +3,7 @@ import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WebSocketServer } from "ws";
 import type { PreviewToCoreChunk, RelayChannel } from "@konteks/remote-common";
-import { PreviewForwarder } from "../preview/forwarder.js";
+import { COULD_NOT_START_PREFIX, PreviewForwarder } from "../preview/forwarder.js";
 import { PreviewChannel, STARTING_MESSAGE, sessionIdOf } from "../preview/preview-channel.js";
 import type { OutboundMessage } from "../transport/transport.js";
 
@@ -71,6 +71,44 @@ describe("preview forwarder (loopback only, preview policy on this hop)", () => 
     expect(instance.activeStreams).toBe(0);
   });
 
+  it("sends a small response in one frame that carries final itself (D52)", async () => {
+    handler = (_request, response) => response.end("{\"ok\":true}");
+    const { instance, sent } = forwarder();
+    instance.handle({ streamId: "one", kind: "request", method: "GET", path: "/api/session", headers: {}, final: true });
+    const last = await final(sent, "one");
+    expect(sent.filter(chunk => chunk.streamId === "one")).toHaveLength(1);
+    expect(last).toMatchObject({ kind: "response", status: 200, final: true, body: b64("{\"ok\":true}") });
+  });
+
+  it("still ends a streamed response that is open when a piece arrives", async () => {
+    let finish: (() => void) | undefined;
+    handler = (_request, response) => {
+      response.write("first");
+      finish = () => response.end();
+    };
+    const { instance, sent } = forwarder();
+    instance.handle({ streamId: "sse", kind: "request", method: "GET", path: "/events", headers: {}, final: true });
+    await vi.waitFor(() => expect(sent.find(chunk => chunk.streamId === "sse")).toMatchObject({ final: false, body: b64("first") }));
+    finish!();
+    const last = await final(sent, "sse");
+    expect(last).toMatchObject({ kind: "response", final: true });
+    expect(responseOf(sent, "sse").body).toBe("first");
+  });
+
+  it("logs a slow request by stage with its stream id, never its path", async () => {
+    let now = 1_000;
+    handler = (_request, response) => { now += 400; response.end("late"); };
+    const lines: Array<Record<string, unknown>> = [];
+    const logger = { info: (fields: Record<string, unknown>) => void lines.push(fields), warn: () => undefined } as never;
+    const { instance, sent } = forwarder({ now: () => now, logger });
+    instance.handle({ streamId: "slow", kind: "request", method: "GET", path: "/api/contacts?id=7", headers: {}, final: true });
+    await final(sent, "slow");
+    await vi.waitFor(() => expect(lines.find(line => line.event === "preview.forward.slow")).toBeDefined());
+    const line = lines.find(entry => entry.event === "preview.forward.slow")!;
+    expect(line).toMatchObject({ streamId: "slow", method: "GET", status: 200, frames: 1, firstByteMs: 400, totalMs: 400 });
+    expect(JSON.stringify(line)).not.toContain("contacts");
+  });
+
   it("reassembles a request body sent across chunks, and refuses one over the cap with 413", async () => {
     handler = (request, response, body) => response.end(`${request.method} ${body.toString()}`);
     const { instance, sent } = forwarder({ limits: { maxRequestBodyBytes: 8 } });
@@ -93,16 +131,50 @@ describe("preview forwarder (loopback only, preview policy on this hop)", () => 
     expect(remote.instance.counters.refusedNoPreview).toBe(1);
   });
 
-  it("refuses a dot-segment path and a forbidden header before dialing", () => {
+  it("refuses a dot-segment path, a forbidden header and a Konteks cookie before dialing", () => {
     const requests = vi.fn();
     handler = (_request, response) => { requests(); response.end(); };
     const { instance, sent } = forwarder();
     instance.handle({ streamId: "dots", kind: "request", method: "GET", path: "/a/%2e%2e/secret", headers: {}, final: true });
-    instance.handle({ streamId: "cookie", kind: "request", method: "GET", path: "/", headers: { cookie: "session=1" } as never, final: true });
+    instance.handle({ streamId: "host", kind: "request", method: "GET", path: "/", headers: { host: "evil.example" } as never, final: true });
+    instance.handle({ streamId: "konteks", kind: "request", method: "GET", path: "/", headers: { cookie: "sid=1; konteks_preview=t" }, final: true });
     expect(responseOf(sent, "dots").status).toBe(400);
-    expect(responseOf(sent, "cookie").status).toBe(400);
-    expect(instance.counters).toMatchObject({ rejectedPaths: 1, rejectedHeaders: 1 });
+    expect(responseOf(sent, "host").status).toBe(400);
+    expect(responseOf(sent, "konteks").status).toBe(400);
+    expect(responseOf(sent, "konteks").body).toContain("konteks_cookie");
+    expect(instance.counters).toMatchObject({ rejectedPaths: 1, rejectedHeaders: 2 });
     expect(requests).not.toHaveBeenCalled();
+  });
+
+  it("hands the app its own cookie and Authorization, and returns its set-cookie host-only to a Core that takes it (D46)", async () => {
+    handler = (request, response) => {
+      response.setHeader("set-cookie", [
+        "sid=new; Domain=127.0.0.1; Path=/; HttpOnly",
+        "konteks_preview=forged; Path=/",
+        "theme=dark; SameSite=Strict",
+      ]);
+      response.end(`${request.headers.cookie} | ${request.headers.authorization}`);
+    };
+    const { instance, sent } = forwarder({ forwardSetCookies: () => true });
+    instance.handle({ streamId: "app", kind: "request", method: "GET", path: "/api/session", headers: { cookie: "sid=old; theme=light", authorization: "Bearer app" }, final: true });
+    await final(sent, "app");
+    expect(responseOf(sent, "app").body).toBe("sid=old; theme=light | Bearer app");
+    const head = sent.find(chunk => chunk.streamId === "app" && chunk.kind === "response");
+    expect(head).toMatchObject({ setCookie: ["sid=new; Path=/; HttpOnly; SameSite=Lax", "theme=dark; SameSite=Strict"] });
+    expect(sent.filter(chunk => chunk.streamId === "app" && "setCookie" in chunk)).toHaveLength(1);
+  });
+
+  it("drops the app's set-cookie for a Core that would refuse it", async () => {
+    handler = (_request, response) => {
+      response.setHeader("set-cookie", "sid=new");
+      response.end("ok");
+    };
+    for (const options of [{}, { forwardSetCookies: () => false }]) {
+      const { instance, sent } = forwarder(options);
+      instance.handle({ streamId: "old", kind: "request", method: "GET", path: "/", headers: {}, final: true });
+      await final(sent, "old");
+      expect(sent.some(chunk => "setCookie" in chunk)).toBe(false);
+    }
   });
 
   it("rewrites a redirect to its own loopback origin to origin-form and turns any other absolute redirect into 502", async () => {
@@ -175,6 +247,21 @@ describe("preview forwarder (loopback only, preview policy on this hop)", () => 
     }
   });
 
+  it("opens the app's WebSocket with its own cookie", async () => {
+    const wss = new WebSocketServer({ server });
+    const cookies: Array<string | undefined> = [];
+    wss.on("connection", (_socket, request) => void cookies.push(request.headers.cookie));
+    try {
+      const { instance, sent } = forwarder();
+      instance.handle({ streamId: "wsc", kind: "request", method: "GET", path: "/socket", headers: { "sec-websocket-version": "13", cookie: "sid=abc" }, final: true });
+      await vi.waitFor(() => expect(sent.find(chunk => chunk.streamId === "wsc" && chunk.kind === "response")).toMatchObject({ status: 101 }));
+      expect(cookies).toEqual(["sid=abc"]);
+      instance.handle({ streamId: "wsc", kind: "close", code: 1000, final: true });
+    } finally {
+      wss.close();
+    }
+  });
+
   it("tells the viewer when the dev server closes its WebSocket", async () => {
     const wss = new WebSocketServer({ server });
     wss.on("connection", socket => setTimeout(() => socket.close(4001, "bye"), 10));
@@ -189,7 +276,7 @@ describe("preview forwarder (loopback only, preview policy on this hop)", () => 
 });
 
 describe("preview channel on the supervisor", () => {
-  function channel(options: { origin?: string | null; canOpen?: boolean; autoStart?: (sessionId: string) => Promise<boolean> } = {}) {
+  function channel(options: { origin?: string | null; canOpen?: boolean; autoStart?: (sessionId: string) => Promise<boolean | { reason: string }>; failureFor?: (sessionId: string) => string | null } = {}) {
     const sent: OutboundMessage[] = [];
     const opened: Array<[string, RelayChannel]> = [];
     const closed: string[] = [];
@@ -202,6 +289,7 @@ describe("preview channel on the supervisor", () => {
         originFor: () => options.origin === undefined ? origin : options.origin,
         touch: id => void touched.push(id),
         ...(options.autoStart ? { autoStart: options.autoStart } : {}),
+        ...(options.failureFor ? { failureFor: options.failureFor } : {}),
       },
     });
     return { instance, sent, opened, closed, touched, setCanOpen: (value: boolean) => { canOpen = value; } };
@@ -243,7 +331,7 @@ describe("preview channel on the supervisor", () => {
     f.setCanOpen(true);
     f.instance.onToRuntime("preview:s", { streamId: "m", kind: "request", method: "TRACE", path: "/", headers: {}, final: true });
     expect(bodies(f.sent)[1]).toMatchObject({ streamId: "m", status: 400 });
-    expect(f.instance.counters).toEqual({ malformed: 1, refusedDraining: 1, autoStarted: 0 });
+    expect(f.instance.counters).toEqual({ malformed: 1, refusedDraining: 1, autoStarted: 0, couldNotStart: 0 });
   });
 
   it("starts the preview for a viewer's first request when nothing runs, and says it is starting", async () => {
@@ -271,6 +359,27 @@ describe("preview channel on the supervisor", () => {
     autoStart.mockClear();
     f.instance.onToRuntime("preview:sess-4", { streamId: "p", kind: "request", method: "POST", path: "/x", headers: {}, body: b64("part"), final: false });
     expect(autoStart).not.toHaveBeenCalled();
+  });
+
+  it("says why a preview could not start instead of \"nothing yet\", for a viewer's page and a multi-part body alike", async () => {
+    const reason = "This change has nothing a browser can open (no serve command). Ask the agent to make it runnable.";
+    const autoStart = vi.fn(async () => ({ reason }));
+    const f = channel({ origin: null, autoStart, failureFor: () => reason });
+    f.instance.onToRuntime("preview:sess-5", { streamId: "f", kind: "request", method: "GET", path: "/", headers: { accept: "text/html" }, final: true });
+    await vi.waitFor(() => expect(f.sent).toHaveLength(1));
+    const reply = bodies(f.sent)[0] as Extract<PreviewToCoreChunk, { kind: "response" }>;
+    expect(reply).toMatchObject({ streamId: "f", status: 503, final: true, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
+    expect(Buffer.from(reply.body ?? "", "base64url").toString()).toBe(`Preview could not start: ${reason}`);
+    expect(COULD_NOT_START_PREFIX).toBe("Preview could not start: ");
+    expect(f.instance.counters).toMatchObject({ autoStarted: 0, couldNotStart: 1 });
+
+    // A body in several parts never auto-starts; the forwarder gives the same reason.
+    f.instance.onToRuntime("preview:sess-5", { streamId: "g", kind: "request", method: "POST", path: "/x", headers: {}, body: b64("part"), final: false });
+    await vi.waitFor(() => expect(f.sent).toHaveLength(2));
+    const plain = bodies(f.sent)[1] as Extract<PreviewToCoreChunk, { kind: "response" }>;
+    expect(plain.status).toBe(503);
+    expect(Buffer.from(plain.body ?? "", "base64url").toString()).toBe(`Preview could not start: ${reason}`);
+    expect(autoStart).toHaveBeenCalledTimes(1);
   });
 
   it("reads the session id only from a well-formed preview channel id", () => {
