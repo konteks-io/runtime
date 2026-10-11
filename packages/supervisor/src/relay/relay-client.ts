@@ -67,6 +67,8 @@ type DeliveryReceiver<R> = (request: R, connection: { connectionEpoch: number; a
 interface SocketAttempt {
   socket: NodeWebSocket;
   lease: string;
+  /** The relay's upgrade response named `holder-replay-request-v1`. */
+  holderReplayOnRequest: boolean;
   handshook: boolean;
   handshakeProcessing: boolean;
   validatedEpoch: number | null;
@@ -77,6 +79,20 @@ interface SocketAttempt {
   /** This attempt still owns the client's socket. */
   current(): boolean;
   discardPending(): void;
+}
+
+/**
+ * The relay's WebSocket upgrade response lists its optional behaviours in
+ * this header, comma-separated. A header leaves the strict handshake schemas
+ * untouched in both directions, so an older relay or connector ignores it.
+ */
+const RELAY_FEATURES_HEADER = "konteks-relay-features";
+/** The relay sends `replay_request` when a holder attaches and after a runtime reconnect for one already attached. */
+const HOLDER_REPLAY_REQUEST_FEATURE = "holder-replay-request-v1";
+
+function namesHolderReplayRequest(header: string | string[] | undefined): boolean {
+  const values = Array.isArray(header) ? header : header === undefined ? [] : [header];
+  return values.flatMap(value => value.split(",")).some(token => token.trim() === HOLDER_REPLAY_REQUEST_FEATURE);
 }
 
 /** Post-handshake envelopes in the order they are recognised; anything else must be a channel frame. */
@@ -362,6 +378,7 @@ export class RelayClient {
     const attempt = this.newAttempt(socket, lease, () => attemptNumber === this.attemptEpoch && fence === this.connectionFence);
     attempt.handshakeTimer = setTimeout(() => this.handshakeTimedOut(attempt), this.options.handshakeTimeoutMs ?? 15_000);
     attempt.handshakeTimer.unref();
+    socket.on("upgrade", response => { attempt.holderReplayOnRequest = namesHolderReplayRequest(response.headers[RELAY_FEATURES_HEADER]); });
     socket.on("open", () => this.onOpen(attempt));
     socket.on("message", data => this.onMessage(attempt, data));
     socket.on("unexpected-response", (_request, response) => {
@@ -389,7 +406,7 @@ export class RelayClient {
 
   private newAttempt(socket: NodeWebSocket, lease: string, ownsAttempt: () => boolean): SocketAttempt {
     const attempt: SocketAttempt = {
-      socket, lease, handshook: false, handshakeProcessing: false, validatedEpoch: null, pending: [], pendingBytes: 0, receiveFailed: false, handshakeTimer: undefined,
+      socket, lease, holderReplayOnRequest: false, handshook: false, handshakeProcessing: false, validatedEpoch: null, pending: [], pendingBytes: 0, receiveFailed: false, handshakeTimer: undefined,
       current: () => ownsAttempt() && !this.stopped && this.socket === socket && !attempt.receiveFailed,
       discardPending: () => { attempt.pending.length = 0; attempt.pendingBytes = 0; },
     };
@@ -490,7 +507,7 @@ export class RelayClient {
     if (!this.socketCurrent(attempt)) return;
     attempt.validatedEpoch = handshake.connectionEpoch;
     this.replaySocket = attempt.socket;
-    await this.options.mux.applyHandshake(handshake);
+    await this.options.mux.applyHandshake(handshake, { holderReplayOnRequest: attempt.holderReplayOnRequest });
     if (!this.socketCurrent(attempt)) return;
     return this.revalidateHandshake(attempt, handshake);
   }

@@ -1442,8 +1442,7 @@ describe("relayed session", () => {
       await session.close("cancelled");
     }
     expect(emitted).toEqual([]);
-    await mux.applyHandshake({ connectionEpoch: 7, resume: { "session:s": { to_core: 0, to_runtime: 0 } }, reset: [] });
-    await mux.requestReplay({ kind: "replay_request", channelId: "session:s", dataDirection: "to_core", connectionEpoch: 7 });
+    mux.applyHandshake({ connectionEpoch: 7, resume: { "session:s": { to_core: 0, to_runtime: 0 } }, reset: [] });
     expect(emitted.map(frame => "seq" in frame && frame.channel === "session" ? [frame.channelId, frame.seq, frame.body.kind] : null)).toEqual([
       ["session:s", 1, "session_ready"], ["session:s", 2, "session_closed"],
       ["session:s", 3, "session_ready"], ["session:s", 4, "session_closed"],

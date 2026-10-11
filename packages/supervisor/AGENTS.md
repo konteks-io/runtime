@@ -69,12 +69,18 @@ QA browser, structured results, updates and doctor/support.
   side by side (`Promise.allSettled`). `reapStrayServers` touches only
   `<root>/releases/`.
 - **Holder-bound replay** (`relay/channel-mux.ts`): session and preview
-  frames stay until their holder acknowledges them, with no age limit.
-  After a reconnect they are re-sent only on the relay's `replay_request`
-  (a holder attached) or ahead of the channel's next frame, never on every
-  handshake. The connector is never told a session ended, and Core keeps
-  idle sessions open, so do not retire or renumber a session channel: the
-  App holder drops any frame at or below its durable cursor.
+  frames stay until their holder acknowledges them, with no age limit. On a
+  relay whose upgrade response names `holder-replay-request-v1` in
+  `konteks-relay-features` (`relay/relay-client.ts`), they are re-sent after
+  a reconnect only on its `replay_request` or ahead of the channel's next
+  frame; an older relay gets them on every handshake. The connector is never
+  told a session ended, and Core keeps idle sessions open, so do not retire
+  or renumber a session channel: the App holder drops any frame at or below
+  its durable cursor.
+- **Handshake channel cap.** `handshakeCursors` never names more than
+  `maxHandshakeChannels` (512; over it the relay refuses every handshake
+  with 4401). Fully acknowledged holder-bound channels are left out first,
+  least recently active first, and keep their local cursor.
 - **Host agents never fail the connector.** A listed host agent the load cannot
   find or verify is returned in `unavailableAgents` and parked with
   `NativeAgentRetry` (`parkUnavailableHostAgent`).

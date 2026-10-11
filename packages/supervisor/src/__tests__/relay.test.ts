@@ -105,8 +105,6 @@ describe("channel mux", () => {
     second.clock.advance(40 * 60_000);
     second.mux.restoreDurableState(durable!, () => "session");
     await second.mux.applyHandshake({ connectionEpoch: 2, resume: { 'session:s': { to_core: 0, to_runtime: 0 } }, reset: [] });
-    expect(second.emitted).toEqual([]);
-    await second.mux.requestReplay({ kind: "replay_request", channelId: "session:s", dataDirection: "to_core", connectionEpoch: 2 });
     expect(second.emitted.filter(frame => 'seq' in frame).map(frame => (frame as ToCoreRelayFrame).seq)).toEqual([1, 2]);
     expect(second.mux.handshakeCursors()['session:s']?.to_core).toBe(0);
     expect(second.resets).toEqual([]);
@@ -142,7 +140,7 @@ describe("channel mux", () => {
       restarted.clock.advance(6 * 24 * 60 * 60_000);
       restarted.mux.restoreDurableState(durable()!, () => "session");
 
-      await restarted.mux.applyHandshake({ connectionEpoch: 2, reset: [], resume: { "session:ended": { to_core: 0, to_runtime: 0 } } });
+      await restarted.mux.applyHandshake({ connectionEpoch: 2, reset: [], resume: { "session:ended": { to_core: 0, to_runtime: 0 } } }, { holderReplayOnRequest: true });
       restarted.mux.resumeAfterRecovery();
 
       expect(sessionSeqs(restarted.emitted, "session:ended")).toEqual([]);
@@ -169,7 +167,7 @@ describe("channel mux", () => {
       const restarted = buildMux({ persistRelayState: async () => undefined });
       restarted.clock.advance(3 * 24 * 60 * 60_000);
       restarted.mux.restoreDurableState(durable()!, () => "session");
-      await restarted.mux.applyHandshake({ connectionEpoch: 2, resume: { "session:direct-s": { to_core: 2, to_runtime: 0 } }, reset: [] });
+      await restarted.mux.applyHandshake({ connectionEpoch: 2, resume: { "session:direct-s": { to_core: 2, to_runtime: 0 } }, reset: [] }, { holderReplayOnRequest: true });
       restarted.mux.resumeAfterRecovery();
       expect(sessionSeqs(restarted.emitted, "session:direct-s")).toEqual([]);
 
@@ -191,6 +189,63 @@ describe("channel mux", () => {
       await restarted.mux.receive(holderAck("session:direct-s", 6, 2));
       expect(restarted.mux.snapshot().find(channel => channel.channelId === "session:direct-s")).toMatchObject({ unacked: 0, stalled: false });
       expect(restarted.resets).toEqual([]);
+    });
+  });
+
+  it("still re-sends a retained session's replay on every handshake to a relay that does not ask for it (D64)", async () => {
+    const { mux, emitted } = buildMux();
+    await mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: [] });
+    mux.send("session:s", "session", { kind: "session_closed", assignmentId: "a", reason: "completed" });
+    await vi.waitFor(() => expect(emitted).toHaveLength(1));
+    await mux.applyHandshake({ connectionEpoch: 2, resume: { "session:s": { to_core: 0, to_runtime: 0 } }, reset: [] });
+    expect(emitted.map(frame => (frame as ToCoreRelayFrame).connectionEpoch)).toEqual([1, 2]);
+  });
+
+  describe("handshake channel cap (D64)", () => {
+    const frameOf = (channelId: string, seq: number) => ({ frame: { channel: "session", direction: "to_core", channelId, connectionEpoch: 1, seq,
+      issuedAt: "2026-09-06T00:00:00Z", body: { kind: "session_closed", assignmentId: "a", reason: "completed" } } as ToCoreRelayFrame, bytes: 100, enqueuedAt: Date.parse("2026-09-06T00:00:00Z") });
+    function crowded() {
+      const logger = createLogger({ name: "mux-test", silent: true });
+      const info = vi.spyOn(logger, "info");
+      const f = buildMux({ logger, assignmentCursors: () => ({ channelId: "assignment:i", to_core: 4, to_runtime: 2 }) });
+      const cursors: import("../relay/channel-mux.js").RelayDurableState["cursors"] = {
+        "control:i": { to_core: 1, to_runtime: 1, allocated: 1 }, "heartbeat:i": { to_core: 9, to_runtime: 0, allocated: 9 } };
+      const outbound: import("../relay/channel-mux.js").RelayDurableState["outbound"] = {};
+      for (let n = 0; n < 600; n += 1) cursors[`session:quiet-${n}`] = { to_core: 3, to_runtime: 1, allocated: 3 };
+      for (let n = 0; n < 5; n += 1) {
+        cursors[`session:replay-${n}`] = { to_core: 1, to_runtime: 0, allocated: 2 };
+        outbound[`session:replay-${n}`] = [frameOf(`session:replay-${n}`, 2)];
+      }
+      f.mux.restoreDurableState({ cursors, outbound }, channelId => channelId.split(":")[0] as never);
+      return { ...f, info };
+    }
+
+    it("names at most maxHandshakeChannels: every Core-bound channel and every channel with replay, leaving out the oldest quiet ones", async () => {
+      const f = crowded();
+      await f.mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: [] });
+      f.clock.advance(1);
+      await f.mux.receive({ kind: "ack", channelId: "session:quiet-0", connectionEpoch: 1, cumulativeSeq: 3,
+        issuedAt: "2026-09-06T00:00:00Z", dataDirection: "to_core", origin: "grant_holder", grantId: "grant" });
+
+      const named = f.mux.handshakeCursors();
+      const ids = Object.keys(named);
+      expect(ids).toHaveLength(512);
+      expect(ids).toEqual(expect.arrayContaining(["control:i", "heartbeat:i", "assignment:i", "session:quiet-0",
+        ...Array.from({ length: 5 }, (_, n) => `session:replay-${n}`)]));
+      expect(ids).not.toContain("session:quiet-1");
+      expect(named["session:replay-0"]).toEqual({ to_core: 1, to_runtime: 0 });
+      const omitted = f.info.mock.calls.find(([fields]) => (fields as { event?: string }).event === "relay.handshake.channels_omitted");
+      expect(omitted?.[0]).toEqual({ event: "relay.handshake.channels_omitted", channels: 607, named: 511, omittedQuiet: 96, omittedWithReplay: 0, maxHandshakeChannels: 512 });
+    });
+
+    it("keeps a left-out channel's cursor so its next frame continues the numbering", async () => {
+      const f = crowded();
+      await f.mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: [] });
+      expect(f.mux.handshakeCursors()).not.toHaveProperty("session:quiet-0");
+      expect(f.mux.send("session:quiet-0", "session", { kind: "session_closed", assignmentId: "next", reason: "completed" })).toBe(4);
+      await vi.waitFor(() => expect(f.emitted.filter(frame => "seq" in frame && frame.channelId === "session:quiet-0").map(frame => (frame as ToCoreRelayFrame).seq)).toEqual([4]));
+      expect(f.mux.handshakeCursors()["session:quiet-0"]).toEqual({ to_core: 3, to_runtime: 1 });
+      expect(f.resets).toEqual([]);
     });
   });
 
@@ -277,7 +332,6 @@ describe("channel mux", () => {
       const restarted = buildMux({ replayBufferBytes: 1_000_000, persistRelayState: state => store.saveRelayState(state) });
       restarted.mux.restoreDurableState((await new SupervisorStore(dir).relayState())!, () => "session");
       await restarted.mux.applyHandshake({ connectionEpoch: 2, resume: { s: { to_core: 0, to_runtime: 0 } }, reset: [] });
-      await restarted.mux.requestReplay({ kind: "replay_request", channelId: "s", dataDirection: "to_core", connectionEpoch: 2 });
       expect(restarted.emitted.map(frame => [(frame as ToCoreRelayFrame).seq, (frame as ToCoreRelayFrame).connectionEpoch]))
         .toEqual(Array.from({ length: burst }, (_, index) => [index + 1, 2]));
       expect(restarted.mux.send("s", "session", { kind: "session_closed", assignmentId: "next", reason: "completed" })).toBe(burst + 1);
@@ -817,8 +871,6 @@ it.each(['reconnect', 'restart'])('persists an offline terminal frame and replay
     const recovered = recovery === 'restart' ? buildMux() : first;
     if (recovery === 'restart') recovered.mux.restoreDurableState(durable!, () => 'session');
     await recovered.mux.applyHandshake({ connectionEpoch: 2, resume: { 'session:s': { to_core: 0, to_runtime: 0 } }, reset: [] });
-    expect(recovered.emitted).toHaveLength(0);
-    await recovered.mux.requestReplay({ kind: 'replay_request', channelId: 'session:s', dataDirection: 'to_core', connectionEpoch: 2 });
     expect(recovered.emitted).toHaveLength(1);
     expect(recovered.emitted[0]).toMatchObject({ channelId: 'session:s', seq: 1, connectionEpoch: 2, body: { kind: 'acp_error', id: 'request' } });
     expect(ToCoreRelayFrameSchema.safeParse(recovered.emitted[0]).success).toBe(true);

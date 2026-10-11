@@ -1,4 +1,5 @@
 import {
+  REMOTE_INSTANCE_LIMITS,
   RelayAckSchema,
   RemoteInstanceError,
   AssignmentReplyFrameSchema,
@@ -73,16 +74,32 @@ export interface MuxOptions {
  * Channels whose to_core data a grant holder (a viewer), not Core, receives
  * and acknowledges: `session:<id>` and `preview:<id>`. Their replay is kept
  * until that endpoint acknowledges it, and a quiet one is never a stall.
- * After a reconnect it is re-sent only when a holder asks (`replay_request`:
- * the relay sends one when a holder attaches, and after a reconnect for one
- * already attached) or ahead of the channel's next frame, so the holder still
- * receives it in order. A session can stay open for days with no holder and
+ * On a relay that says it asks for it, it is re-sent after a reconnect only
+ * when a holder asks (`replay_request`: when a holder attaches, and after a
+ * reconnect for one already attached) or ahead of the channel's next frame,
+ * so the holder still receives it in order. An older relay gets it on every
+ * handshake as before. A session can stay open for days with no holder and
  * the connector never hears that a session ended, so re-sending every
  * retained channel on every handshake flooded the relay with frames it could
  * only drop.
  */
 function holderBound(channel: RelayChannel): boolean {
   return channel === "session" || channel === "preview";
+}
+
+/**
+ * A holder-bound channel whose every frame its holder acknowledged and that
+ * is not fenced: it can sit out a handshake. Its own ACKs to the holder still
+ * go out on the tick.
+ */
+function quietHolderChannel(state: ChannelState): boolean {
+  return holderBound(state.channel) && state.nextSeq - 1 === state.ackedByEndpoint && !state.stalled && !state.buffer.needsReset;
+}
+
+/** Last resort over the cap: Core-bound channels first, then the most recently active holder-bound ones. */
+function byHandshakePriority(a: ChannelState, b: ChannelState): number {
+  const holder = Number(holderBound(a.channel)) - Number(holderBound(b.channel));
+  return holder !== 0 ? holder : b.lastInboundAt - a.lastInboundAt;
 }
 
 /** Upper bound for repeated stalls of one unacknowledged channel. */
@@ -166,6 +183,8 @@ export class ChannelMux {
   private epoch = 0;
   private connected = false;
   private generation = 0;
+  /** This connection's relay asks for holder-bound replay (`replay_request`) after reconnects. */
+  private holderReplayOnRequest = false;
   private readonly receiveLanes = new Map<string, Promise<void>>();
   /** Only cursor snapshot/persist/publish holds this shared mutation lane. */
   private pending: Promise<void> = Promise.resolve();
@@ -267,14 +286,37 @@ export class ChannelMux {
     return state;
   }
 
-  /** The caller's own cursors for `RelayHandshakeRequest.lastAckedSeq`. */
+  /**
+   * The caller's own cursors for `RelayHandshakeRequest.lastAckedSeq`, never
+   * more channels than the relay accepts (`maxHandshakeChannels`): a request
+   * over the cap is refused (4401) on every reconnect.
+   */
   handshakeCursors(): Record<string, { to_core: number; to_runtime: number }> {
     // Wire shape only: the allocation cursor is local durable state, never a handshake field.
     const out: Record<string, { to_core: number; to_runtime: number }> = {};
-    for (const [channelId, cursor] of Object.entries(this.genericCursors())) out[channelId] = { to_core: cursor.to_core, to_runtime: cursor.to_runtime };
     const assignment = this.options.assignmentCursors?.();
+    const capacity = REMOTE_INSTANCE_LIMITS.maxHandshakeChannels - (assignment ? 1 : 0);
+    for (const [channelId, state] of this.handshakeChannels(capacity)) out[channelId] = { to_core: state.ackedByEndpoint, to_runtime: state.receivedCursor };
     if (assignment) out[assignment.channelId] = { to_core: assignment.to_core, to_runtime: assignment.to_runtime };
     return out;
+  }
+
+  /**
+   * Generic channels within `capacity`. Over it, idle fully acknowledged
+   * holder-bound channels are left out first, least recently active first;
+   * they keep their local cursor, so their numbering continues.
+   */
+  private handshakeChannels(capacity: number): Array<[string, ChannelState]> {
+    const named = [...this.channels].filter(([, state]) => !(state.channel === "assignment" && this.options.assignmentCursors));
+    if (named.length <= capacity) return named;
+    const quiet = named.filter(([, state]) => quietHolderChannel(state)).sort(([, a], [, b]) => a.lastInboundAt - b.lastInboundAt);
+    const omitted = new Set(quiet.slice(0, named.length - capacity).map(([channelId]) => channelId));
+    const kept = named.filter(([channelId]) => !omitted.has(channelId));
+    const sent = kept.length <= capacity ? kept : kept.sort(([, a], [, b]) => byHandshakePriority(a, b)).slice(0, capacity);
+    this.logger[sent.length < kept.length ? "warn" : "info"]({ event: "relay.handshake.channels_omitted", channels: named.length,
+      named: sent.length, omittedQuiet: omitted.size, omittedWithReplay: kept.length - sent.length, maxHandshakeChannels: REMOTE_INSTANCE_LIMITS.maxHandshakeChannels },
+    "handshake names only the channels the relay cap allows");
+    return sent;
   }
 
   /** Generic replay cursor persistence excludes the assignment's independently durable stream. */
@@ -302,9 +344,14 @@ export class ChannelMux {
     return this.options.persistRelayState?.(durable) ?? this.options.persistCursors(durable.cursors);
   }
 
-  /** Adopt the epoch and replay locally unacknowledged frames; handshake cursors are not ACKs. */
-  applyHandshake(result: RelayHandshakeResult): Promise<void> {
+  /**
+   * Adopt the epoch and replay locally unacknowledged frames; handshake
+   * cursors are not ACKs. Holder-bound replay waits for the holder only on a
+   * relay that says it asks for it (`holderReplayOnRequest`).
+   */
+  applyHandshake(result: RelayHandshakeResult, relay: { holderReplayOnRequest: boolean } = { holderReplayOnRequest: false }): Promise<void> {
     this.generation += 1;
+    this.holderReplayOnRequest = relay.holderReplayOnRequest;
     this.epoch = result.connectionEpoch;
     this.connected = true;
     this.lastSocketInboundAt = this.options.clock.now();
@@ -359,8 +406,7 @@ export class ChannelMux {
     const replay = state.buffer.after(state.ackedByEndpoint);
     const refusal = resumeRefusal(cursor, state, replay);
     if (refusal !== null || replay === null) return this.resumeRefused(channelId, state, refusal ?? "replay_unavailable", cursor, replay);
-    // A holder-bound replay waits for its holder's replay request.
-    if (!holderBound(state.channel)) this.emitPermitted(state, replay);
+    if (this.resendsOnResume(state)) this.emitPermitted(state, replay);
   }
 
   /**
@@ -443,10 +489,15 @@ export class ChannelMux {
     }
   }
 
-  /** Permitted and not stalled; a holder-bound channel only once its replay was sent or asked for on this connection. */
+  /** Permitted and not stalled; a holder-bound channel waiting for its holder only once its replay was sent or asked for here. */
   private replaysOnRecovery(state: ChannelState): boolean {
     if (!this.recovery.permits(state.channel) || state.stalled) return false;
-    return !holderBound(state.channel) || state.replayedGeneration === this.generation;
+    return this.resendsOnResume(state) || state.replayedGeneration === this.generation;
+  }
+
+  /** Every channel but a holder-bound one on a relay that asks for holder replay itself. */
+  private resendsOnResume(state: ChannelState): boolean {
+    return !holderBound(state.channel) || !this.holderReplayOnRequest;
   }
 
   /** Send a to_core frame; the frame is buffered before any transmission attempt. */
@@ -844,6 +895,7 @@ export class ChannelMux {
 
   /** One line per handshake for the holder-bound replay kept back until a holder asks; counts and ages only. */
   private logHeldForHolders(): void {
+    if (!this.holderReplayOnRequest) return;
     const held = [...this.channels.values()].filter(state => holderBound(state.channel) && state.buffer.unackedCount > 0);
     if (held.length === 0) return;
     const oldest = Math.min(...held.map(state => state.buffer.snapshot()[0]!.enqueuedAt));
