@@ -1587,6 +1587,43 @@ describe("relayed session", () => {
     expect(JSON.stringify(bodies)).not.toContain("private-person");
   });
 
+  // 10-11 (D1): "I'm working in: [local-path] Support/konteks-remote/workspaces/…/source"; the folder split across chunks.
+  it("names the session's folder as [workspace] wherever the stream splits it", async () => {
+    const cwd = join(dir, "Library", "Application Support", "konteks-remote", "workspaces", "claude-code", "session-22fd", "source");
+    await mkdir(cwd, { recursive: true });
+    const { session, sent } = await build({ prepareInputs: async target => ({ binding: { workspaceId: target.workspaceId, sessionId: "s", assignmentId: target.id,
+      instanceId: target.instanceId, attempt: target.attempt }, cwd, skillInstructions: "", beforePrompt: async () => undefined }) });
+    await session.bootstrap();
+    const update = (value: Record<string, unknown>) => session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: value } });
+    const reply = `I'm working in:\n\n\`${cwd}\`\n\nIt's empty.`;
+    const wrong: string[] = [];
+    for (let at = 1; at < reply.length; at += 1) {
+      const before = sent.length;
+      await update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: reply.slice(0, at) } });
+      await update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: reply.slice(at) } });
+      await update({ sessionUpdate: "plan", entries: [] });
+      const text = sent.slice(before).map(message => (message.body as { params: { update: { content?: { text?: string } } } }).params.update.content?.text ?? "").join("");
+      if (text !== "I'm working in:\n\n`[workspace]`\n\nIt's empty.") wrong.push(`${at}: ${text}`);
+    }
+    expect(wrong).toEqual([]);
+    expect(session.counters.malformedResponses).toBe(0);
+  });
+
+  it("sends a reply's last path before the agent's next step or the turn's end", async () => {
+    const { session, sent } = await build();
+    await session.bootstrap();
+    const before = sent.length;
+    const update = (value: Record<string, unknown>) => session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: value } });
+    await update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Reading /etc/hos" } });
+    await update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ts" } });
+    await update({ sessionUpdate: "tool_call", toolCallId: "read", title: "Read hosts", kind: "read", status: "pending" });
+    await update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Done with /tmp/x" } });
+    await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "unknown", result: { stopReason: "end_turn" } });
+    const shown = sent.slice(before).map(message => message.body as { kind: string; params?: { update?: { sessionUpdate: string; content?: { text?: string } } } })
+      .filter(body => body.kind === "acp").map(body => `${body.params?.update?.sessionUpdate}:${body.params?.update?.content?.text ?? ""}`);
+    expect(shown).toEqual(["agent_message_chunk:Reading ", "agent_message_chunk:[local-path]", "tool_call:", "agent_message_chunk:Done with ", "agent_message_chunk:[local-path]"]);
+  });
+
   it("names the refused field when a redacted update still fails the relay contract", async () => {
     const warn = vi.fn();
     const { session, sent } = await build({ logger: { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn() } as never });

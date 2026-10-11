@@ -59,6 +59,7 @@ import { continuedSession, isDirectAssignment, isNativeTurn } from "../work/cont
 import { hostToolGovernance, type HostToolBypass, type HostToolGovernance } from "./host-tool-governance.js";
 import { McpToolCallLedger } from "./permission-tool-identity.js";
 import { FolderAccessCue, type FolderAccessCueOptions } from "./folder-access-cue.js";
+import { heldChunk, StreamedPathHold } from "./path-hold.js";
 import { antigravityKonteksToolsLine, antigravityResultToolReference } from "./antigravity-prompt.js";
 import { openCodeKonteksToolsLine, openCodeResultToolReference } from "./opencode-prompt.js";
 import { compileResultSchema as compileTurnValidator, StructuredResultToolServer, toolInputSchema } from "../structured-result/result-tool-server.js";
@@ -226,6 +227,8 @@ export class RelayedSession {
   private sessionServers: ReadonlySet<string> = new Set();
   /** Codex's announced MCP calls: its approvals name only the tool call id. */
   private readonly mcpCalls: McpToolCallLedger | null;
+  /** The path the agent's streamed reply ends inside, sent whole with the next chunk. */
+  private readonly pathHold = new StreamedPathHold();
   /** Says on a waiting step when macOS is asking the person to let Konteks open a folder (E11). */
   private readonly folderAccess: FolderAccessCue;
   /** A governed permission request's tool call and options, until Konteks answers it. */
@@ -1298,7 +1301,22 @@ export class RelayedSession {
   private async onRunnerEventImpl(event: RunnerEvent): Promise<void> {
     if (this.closed || this.acpSessionRef === null || !("acpSessionRef" in event) || event.acpSessionRef !== this.acpSessionRef) return;
     this.deps.assertExecutionOwned?.();
+    await this.sendHeldPath(event);
     await this.runnerEventHandlers.get(event.kind)?.(event);
+  }
+
+  /** A held path goes out before anything else the agent does, and before its turn ends. */
+  private async sendHeldPath(event: RunnerEvent): Promise<void> {
+    if (event.kind === "session_update" && heldChunk(event.params)) return;
+    const held = this.pathHold.flush();
+    if (held) await this.sendToCore({ kind: "acp", method: "session/update", params: held as never });
+  }
+
+  /** An update as the agent sent it; its streamed words wait while they end inside a path. */
+  private async sendUpdate(params: unknown): Promise<void> {
+    const chunk = heldChunk(params);
+    const ready = chunk ? this.pathHold.take(chunk) : params;
+    if (ready) await this.sendToCore({ kind: "acp", method: "session/update", params: ready as never });
   }
 
   /** What each runner event does to this session; other events are ignored. */
@@ -1343,7 +1361,7 @@ export class RelayedSession {
     this.mcpCalls?.observe(update);
     this.folderAccess.observe(update);
     const bypass = this.toolGovernance?.observe(update, this.sessionCwd(), this.readOnlyRoots) ?? null;
-    await this.sendToCore({ kind: "acp", method: "session/update", params: event.params as never });
+    await this.sendUpdate(event.params);
     if (bypass) await this.onToolGovernanceBypass(bypass);
   }
 
