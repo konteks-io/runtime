@@ -804,6 +804,23 @@ describe("relayed session", () => {
         expect(registered[0]).toMatchObject({ sessionId: "s", assignmentId: "asg" });
       } finally { await f.session.close("cancelled"); }
     });
+
+    // 10-09 (E11): `ls -la ~/Desktop` read "Waiting" for minutes while macOS asked on the Mac.
+    it("says on a running step that the Mac is asking to open a folder, and the step runs on", async () => {
+      const probe = vi.fn(async () => "waiting" as const);
+      const f = await build({ folderAccess: { platform: "darwin", home: "/Users/person", probe, delayMs: 5 } }, directWork);
+      try {
+        await f.session.bootstrap();
+        await f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: {
+          sessionUpdate: "tool_call", toolCallId: "ls-desktop", title: "ls -la ~/Desktop", kind: "execute", status: "in_progress", rawInput: { command: "ls -la ~/Desktop" } } } } as never);
+        await vi.waitFor(() => expect(f.sent.map(message => (message.body as { params?: { update?: Record<string, unknown> } }).params?.update)
+          .filter(update => update?.toolCallId === "ls-desktop" && update.sessionUpdate === "tool_call_update")).toEqual([expect.objectContaining({
+          sessionUpdate: "tool_call_update", toolCallId: "ls-desktop", status: "in_progress", title: "ls -la ~/Desktop",
+          content: [{ type: "content", content: { type: "text", text: "Your Mac is asking whether Konteks may open your Desktop folder. Answer it on the Mac to carry on.", annotations: { audience: ["user"] } } }],
+        })]));
+        expect(probe).toHaveBeenCalledWith("/Users/person/Desktop");
+      } finally { await f.session.close("cancelled"); }
+    });
   });
 
   describe("DeepSeek Harness tool governance", () => {
