@@ -32,12 +32,14 @@ function trailingPathStart(text: string): number {
   if (text[start - 1] === "<") return -1; // a tag (`</h2>`), not a path
   const token = text.slice(start, end);
   if (PATH_START.test(token) || (end === text.length && DRIVE_LETTER.test(token))) return start;
-  // "Support/…" after "/Application ": the path began before the space.
-  if (/[\\/]Application $/.test(text.slice(0, start)) && /^Support(?:[\\/]|$)/.test(text.slice(start))) {
-    const earlier = tokenStart(text, start - 1);
-    if (text[earlier - 1] !== "<" && PATH_START.test(text.slice(earlier, start - 1))) return earlier;
-  }
-  return -1;
+  return applicationSupportStart(text, start);
+}
+
+/** "Support/…" after "/Application ": the path began before the space. */
+function applicationSupportStart(text: string, start: number): number {
+  if (!/[\\/]Application $/.test(text.slice(0, start)) || !/^Support(?:[\\/]|$)/.test(text.slice(start))) return -1;
+  const earlier = tokenStart(text, start - 1);
+  return text[earlier - 1] !== "<" && PATH_START.test(text.slice(earlier, start - 1)) ? earlier : -1;
 }
 
 /** Where the token that ends at `end` starts. */
