@@ -3,7 +3,7 @@ import { syncSkills } from "../native/control-commands.js";
 import { AlreadyToldError, type Output } from "../output.js";
 
 it.each([true, false])("reports profile outcomes before returning complete=%s", async complete => {
-  const report = { complete, loaded: "unknown", skills: [], profiles: [
+  const report = { complete, loaded: "unknown", catalogDigest: `sha256:${"a".repeat(64)}`, skills: [], profiles: [
     { home: "/private/agent-a", paths: [], status: complete ? "installed" : "failed",
       ...(complete ? {} : { reason: "profile_publication_failed" }) },
   ] };
@@ -18,7 +18,7 @@ it.each([true, false])("reports profile outcomes before returning complete=%s", 
 });
 
 it("reports a configured agent without a discovery profile as a failed sync", async () => {
-  const report = { complete: false, loaded: "unknown", skills: [], profiles: [
+  const report = { complete: false, loaded: "unknown", catalogDigest: `sha256:${"a".repeat(64)}`, skills: [], profiles: [
     { agentId: "codex", home: "", paths: [], status: "failed", reason: "native_profile_unconfigured" },
   ] };
   const output: Output = { json: true, line: vi.fn(), table: vi.fn(), result: vi.fn(), error: vi.fn() };

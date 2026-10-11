@@ -22,7 +22,7 @@ test("the shipped common contract supports scoped Skill synchronization", () => 
     const contract = require(join(temporary, "package", "dist", "remote-instance-internal.js"));
     for (const name of ["RuntimeSkillSyncItemSchema", "RuntimeSkillSyncEnvelopeSchema", "RuntimeSkillShareOwnerRequestSchema",
       "RuntimeSkillSharePublishRequestSchema", "RuntimeSkillShareRequestSchema", "RuntimeSkillSharePublicationResultSchema", "RuntimeSkillPublicationReceiptSchema",
-      "LocalSkillExportIntentSchema", "skillScopeAllows", "skillFreshnessFailure"]) {
+      "LocalSkillExportIntentSchema", "RuntimeSkillStatusSchema", "RuntimeSkillProfileFreshnessSchema", "skillScopeAllows", "skillFreshnessFailure"]) {
       assert.ok(contract[name], `Vendored common@${version} is missing ${name}`);
     }
     assert.equal(contract.RUNTIME_SKILL_SHARE_MIN_CORE_CONTRACT_VERSION, "7.6");
@@ -42,6 +42,9 @@ test("the shipped common contract supports scoped Skill synchronization", () => 
     const scope = { tenantId: "tenant-a", audience: { kind: "systems", systemRefs: ["system-a"] }, context: { kind: "initiatives", initiativeRefs: ["initiative-a"] } };
     assert.ok(contract.SkillScopeSchema.parse(scope));
     assert.throws(() => contract.SkillScopeSchema.parse({ ...scope, audience: { kind: "systems", systemRefs: [] } }));
+    const freshness = { agentId: "codex", desiredRevision: digest, installedRevision: digest, loadedRevision: null, state: "current" };
+    assert.deepEqual(contract.RuntimeSkillStatusSchema.parse({ syncing: false, profiles: [freshness], lastSuccess: null }).profiles, [freshness]);
+    assert.throws(() => contract.RuntimeSkillStatusSchema.parse({ syncing: false, profiles: [{ ...freshness, loadedRevision: `sha256:${"b".repeat(64)}` }], lastSuccess: null }));
   } finally {
     rmSync(temporary, { recursive: true, force: true });
   }

@@ -79,7 +79,7 @@ function skillContext(scope: SkillScope, id: boolean): string {
   return `${id ? "Inisiatif" : "Initiatives"}: ${scope.context.initiativeRefs.join(", ")}`;
 }
 
-const SkillSyncSchema = z.object({ complete: z.boolean(), loaded: z.literal("unknown"),
+const SkillSyncSchema = z.object({ complete: z.boolean(), loaded: z.literal("unknown"), catalogDigest: z.string().optional(),
   skills: z.array(RuntimeSkillSyncItemSchema), profiles: z.array(z.object({ home: z.string(), paths: z.array(z.string()),
     status: z.enum(["installed", "failed"]), reason: z.string().optional(), agentId: z.string().optional() }).strict()) }).strict();
 export async function syncSkills(context: ControlContext): Promise<void> {

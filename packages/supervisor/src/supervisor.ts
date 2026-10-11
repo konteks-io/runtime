@@ -4,7 +4,9 @@ import { exchangeLocalSkills } from "./native/local-skill-exchange.js";
 import { exportLocalSkill, inspectLocalSkill, inspectLocalSkillPath } from "./skills/local-skills.js";
 import { runRequestedSkillSync } from "./native/requested-skill-sync.js";
 import { refreshSkillPublications } from "./native/skill-publication-refresh.js";
-import { refreshMachineSkills, machineSkillHomes, runnerSkillProfileHomes, MachineSkillPartialFailure, type MachineSkillInventory } from "./native/skill-refresh.js";
+import { refreshMachineSkills, machineSkillHomes, runnerSkillProfileHomes, MachineSkillPartialFailure, MachineSkillSyncFailure, type MachineSkillInventory } from "./native/skill-refresh.js";
+import { skillProfileFreshness } from "./native/skill-profile-freshness.js";
+import type { RuntimeSkillProfileFreshness } from "@konteks/backstage-plugin-common";
 import { SkillSyncCoordinator } from "./skills/sync-coordinator.js";
 import { NativeSkillSyncClient } from "./native/skill-sync-client.js";
 import { ObservationDelivery } from "./control/observation-delivery.js";
@@ -37,6 +39,7 @@ import {
   type ConnectedAgentView,
   type ConnectorCommandsManifest,
   type HeartbeatResult,
+  type HeartbeatMessage,
   type InstanceKeyPair,
   type JsonValue,
   type Logger,
@@ -238,6 +241,7 @@ export class Supervisor {
   private skillSyncClient: NativeSkillSyncClient | undefined;
   private skillSync: SkillSyncCoordinator<MachineSkillInventory> | undefined;
   private skillInstallationSnapshot: SkillInstallationSnapshot | undefined;
+  private lastSkillProfileFreshness: RuntimeSkillProfileFreshness[] | undefined;
   /** Runs `integration` work; composed with the native runners. */
   private integrationCarrier: IntegrationWorkCarrier | undefined;
   private roleBindings: RoleBinding[] = [];
@@ -1256,6 +1260,7 @@ export class Supervisor {
       activeAssignmentIds: () => this.work.activeAssignmentIds(),
       modelCapabilitySnapshots: () => this.modelCapabilities?.snapshots() ?? [],
       supportedAgents: agents => this.supportedAgents(agents),
+      skillStatus: () => this.skillStatusReport(),
       // The commands this release carries, only to a Core that takes 7.1 fields.
       connectorCommands: () =>
         this.hostSettings.coreAcceptsRouteBilling ? this.connectorCommands() : undefined,
@@ -2407,11 +2412,55 @@ export class Supervisor {
       });
     });
     this.skillSync.startPeriodic(() => this.skillSyncReady(), () => this.logSkillSyncFailure());
-    try { return { ...await this.skillSync.sync(reconcileAfterPending), complete: true, loaded: "unknown" as const }; }
-    catch (error) {
-      if (error instanceof MachineSkillPartialFailure) return { ...error.inventory, complete: false, loaded: "unknown" as const };
+    const agentIds = this.skillAgentIds();
+    try {
+      const inventory = await this.skillSync.sync(reconcileAfterPending);
+      this.lastSkillProfileFreshness = skillProfileFreshness({ agentIds, inventory,
+        ...(this.lastSkillProfileFreshness ? { previous: this.lastSkillProfileFreshness } : {}) });
+      return { ...inventory, complete: true, loaded: "unknown" as const };
+    } catch (error) {
+      if (error instanceof MachineSkillPartialFailure) {
+        this.lastSkillProfileFreshness = skillProfileFreshness({ agentIds, inventory: error.inventory,
+          ...(this.lastSkillProfileFreshness ? { previous: this.lastSkillProfileFreshness } : {}) });
+        return { ...error.inventory, complete: false, loaded: "unknown" as const };
+      }
+      this.lastSkillProfileFreshness = skillProfileFreshness({ agentIds,
+        ...(this.lastSkillProfileFreshness ? { previous: this.lastSkillProfileFreshness } : {}),
+        unavailableReason: error instanceof MachineSkillSyncFailure && error.phase === "configuration" ? "skill_home_unavailable" : "catalog_unavailable" });
       throw error;
     }
+  }
+
+  private skillAgentIds(): string[] {
+    return [...new Set((this.options.native?.runners ?? []).map(runner => runner.RUNNER_AGENT_ID))];
+  }
+
+  private initialSkillProfileFreshness(): RuntimeSkillProfileFreshness[] {
+    const runners = this.options.native?.runners ?? [];
+    const configured = new Map<string, boolean>();
+    for (const runner of runners) {
+      const hasHome = runnerSkillProfileHomes(runner).length > 0 || (runner.RUNNER_NATIVE_SKILL_HOMES?.length ?? 0) > 0;
+      configured.set(runner.RUNNER_AGENT_ID, (configured.get(runner.RUNNER_AGENT_ID) ?? false) || hasHome);
+    }
+    return [...configured].map(([agentId, hasHome]) => ({
+      agentId, desiredRevision: null, installedRevision: null, loadedRevision: null,
+      state: hasHome ? "unknown" : "failed",
+      reason: hasHome ? "no_sync_proof" : "skill_home_unavailable",
+    }));
+  }
+
+  private skillStatusReport(): HeartbeatMessage["skillStatus"] {
+    const status = this.skillSync?.status();
+    const success = status?.lastSuccess;
+    return {
+      syncing: status?.syncing ?? false,
+      profiles: this.lastSkillProfileFreshness ?? this.initialSkillProfileFreshness(),
+      lastSuccess: success ? {
+        syncedAt: success.syncedAt,
+        ...(success.inventory.catalogDigest ? { catalogRevision: success.inventory.catalogDigest } : {}),
+        skills: success.inventory.skills.map(({ skillId, name, description, version }) => ({ skillId, name, description, version })),
+      } : null,
+    };
   }
 
   private async shareSkill(request: Extract<ControlRequest, { op: "skills.share" }>, signal: AbortSignal) {

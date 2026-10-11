@@ -30,6 +30,8 @@ function claudeSkillProfileHomes(runner: SkillHomeRunner, operatorHome: string):
   return runner.RUNNER_NATIVE_CLAUDE_EXECUTABLE ? [runner.RUNNER_NATIVE_CLAUDE_CONFIG_DIR ?? join(operatorHome, ".claude")] : [];
 }
 export interface MachineSkillInventory {
+  /** Catalog revision observed during this synchronization attempt. */
+  catalogDigest?: string;
   skills: RuntimeSkillSyncItem[];
   profiles: Array<{ home: string; paths: string[]; status: "installed" | "failed"; reason?: string; agentId?: string }>;
 }
@@ -73,7 +75,7 @@ export async function refreshMachineSkills(options: {
     check();
   }
   await assertAuthorized();
-  const inventory = { skills: structuredClone(envelope.catalog.skills), profiles };
+  const inventory = { catalogDigest: envelope.catalogDigest, skills: structuredClone(envelope.catalog.skills), profiles };
   if (profiles.some(profile => profile.status === "failed")) throw new MachineSkillPartialFailure(inventory);
   check(); options.onVerified?.(structuredClone(staged), [...homes], { ...owner });
   return inventory;
