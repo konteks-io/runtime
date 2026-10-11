@@ -42,6 +42,14 @@ export interface AgentRuntimeOptions {
   modelCapabilityTtlMs?: number;
   /** Native supervisor-owned provider process must reload a completed official login. */
   afterSuccessfulLogin?: () => Promise<void>;
+  /**
+   * Frees the execution process of this agent's longest-idle completed
+   * session (one the supervisor may release, as its idle reaper does);
+   * resolves `true` when one was freed. With it, a session that finds every
+   * execution slot held asks for one and otherwise waits for a free slot
+   * while its claim is current, instead of being refused (D62).
+   */
+  reclaimIdleExecution?: () => Promise<boolean>;
 }
 
 /**
@@ -497,25 +505,59 @@ export class AgentRuntime {
 
   private createExecutionBridge(ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string, readOnlyRoots: readonly string[] = []): Promise<BridgeProcess> {
     const queueMs = this.host?.processLimits?.queueMs;
-    return queueMs === undefined ? this.reserveExecutionBridge(ref, lifecycle, cwd, readOnlyRoots) : this.queueForExecutionBridge(ref, Date.now() + queueMs, lifecycle, cwd, readOnlyRoots);
+    if (queueMs !== undefined) return this.queueForExecutionBridge(ref, Date.now() + queueMs, lifecycle, cwd, readOnlyRoots);
+    // Without its own ceiling an agent waits only where the supervisor can
+    // free idle slots and the claim can end the wait; otherwise a full
+    // ceiling is refused at once, as before.
+    if (this.options.reclaimIdleExecution && lifecycle) return this.queueForExecutionBridge(ref, Number.POSITIVE_INFINITY, lifecycle, cwd, readOnlyRoots);
+    return this.reserveExecutionBridge(ref, lifecycle, cwd, readOnlyRoots);
   }
 
   /**
-   * An agent with its own process ceiling (Antigravity) waits for a free
-   * execution process instead of being refused at once: a session finishing
-   * or its resident process being taken frees one. Past the wait it is
-   * refused plainly; nothing was reserved.
+   * A session that finds every execution slot held first frees the
+   * longest-idle completed session's process: with parallel deliveries the
+   * slots were all held by finished conversations waiting out the 30-minute
+   * idle reaper, and each new review was refused (D62). Otherwise it waits:
+   * a session finishing or its resident process being taken frees one. An
+   * agent with its own process ceiling (Antigravity) waits only its own
+   * window and is then refused plainly; nothing was reserved. Every other
+   * wait lasts while the claim is current.
    */
   private async queueForExecutionBridge(ref: string, until: number, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string, readOnlyRoots: readonly string[] = []): Promise<BridgeProcess> {
-    for (let logged = false; ; logged = true) {
+    const startedAt = Date.now();
+    for (let waited = false; ; waited = true) {
       const limit = this.executionLimit();
-      if (!this.waitsForCapacity(ref, limit)) return this.reserveExecutionBridge(ref, lifecycle, cwd, readOnlyRoots);
-      if (Date.now() >= until) {
-        throw new RemoteInstanceError("temporarily_unavailable", `${this.family.displayName} is already running ${limit} sessions on this computer. Try again when one of them finishes.`, { diagnostic: "execution_processes_busy" });
+      if (!this.waitsForCapacity(ref, limit)) {
+        if (waited) this.logger.info({ agentId: this.family.agentId, limit, waitedMs: Date.now() - startedAt }, "a free execution process was found for the waiting session");
+        return this.reserveExecutionBridge(ref, lifecycle, cwd, readOnlyRoots);
       }
-      if (!logged) this.logger.info({ agentId: this.family.agentId, limit }, "a session waits for a free execution process");
       lifecycle?.assertCurrent();
-      await new Promise(resolve => setTimeout(resolve, 250));
+      if (await this.reclaimIdleExecution(limit)) continue;
+      await this.awaitFreeExecutionSlot(limit, until, waited, lifecycle);
+    }
+  }
+
+  /** One wait step for a full ceiling, refused once an agent's own window has passed. */
+  private async awaitFreeExecutionSlot(limit: number | undefined, until: number, waited: boolean, lifecycle?: SessionLifecycle): Promise<void> {
+    if (Date.now() >= until) {
+      throw new RemoteInstanceError("temporarily_unavailable", `${this.family.displayName} is already running ${limit} sessions on this computer. Try again when one of them finishes.`, { diagnostic: "execution_processes_busy" });
+    }
+    if (!waited) this.logger.info({ agentId: this.family.agentId, limit }, "a session waits for a free execution process");
+    lifecycle?.assertCurrent();
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+
+  /** Whether the supervisor freed an idle completed session's slot; a failed ask is waited out like a busy slot. */
+  private async reclaimIdleExecution(limit: number | undefined): Promise<boolean> {
+    const reclaim = this.options.reclaimIdleExecution;
+    if (!reclaim) return false;
+    try {
+      const freed = await reclaim();
+      if (freed) this.logger.info({ agentId: this.family.agentId, limit }, "freed an idle completed session's execution process for a new session");
+      return freed && this.capacityFree(this.executionLimit());
+    } catch (error) {
+      this.logger.warn({ agentId: this.family.agentId, errorCode: error instanceof RemoteInstanceError ? error.code : "reclaim_failed" }, "an idle completed session could not be freed for a new session");
+      return false;
     }
   }
 
@@ -535,7 +577,10 @@ export class AgentRuntime {
     if (this.authRequired) return new RemoteInstanceError("agent_auth_required", "Sign in to the selected local agent.", { recoveryActions: [{ kind: "login_agent", agentId: this.family.agentId }] });
     if (this.activeLogin !== null) return new RemoteInstanceError("temporarily_unavailable", "The local agent is signing in.");
     if (this.stopping || !this.capacityFree(limit) || this.executionBridges.has(ref)) {
-      return new RemoteInstanceError("recovery_required", "Native execution owner capacity is unavailable; retained owners require qualified finalization.");
+      // One code for three checks; the diagnostic names which one refused.
+      return new RemoteInstanceError("recovery_required", "Native execution owner capacity is unavailable; retained owners require qualified finalization.", {
+        diagnostic: this.stopping ? "runtime_stopping" : this.executionBridges.has(ref) ? "execution_reference_reused" : "execution_capacity_full",
+      });
     }
     return null;
   }

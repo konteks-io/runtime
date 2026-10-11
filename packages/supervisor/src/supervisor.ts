@@ -1310,6 +1310,8 @@ export class Supervisor {
     return new NativeRunner({ instanceId: this.nativeRunnerInstanceId, config,
       ...(config.RUNNER_AGENT_ID === "codex" && this.nativeCodexOwner ? { afterSuccessfulLogin: () => this.nativeCodexOwner!.refreshAfterLogin() } : {}),
       executionBridgeLimit: () => Math.min(4, this.configuration.softMaxConcurrent ?? this.config.SUPERVISOR_SOFT_MAX_CONCURRENT ?? 4),
+      // A full ceiling frees a finished session instead of refusing the new one (D62).
+      reclaimIdleExecution: () => this.work?.reclaimIdleCompletedSession(config.RUNNER_AGENT_ID) ?? Promise.resolve(false),
       onEvent: event => { void this.onRunnerEvent(config.RUNNER_AGENT_ID, event).catch(error => this.logger.warn({ err: error }, "native runner event failed")); }, ...(this.options.native!.runtimeOptions ? { runtimeOptions: this.options.native!.runtimeOptions } : {}) });
   }
 
