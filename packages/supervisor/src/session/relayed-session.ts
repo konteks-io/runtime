@@ -58,6 +58,8 @@ import {
 import { continuedSession, isDirectAssignment, isNativeTurn } from "../work/continued-session.js";
 import { hostToolGovernance, type HostToolBypass, type HostToolGovernance } from "./host-tool-governance.js";
 import { McpToolCallLedger } from "./permission-tool-identity.js";
+import { FolderAccessCue, type FolderAccessCueOptions } from "./folder-access-cue.js";
+import { heldChunk, StreamedPathHold } from "./path-hold.js";
 import { antigravityKonteksToolsLine, antigravityResultToolReference } from "./antigravity-prompt.js";
 import { openCodeKonteksToolsLine, openCodeResultToolReference } from "./opencode-prompt.js";
 import { compileResultSchema as compileTurnValidator, StructuredResultToolServer, toolInputSchema } from "../structured-result/result-tool-server.js";
@@ -177,6 +179,8 @@ export interface RelayedSessionDeps {
    * idle stop).
    */
   preview?: SessionPreviewAccess;
+  /** Overrides for the macOS folder-access check (tests). */
+  folderAccess?: Partial<Pick<FolderAccessCueOptions, "platform" | "home" | "probe" | "delayMs">>;
   logger?: Logger;
 }
 
@@ -223,6 +227,10 @@ export class RelayedSession {
   private sessionServers: ReadonlySet<string> = new Set();
   /** Codex's announced MCP calls: its approvals name only the tool call id. */
   private readonly mcpCalls: McpToolCallLedger | null;
+  /** The path the agent's streamed reply ends inside, sent whole with the next chunk. */
+  private readonly pathHold = new StreamedPathHold();
+  /** Says on a waiting step when macOS is asking the person to let Konteks open a folder (E11). */
+  private readonly folderAccess: FolderAccessCue;
   /** A governed permission request's tool call and options, until Konteks answers it. */
   private readonly governedPermissions = new Map<string, { toolCallId: string; options: RequestPermissionRequest["options"] }>();
   /** An OpenCode or Antigravity session is told once how Konteks runs its tools (in its first prompt). */
@@ -254,6 +262,10 @@ export class RelayedSession {
     // Bound only after input preparation proves Core's claim-bound session.
     this.boundChannelId = null;
     this.logger = deps.logger ?? createLogger({ name: "relayed-session" });
+    this.folderAccess = new FolderAccessCue({ ...deps.folderAccess, cwd: () => this.sessionCwd(),
+      note: (toolCallId, text) => this.noteWaitingToolCall(toolCallId, text),
+      onCue: (toolCallId, folderName) => this.logger.info({ event: "folder_access.asking", assignmentId: this.assignment.id, toolCallId, folder: folderName },
+        "a step waits on macOS asking to open a folder; told the person") });
     this.executionGate = isNativeTurn(assignment) && deps.executionAuthority
       ? new NativeExecutionGate({ ...deps.executionAuthority, assignment, logger: this.logger, journal: deps.journal, clock: deps.clock,
         assertOwned: () => {
@@ -1289,7 +1301,22 @@ export class RelayedSession {
   private async onRunnerEventImpl(event: RunnerEvent): Promise<void> {
     if (this.closed || this.acpSessionRef === null || !("acpSessionRef" in event) || event.acpSessionRef !== this.acpSessionRef) return;
     this.deps.assertExecutionOwned?.();
+    await this.sendHeldPath(event);
     await this.runnerEventHandlers.get(event.kind)?.(event);
+  }
+
+  /** A held path goes out before anything else the agent does, and before its turn ends. */
+  private async sendHeldPath(event: RunnerEvent): Promise<void> {
+    if (event.kind === "session_update" && heldChunk(event.params)) return;
+    const held = this.pathHold.flush();
+    if (held) await this.sendToCore({ kind: "acp", method: "session/update", params: held as never });
+  }
+
+  /** An update as the agent sent it; its streamed words wait while they end inside a path. */
+  private async sendUpdate(params: unknown): Promise<void> {
+    const chunk = heldChunk(params);
+    const ready = chunk ? this.pathHold.take(chunk) : params;
+    if (ready) await this.sendToCore({ kind: "acp", method: "session/update", params: ready as never });
   }
 
   /** What each runner event does to this session; other events are ignored. */
@@ -1332,8 +1359,9 @@ export class RelayedSession {
     if (this.previewSessionId !== null) this.deps.preview?.touch(this.previewSessionId);
     this.observeStructuredText(update);
     this.mcpCalls?.observe(update);
+    this.folderAccess.observe(update);
     const bypass = this.toolGovernance?.observe(update, this.sessionCwd(), this.readOnlyRoots) ?? null;
-    await this.sendToCore({ kind: "acp", method: "session/update", params: event.params as never });
+    await this.sendUpdate(event.params);
     if (bypass) await this.onToolGovernanceBypass(bypass);
   }
 
@@ -1648,6 +1676,17 @@ export class RelayedSession {
     } } as never });
   }
 
+  /** A step still running gets a note for the person; its status says it runs on (a refusal note carries none). */
+  private async noteWaitingToolCall(toolCallId: string, text: string): Promise<void> {
+    const ref = this.acpSessionRef;
+    if (ref === null || this.closed) return;
+    await this.sendToCore({ kind: "acp", method: "session/update", params: { sessionId: ref, update: {
+      sessionUpdate: "tool_call_update", toolCallId, status: "in_progress",
+      content: [{ type: "content", content: { type: "text", text, annotations: { audience: ["user"] } } }],
+    } } as never }).catch(error => this.logger.warn({ event: "folder_access.note_failed", assignmentId: this.assignment.id, toolCallId, err: error },
+      "could not say on the step that macOS is asking"));
+  }
+
   /** Answer a permission request, telling a host agent's governance what was decided (Antigravity pairs its own reports with it). */
   private async answerPermission(ref: string, requestId: string, response: { outcome: { outcome: string; optionId?: string } }): Promise<void> {
     this.notePermissionAnswer(requestId, response);
@@ -1887,6 +1926,7 @@ export class RelayedSession {
 
   close(reason: SessionClosedReason): Promise<void> {
     this.executionGate?.stop();
+    this.folderAccess.stop();
     if (this.closeTask) return this.closeTask;
     if (this.closed) return Promise.resolve();
     this.completedSettlementInProgress = reason === "completed";
