@@ -68,14 +68,13 @@ QA browser, structured results, updates and doctor/support.
   update probation (`updateProbation`) takes no new work. Native runners stop
   side by side (`Promise.allSettled`). `reapStrayServers` touches only
   `<root>/releases/`.
-- **Session replay** (`relay/channel-mux.ts`): a session channel keeps its
-  unacknowledged frames until its holder acknowledges them, with no age
-  limit. Only an ended session's channel (`WorkOrchestrator.sessionChannelEnded`:
-  finished direct turns only, nothing holding it) whose newest frame is older
-  than `DETACHED_SESSION_REPLAY_GRACE_MS` (24 h) is retired
-  (`relay.channel.retired`). Never retire a session that may continue: a
-  later turn would restart at seq 1, below the holder's durable cursor, and
-  the holder drops those frames as duplicates.
+- **Holder-bound replay** (`relay/channel-mux.ts`): session and preview
+  frames stay until their holder acknowledges them, with no age limit.
+  After a reconnect they are re-sent only on the relay's `replay_request`
+  (a holder attached) or ahead of the channel's next frame, never on every
+  handshake. The connector is never told a session ended, and Core keeps
+  idle sessions open, so do not retire or renumber a session channel: the
+  App holder drops any frame at or below its durable cursor.
 - **Host agents never fail the connector.** A listed host agent the load cannot
   find or verify is returned in `unavailableAgents` and parked with
   `NativeAgentRetry` (`parkUnavailableHostAgent`).

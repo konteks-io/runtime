@@ -51,7 +51,7 @@ import type { AssignmentSender } from "./assignment-sender.js";
 import { coreChannelId } from "../relay/channel-ids.js";
 import { isSearchAssignment, type SearchControllerBoundary } from "./search-assignment-carrier.js";
 import { isOnboardWorkAssignment, onboardTerminalResult, type OnboardWorkAssignment, type OnboardWorkCarrier } from "../onboard/carrier.js";
-import { continuedSession, isDirectAssignment, logicalSessionId } from "./continued-session.js";
+import { continuedSession, logicalSessionId } from "./continued-session.js";
 import { integrationTerminalResult, isIntegrationWorkAssignment, type IntegrationWorkAssignment, type IntegrationWorkCarrier } from "../integration/carrier.js";
 
 /**
@@ -146,11 +146,6 @@ function runsToCompletionInDispatch(
     Boolean(deps.onboardCarrier && isOnboardWorkAssignment(assignment));
 }
 
-/** A direct turn that finished; its session never takes another turn on this channel once it ended. */
-function endedDirectTurn(entry: JournalEntry): boolean {
-  return isDirectAssignment(entry) && (entry.state === "completed" || entry.state === "cancelled");
-}
-
 export class WorkOrchestrator {
   readonly reports: ReportSender;
   private readonly sessions = new Map<string, RelayedSession>();
@@ -212,25 +207,6 @@ export class WorkOrchestrator {
       if (!session.isClosed && channelId?.startsWith("session:")) live.add(channelId.slice("session:".length));
     }
     return live;
-  }
-
-  /**
-   * A session channel that can never carry another turn: every journal entry
-   * naming it is a finished direct turn and no session here holds it. Core
-   * ends an idle direct session after an hour and never continues one that
-   * ended (a new message starts a new session, on a new channel). Any other
-   * session may continue later, and its holder keeps its own durable cursor,
-   * so its channel and numbering stay.
-   */
-  sessionChannelEnded(channelId: string): boolean {
-    const entries = this.deps.journal.assignments.all().filter(entry => entry.sessionChannelId === channelId);
-    return entries.length > 0 && entries.every(endedDirectTurn) && !this.holdsSessionChannel(channelId);
-  }
-
-  /** An open session, or a retained owner the next turn takes the channel from. */
-  private holdsSessionChannel(channelId: string): boolean {
-    if (this.channelOwners.has(channelId)) return true;
-    return [...this.sessions.values()].some(session => session.channelId === channelId && !session.isClosed);
   }
 
   /** Resolve existing original ownership; absent maps never establish authority. */

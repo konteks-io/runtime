@@ -33,16 +33,6 @@ export class ReplayBuffer<T> {
     return this.bytes;
   }
 
-  /** When the oldest held frame was enqueued; null when nothing is held. */
-  get oldestEnqueuedAt(): number | null {
-    return this.frames[0]?.enqueuedAt ?? null;
-  }
-
-  /** When the newest held frame was enqueued; null when nothing is held. */
-  get newestEnqueuedAt(): number | null {
-    return this.frames.at(-1)?.enqueuedAt ?? null;
-  }
-
   /** True once a frame that is still unacked has been evicted for size/age. */
   get needsReset(): boolean {
     return this.overflowed;

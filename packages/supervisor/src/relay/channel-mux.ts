@@ -62,12 +62,6 @@ export interface MuxOptions {
   assignmentCursors?: () => { channelId: string; to_core: number; to_runtime: number } | null;
   onStall: (channelId: string) => void;
   onReset: (channelId: string) => void;
-  /**
-   * Whether a session channel can never carry another turn (its session
-   * ended and nothing local holds it). Without it no session channel is ever
-   * retired for being detached.
-   */
-  sessionChannelEnded?: (channelId: string) => boolean;
   /** Persist the durable receive cursor (the authoritative cursor for to_runtime). */
   persistCursors: (cursors: Record<string, { to_core: number; to_runtime: number; allocated?: number | undefined }>) => Promise<void>;
   /** Production durability boundary: allocation, replay bytes and cursors in one atomic write. */
@@ -78,30 +72,17 @@ export interface MuxOptions {
 /**
  * Channels whose to_core data a grant holder (a viewer), not Core, receives
  * and acknowledges: `session:<id>` and `preview:<id>`. Their replay is kept
- * until that endpoint acknowledges it (or, for a session that ended, until
- * the holder grace passes), and a quiet one is never a stall.
+ * until that endpoint acknowledges it, and a quiet one is never a stall.
+ * After a reconnect it is re-sent only when a holder asks (`replay_request`:
+ * the relay sends one when a holder attaches, and after a reconnect for one
+ * already attached) or ahead of the channel's next frame, so the holder still
+ * receives it in order. A session can stay open for days with no holder and
+ * the connector never hears that a session ended, so re-sending every
+ * retained channel on every handshake flooded the relay with frames it could
+ * only drop.
  */
 function holderBound(channel: RelayChannel): boolean {
   return channel === "session" || channel === "preview";
-}
-
-/**
- * How long an ended session's unacknowledged replay still waits for a holder.
- * Longer than an attach grant can live (24 h). Core never attaches an ended
- * session again, so after this the frames are retired instead of being
- * replayed on every handshake.
- */
-export const DETACHED_SESSION_REPLAY_GRACE_MS = 24 * 60 * 60_000;
-
-/** A session channel whose newest retained frame has waited past the holder grace. */
-function detachedSession(state: ChannelState, now: number): boolean {
-  const newest = state.buffer.newestEnqueuedAt;
-  return state.channel === "session" && newest !== null && now - newest > DETACHED_SESSION_REPLAY_GRACE_MS;
-}
-
-/** Milliseconds since `at`, or null when there is no such time. */
-function ageMs(at: number | null, now: number): number | null {
-  return at === null ? null : Math.max(0, now - at);
 }
 
 /** Upper bound for repeated stalls of one unacknowledged channel. */
@@ -124,6 +105,8 @@ interface ChannelState {
   stallCursor: number;
   /** Last inbound frame or acknowledgement on this channel: evidence the peer is alive. */
   lastInboundAt: number;
+  /** The connection generation on which this channel's retained replay was last sent or asked for. */
+  replayedGeneration: number;
 }
 
 type ReplayFrames = NonNullable<ReturnType<ChannelState["buffer"]["after"]>>;
@@ -245,47 +228,16 @@ export class ChannelMux {
   }
 
   closeChannel(channelId: string): void {
-    if (!this.forget(channelId)) return;
-    this.persistRetired(channelId);
-  }
-
-  /** The in-memory delete fences queued receives immediately. */
-  private forget(channelId: string): boolean {
-    if (!this.channels.delete(channelId)) return false;
+    if (!this.channels.delete(channelId)) return;
     this.receiveLanes.delete(channelId);
-    return true;
-  }
-
-  /**
-   * Closing a channel is a durable lifecycle transition. Leaving its cursor
-   * behind resurrects a terminal stream on restart, after its bounded replay
-   * has expired, so every later handshake reports the same impossible gap.
-   * Persistence is serialized behind any earlier frame/ACK commit.
-   */
-  private persistRetired(channelId?: string): void {
+    // Closing a channel is a durable lifecycle transition. Leaving its cursor
+    // behind resurrects a terminal stream on restart, after its bounded replay
+    // has expired, so every later handshake reports the same impossible gap.
+    // The in-memory delete fences queued receives immediately; persistence is
+    // serialized behind any earlier frame/ACK commit.
     void this.serialize(() => this.persist(this.durableState())).catch(error => {
       this.logger.warn({ err: error, channelId }, "closed relay channel state could not be retired durably");
     });
-  }
-
-  /**
-   * Retire ended session channels whose replay has waited past the holder
-   * grace: replaying them on every handshake only floods the relay with
-   * frames it has no holder for. Only an ended session qualifies, because a
-   * later turn on the same channel would restart its numbering below the
-   * holder's durable cursor. The caller persists the retirement.
-   */
-  private retireDetachedSessions(): boolean {
-    const ended = this.options.sessionChannelEnded;
-    if (!ended) return false;
-    const now = this.options.clock.now();
-    let retired = false;
-    for (const [channelId, state] of this.channels) {
-      if (!detachedSession(state, now) || !ended(channelId)) continue;
-      this.logRetired(channelId, state, now);
-      retired = this.forget(channelId) || retired;
-    }
-    return retired;
   }
 
   private ensure(channelId: string, channel: RelayChannel): ChannelState {
@@ -296,8 +248,7 @@ export class ChannelMux {
         nextSeq: 1,
         // Logical sessions survive idle time between assignments. Expiring an
         // unacknowledged final frame here would poison the next ready frame.
-        // Keep endpoint-ACK ownership and the byte bound, including on restore;
-        // only retireDetachedSessions releases an ended session's replay.
+        // Keep endpoint-ACK ownership and the byte bound, including on restore.
         buffer: new ReplayBuffer<ToCoreRelayFrame>({ maxBytes: this.options.replayBufferBytes,
           maxAgeMs: holderBound(channel) ? Number.POSITIVE_INFINITY : this.options.replayBufferAgeMs }),
         receivedCursor: 0,
@@ -309,6 +260,7 @@ export class ChannelMux {
         stallStreak: 0,
         stallCursor: 0,
         lastInboundAt: this.options.clock.now(),
+        replayedGeneration: -1,
       };
       this.channels.set(channelId, state);
     }
@@ -356,11 +308,11 @@ export class ChannelMux {
     this.epoch = result.connectionEpoch;
     this.connected = true;
     this.lastSocketInboundAt = this.options.clock.now();
-    this.retireDetachedSessions();
     for (const channelId of result.reset) this.peerReset(channelId);
     for (const [channelId, cursor] of Object.entries(result.resume)) {
       if (!result.reset.includes(channelId)) this.resumeChannel(channelId, cursor);
     }
+    this.logHeldForHolders();
     // Take the snapshot when this write executes, after earlier receive commits.
     return this.serialize(() => this.persist(this.durableState()));
   }
@@ -407,7 +359,8 @@ export class ChannelMux {
     const replay = state.buffer.after(state.ackedByEndpoint);
     const refusal = resumeRefusal(cursor, state, replay);
     if (refusal !== null || replay === null) return this.resumeRefused(channelId, state, refusal ?? "replay_unavailable", cursor, replay);
-    this.emitPermitted(state, replay);
+    // A holder-bound replay waits for its holder's replay request.
+    if (!holderBound(state.channel)) this.emitPermitted(state, replay);
   }
 
   /**
@@ -423,6 +376,7 @@ export class ChannelMux {
 
   /** Re-emit retained frames on this epoch, each only while recovery permits the channel. */
   private emitPermitted(state: ChannelState, replay: ReplayFrames): void {
+    state.replayedGeneration = this.generation;
     for (const entry of replay) {
       if (this.recovery.permits(state.channel)) this.options.emit({ ...entry.frame, connectionEpoch: this.epoch });
     }
@@ -430,6 +384,7 @@ export class ChannelMux {
 
   /** Re-emit retained frames on this epoch until recovery no longer permits the channel. */
   private emitUntilRefused(state: ChannelState, replay: ReplayFrames): void {
+    state.replayedGeneration = this.generation;
     for (const entry of replay) {
       if (!this.recovery.permits(state.channel)) break;
       this.options.emit({ ...entry.frame, connectionEpoch: this.epoch });
@@ -447,7 +402,10 @@ export class ChannelMux {
       return Promise.resolve();
     }
     const state = this.channels.get(request.channelId);
-    if (!state || state.channel === "assignment" || !this.recovery.permits(state.channel)) return Promise.resolve();
+    if (!state || state.channel === "assignment") return Promise.resolve();
+    // A holder asked on this connection: recovery release may send it the replay.
+    state.replayedGeneration = this.generation;
+    if (!this.recovery.permits(state.channel)) return Promise.resolve();
     this.replayFromAck(request.channelId, state);
     return Promise.resolve();
   }
@@ -477,12 +435,18 @@ export class ChannelMux {
   resumeAfterRecovery(): void {
     if (!this.connected) return;
     for (const state of this.channels.values()) {
-      if (!this.recovery.permits(state.channel) || state.stalled) continue;
+      if (!this.replaysOnRecovery(state)) continue;
       const replay = state.buffer.after(state.ackedByEndpoint);
       if (!replay || state.buffer.needsReset) continue;
       state.lastAckAt = this.options.clock.now();
       this.emitUntilRefused(state, replay);
     }
+  }
+
+  /** Permitted and not stalled; a holder-bound channel only once its replay was sent or asked for on this connection. */
+  private replaysOnRecovery(state: ChannelState): boolean {
+    if (!this.recovery.permits(state.channel) || state.stalled) return false;
+    return !holderBound(state.channel) || state.replayedGeneration === this.generation;
   }
 
   /** Send a to_core frame; the frame is buffered before any transmission attempt. */
@@ -552,7 +516,7 @@ export class ChannelMux {
       const persistenceMs = Math.max(0, this.options.clock.now() - startedAt);
       for (const send of batch) {
         this.logSessionReady(send, persistenceMs, batch.length);
-        if (this.emittable(send)) this.options.emit({ ...send.frame, connectionEpoch: this.epoch });
+        if (this.emittable(send)) this.emitSent(send);
       }
     }).catch(error => this.sendBatchFailed(batch, error));
   }
@@ -561,6 +525,21 @@ export class ChannelMux {
   private emittable(send: PendingSend): boolean {
     return this.generation === send.generation && this.channels.get(send.channelId) === send.state && send.state.buffer.holds(send.seq) &&
       this.connected && !send.state.stalled && this.recovery.permits(send.channel);
+  }
+
+  /**
+   * A holder-bound channel's first frame on a connection brings the replay it
+   * kept back along, in order, so a holder never sees the new frame before
+   * the ones it has not acknowledged.
+   */
+  private emitSent(send: PendingSend): void {
+    const { state } = send;
+    const replay = state.buffer.after(state.ackedByEndpoint);
+    if (!holderBound(state.channel) || state.replayedGeneration === this.generation || replay === null) {
+      this.options.emit({ ...send.frame, connectionEpoch: this.epoch });
+      return;
+    }
+    this.emitUntilRefused(state, replay.filter(entry => entry.seq <= send.seq));
   }
 
   private logSessionReady(send: PendingSend, persistenceMs: number, batchFrames: number): void {
@@ -807,7 +786,6 @@ export class ChannelMux {
     const now = this.options.clock.now();
     const intervalMs = this.options.ackIntervalSeconds * 1_000;
     const socketLive = now - this.lastSocketInboundAt <= CHANNEL_LIVENESS_MS;
-    if (this.retireDetachedSessions()) this.persistRetired();
     for (const [channelId, state] of this.channels) this.tickChannel(channelId, state, { now, intervalMs, socketLive });
   }
 
@@ -858,18 +836,21 @@ export class ChannelMux {
     this.logger.warn({ event: "relay.channel.reset", channelId, channel: state.channel, connectionEpoch: this.epoch,
       reason, nextSeq: state.nextSeq, ackedByEndpoint: state.ackedByEndpoint, receivedCursor: state.receivedCursor,
       unackedCount: state.buffer.unackedCount, unackedBytes: state.buffer.unackedBytes,
-      oldestUnackedAgeMs: ageMs(state.buffer.oldestEnqueuedAt, this.options.clock.now()),
+      oldestUnackedAgeMs: state.buffer.snapshot()[0] ? Math.max(0, this.options.clock.now() - state.buffer.snapshot()[0]!.enqueuedAt) : null,
       replayMaxBytes: this.options.replayBufferBytes,
       replayRetention: holderBound(state.channel) ? "endpoint_ack_or_byte_limit" : "age_or_byte_limit",
       ...peer }, "channel replay reset");
   }
 
-  /** Only bounded protocol metadata; never bodies, signatures, or credentials. */
-  private logRetired(channelId: string, state: ChannelState, now: number): void {
-    this.logger.info({ event: "relay.channel.retired", channelId, channel: state.channel, reason: "session_detached",
-      frames: state.buffer.unackedCount, bytes: state.buffer.unackedBytes,
-      oldestUnackedAgeMs: ageMs(state.buffer.oldestEnqueuedAt, now), newestUnackedAgeMs: ageMs(state.buffer.newestEnqueuedAt, now) },
-    "retired a detached session channel's replay");
+  /** One line per handshake for the holder-bound replay kept back until a holder asks; counts and ages only. */
+  private logHeldForHolders(): void {
+    const held = [...this.channels.values()].filter(state => holderBound(state.channel) && state.buffer.unackedCount > 0);
+    if (held.length === 0) return;
+    const oldest = Math.min(...held.map(state => state.buffer.snapshot()[0]!.enqueuedAt));
+    this.logger.info({ event: "relay.holder_replay.held", connectionEpoch: this.epoch, channels: held.length,
+      frames: held.reduce((total, state) => total + state.buffer.unackedCount, 0),
+      oldestUnackedAgeMs: Math.max(0, this.options.clock.now() - oldest) },
+    "holder-bound replay kept until a holder asks for it");
   }
 
   /**
