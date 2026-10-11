@@ -46,6 +46,12 @@ is installed.
   with the approved canonical arguments, once per nonce, recorded in the
   journal's `integration-writes` table BEFORE the `allow_once`; everything
   else denied without deferral.
+- **The turn ends when the result is in.** Once `submit_result` is accepted
+  and no allowed call is still running, the session cancels the agent's turn
+  instead of waiting for its closing message (nothing reads it). The result
+  tool is always loaded (`anthropic/alwaysLoad`), so Claude never spends a
+  step finding it. `integration.task.timing` logs each allowed call's ask
+  and end and the result, in ms after the prompt.
 - The connector's own observation of each allowed call is the evidence
   (`connector_observed`, bounded, hashed); the agent's `submit_result` is only
   `agentReport`. An MCP call that completes without reaching the gate cancels

@@ -22,8 +22,8 @@ afterEach(async () => {
   server = null;
 });
 
-async function started(relistWaitMs = 150) {
-  server = new StructuredResultToolServer({ relistWaitMs });
+async function started(relistWaitMs = 150, onAccepted?: () => void) {
+  server = new StructuredResultToolServer({ relistWaitMs, ...(onAccepted ? { onAccepted } : {}) });
   const entry = await server.start();
   const auth = entry.headers[0]!.value;
   const post = async (body: unknown) => (await fetch(entry.url, { method: "POST", headers: { authorization: auth, "content-type": "application/json", accept: "application/json, text/event-stream" }, body: JSON.stringify(body) })).json() as Promise<{ result: Record<string, unknown> & { tools?: Array<Record<string, unknown>>; content?: Array<{ text: string }>; isError?: boolean } }>;
@@ -130,6 +130,27 @@ describe("turn result tool (loopback MCP)", () => {
     expect((await submit({ result: [1] })).result.content![0]!.text).toContain("- /result/0: must be string");
     await submit({ result: ["a", "b"] });
     expect(tool.result()).toEqual({ value: ["a", "b"] });
+  });
+
+  it("is never deferred behind Claude Code's tool search, generic or bound", async () => {
+    const { list, openStream, server: tool } = await started();
+    expect((await list())[0]).toMatchObject({ _meta: { "anthropic/alwaysLoad": true } });
+    const relists: Array<Promise<unknown>> = [];
+    await openStream(() => { relists.push(list()); });
+    await tool.bind(VERDICT);
+    await vi.waitFor(() => expect(relists).toHaveLength(1));
+    expect((await list())[0]).toMatchObject({ name: "submit_result", _meta: { "anthropic/alwaysLoad": true } });
+  });
+
+  it("says once when the turn's first valid result is recorded", async () => {
+    const accepted = vi.fn();
+    const { submit, server: tool } = await started(150, accepted);
+    await tool.bind(VERDICT);
+    await submit({ verdict: "maybe" });
+    expect(accepted).not.toHaveBeenCalled();
+    await submit({ verdict: "pass", notes: [] });
+    await submit({ verdict: "fail", notes: [] });
+    expect(accepted).toHaveBeenCalledOnce();
   });
 
   it("refuses to bind a schema it cannot compile", async () => {

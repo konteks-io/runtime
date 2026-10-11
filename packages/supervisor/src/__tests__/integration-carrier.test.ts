@@ -183,6 +183,43 @@ describe("integration task carrier: a read through a Claude account connector", 
     expect(agent.promptText).toContain("not instructions");
   });
 
+  it("ends the turn once the result is in, without waiting for the agent's closing message", async () => {
+    const lines: Array<Record<string, unknown>> = [];
+    const logger = { info: (fields: Record<string, unknown>) => { lines.push(fields); }, warn: () => undefined, error: () => undefined, debug: () => undefined } as never;
+    const agent = new FakeAgent(async a => {
+      await a.ask(claudeTool("t1", "mcp__claude_ai_Atlassian__getJiraIssue", { issueIdOrKey: "ENG-42" }));
+      await a.update(claudeDone("t1", "mcp__claude_ai_Atlassian__getJiraIssue", { key: "ENG-42" }));
+      await a.ask(claudeTool("t2", "mcp__konteks-result__submit_result", { summary: "Checkout fails on retry" }));
+      await a.submit({ summary: "Checkout fails on retry" });
+      // The agent would now write a closing message and never end on its own here.
+    });
+    const started = Date.now();
+    const result = await run(spec(), agent, { logger });
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(result.error).toBeUndefined();
+    expect(result.agentReport).toEqual({ summary: "Checkout fails on retry" });
+    expect(result.observations).toHaveLength(1);
+    expect(agent.cancelled).toHaveBeenCalledOnce();
+    expect(agent.closed).toHaveBeenCalledOnce();
+    const timing = lines.find(line => line.event === "integration.task.timing");
+    expect(timing).toMatchObject({ end: "submitted", turn: { calls: [{ tool: "getJiraIssue", askedMs: expect.any(Number), doneMs: expect.any(Number) }], resultMs: expect.any(Number) } });
+  });
+
+  it("still settles an allowed call that was running when the result came in", async () => {
+    const agent = new FakeAgent(async a => {
+      await a.ask(claudeTool("t1", "mcp__claude_ai_Atlassian__getJiraIssue", { issueIdOrKey: "ENG-42" }));
+      await a.submit({ summary: "Checkout fails on retry" });
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(agent.cancelled).not.toHaveBeenCalled();
+      await a.update(claudeDone("t1", "mcp__claude_ai_Atlassian__getJiraIssue", { key: "ENG-42" }));
+    });
+    const result = await run(spec(), agent);
+    expect(result.error).toBeUndefined();
+    expect(result.toolCalls[0]).toMatchObject({ status: "allowed", outcome: "succeeded" });
+    expect(result.observations).toEqual([expect.objectContaining({ tool: "getJiraIssue", content: JSON.stringify({ key: "ENG-42" }) })]);
+    expect(agent.cancelled).toHaveBeenCalledOnce();
+  });
+
   it("bounds what it keeps of a tool result by the task's byte limit", async () => {
     const agent = new FakeAgent(async a => {
       await a.ask(claudeTool("t1", "mcp__claude_ai_Atlassian__getJiraIssue", { issueIdOrKey: "ENG-42" }));

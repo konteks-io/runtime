@@ -19,6 +19,7 @@ import { STRUCTURED_RESULT_MCP_SERVER_NAME, StructuredResultToolServer, compileR
 import { IntegrationTaskError } from "./errors.js";
 import { buildIntegrationPrompt } from "./prompt.js";
 import { IntegrationToolGate, type IntegrationWriteLedger } from "./tool-gate.js";
+import { TurnTiming } from "./turn-timing.js";
 
 interface IntegrationSessionDeps {
   runner: RunnerPort;
@@ -35,7 +36,8 @@ interface IntegrationSessionDeps {
   logger?: Logger;
 }
 
-type TurnEnd = { kind: "result" } | { kind: "error"; class: string } | { kind: "exited" } | { kind: "deadline" } | { kind: "ungated" };
+/** `submitted`: the agent handed in its result and no allowed call is still running; its closing words are not waited for. */
+type TurnEnd = { kind: "result" } | { kind: "submitted" } | { kind: "error"; class: string } | { kind: "exited" } | { kind: "deadline" } | { kind: "ungated" };
 
 const TERMINAL = new Set(["completed", "failed"]);
 
@@ -182,6 +184,9 @@ export class IntegrationSession {
   private readonly pending = new Set<Promise<unknown>>();
   /** An MCP call completed without reaching the gate. */
   private ungated = false;
+  /** The agent handed in a valid result. */
+  private submitted = false;
+  private readonly timing: TurnTiming;
 
   constructor(
     private readonly assignment: RemoteWorkAssignment,
@@ -189,6 +194,7 @@ export class IntegrationSession {
     private readonly deps: IntegrationSessionDeps,
   ) {
     this.logger = deps.logger ?? createLogger({ name: "integration-session" });
+    this.timing = new TurnTiming(deps.now ?? Date.now);
   }
 
   async run(assertCurrent: () => void): Promise<IntegrationTaskResult> {
@@ -200,10 +206,11 @@ export class IntegrationSession {
     const fixture = source.kind === "fixture_mcp" ? spec.fixtureServer : undefined;
     const cwd = await mkdtemp(join(this.deps.workspaceRoot, ".integration-"));
     await chmod(cwd, 0o700);
-    const resultTools = new StructuredResultToolServer({ logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt } });
+    const resultTools = new StructuredResultToolServer({ logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt },
+      onAccepted: () => this.resultAccepted() });
     let created = false;
-    // Where a read's time goes, one line per task (a read takes ~45 s and
-    // nothing said which part was slow).
+    // Where a read's time goes, one line per task: the phases, and inside
+    // the turn each allowed call's ask and end and the result (`turn`).
     const startedAt = now();
     const phasesMs: Record<string, number> = {};
     let mark = startedAt;
@@ -239,7 +246,7 @@ export class IntegrationSession {
       await this.cleanUp(created, resultTools, cwd);
       lap("cleanup");
       this.logger.info({ event: "integration.task.timing", assignmentId: this.assignment.id, phase: spec.phase,
-        agentId: spec.agentId, totalMs: now() - startedAt, phasesMs }, "integration task timing");
+        agentId: spec.agentId, totalMs: now() - startedAt, phasesMs, end: this.ended?.kind, turn: this.timing.fields() }, "integration task timing");
     }
   }
 
@@ -250,6 +257,7 @@ export class IntegrationSession {
     let timer: NodeJS.Timeout | undefined;
     const deadline = new Promise<TurnEnd>(resolve => { timer = setTimeout(() => resolve({ kind: "deadline" }), remaining); timer.unref(); });
     this.promptId = `integration-${randomUUID()}`;
+    this.timing.prompted();
     await this.deps.runner.prompt(acpSessionRef, this.promptId, {
       sessionId: acpSessionRef,
       prompt: [{ type: "text", text: text() }],
@@ -261,6 +269,10 @@ export class IntegrationSession {
       // Give the turn a moment to end, so a call that already ran is settled.
       await Promise.race([turn, new Promise(resolve => setTimeout(resolve, this.deps.cancelGraceMs ?? 2_000).unref())]);
     }
+    // The result is in and every allowed call has ended: stop the agent
+    // instead of waiting for its closing message (~6 s of a ~35 s read, 10-11),
+    // which nothing reads.
+    if (end.kind === "submitted") await this.deps.runner.cancel(acpSessionRef).catch(() => undefined);
     this.ended = end;
     // Bounded like every other step of a read: one handler that never
     // settles must not hold the task (and its terminal report) open.
@@ -308,6 +320,8 @@ export class IntegrationSession {
       return;
     }
     const decision = await this.gate.evaluate(request);
+    const allowed = this.gate.allowedCall(request.toolCall.toolCallId);
+    if (decision.kind === "allow" && allowed) this.timing.asked(request.toolCall.toolCallId, allowed.tool);
     if (decision.kind === "deny") {
       this.logger.info({ assignmentId: this.assignment.id, toolCallId: request.toolCall?.toolCallId, reason: decision.reason }, "integration gate refused a tool call");
     }
@@ -326,7 +340,29 @@ export class IntegrationSession {
     if (!allowed) return this.stopIfUngated(id, update.status);
     this.settled.add(id);
     this.gate!.settle(id, update.status === "completed" ? "succeeded" : "failed");
+    this.timing.ended(id);
     if (update.status === "completed") this.recordObservation(update, allowed);
+    this.endOnceSubmitted();
+  }
+
+  private resultAccepted(): void {
+    this.submitted = true;
+    this.timing.submitted();
+    this.endOnceSubmitted();
+  }
+
+  /**
+   * A handed-in result ends the turn as soon as no allowed provider call is
+   * still running, so a call that was under way when the result came in is
+   * still settled and observed (a write's outcome stays known).
+   */
+  private endOnceSubmitted(): void {
+    if (!this.submitted || this.callInFlight()) return;
+    this.endTurn?.({ kind: "submitted" });
+  }
+
+  private callInFlight(): boolean {
+    return (this.gate?.records() ?? []).some(call => call.status === "allowed" && call.outcome === "unknown");
   }
 
   private unsettledTerminal(status: unknown, id: string): status is string {
