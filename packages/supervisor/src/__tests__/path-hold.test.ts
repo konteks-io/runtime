@@ -10,6 +10,9 @@ describe("a path split across streamed chunks (10-11, D1)", () => {
     expect(splitTrailingPath("in /Users/p/Library/Application Supp")).toEqual({ ready: "in ", held: "/Users/p/Library/Application Supp" });
     expect(splitTrailingPath("in [x](/Users/p/Library/Application Support/konteks-remote/wor")).toEqual({ ready: "in [x](", held: "/Users/p/Library/Application Support/konteks-remote/wor" });
     expect(splitTrailingPath("C:\\Users\\p\\rep")).toEqual({ ready: "", held: "C:\\Users\\p\\rep" });
+    // Windows: a drive letter alone, and "Application Support" with backslashes.
+    expect(splitTrailingPath("I'm in `C")).toEqual({ ready: "I'm in `", held: "C" });
+    expect(splitTrailingPath("x `C:\\T\\Application Support\\konteks")).toEqual({ ready: "x `", held: "C:\\T\\Application Support\\konteks" });
     expect(splitTrailingPath("Done: `/Users/p/a.txt`.")).toEqual({ ready: "Done: `/Users/p/a.txt`.", held: "" });
     expect(splitTrailingPath("renders as <h2>Title</")).toEqual({ ready: "renders as <h2>Title</", held: "" });
     expect(splitTrailingPath("and/or so")).toEqual({ ready: "and/or so", held: "" });

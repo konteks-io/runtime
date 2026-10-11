@@ -11,6 +11,8 @@
 /** Where a token ends: as path detection reads it (activity.ts `TOKEN_DELIMITER`). */
 const TOKEN_DELIMITER = /[\s"'<>`)[\]}=(]/;
 const PATH_START = /^(?:\/(?![/*])|[A-Za-z]:(?:[\\/]|$)|\\\\)/;
+/** A drive letter alone may be the start of `C:\…` split after its first character. */
+const DRIVE_LETTER = /^[A-Za-z]$/;
 /** A held path never grows past this: a runaway token goes out as it is. */
 const MAX_HELD = 4_096;
 
@@ -24,13 +26,14 @@ export function splitTrailingPath(text: string): { ready: string; held: string }
 function trailingPathStart(text: string): number {
   let end = text.length;
   // "…/Application", "…/Application " and "…/Application Supp" may be one path.
-  const support = /\/Application(?: S?u?p?p?o?r?t?)?$/.exec(text);
+  const support = /[\\/]Application(?: S?u?p?p?o?r?t?)?$/.exec(text);
   if (support) end = support.index + "/Application".length;
   const start = tokenStart(text, end);
   if (text[start - 1] === "<") return -1; // a tag (`</h2>`), not a path
-  if (PATH_START.test(text.slice(start, end))) return start;
+  const token = text.slice(start, end);
+  if (PATH_START.test(token) || (end === text.length && DRIVE_LETTER.test(token))) return start;
   // "Support/…" after "/Application ": the path began before the space.
-  if (/\/Application $/.test(text.slice(0, start)) && /^Support(?:[\\/]|$)/.test(text.slice(start))) {
+  if (/[\\/]Application $/.test(text.slice(0, start)) && /^Support(?:[\\/]|$)/.test(text.slice(start))) {
     const earlier = tokenStart(text, start - 1);
     if (text[earlier - 1] !== "<" && PATH_START.test(text.slice(earlier, start - 1))) return earlier;
   }
