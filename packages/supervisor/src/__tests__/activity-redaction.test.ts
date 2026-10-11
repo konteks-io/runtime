@@ -124,6 +124,7 @@ describe("streamed activity redaction", () => {
     ["grep", { pattern: "def celsius", path: "." }, "Search for def celsius", "search"],
     ["glob", { pattern: "**/*.py" }, "Find **/*.py", "search"],
     ["web_search", { queries: ["kelvin formula"] }, "Search the web for kelvin formula", "fetch"],
+    ["todo_write", { todos: [{ content: "Run 1", status: "completed" }] }, "Update the to-do list", "other"],
   ] as const)("names a DeepSeek Harness %s step by what it touches", (tool, rawInput, title, kind) => {
     const canonical = canonicalizeAcpToolActivity({
       sessionUpdate: "tool_call", toolCallId: `dsh-${tool}`, title: tool, kind: "other", status: "in_progress", rawInput,
