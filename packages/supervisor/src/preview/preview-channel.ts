@@ -57,7 +57,7 @@ export class PreviewChannel {
   private readonly forwarders = new Map<string, PreviewForwarder>();
   private readonly logger: Logger;
   private disposed = false;
-  /** Channels whose next viewer chunk follows frames the relay lost (D100). */
+  /** Channels that require a known opening frame for body continuations after lost frames. */
   private readonly resyncing = new Set<string>();
   readonly counters = { malformed: 0, refusedDraining: 0, autoStarted: 0, couldNotStart: 0, resyncs: 0, refusedAfterGap: 0 };
 
@@ -81,10 +81,10 @@ export class PreviewChannel {
   }
 
   private refuseInterruptedRequest(channelId: string, sessionId: string, chunk: PreviewToRuntimeChunk): boolean {
-    if (!this.resyncing.delete(channelId) || chunk.kind !== "request" || chunk.body === undefined) return false;
-    // Only a request with a body can be the tail of one whose start was lost.
-    this.counters.refusedAfterGap += 1;
-    this.forwarderFor(channelId, sessionId).refuseAfterGap(chunk);
+    if (!this.resyncing.has(channelId) || chunk.kind !== "request" || chunk.body === undefined) return false;
+    // Other streams cannot establish this stream's missing start. Core opens
+    // a fresh upload with a bodyless frame before sending its body chunks.
+    if (this.forwarderFor(channelId, sessionId).refuseAfterGap(chunk)) this.counters.refusedAfterGap += 1;
     return true;
   }
 

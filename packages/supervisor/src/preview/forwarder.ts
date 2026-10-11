@@ -181,14 +181,19 @@ export class PreviewForwarder {
   }
 
   /**
-   * The first request chunk after the relay lost frames on this channel may
-   * be the rest of a request whose start was lost: answer it with a 503 the
-   * viewer retries, and ignore the rest of that stream.
+   * After a receive gap, body chunks require this stream's own opening frame.
+   * Known streams continue or ignore their abandoned tails; unknown bodies
+   * get a 503 and cannot become a truncated loopback request.
+   * Returns true only when this chunk was newly refused.
    */
-  refuseAfterGap(chunk: RequestChunk): void {
-    if (this.abandoned.has(chunk.streamId) || this.streams.has(chunk.streamId)) return this.handle(chunk);
+  refuseAfterGap(chunk: RequestChunk): boolean {
+    if (this.abandoned.has(chunk.streamId) || this.streams.has(chunk.streamId)) {
+      this.handle(chunk);
+      return false;
+    }
     if (!chunk.final) this.abandoned.set(chunk.streamId, this.now());
     this.reply(chunk.streamId, 503, INTERRUPTED_MESSAGE);
+    return true;
   }
 
   dispose(): void {

@@ -361,6 +361,51 @@ describe("preview channel on the supervisor", () => {
     } finally { f.instance.dispose(); }
   });
 
+  it("rejects a lost upload tail even when another stream follows the gap first", async () => {
+    const requests: string[] = [];
+    handler = (request, response) => { requests.push(request.url!); response.end("complete"); };
+    const f = channel();
+    try {
+      f.instance.resyncChannel("preview:gap");
+      f.instance.onToRuntime("preview:gap", { streamId: "poll", kind: "request", method: "GET", path: "/poll", headers: {}, final: true });
+      f.instance.onToRuntime("preview:gap", { streamId: "lost-start", kind: "request", method: "POST", path: "/must-not-run", headers: {}, body: b64("tail"), final: true });
+      await vi.waitFor(() => expect(responseOf(bodies(f.sent), "lost-start").status).toBeDefined());
+      expect(requests).not.toContain("/must-not-run");
+      expect(responseOf(bodies(f.sent), "lost-start")).toMatchObject({ status: 503 });
+    } finally { f.instance.dispose(); }
+  });
+
+  it("rejects tails of two uploads whose starts were both lost in one gap", async () => {
+    const requests: string[] = [];
+    handler = (request, response) => { requests.push(request.url!); response.end("complete"); };
+    const f = channel();
+    try {
+      f.instance.resyncChannel("preview:gap");
+      f.instance.onToRuntime("preview:gap", { streamId: "first", kind: "request", method: "POST", path: "/first-tail", headers: {}, body: b64("tail"), final: true });
+      f.instance.onToRuntime("preview:gap", { streamId: "second", kind: "request", method: "POST", path: "/second-tail", headers: {}, body: b64("tail"), final: true });
+      await vi.waitFor(() => expect(responseOf(bodies(f.sent), "second").status).toBeDefined());
+      expect(requests).toEqual([]);
+      expect(responseOf(bodies(f.sent), "second")).toMatchObject({ status: 503 });
+    } finally { f.instance.dispose(); }
+  });
+
+  it("accepts a fresh upload opened after the gap, including its later body chunks", async () => {
+    const requests: Array<{ path: string; body: string }> = [];
+    handler = (request, response, body) => {
+      requests.push({ path: request.url!, body: body.toString() });
+      response.end("complete");
+    };
+    const f = channel();
+    try {
+      f.instance.resyncChannel("preview:gap");
+      f.instance.onToRuntime("preview:gap", { streamId: "fresh-upload", kind: "request", method: "POST", path: "/fresh", headers: {}, final: false });
+      f.instance.onToRuntime("preview:gap", { streamId: "fresh-upload", kind: "request", method: "POST", path: "/fresh", headers: {}, body: b64("body"), final: true });
+      await vi.waitFor(() => expect(responseOf(bodies(f.sent), "fresh-upload")).toMatchObject({ status: 200 }));
+      expect(requests).toEqual([{ path: "/fresh", body: "body" }]);
+      expect(f.instance.counters.refusedAfterGap).toBe(0);
+    } finally { f.instance.dispose(); }
+  });
+
   it("answers a body whose start may be lost with 503, ignores its tail, and serves the next complete request", async () => {
     const requests: string[] = [];
     handler = (request, response) => { requests.push(request.url!); response.end("complete"); };
