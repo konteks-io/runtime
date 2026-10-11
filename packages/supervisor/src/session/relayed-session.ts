@@ -1133,21 +1133,79 @@ export class RelayedSession {
       // be admitted or running on this ACP session at a time.
       if (this.promptBusy(operation.key)) return this.refuseConcurrentPrompt(gate, operation.key, message.id);
       this.promptReservation = operation.key;
+    } else if (this.stopsWaitingPrompt(message)) {
+      return this.stopWaitingTurn(gate, operation);
     }
-    const begun = await this.beginAuthorized(gate, operation, assertDeliveryCurrent);
+    return this.runAuthorized({ gate, operation, ref }, assertDeliveryCurrent);
+  }
+
+  /**
+   * Begin and dispatch. An operation still waiting for Core's first check
+   * releases its relay frame, so the frames behind it on this channel (the
+   * person's Stop) are heard at once (D89); the wait and dispatch go on as a
+   * tracked task that a close ends.
+   */
+  private async runAuthorized(context: { gate: NativeExecutionGate; operation: AuthorizedOperation; ref: string }, assertDeliveryCurrent: () => void): Promise<void> {
+    let waiting!: () => void;
+    const released = new Promise<"waiting">(resolve => { waiting = () => resolve("waiting"); });
+    const run = this.beginAndDispatch(context, assertDeliveryCurrent, waiting);
+    if (await Promise.race([run.then(() => "done" as const), released]) === "done") return;
+    void this.track(() => run).catch(error => this.afterWaitFailure(context, error)).catch(() => {
+      this.logger.warn({ event: "execution.dispatch_failure_report_failed", assignmentId: this.assignment.id,
+        attempt: this.assignment.attempt }, "a prompt that failed after waiting could not report its failure");
+    });
+  }
+
+  /**
+   * The released frame can no longer carry a failure. A prompt this process
+   * began that the runner then failed ends visibly now, with its ACP error
+   * and an agent exit, rather than staying "Working" until Core's watch. The
+   * runner's busy refusal (operation_conflict) was already settled as a denial.
+   */
+  private async afterWaitFailure(context: { gate: NativeExecutionGate; operation: AuthorizedOperation }, error: unknown): Promise<void> {
+    this.logger.warn({ event: "execution.dispatch_after_wait_failed", assignmentId: this.assignment.id, attempt: this.assignment.attempt,
+      code: error instanceof RemoteInstanceError ? error.code : "unexpected_error" }, "an operation that waited for Core's check did not settle");
+    const message = context.operation.envelope.message;
+    if (this.closed || !isPromptMessage(message) || !context.gate.isDispatching(context.operation.key)) return;
+    await this.reportDenied(deniedCompletion(message, error), "agent_exited");
+  }
+
+  private async beginAndDispatch(context: { gate: NativeExecutionGate; operation: AuthorizedOperation; ref: string }, assertDeliveryCurrent: () => void, onWait: () => void): Promise<void> {
+    const begun = await this.beginAuthorized(context.gate, context.operation, assertDeliveryCurrent, onWait);
     if (!begun.started) return;
     // Do not convert a bridge transport exception into proof of completion.
-    return this.dispatchAuthorized({ gate, operation, ref }, begun.params);
+    return this.dispatchAuthorized(context, begun.params);
+  }
+
+  /** A Core-permitted stop while this session's prompt is admitted and not yet started. */
+  private stopsWaitingPrompt(message: AuthorizedMessage): boolean {
+    const reserved = this.promptReservation;
+    return message.kind === "acp" && message.method === "session/cancel" && reserved !== null &&
+      this.deps.journal.pendingRequests.get(reserved)?.authorization?.state === "admitted";
+  }
+
+  /**
+   * The person stopped the turn while its prompt waits for Core's first
+   * check: nothing reached the agent, so the turn ends as stopped now. The
+   * close stops the gate at once (the prompt can no longer start) and ends
+   * the wait and its timer.
+   */
+  private async stopWaitingTurn(gate: NativeExecutionGate, operation: AuthorizedOperation): Promise<void> {
+    this.logger.info({ event: "execution.stopped_before_dispatch", assignmentId: this.assignment.id, attempt: this.assignment.attempt },
+      "the turn was stopped before its prompt reached the agent");
+    const closing = this.close("cancelled");
+    try { await gate.denyBeforeDispatch(operation.key); }
+    finally { await closing; }
   }
 
   /** Prepare a prompt's inputs and start the operation; a proven pre-dispatch refusal becomes a replayable rejection. */
-  private async beginAuthorized(gate: NativeExecutionGate, operation: AuthorizedOperation, assertDeliveryCurrent: () => void): Promise<{ started: boolean; params: unknown }> {
+  private async beginAuthorized(gate: NativeExecutionGate, operation: AuthorizedOperation, assertDeliveryCurrent: () => void, onWait: () => void): Promise<{ started: boolean; params: unknown }> {
     const message = operation.envelope.message;
     let params: unknown = message.kind === "acp" ? message.params : null;
     try {
       if (isPromptMessage(message)) params = await this.authorizedPromptParams(message.params);
       if (this.closed) throw new RemoteInstanceError("execution_fenced", "The execution session is closed.");
-      if (!(await gate.begin(operation))) return { started: false, params };
+      if (!(await gate.begin(operation, onWait))) return { started: false, params };
       assertDeliveryCurrent();
       return { started: true, params };
     } catch (error) {
@@ -1173,7 +1231,7 @@ export class RelayedSession {
     const message = operation.envelope.message;
     const completion = deniedCompletion(message, error);
     await gate.denyBeforeDispatch(operation.key, completion);
-    await this.reportDenied(completion, this.terminalTurnFailure(message, completion));
+    await this.reportDenied(completion, this.terminalTurnFailure(message, completion) ? refusedTurnCloseReason(error) : null);
   }
 
   private terminalTurnFailure(message: AuthorizedMessage, completion: SessionToCoreMessage | undefined,
@@ -1183,14 +1241,14 @@ export class RelayedSession {
     );
   }
 
-  private async reportDenied(completion: SessionToCoreMessage | undefined, terminalTurnFailure: boolean): Promise<void> {
+  private async reportDenied(completion: SessionToCoreMessage | undefined, closeReason: SessionClosedReason | null): Promise<void> {
     try {
       if (completion && !this.closed) await this.sendToCore(completion);
     } finally {
       // No runner prompt exists to produce a later terminal event. Close the
-      // failed turn locally so its durable assignment report and capacity
+      // refused turn locally so its durable assignment report and capacity
       // release do not depend on a best-effort cloud cancellation round trip.
-      if (terminalTurnFailure && !this.closed) await this.close("agent_exited");
+      if (closeReason && !this.closed) await this.close(closeReason);
     }
   }
 
@@ -2129,6 +2187,16 @@ function isPromptMessage(message: AuthorizedMessage): message is Extract<Authori
 function issuedAnswer(message: { kind: string; result?: unknown }, method: string): unknown {
   if (message.kind === "acp_result") return message.result;
   return method === "elicitation/create" ? { action: "cancel" } : { outcome: { outcome: "cancelled" } };
+}
+
+/**
+ * A turn refused before dispatch fails only on a definite answer. One still
+ * refused for a transient reason (Core unreachable) is an interruption the
+ * infrastructure caused, so Core issues a successor and the Assistant resumes
+ * the turn instead of failing it (D89).
+ */
+function refusedTurnCloseReason(error: unknown): SessionClosedReason {
+  return isTransientExecutionRefusal(error) ? "lease_lost" : "agent_exited";
 }
 
 function deniedCompletion(message: AuthorizedMessage, error: unknown): SessionToCoreMessage | undefined {
