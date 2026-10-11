@@ -239,6 +239,8 @@ const DSH_STEP_TITLES: Readonly<Record<string, (input: DshInput) => string | und
   glob: input => worded("Find", trimmed(input.pattern)),
   web_fetch: input => worded("Fetch", trimmed(input.url)),
   web_search: input => worded("Search the web for", trimmed(Array.isArray(input.queries) ? input.queries[0] : undefined)),
+  // Read "todo_write · Done" after every run of a 25-minute turn (10-11).
+  todo_write: () => "Update the to-do list",
 });
 
 function dshStepTitle(tool: string | undefined, input: DshInput | undefined): string | undefined {
