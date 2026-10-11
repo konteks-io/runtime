@@ -403,7 +403,8 @@ publisher".
 ### Updates
 
 The connector runs as a user service (launchd, user systemd or Task
-Scheduler), checks the stable channel every 6 hours, and updates
+Scheduler), checks the stable channel every 6 hours (every 15 minutes to an
+hour while a newer release waits for Konteks to accept it), and updates
 transactionally: the new release is staged, work is drained, the service is
 swapped and health-gated, and the previous release is restored if the gate
 fails. A release that is being checked takes no new work. Konteks can also

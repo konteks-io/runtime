@@ -25,7 +25,7 @@ function manifests() {
   return { trust, same: signed("1.0.0"), newer: signed("1.1.0") };
 }
 
-function coordinator(input: { manifest?: "same" | "newer"; ledger?: NativeUpdateLedger; canApply?: boolean; trust?: unknown[]; now?: () => number; acceptedRelease?: () => Promise<{ bundleVersion: string; manifestDigest?: string } | null> }) {
+function coordinator(input: { manifest?: "same" | "newer"; ledger?: NativeUpdateLedger; canApply?: boolean; trust?: unknown[]; now?: () => number; acceptedRelease?: () => Promise<{ bundleVersion: string; manifestDigest?: string } | null>; logger?: ReturnType<typeof createLogger> }) {
   const m = manifests();
   const launch = vi.fn(async () => ({ pid: 4242 }));
   const fetchManifest = vi.fn(async () => input.manifest === "same" ? m.same : m.newer);
@@ -33,7 +33,7 @@ function coordinator(input: { manifest?: "same" | "newer"; ledger?: NativeUpdate
   const c = new NativeUpdateCoordinator({
     currentBundleVersion: "1.0.0", trustedRoots: (input.trust ?? m.trust) as never, fetchManifest, launch, readLedger,
     canApply: () => input.canApply === false ? { ok: false, reason: "draining (user)" } : { ok: true },
-    logger: createLogger({ name: "test" }), now: input.now ?? (() => Date.parse("2026-09-15T12:00:00Z")),
+    logger: input.logger ?? createLogger({ name: "test" }), now: input.now ?? (() => Date.parse("2026-09-15T12:00:00Z")),
     ...(input.acceptedRelease ? { acceptedRelease: input.acceptedRelease } : {}),
   });
   return { c, launch, fetchManifest, readLedger, m };
@@ -192,6 +192,68 @@ describe("native update coordinator", () => {
     (c as unknown as { options: { readLedger: () => Promise<NativeUpdateLedger> } }).options.readLedger = async () => ledger;
     expect((await c.check()).inFlight).toBeNull();
     expect(launch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("re-check while Konteks has not accepted the newest release (R5-O39)", () => {
+  afterEach(() => { vi.useRealTimers(); });
+  const recheckDelays = (info: { mock: { calls: unknown[][] } }) => info.mock.calls
+    .map(([fields]) => fields as { event?: string; delayMs?: number }).filter(fields => fields.event === "native.update.recheck_scheduled").map(fields => fields.delayMs);
+
+  it("re-checks at 15 min, then 30, capped at 1 h, and launches once Konteks accepts the release", async () => {
+    vi.useFakeTimers();
+    const logger = createLogger({ name: "test", silent: true });
+    const info = vi.spyOn(logger, "info");
+    let accepted: { bundleVersion: string; manifestDigest?: string } = { bundleVersion: "1.0.5" };
+    const f = coordinator({ logger, acceptedRelease: async () => accepted });
+    try {
+      expect(await f.c.apply("periodic")).toMatchObject({ started: false, reason: "Konteks accepts 1.0.5, not 1.1.0 yet; staying on this one until it does" });
+      expect(recheckDelays(info)).toEqual([15 * 60_000]);
+      expect(info.mock.calls.map(([fields]) => fields).find(fields => (fields as { event?: string }).event === "native.update.recheck_scheduled"))
+        .toMatchObject({ reason: "accepted_mismatch", accepted: "1.0.5", available: "1.1.0", current: "1.0.0" });
+      await vi.advanceTimersByTimeAsync(15 * 60_000);
+      await vi.advanceTimersByTimeAsync(30 * 60_000);
+      await vi.advanceTimersByTimeAsync(60 * 60_000);
+      expect(f.fetchManifest).toHaveBeenCalledTimes(4);
+      expect(recheckDelays(info)).toEqual([15, 30, 60, 60].map(minutes => minutes * 60_000));
+      expect(f.launch).not.toHaveBeenCalled();
+
+      accepted = { bundleVersion: "1.1.0", manifestDigest: f.m.newer.digest };
+      await vi.advanceTimersByTimeAsync(60 * 60_000);
+      expect(f.launch).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ bundleVersion: "1.1.0", reason: "periodic" }));
+      await vi.advanceTimersByTimeAsync(3 * 60 * 60_000);
+      expect(f.fetchManifest).toHaveBeenCalledTimes(5);
+      expect(recheckDelays(info)).toHaveLength(4);
+    } finally { f.c.stop(); }
+  });
+
+  it("re-checks soon when Konteks could not be asked which release it accepts", async () => {
+    vi.useFakeTimers();
+    const logger = createLogger({ name: "test", silent: true });
+    const info = vi.spyOn(logger, "info");
+    const f = coordinator({ logger, acceptedRelease: async () => { throw new Error("offline"); } });
+    try {
+      expect(await f.c.apply("periodic")).toMatchObject({ started: false, reason: "Konteks could not be asked which release it accepts; staying on this one" });
+      expect(info.mock.calls.map(([fields]) => fields).find(fields => (fields as { event?: string }).event === "native.update.recheck_scheduled"))
+        .toMatchObject({ reason: "core_unanswered", accepted: null, available: "1.1.0", delayMs: 15 * 60_000 });
+    } finally { f.c.stop(); }
+  });
+
+  it("keeps the 5-minute first check and the 6-hour cadence when nothing newer is published", async () => {
+    vi.useFakeTimers();
+    const logger = createLogger({ name: "test", silent: true });
+    const info = vi.spyOn(logger, "info");
+    const f = coordinator({ manifest: "same", logger, acceptedRelease: async () => ({ bundleVersion: "1.0.0" }) });
+    try {
+      f.c.start();
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(f.fetchManifest).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(5 * 60 * 60_000);
+      expect(f.fetchManifest).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(55 * 60_000);
+      expect(f.fetchManifest).toHaveBeenCalledTimes(2);
+      expect(recheckDelays(info)).toEqual([]);
+    } finally { f.c.stop(); }
   });
 });
 
