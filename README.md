@@ -35,6 +35,11 @@ tasks migrate automatically when the updated connector starts.
 - **Releases**: GitHub Releases of this repo; `releases/latest` is the stable
   channel every installed connector follows.
 
+Running work survives temporary Core timeouts and clock differences. The
+connector retries signed execution checks that are expired or not yet valid,
+and waits for a current verified lease before dispatching new work. Core's
+explicit refusal and invalid signatures still stop the affected execution.
+
 ## Quick start
 
 ### Install from your own coding agent

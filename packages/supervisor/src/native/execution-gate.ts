@@ -67,12 +67,14 @@ const signedOperationKeyId = (permit: string): string | undefined => {
 export const NATIVE_EXECUTION_RENEWAL_BUDGET_MS = 12_000;
 
 /**
- * An unanswered renewal is retried with exponential backoff (1 s, 2 s, 4 s …
- * 30 s) and no attempt cap. Only Core's own answer that
- * the execution is gone stops the agent; a timeout never does.
+ * An unanswered renewal, like the first check before a prompt is dispatched,
+ * is retried with exponential backoff (1 s, 2 s, 4 s … 30 s) and no attempt
+ * cap. Only Core's own answer that the execution is gone stops the agent; a
+ * timeout never does.
  */
 const RENEWAL_RETRY_BASE_MS = 1_000;
 const RENEWAL_RETRY_MAX_MS = 30_000;
+const renewalRetryDelayMs = (failures: number): number => Math.min(RENEWAL_RETRY_MAX_MS, RENEWAL_RETRY_BASE_MS * 2 ** (failures - 1));
 /** Waiting for trust keys during admission never outlives the permit itself. */
 const ADMISSION_KEYS_RETRY_BASE_MS = 500;
 const ADMISSION_KEYS_RETRY_MAX_MS = 8_000;
@@ -104,6 +106,8 @@ export class NativeExecutionGate {
   private refreshing: Promise<void> | null = null;
   private stopped = false;
   private authorityStop: Promise<void> | null = null;
+  /** Backoff waits in progress; stop() ends them so nothing outlives the session. */
+  private readonly waits = new Set<() => void>();
   private readonly monotonic: () => number;
   private readonly logger: Logger;
 
@@ -230,7 +234,7 @@ export class NativeExecutionGate {
       } catch (error) {
         const delayMs = Math.min(ADMISSION_KEYS_RETRY_MAX_MS, ADMISSION_KEYS_RETRY_BASE_MS * 2 ** (retry - 1));
         if (!this.keysRetryAllowed(error, { retry, delayMs, permitExpiresAtMs })) throw error;
-        await new Promise<void>(resolve => { const timer = setTimeout(resolve, delayMs); timer.unref?.(); });
+        await this.pause(delayMs);
         this.options.assertOwned();
         if (this.stopped) throw fenced();
       }
@@ -254,11 +258,12 @@ export class NativeExecutionGate {
     return permitExpiresAtMs === undefined ? null : Math.max(0, permitExpiresAtMs - this.options.clock.coreNow());
   }
 
-  /** Called immediately before the bridge call, after any local preparation IO. */
-  async begin(operation: AuthorizedNativeOperation): Promise<boolean> {
+  /** Called immediately before the bridge call, after any local preparation IO.
+   * `onWait` hears that the operation waits for Core's first check. */
+  async begin(operation: AuthorizedNativeOperation, onWait?: () => void): Promise<boolean> {
     if (operation.replay) return false;
     try {
-      return await this.beginDispatch(operation);
+      return await this.beginDispatch(operation, onWait);
     } catch (error) {
       const state = this.options.journal.pendingRequests.get(operation.key)?.authorization?.state;
       if (state === "admitted") await this.operations.denyBeforeDispatch(operation.key);
@@ -266,11 +271,11 @@ export class NativeExecutionGate {
     }
   }
 
-  private async beginDispatch(operation: AuthorizedNativeOperation): Promise<boolean> {
+  private async beginDispatch(operation: AuthorizedNativeOperation, onWait?: () => void): Promise<boolean> {
     if (operation.admissionFailure) throw operation.admissionFailure;
     // A fence is scoped to one signed check, so establish that check before
     // deciding whether the durable control record applies to this dispatch.
-    await this.refresh();
+    await this.checkBeforeDispatch(onWait);
     const fence = this.durableRevisionFence(operation.authority);
     if (fence) {
       await this.fenceAuthority();
@@ -284,6 +289,47 @@ export class NativeExecutionGate {
       this.timer.unref();
     }
     return started;
+  }
+
+  /**
+   * An admitted operation waits for Core's first check with the renewal's
+   * backoff (1 s … 30 s) and no attempt cap: a slow or briefly unavailable
+   * Core is not an answer (D89: one 503 during a Core slowdown failed the
+   * person's turn). Only Core's definite answer refuses it; a stop
+   * (cancel, close, recovery) ends the wait.
+   */
+  private async checkBeforeDispatch(onWait: (() => void) | undefined): Promise<void> {
+    for (;;) {
+      try {
+        return await this.refresh();
+      } catch (error) {
+        if (this.stopped || !isTransientExecutionRefusal(error)) throw error;
+        this.renewalFailures += 1;
+        const delayMs = renewalRetryDelayMs(this.renewalFailures);
+        this.logDispatchCheckRetry(error, delayMs);
+        onWait?.();
+        await this.pause(delayMs);
+        this.options.assertOwned();
+        if (this.stopped) throw fenced();
+      }
+    }
+  }
+
+  private logDispatchCheckRetry(error: unknown, delayMs: number): void {
+    this.logger.warn({ event: "execution.dispatch_check_retry_scheduled", assignmentId: this.authority?.assignmentId,
+      attempt: this.authority?.attempt, executionId: this.authority?.executionId,
+      retry: this.renewalFailures, retryInMs: delayMs, ...errorFields(error) },
+    "Core did not answer the check before dispatch; the operation waits and the check retries");
+  }
+
+  /** A backoff wait that stop() ends early. */
+  private pause(delayMs: number): Promise<void> {
+    return new Promise<void>(resolve => {
+      const wake = () => { clearTimeout(timer); this.waits.delete(wake); resolve(); };
+      const timer = setTimeout(wake, delayMs);
+      timer.unref?.();
+      this.waits.add(wake);
+    });
   }
 
   complete(key: string, completion?: SessionToCoreMessage): Promise<void> {
@@ -308,6 +354,7 @@ export class NativeExecutionGate {
     this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    for (const wake of [...this.waits]) wake();
   }
 
   /** Owner teardown must observe a failed safety stop; callback failure is not
@@ -460,12 +507,10 @@ export class NativeExecutionGate {
   }
 
   /**
-   * The check lease's verified claims. A genuine check that a slow Core
-   * answered after its own expiry says nothing about the execution: it is
-   * asked again rather than stopping the agent. Delivery, direct and
-   * Assistant turns alike are verified against the renewed view, so a lease
-   * Core renewed is adopted (10-09: a direct turn was fenced one hour after
-   * the session's first prompt).
+   * The check lease's verified claims. A genuine check outside its validity
+   * window is retried without adopting it or stopping the running agent.
+   * Delivery, direct and Assistant turns alike use the renewed authority
+   * view; signature, identity and revision failures remain fences.
    */
   private verifiedCheck(authority: Authority, lease: string, keys: ReadonlyMap<string, KeyObject>): CheckClaims {
     const checkInput = { lease, trustedKeys: keys, nowSeconds: Math.floor(this.options.clock.coreNow() / 1000), issuedAtToleranceSeconds: 1 };
@@ -478,7 +523,7 @@ export class NativeExecutionGate {
       this.logger.warn({ event: "execution.check_refused", assignmentId: authority.assignmentId, attempt: authority.attempt,
         claimId: authority.claimId, executionId: authority.executionId, executionRevision: authority.executionRevision,
         diagnostic: reason, skewMs: this.options.clock.skewMs(), issuedAtToleranceSeconds: 1 }, "Native execution check refused");
-      if (reason === "expired") throw new RemoteInstanceError("execution_authority_unavailable", "Execution check lease expired in transit", { diagnostic: reason, retryable: true });
+      if (reason === "expired" || reason === "not_yet_valid") throw new RemoteInstanceError("execution_authority_unavailable", "Execution check lease is outside its validity window", { diagnostic: reason, retryable: true });
       throw new RemoteInstanceError("execution_fenced", "Invalid execution check lease", { diagnostic: reason });
     }
   }
@@ -547,7 +592,7 @@ export class NativeExecutionGate {
   private scheduleRenewalRetry(error: unknown): void {
     this.renewalFailures += 1;
     const now = this.monotonic();
-    const delayMs = Math.min(RENEWAL_RETRY_MAX_MS, RENEWAL_RETRY_BASE_MS * 2 ** (this.renewalFailures - 1));
+    const delayMs = renewalRetryDelayMs(this.renewalFailures);
     const leaseExpired = now >= this.monotonicDeadline;
     this.refreshAfter = leaseExpired ? now + delayMs : Math.min(this.monotonicDeadline, now + delayMs);
     this.logger.warn({ event: "execution.renewal_retry_scheduled", assignmentId: this.authority?.assignmentId,
