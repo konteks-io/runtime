@@ -625,6 +625,8 @@ export class Supervisor {
       onStall: (channelId) => this.relay?.rehandshake(`stall:${channelId}`),
       onReset: (channelId) => void this.onChannelReset(channelId)
         .catch(error => this.logger.error({ err: error, channelId }, "channel reset handling failed")),
+      // Before the orchestrator exists nothing may be retired.
+      sessionChannelInUse: (channelId) => this.work === undefined || this.work.sessionChannelInUse(channelId),
       persistCursors: (cursors) => this.store.saveCursors(cursors),
       persistRelayState: (state) => this.store.saveRelayState(state),
     });

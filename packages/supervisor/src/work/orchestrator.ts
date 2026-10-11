@@ -209,6 +209,18 @@ export class WorkOrchestrator {
     return live;
   }
 
+  /**
+   * Local work still owns this session channel: an open session, a retained
+   * owner the next turn takes it from, or a journal entry that is active or
+   * awaiting recovery. Anything else is terminal history to the relay mux.
+   */
+  sessionChannelInUse(channelId: string): boolean {
+    if (this.channelOwners.has(channelId)) return true;
+    for (const session of this.sessions.values()) if (session.channelId === channelId && !session.isClosed) return true;
+    const named = (entry: JournalEntry) => entry.sessionChannelId === channelId;
+    return this.deps.journal.activeAssignments().some(named) || this.deps.journal.recoveryRequired().some(named);
+  }
+
   /** Resolve existing original ownership; absent maps never establish authority. */
   capturePendingClaimAuthority(admission: LocalAdmission): () => void {
     const key = `${admission.assignmentId}:${admission.attempt}`;

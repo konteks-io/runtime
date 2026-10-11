@@ -68,6 +68,12 @@ QA browser, structured results, updates and doctor/support.
   update probation (`updateProbation`) takes no new work. Native runners stop
   side by side (`Promise.allSettled`). `reapStrayServers` touches only
   `<root>/releases/`.
+- **Session replay** (`relay/channel-mux.ts`): a session channel keeps its
+  unacknowledged frames until its holder acknowledges them, with no age
+  limit, while local work owns it (`WorkOrchestrator.sessionChannelInUse`).
+  Once nothing owns it and its newest frame is older than
+  `DETACHED_SESSION_REPLAY_GRACE_MS` (24 h), the channel is retired
+  (`relay.channel.retired`) instead of being replayed on every handshake.
 - **Host agents never fail the connector.** A listed host agent the load cannot
   find or verify is returned in `unavailableAgents` and parked with
   `NativeAgentRetry` (`parkUnavailableHostAgent`).

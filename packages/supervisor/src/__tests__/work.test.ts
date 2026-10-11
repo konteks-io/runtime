@@ -584,6 +584,23 @@ describe("work orchestrator claim validation", () => {
     expect(close).toHaveBeenCalledExactlyOnceWith("session:done");
   });
 
+  it("names a session channel in use only while local work still owns it (D64)", async () => {
+    const f = await orchestrator();
+    const base = {
+      attempt: 1, kind: "direct" as const, placementId: "placement", workspaceId: "ws-1", agentId: "codex",
+      recoveryEpoch: 0, reports: { nextSequence: 1, durableWatermark: 0 }, evidenceUpload: "structured_only" as const,
+      expiresAt: "2026-09-07T00:00:00Z", latestResumeAt: "2026-09-07T00:00:00Z", updatedAt: clock.nowIso(),
+    };
+    await f.journal.assignments.put({ ...base, assignmentId: "ended", claimId: "ended-claim", state: "completed", sessionChannelId: "session:ended" });
+    await f.journal.assignments.put({ ...base, assignmentId: "running", claimId: "running-claim", state: "running", sessionChannelId: "session:running" });
+    await f.journal.assignments.put({ ...base, assignmentId: "fenced", claimId: "fenced-claim", state: "recovery_required", sessionChannelId: "session:fenced" });
+    (f.work as unknown as { sessions: Map<string, unknown> }).sessions.set("open:1", { channelId: "session:open", isClosed: false });
+    (f.work as unknown as { channelOwners: Map<string, unknown> }).channelOwners.set("session:retained", {});
+
+    expect(["session:ended", "session:running", "session:fenced", "session:open", "session:retained"].filter(id => f.work.sessionChannelInUse(id)))
+      .toEqual(["session:running", "session:fenced", "session:open", "session:retained"]);
+  });
+
   it("native continuation rejects a newer accepted generation after admission fsync", async () => {
     let generation: string | null = "accepted-A";
     const f = await orchestrator({ recoveryAuthority: () => generation });

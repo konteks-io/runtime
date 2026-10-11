@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import { createLogger, FixedClock, generateInstanceKey, logicalAssignmentRequestDigest, logicalAssignmentResponseDigest, ToCoreRelayFrameSchema, verifyBody, type AssignmentReplyFrame, type AssignmentRequestFrame, type LogicalAssignmentRequestFrame, type RelayAck, type ToCoreRelayFrame, type ToRuntimeRelayFrame } from "@konteks/remote-common";
-import { CHANNEL_LIVENESS_MS, ChannelMux } from "../relay/channel-mux.js";
+import { CHANNEL_LIVENESS_MS, ChannelMux, DETACHED_SESSION_REPLAY_GRACE_MS } from "../relay/channel-mux.js";
 import type { MuxOptions } from "../relay/channel-mux.js";
 import { ReplayBuffer } from "../relay/replay-buffer.js";
 import { SupervisorStore } from "../state/store.js";
@@ -108,6 +108,83 @@ describe("channel mux", () => {
     expect(second.emitted.filter(frame => 'seq' in frame).map(frame => (frame as ToCoreRelayFrame).seq)).toEqual([1, 2]);
     expect(second.mux.handshakeCursors()['session:s']?.to_core).toBe(0);
     expect(second.resets).toEqual([]);
+  });
+  describe("detached session replay (D64)", () => {
+    type Durable = import("../relay/channel-mux.js").RelayDurableState;
+    const closed = (assignmentId: string) => ({ kind: "session_closed", assignmentId, reason: "completed" } as const);
+    const replayedSeqs = (emitted: ReturnType<typeof buildMux>["emitted"], channelId: string) =>
+      emitted.filter(frame => "seq" in frame && frame.channelId === channelId).map(frame => (frame as ToCoreRelayFrame).seq);
+
+    /** Frames retained by one process, as a restarted process restores them. */
+    async function retained(sends: Array<{ channelId: string; afterMs: number }>): Promise<Durable> {
+      let durable: Durable | undefined;
+      const first = buildMux({ persistRelayState: async state => { durable = structuredClone(state); } });
+      await first.mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: [] });
+      for (const [index, { channelId, afterMs }] of sends.entries()) {
+        first.clock.advance(afterMs);
+        first.mux.send(channelId, "session", closed(`turn-${index}`));
+        await vi.waitFor(() => expect(durable?.outbound[channelId]?.length).toBeGreaterThan(0));
+      }
+      return durable!;
+    }
+
+    it("retires an ended session's unacknowledged replay after the holder grace instead of replaying it on every handshake", async () => {
+      const durable = await retained([{ channelId: "session:ended", afterMs: 0 }]);
+      let persisted: Durable | undefined;
+      const logger = createLogger({ name: "mux-test", silent: true });
+      const info = vi.spyOn(logger, "info");
+      const restarted = buildMux({ logger, sessionChannelInUse: () => false, persistRelayState: async state => { persisted = structuredClone(state); } });
+      restarted.clock.advance(6 * 24 * 60 * 60_000);
+      restarted.mux.restoreDurableState(durable, () => "session");
+
+      await restarted.mux.applyHandshake({ connectionEpoch: 2, resume: { "session:ended": { to_core: 0, to_runtime: 0 } }, reset: [] });
+
+      expect(replayedSeqs(restarted.emitted, "session:ended")).toEqual([]);
+      expect(restarted.resets).toEqual([]);
+      expect(restarted.mux.handshakeCursors()).not.toHaveProperty("session:ended");
+      expect(persisted?.cursors).not.toHaveProperty("session:ended");
+      expect(persisted?.outbound).not.toHaveProperty("session:ended");
+      const retiredLog = info.mock.calls.find(([fields]) => (fields as { event?: string }).event === "relay.channel.retired");
+      expect(retiredLog?.[0]).toEqual({ event: "relay.channel.retired", channelId: "session:ended", channel: "session", reason: "session_detached",
+        frames: 1, bytes: expect.any(Number), oldestUnackedAgeMs: 6 * 24 * 60 * 60_000, newestUnackedAgeMs: 6 * 24 * 60 * 60_000 });
+      expect(JSON.stringify(retiredLog)).not.toContain("turn-0");
+    });
+
+    it("retires a detached session on the tick once the grace passes, and not before", async () => {
+      let persisted: Durable | undefined;
+      const f = buildMux({ sessionChannelInUse: () => false, persistRelayState: async state => { persisted = structuredClone(state); } });
+      await f.mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: [] });
+      f.mux.send("session:ended", "session", closed("last"));
+      await vi.waitFor(() => expect(persisted?.outbound["session:ended"]).toHaveLength(1));
+      f.clock.advance(DETACHED_SESSION_REPLAY_GRACE_MS);
+      f.mux.tick();
+      expect(f.mux.snapshot().map(channel => channel.channelId)).toContain("session:ended");
+      f.clock.advance(1);
+      f.mux.tick();
+      expect(f.mux.snapshot().map(channel => channel.channelId)).not.toContain("session:ended");
+      await vi.waitFor(() => expect(persisted?.outbound).not.toHaveProperty("session:ended"));
+    });
+
+    it("still replays a live session whose holder is detached: one local work owns, or one inside the holder grace", async () => {
+      const durable = await retained([
+        { channelId: "session:owned", afterMs: 0 },
+        { channelId: "session:recent", afterMs: DETACHED_SESSION_REPLAY_GRACE_MS / 2 },
+      ]);
+      const inUse = vi.fn((channelId: string) => channelId === "session:owned");
+      const restarted = buildMux({ sessionChannelInUse: inUse });
+      restarted.clock.advance(DETACHED_SESSION_REPLAY_GRACE_MS + 60_000);
+      restarted.mux.restoreDurableState(durable, () => "session");
+
+      await restarted.mux.applyHandshake({ connectionEpoch: 2, reset: [],
+        resume: { "session:owned": { to_core: 0, to_runtime: 0 }, "session:recent": { to_core: 0, to_runtime: 0 } } });
+
+      expect(replayedSeqs(restarted.emitted, "session:owned")).toEqual([1]);
+      expect(replayedSeqs(restarted.emitted, "session:recent")).toEqual([1]);
+      expect(restarted.mux.handshakeCursors()).toHaveProperty("session:owned");
+      expect(restarted.mux.handshakeCursors()).toHaveProperty("session:recent");
+      expect(inUse).toHaveBeenCalledWith("session:owned");
+      expect(restarted.resets).toEqual([]);
+    });
   });
 
   it("replays a fresh holder's channel immediately without advancing durable acknowledgement", async () => {
