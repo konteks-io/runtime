@@ -63,11 +63,11 @@ export interface MuxOptions {
   onStall: (channelId: string) => void;
   onReset: (channelId: string) => void;
   /**
-   * Whether local work still owns a session channel (an open or retained
-   * session, or a journal entry still active or awaiting recovery). Without
-   * it no session channel is ever retired for being detached.
+   * Whether a session channel can never carry another turn (its session
+   * ended and nothing local holds it). Without it no session channel is ever
+   * retired for being detached.
    */
-  sessionChannelInUse?: (channelId: string) => boolean;
+  sessionChannelEnded?: (channelId: string) => boolean;
   /** Persist the durable receive cursor (the authoritative cursor for to_runtime). */
   persistCursors: (cursors: Record<string, { to_core: number; to_runtime: number; allocated?: number | undefined }>) => Promise<void>;
   /** Production durability boundary: allocation, replay bytes and cursors in one atomic write. */
@@ -78,19 +78,18 @@ export interface MuxOptions {
 /**
  * Channels whose to_core data a grant holder (a viewer), not Core, receives
  * and acknowledges: `session:<id>` and `preview:<id>`. Their replay is kept
- * until that endpoint acknowledges it (or, for a session no local work owns,
- * until the holder grace passes), and a quiet one is never a stall.
+ * until that endpoint acknowledges it (or, for a session that ended, until
+ * the holder grace passes), and a quiet one is never a stall.
  */
 function holderBound(channel: RelayChannel): boolean {
   return channel === "session" || channel === "preview";
 }
 
 /**
- * How long a session channel's unacknowledged replay waits for a holder once
- * no local work owns it. Longer than an attach grant can live (24 h), so a
- * holder that detaches and comes back to an open session still gets its
- * replay. Core never attaches an ended session again, so after this the
- * frames are retired instead of being replayed on every handshake.
+ * How long an ended session's unacknowledged replay still waits for a holder.
+ * Longer than an attach grant can live (24 h). Core never attaches an ended
+ * session again, so after this the frames are retired instead of being
+ * replayed on every handshake.
  */
 export const DETACHED_SESSION_REPLAY_GRACE_MS = 24 * 60 * 60_000;
 
@@ -270,18 +269,19 @@ export class ChannelMux {
   }
 
   /**
-   * Retire session channels no local work owns whose replay has waited past
-   * the holder grace: their session is over, and replaying them on every
-   * handshake only floods the relay with frames it has no holder for. The
-   * caller persists the retirement.
+   * Retire ended session channels whose replay has waited past the holder
+   * grace: replaying them on every handshake only floods the relay with
+   * frames it has no holder for. Only an ended session qualifies, because a
+   * later turn on the same channel would restart its numbering below the
+   * holder's durable cursor. The caller persists the retirement.
    */
   private retireDetachedSessions(): boolean {
-    const inUse = this.options.sessionChannelInUse;
-    if (!inUse) return false;
+    const ended = this.options.sessionChannelEnded;
+    if (!ended) return false;
     const now = this.options.clock.now();
     let retired = false;
     for (const [channelId, state] of this.channels) {
-      if (!detachedSession(state, now) || inUse(channelId)) continue;
+      if (!detachedSession(state, now) || !ended(channelId)) continue;
       this.logRetired(channelId, state, now);
       retired = this.forget(channelId) || retired;
     }
@@ -297,7 +297,7 @@ export class ChannelMux {
         // Logical sessions survive idle time between assignments. Expiring an
         // unacknowledged final frame here would poison the next ready frame.
         // Keep endpoint-ACK ownership and the byte bound, including on restore;
-        // only retireDetachedSessions releases an ownerless session's replay.
+        // only retireDetachedSessions releases an ended session's replay.
         buffer: new ReplayBuffer<ToCoreRelayFrame>({ maxBytes: this.options.replayBufferBytes,
           maxAgeMs: holderBound(channel) ? Number.POSITIVE_INFINITY : this.options.replayBufferAgeMs }),
         receivedCursor: 0,

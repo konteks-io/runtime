@@ -584,21 +584,27 @@ describe("work orchestrator claim validation", () => {
     expect(close).toHaveBeenCalledExactlyOnceWith("session:done");
   });
 
-  it("names a session channel in use only while local work still owns it (D64)", async () => {
+  it("names a session channel ended only for finished direct turns nothing here holds (D64)", async () => {
     const f = await orchestrator();
     const base = {
       attempt: 1, kind: "direct" as const, placementId: "placement", workspaceId: "ws-1", agentId: "codex",
       recoveryEpoch: 0, reports: { nextSequence: 1, durableWatermark: 0 }, evidenceUpload: "structured_only" as const,
       expiresAt: "2026-09-07T00:00:00Z", latestResumeAt: "2026-09-07T00:00:00Z", updatedAt: clock.nowIso(),
     };
-    await f.journal.assignments.put({ ...base, assignmentId: "ended", claimId: "ended-claim", state: "completed", sessionChannelId: "session:ended" });
-    await f.journal.assignments.put({ ...base, assignmentId: "running", claimId: "running-claim", state: "running", sessionChannelId: "session:running" });
-    await f.journal.assignments.put({ ...base, assignmentId: "fenced", claimId: "fenced-claim", state: "recovery_required", sessionChannelId: "session:fenced" });
+    const put = (assignmentId: string, sessionChannelId: string, extra: Record<string, unknown> = {}) =>
+      f.journal.assignments.put({ ...base, assignmentId, claimId: `${assignmentId}-claim`, state: "completed", sessionChannelId, ...extra } as never);
+    await put("ended-1", "session:ended");
+    await put("ended-2", "session:ended", { state: "cancelled" });
+    await put("running", "session:running", { state: "running" });
+    await put("fenced", "session:fenced", { state: "recovery_required" });
+    await put("conversation", "session:conversation", { kind: "assistant_execution" });
+    await put("open", "session:open");
+    await put("retained", "session:retained");
     (f.work as unknown as { sessions: Map<string, unknown> }).sessions.set("open:1", { channelId: "session:open", isClosed: false });
     (f.work as unknown as { channelOwners: Map<string, unknown> }).channelOwners.set("session:retained", {});
 
-    expect(["session:ended", "session:running", "session:fenced", "session:open", "session:retained"].filter(id => f.work.sessionChannelInUse(id)))
-      .toEqual(["session:running", "session:fenced", "session:open", "session:retained"]);
+    const channels = ["session:ended", "session:running", "session:fenced", "session:conversation", "session:open", "session:retained", "session:unknown"];
+    expect(channels.filter(id => f.work.sessionChannelEnded(id))).toEqual(["session:ended"]);
   });
 
   it("native continuation rejects a newer accepted generation after admission fsync", async () => {

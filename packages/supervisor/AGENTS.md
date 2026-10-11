@@ -70,10 +70,12 @@ QA browser, structured results, updates and doctor/support.
   `<root>/releases/`.
 - **Session replay** (`relay/channel-mux.ts`): a session channel keeps its
   unacknowledged frames until its holder acknowledges them, with no age
-  limit, while local work owns it (`WorkOrchestrator.sessionChannelInUse`).
-  Once nothing owns it and its newest frame is older than
-  `DETACHED_SESSION_REPLAY_GRACE_MS` (24 h), the channel is retired
-  (`relay.channel.retired`) instead of being replayed on every handshake.
+  limit. Only an ended session's channel (`WorkOrchestrator.sessionChannelEnded`:
+  finished direct turns only, nothing holding it) whose newest frame is older
+  than `DETACHED_SESSION_REPLAY_GRACE_MS` (24 h) is retired
+  (`relay.channel.retired`). Never retire a session that may continue: a
+  later turn would restart at seq 1, below the holder's durable cursor, and
+  the holder drops those frames as duplicates.
 - **Host agents never fail the connector.** A listed host agent the load cannot
   find or verify is returned in `unavailableAgents` and parked with
   `NativeAgentRetry` (`parkUnavailableHostAgent`).

@@ -626,7 +626,7 @@ export class Supervisor {
       onReset: (channelId) => void this.onChannelReset(channelId)
         .catch(error => this.logger.error({ err: error, channelId }, "channel reset handling failed")),
       // Before the orchestrator exists nothing may be retired.
-      sessionChannelInUse: (channelId) => this.work === undefined || this.work.sessionChannelInUse(channelId),
+      sessionChannelEnded: (channelId) => this.work !== undefined && this.work.sessionChannelEnded(channelId),
       persistCursors: (cursors) => this.store.saveCursors(cursors),
       persistRelayState: (state) => this.store.saveRelayState(state),
     });
