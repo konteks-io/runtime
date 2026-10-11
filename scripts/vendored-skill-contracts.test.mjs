@@ -22,7 +22,8 @@ test("the shipped common contract supports scoped Skill synchronization", () => 
     const contract = require(join(temporary, "package", "dist", "remote-instance-internal.js"));
     for (const name of ["RuntimeSkillSyncItemSchema", "RuntimeSkillSyncEnvelopeSchema", "RuntimeSkillShareOwnerRequestSchema",
       "RuntimeSkillSharePublishRequestSchema", "RuntimeSkillShareRequestSchema", "RuntimeSkillSharePublicationResultSchema", "RuntimeSkillPublicationReceiptSchema",
-      "LocalSkillExportIntentSchema", "RuntimeSkillStatusSchema", "RuntimeSkillProfileFreshnessSchema", "skillScopeAllows", "skillFreshnessFailure"]) {
+      "LocalSkillExportIntentSchema", "RuntimeSkillStatusSchema", "RuntimeSkillProfileFreshnessSchema", "RuntimeSkillCatalogChangedSchema",
+      "runtimeSkillCatalogChangedSigningBytes", "skillScopeAllows", "skillFreshnessFailure"]) {
       assert.ok(contract[name], `Vendored common@${version} is missing ${name}`);
     }
     assert.equal(contract.RUNTIME_SKILL_SHARE_MIN_CORE_CONTRACT_VERSION, "7.6");
@@ -45,6 +46,14 @@ test("the shipped common contract supports scoped Skill synchronization", () => 
     const freshness = { agentId: "codex", desiredRevision: digest, installedRevision: digest, loadedRevision: null, state: "current" };
     assert.deepEqual(contract.RuntimeSkillStatusSchema.parse({ syncing: false, profiles: [freshness], lastSuccess: null }).profiles, [freshness]);
     assert.throws(() => contract.RuntimeSkillStatusSchema.parse({ syncing: false, profiles: [{ ...freshness, loadedRevision: `sha256:${"b".repeat(64)}` }], lastSuccess: null }));
+
+    const change = { type: "runtime_skill_catalog_changed", workspaceId: "workspace-a", instanceId: "instance-a",
+      notificationId: "11111111-1111-4111-8111-111111111111", catalogRevision: digest, changeKind: "updated",
+      issuedAt: "2026-10-12T00:00:00Z", expiresAt: "2026-10-12T00:01:00Z", signature: "c2lnbmVk" };
+    assert.deepEqual(contract.RuntimeSkillCatalogChangedSchema.parse(change), change);
+    assert.match(contract.runtimeSkillCatalogChangedSigningBytes(change).toString("utf8"), /^konteks-runtime-skill-catalog-change-v1\0/);
+    assert.throws(() => contract.RuntimeSkillCatalogChangedSchema.parse({ ...change, expiresAt: "2026-10-12T00:01:01Z" }));
+    assert.throws(() => contract.RuntimeSkillCatalogChangedSchema.parse({ ...change, skillContents: "never sent over WSS" }));
   } finally {
     rmSync(temporary, { recursive: true, force: true });
   }

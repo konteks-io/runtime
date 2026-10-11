@@ -258,6 +258,9 @@ describe("closed native runtime installation", () => {
     vi.stubEnv("DSH_EXECUTABLE", undefined as unknown as string);
     onTestFinished(() => { vi.unstubAllEnvs(); });
     const f = await fixture();
+    // Keep this service-environment probe independent from the developer's
+    // real npm npx cache, which can contain a supported DSH installation.
+    vi.stubEnv("npm_config_cache", join(root, "empty-npm-cache"));
     const dsh = async (version: string) => {
       const pkg = join(root, `dsh-${version}`);
       await mkdir(join(pkg, "lib"), { recursive: true });
@@ -302,6 +305,10 @@ describe("closed native runtime installation", () => {
     } finally {
       await rm(globalCopy, { recursive: true });
     }
+    // The runtime also scans fixed host-wide npm prefixes such as
+    // /opt/homebrew; prevent this machine's unrelated global DSH from
+    // satisfying the unsupported-record fallback.
+    vi.stubEnv("DSH_EXECUTABLE", join(root, "missing-dsh"));
     // An upgrade out of the tested range never runs silently: dsh is left out
     // with the install hint (retried by the supervisor), and Codex still loads
     // (start isolation).
