@@ -46,6 +46,7 @@ import {
   type PreviewStatusReport,
   type RuntimeAgentLoginDeliveryRequest,
   coreContractAtLeast,
+  REMOTE_PREVIEW_APP_CREDENTIALS_MIN_CORE_CONTRACT_VERSION,
 } from "@konteks/remote-common";
 import { EmbeddedReleaseRootSchema, NATIVE_MANIFEST_URL, isHostAgentId, nativeManifestUrl, connectorCommandsManifest, selectNativeModelCapabilityMappings, verifyNativeRelease, type VerifiedNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 import { chromeInstalled, readAntigravityAdminObservation, type RunnerConfig } from "@konteks/remote-agent-runner";
@@ -80,7 +81,7 @@ import { LeaseLane } from "./lease/lease-lane.js";
 import { channelOfId, coreChannelId, CORE_BOUND_CHANNELS } from "./relay/channel-ids.js";
 import { PreviewWorktreePermits } from "./preview/worktree-permits.js";
 import { PreviewChannel } from "./preview/preview-channel.js";
-import { PreviewProcessManager, PreviewProcessRegistry } from "./preview/process-manager.js";
+import { PreviewProcessManager, PreviewProcessRegistry, pendingViewerRetry, type PreviewStatus } from "./preview/process-manager.js";
 import type { SessionPreviewAccess } from "./preview/mcp-server.js";
 import { provisioningCredentialIsExpired, refreshProvisioningCredential, submitReadiness } from "./provisioning/activation.js";
 import { Reconciliation } from "./reconnect/reconciliation.js";
@@ -954,8 +955,10 @@ export class Supervisor {
         originFor: sessionId => this.previews.originFor(sessionId),
         touch: sessionId => this.previews.touch(sessionId),
         autoStart: sessionId => this.startPreviewForViewer(sessionId),
+        failureFor: sessionId => this.previews.status(sessionId).state === "failed" ? this.previews.lastFailureFor(sessionId)?.reason ?? null : null,
       },
       hasCapacity: channelId => this.mux.unackedBytes(channelId) < previewWindowBytes,
+      coreAcceptsSetCookies: () => coreContractAtLeast(this.coreContractVersion, REMOTE_PREVIEW_APP_CREDENTIALS_MIN_CORE_CONTRACT_VERSION),
       logger: this.logger,
     });
   }
@@ -1324,6 +1327,8 @@ export class Supervisor {
     return new NativeRunner({ instanceId: this.nativeRunnerInstanceId, config,
       ...(config.RUNNER_AGENT_ID === "codex" && this.nativeCodexOwner ? { afterSuccessfulLogin: () => this.nativeCodexOwner!.refreshAfterLogin() } : {}),
       executionBridgeLimit: () => Math.min(4, this.configuration.softMaxConcurrent ?? this.config.SUPERVISOR_SOFT_MAX_CONCURRENT ?? 4),
+      // A full ceiling frees a finished session instead of refusing the new one (D62).
+      reclaimIdleExecution: () => this.work?.reclaimIdleCompletedSession(config.RUNNER_AGENT_ID) ?? Promise.resolve(false),
       onEvent: event => { void this.onRunnerEvent(config.RUNNER_AGENT_ID, event).catch(error => this.logger.warn({ err: error }, "native runner event failed")); }, ...(this.options.native!.runtimeOptions ? { runtimeOptions: this.options.native!.runtimeOptions } : {}) });
   }
 
@@ -2213,34 +2218,41 @@ export class Supervisor {
    * the same process manager, inference and caps preview_start uses, when the
    * session's worktree exists and this computer takes work. True while one is
    * starting (the viewer is told "Starting preview" and its page refreshes).
-   * A preview that just failed is not restarted on every refresh.
+   * A preview that just failed is not restarted on every refresh: until the
+   * retry, the viewer is told why it could not start (`{ reason }`), never
+   * "nothing yet" for something that will not appear by itself.
    */
-  private async startPreviewForViewer(sessionId: string): Promise<boolean> {
+  private async startPreviewForViewer(sessionId: string): Promise<boolean | { reason: string }> {
     const current = this.previews.status(sessionId);
     if (current.state === "starting") return true;
-    const cwd = this.viewerPreviewWorktree(sessionId, current.state);
+    const cwd = this.viewerPreviewWorktree(sessionId);
     if (cwd === null) return false;
+    const pending = this.viewerRetryPending(sessionId);
+    if (pending !== null) return { reason: pending };
     this.previewViewerStarts.set(sessionId, Date.now());
     const started = await this.previews.start(sessionId, cwd, "viewer");
-    if (started.state !== "starting" && started.state !== "running") {
-      this.logger.info({ event: "preview.viewer_start_refused", state: started.state }, "a viewer's preview could not start");
-      return false;
-    }
+    if (started.state !== "starting" && started.state !== "running") return this.viewerStartRefused(sessionId, started);
     this.logger.info({ event: "preview.viewer_started" }, "a viewer started this session's preview");
     return true;
   }
 
-  /** The session's worktree when a viewer may start its preview now; null while stopping, draining, without an active lease or a worktree, or soon after a viewer start failed. */
-  private viewerPreviewWorktree(sessionId: string, state: string): string | null {
-    if (this.stopping || this.draining || this.lease.mode() !== "active") return null;
-    const cwd = this.previewWorktrees.get(sessionId);
-    if (cwd === undefined || !existsSync(cwd)) return null;
-    return this.viewerRetryPending(sessionId, state) ? null : cwd;
+  /** A viewer's start that was refused at once (the cap, a stopping connector): its reason, logged. */
+  private viewerStartRefused(sessionId: string, started: PreviewStatus): false | { reason: string } {
+    const reason = started.reason ?? this.previews.lastFailureFor(sessionId)?.reason ?? null;
+    this.logger.info({ event: "preview.viewer_start_refused", state: started.state, reason }, "a viewer's preview could not start");
+    return reason === null ? false : { reason };
   }
 
-  private viewerRetryPending(sessionId: string, state: string): boolean {
-    const last = this.previewViewerStarts.get(sessionId);
-    return state === "failed" && last !== undefined && Date.now() - last < PREVIEW_VIEWER_RETRY_MS;
+  /** The session's worktree when a viewer may start its preview; null while stopping, draining, without an active lease or a worktree. */
+  private viewerPreviewWorktree(sessionId: string): string | null {
+    if (this.stopping || this.draining || this.lease.mode() !== "active") return null;
+    const cwd = this.previewWorktrees.get(sessionId);
+    return cwd === undefined || !existsSync(cwd) ? null : cwd;
+  }
+
+  /** The reason the last viewer start failed, while its retry waits (PREVIEW_VIEWER_RETRY_MS); null when a start may go ahead. */
+  private viewerRetryPending(sessionId: string): string | null {
+    return pendingViewerRetry(this.previewViewerStarts.get(sessionId), this.previews.lastFailureFor(sessionId), Date.now(), PREVIEW_VIEWER_RETRY_MS);
   }
 
   private forgetPreviewWorktree(sessionId: string): void {
@@ -2292,9 +2304,12 @@ export class Supervisor {
         sessionId: preview.sessionId, state: preview.state, url: preview.url, port: preview.port, command: preview.command, source: preview.source,
         explanation: preview.explanation, message: preview.message, startedAt: preview.startedAt, readyAt: preview.readyAt,
         startedBy: preview.startedBy,
+        openPath: preview.openPath,
+        reason: preview.reason,
         viewerConnected: this.previewChannel?.hasViewer(preview.sessionId) ?? false,
       })),
       lastFailure: health.lastFailure,
+      failures: this.previews.recentFailures(),
     };
   }
 

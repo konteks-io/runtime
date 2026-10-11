@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { DSH_PROFILE_EXPECTATIONS, DSH_READ_ONLY_TOOLS, renderDshKonteksProfile, writeDshKonteksProfile } from "../bridge/dsh-profile.js";
+import { DSH_COMMAND_CAP_MS, DSH_PROFILE_EXPECTATIONS, DSH_READ_ONLY_TOOLS, renderDshKonteksProfile, writeDshKonteksProfile } from "../bridge/dsh-profile.js";
 
 const folders: string[] = [];
 afterEach(async () => { for (const folder of folders.splice(0)) await rm(folder, { recursive: true, force: true }); });
@@ -41,6 +41,15 @@ describe("Konteks patch set for DeepSeek Harness", () => {
     }
     expect(DSH_PROFILE_EXPECTATIONS("/konteks/dsh", "darwin").find(row => row.id === "acp")?.config).toEqual({ provider: "deepseek-official", model: "deepseek-flash" });
     expect(DSH_PROFILE_EXPECTATIONS("/konteks/dsh", "darwin").find(row => row.id === "konteks-ask-hook")?.config).toEqual({ configPath: "/konteks/dsh/konteks-hooks.json" });
+  });
+
+  // 10-11: a 40-minute foreground run was killed at dsh's 10-minute cap, background runs being off.
+  it("lifts dsh's foreground command cap on both shells", () => {
+    for (const platform of ["darwin", "win32"] as const) {
+      const patch = renderDshKonteksProfile("/konteks/dsh", platform).files.find(file => file.name === "konteks-dsh.patch.yml")!.content;
+      for (const id of ["bash-sandbox", "pwsh-sandbox"]) expect(patch, `${platform} ${id}`).toContain(`- id: ${id}\n  config:\n    maxTimeoutMs: ${DSH_COMMAND_CAP_MS}\n`);
+    }
+    expect(DSH_COMMAND_CAP_MS).toBe(2 ** 31 - 1);
   });
 
   it("writes the set privately and returns the patch paths in layer order", async () => {

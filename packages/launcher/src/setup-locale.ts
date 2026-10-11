@@ -207,7 +207,7 @@ const COPY = {
   updateNoAnswer: ["The updated connector stopped making progress before it answered on its control socket.", "Konektor yang diperbarui berhenti menunjukkan kemajuan sebelum merespons pada soket kontrolnya."],
   updateAgentsStalled: ["The updated connector stopped making progress while probing its agents ({agents}).", "Konektor yang diperbarui berhenti menunjukkan kemajuan saat memeriksa agennya ({agents})."],
   updateDoctorFailed: ["The updated connector introduced doctor failure(s): {detail}.", "Konektor yang diperbarui menimbulkan kegagalan doctor: {detail}."],
-  updateDoctorWaiting: ["waiting for the updated connector to clear doctor failure(s): {checks}…", "menunggu konektor yang diperbarui mengatasi kegagalan doctor: {checks}…"],
+  updateDoctorWaiting: ["Waiting for the new version to connect ({checks})…", "Menunggu versi baru terhubung ({checks})…"],
   updateAddedChecks: ["{version} reports a check {previous} did not have: {detail}. It is not held against the update.", "{version} melaporkan pemeriksaan yang tidak ada pada {previous}: {detail}. Hal ini tidak membuat pembaruan dianggap gagal."],
   actionRetry: ["retry the command", "coba jalankan perintah lagi"],
   actionDoctor: ["run `konteks-remote doctor`", "jalankan `konteks-remote doctor`"],

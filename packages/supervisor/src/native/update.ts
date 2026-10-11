@@ -40,6 +40,17 @@ const DEFAULT_INITIAL_DELAY_MS = 5 * 60_000;
 const DEFAULT_MAX_ATTEMPTS = 3;
 const DEFAULT_ATTEMPT_WINDOW_MS = 24 * 60 * 60_000;
 const DEFAULT_STALE_ATTEMPT_MS = 45 * 60_000;
+/**
+ * A release waiting only for Core to accept it (or for Core to answer) is
+ * checked again this soon, doubling up to the cap, instead of at the next
+ * 6-hour tick: Core moves its accepted release minutes to hours after the
+ * channel publishes one.
+ */
+const ACCEPTANCE_RECHECK_FIRST_MS = 15 * 60_000;
+const ACCEPTANCE_RECHECK_MAX_MS = 60 * 60_000;
+
+/** Why the newest signed release waits for Core, for the scheduled re-check. */
+interface AwaitingAcceptance { reason: "accepted_mismatch" | "core_unanswered"; accepted: string | null; available: string }
 
 /**
  * Decides when the running connector asks for its own replacement. The
@@ -64,6 +75,11 @@ export class NativeUpdateCoordinator {
   private lastAttempt: NativeUpdateStatus["lastAttempt"] = null;
   private timer: NodeJS.Timeout | null = null;
   private initialTimer: NodeJS.Timeout | null = null;
+  private recheckTimer: NodeJS.Timeout | null = null;
+  /** Re-checks scheduled since the release last stopped waiting for Core. */
+  private recheckStreak = 0;
+  /** Set by the current check when the newest release waits only for Core's acceptance. */
+  private awaitingAcceptance: AwaitingAcceptance | null = null;
   private applying: Promise<NativeUpdateApply> | null = null;
   private stopped = false;
   private readonly now: () => number;
@@ -85,8 +101,10 @@ export class NativeUpdateCoordinator {
     this.stopped = true;
     if (this.initialTimer) clearTimeout(this.initialTimer);
     if (this.timer) clearInterval(this.timer);
+    if (this.recheckTimer) clearTimeout(this.recheckTimer);
     this.initialTimer = null;
     this.timer = null;
+    this.recheckTimer = null;
   }
 
   /** Core's `version_policy` says this bundle is below the minimum: act now rather than at the next tick. */
@@ -145,8 +163,35 @@ export class NativeUpdateCoordinator {
   /** Check, then launch at most one transaction; refusals are reported, never thrown, so callers see why. */
   apply(reason: NativeUpdateReason, target?: NativeUpdateTarget, assertCurrent?: () => void): Promise<NativeUpdateApply> {
     if (target && this.applying) return Promise.resolve(this.refuse("busy"));
-    this.applying ??= this.applyImpl(reason, target, assertCurrent).finally(() => { this.applying = null; });
+    this.applying ??= this.applyImpl(reason, target, assertCurrent).finally(() => {
+      this.applying = null;
+      this.scheduleAcceptanceRecheck();
+    });
     return this.applying;
+  }
+
+  /**
+   * While the newest signed release waits only for Core, check again soon
+   * (15 min, doubling to 1 h) until it launches or stops waiting; the
+   * 6-hour tick carries on unchanged.
+   */
+  private scheduleAcceptanceRecheck(): void {
+    const awaiting = this.awaitingAcceptance;
+    if (this.recheckTimer) clearTimeout(this.recheckTimer);
+    this.recheckTimer = null;
+    if (!awaiting || this.stopped) {
+      this.recheckStreak = 0;
+      return;
+    }
+    const delayMs = Math.min(ACCEPTANCE_RECHECK_FIRST_MS * 2 ** this.recheckStreak, ACCEPTANCE_RECHECK_MAX_MS);
+    this.recheckStreak += 1;
+    this.recheckTimer = setTimeout(() => {
+      this.recheckTimer = null;
+      void this.apply("periodic").catch(() => undefined);
+    }, delayMs);
+    this.recheckTimer.unref();
+    this.options.logger.info({ event: "native.update.recheck_scheduled", ...awaiting, current: this.options.currentBundleVersion, delayMs },
+      "the newest release waits for Konteks to accept it; checking again soon");
   }
 
   private refuse(reason: string): NativeUpdateApply {
@@ -154,6 +199,7 @@ export class NativeUpdateCoordinator {
   }
 
   private async applyImpl(reason: NativeUpdateReason, target?: NativeUpdateTarget, assertCurrent?: () => void): Promise<NativeUpdateApply> {
+    this.awaitingAcceptance = null;
     if (this.stopped) return this.refuse(target ? "busy" : "supervisor is stopping");
     await this.check();
     const available = this.available;
@@ -198,14 +244,17 @@ export class NativeUpdateCoordinator {
     if (frozen) return frozenAcceptedReleaseRefusal(accepted, available);
     if (accepted === undefined) return this.unansweredAcceptedRelease(reason, available);
     if (accepted === null) return "this Konteks does not say which release it accepts; update by hand with `konteks-remote update`";
-    return accepted.bundleVersion !== available.bundleVersion
-      ? `Konteks accepts ${accepted.bundleVersion}, not ${available.bundleVersion} yet; staying on this one until it does`
-      : null;
+    if (accepted.bundleVersion === available.bundleVersion) return null;
+    this.awaitingAcceptance = { reason: "accepted_mismatch", accepted: accepted.bundleVersion, available: available.bundleVersion };
+    return `Konteks accepts ${accepted.bundleVersion}, not ${available.bundleVersion} yet; staying on this one until it does`;
   }
 
   /** Konteks could not be asked: stay, unless it refuses this release as too old. */
   private unansweredAcceptedRelease(reason: NativeUpdateReason, available: AvailableRelease): string | null {
-    if (!this.mayUpdateWithoutAcceptedRelease(reason, available.bundleVersion)) return "Konteks could not be asked which release it accepts; staying on this one";
+    if (!this.mayUpdateWithoutAcceptedRelease(reason, available.bundleVersion)) {
+      this.awaitingAcceptance = { reason: "core_unanswered", accepted: null, available: available.bundleVersion };
+      return "Konteks could not be asked which release it accepts; staying on this one";
+    }
     this.options.logger.warn({ bundleVersion: available.bundleVersion, minimumSupportedBundle: this.refusedAsTooOld?.minimumSupportedBundle ?? null }, "Konteks refuses this release and cannot be asked which one it accepts; installing the newer signed release");
     return null;
   }

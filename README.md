@@ -181,7 +181,7 @@ session's working copy. It calls `preview_start` (with `preview_status` and
 `preview_stop`), and the connector:
 
 - reads `.konteks/preview.yaml` if present (`serve.command`, `install`,
-  `prepare`, `healthPath`, `env`), or infers the command: the `dev` (else
+  `prepare`, `healthPath`, `openPath`, `env`), or infers the command: the `dev` (else
   `start`, `serve`) script with the package manager the lockfile names, plus
   the host/port flags common dev servers need; `manage.py runserver` for
   Django and `bin/rails server` for Rails;
@@ -192,9 +192,16 @@ session's working copy. It calls `preview_start` (with `preview_status` and
   log lines.
 
 People open the preview from the session in Konteks; the relay carries it to
-this computer, which forwards it only to that session's port. When a viewer
+this computer, which forwards it only to that session's port. The app keeps
+its own sign-in: its cookies and `Authorization` reach it, and its
+`set-cookie` reaches the viewer's browser for the preview's host only. Konteks's
+own `konteks_` cookies never reach the app, and the app cannot set them. When a viewer
 opens a preview and nothing runs, the connector starts it itself, if the
-session's worktree is still here. A preview stops after 30 idle minutes, when
+session's worktree is still here. When it cannot start (nothing to serve, a
+failed install, an app that exits), the viewer gets a 503 that starts with
+`Preview could not start: ` and says why and what to do; it is retried at most
+once a minute, and `konteks-remote preview status` lists each session's last
+failed start with its reason. A preview stops after 30 idle minutes, when
 its session ends, when this computer stops taking work or loses its lease, and
 when the connector stops. At most 3 run at once. Commands the connector's
 policy refuses (`git push`, `ssh`, `sudo`, ...) are refused in `preview.yaml`
@@ -206,6 +213,7 @@ serve:
   command: pnpm --filter web dev --host $HOST --port $PORT
   install: pnpm install
   healthPath: /
+  openPath: /docs   # the page people land on (an API's docs); / by default
   env:
     VITE_API_URL: http://127.0.0.1:8787
 ```
@@ -395,7 +403,8 @@ publisher".
 ### Updates
 
 The connector runs as a user service (launchd, user systemd or Task
-Scheduler), checks the stable channel every 6 hours, and updates
+Scheduler), checks the stable channel every 6 hours (every 15 minutes to an
+hour while a newer release waits for Konteks to accept it), and updates
 transactionally: the new release is staged, work is drained, the service is
 swapped and health-gated, and the previous release is restored if the gate
 fails. A release that is being checked takes no new work. Konteks can also

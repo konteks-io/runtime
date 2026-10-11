@@ -81,6 +81,7 @@ error: the published checksum manifest does not match this release's bootstrap; 
 error: connector checksum mismatch; refusing to install|kesalahan: checksum konektor tidak cocok; pemasangan ditolak
 konteks-remote installed for this user at %s/bin/konteks-remote|konteks-remote dipasang untuk pengguna ini di %s/bin/konteks-remote
 add it to PATH for this shell:  export PATH="%s:$PATH"|tambahkan ke PATH untuk shell ini:  export PATH="%s:$PATH"
+until then, the command is:  "%s/konteks-remote"|sampai saat itu, perintahnya:  "%s/konteks-remote"
 error: package checksum mismatch; refusing to install|kesalahan: checksum paket tidak cocok; pemasangan ditolak
 error: package is not Developer ID signed|kesalahan: paket tidak ditandatangani dengan Developer ID
 error: package signer is not the expected publisher|kesalahan: penandatangan paket bukan penerbit yang diharapkan
@@ -348,7 +349,9 @@ if [ "$user_install" -eq 1 ]; then
   fi
   case ":$PATH:" in
     *":$root/bin:"*) ;;
-    *) setup_detail 'add it to PATH for this shell:  export PATH="%s:$PATH"' "$root/bin" ;;
+    *)
+      setup_detail 'add it to PATH for this shell:  export PATH="%s:$PATH"' "$root/bin"
+      setup_detail 'until then, the command is:  "%s/konteks-remote"' "$root/bin" ;;
   esac
   if [ "$enroll" -eq 1 ]; then
     setup_connect "$root/bin/konteks-remote" install --enroll

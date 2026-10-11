@@ -1,12 +1,13 @@
 import { access, readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { validatePreviewPath } from "@konteks/remote-common";
 
 /**
  * How a session's preview is served: from the repository's own
  * `.konteks/preview.yaml` when it says, otherwise inferred from the working
  * copy (zero setup). The `serve` fields are the same as validation-runtime's
  * `PreviewEnvironmentSpecSchema.serve` (command, install, prepare, healthPath,
- * env); `port` is not honoured because the connector always picks the port
+ * env), plus `openPath`, the page a viewer lands on; `port` is not honoured because the connector always picks the port
  * and passes it as `$PORT` with `HOST=127.0.0.1`.
  *
  * Commands may use `$PORT`/`${PORT}` and `$HOST`/`${HOST}`; they are replaced
@@ -21,6 +22,8 @@ export interface PreviewPlan {
   prepare?: string;
   /** Path the health probe asks; any HTTP answer means the server is up. */
   healthPath: string;
+  /** The page a viewer lands on (an API's docs page, say); `/` when omitted. */
+  openPath?: string;
   /** Extra literal environment from preview.yaml (never the connector's own). */
   env: Record<string, string>;
   readinessTimeoutMs?: number;
@@ -31,7 +34,15 @@ export interface PreviewPlan {
   notes: string[];
 }
 
-export type PreviewPlanResult = { ok: true; plan: PreviewPlan } | { ok: false; message: string; notes: string[] };
+/**
+ * `reason` is the person's sentence when there is nothing to serve: what is
+ * wrong and what to do, shown where they opened the preview.
+ */
+export type PreviewPlanResult = { ok: true; plan: PreviewPlan } | { ok: false; message: string; reason?: string; notes: string[] };
+
+/** What a viewer reads when the working copy has no command a browser can open. */
+export const NOTHING_TO_SERVE_REASON = "This change has nothing a browser can open (no serve command). Ask the agent to make it runnable.";
+const MAX_OPEN_PATH = 200;
 
 const PREVIEW_YAML = join(".konteks", "preview.yaml");
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
@@ -52,7 +63,7 @@ export async function resolvePreviewPlan(cwd: string, deps: PlanReadDeps = {}): 
   const declared = await declaredPlan(cwd, readText, notes);
   if (declared.command) return { ok: true, plan: declaredOnly(declared.command, declared, notes) };
   const inferred = await inferPreviewPlan(cwd, { readText, exists, platform: deps.platform ?? process.platform });
-  if (!inferred.ok) return { ok: false, message: inferred.message, notes };
+  if (!inferred.ok) return { ...inferred, notes };
   return { ok: true, plan: declaredOverInferred(inferred.plan, declared, notes) };
 }
 
@@ -76,6 +87,7 @@ function declaredOnly(command: string, declared: Partial<PreviewPlan>, notes: st
     ...(declared.install ? { install: declared.install } : {}),
     ...(declared.prepare ? { prepare: declared.prepare } : {}),
     healthPath: declared.healthPath ?? "/",
+    ...(declared.openPath ? { openPath: declared.openPath } : {}),
     env: declared.env ?? {},
     ...(declared.readinessTimeoutMs ? { readinessTimeoutMs: declared.readinessTimeoutMs } : {}),
     source: "preview_yaml",
@@ -91,6 +103,7 @@ function declaredOverInferred(inferred: PreviewPlan, declared: Partial<PreviewPl
     ...(declared.install ? { install: declared.install } : {}),
     ...(declared.prepare ? { prepare: declared.prepare } : {}),
     ...(declared.healthPath ? { healthPath: declared.healthPath } : {}),
+    ...(declared.openPath ? { openPath: declared.openPath } : {}),
     env: declared.env ?? {},
     ...(declared.readinessTimeoutMs ? { readinessTimeoutMs: declared.readinessTimeoutMs } : {}),
     notes: [...notes, ...inferred.notes],
@@ -124,9 +137,9 @@ export async function inferPreviewPlan(cwd: string, deps: Required<PlanReadDeps>
   // checkout of the project: there is nothing to run here, and a delivery's
   // app is what the person's Open preview shows.
   if (await deps.exists(join(cwd, ".assistant"))) {
-    return { ok: false, message: CONVERSATION_HAS_NO_APP, notes: [] };
+    return { ok: false, message: CONVERSATION_HAS_NO_APP, reason: CONVERSATION_HAS_NO_APP_REASON, notes: [] };
   }
-  return { ok: false, message: "Could not tell how to serve this working copy (no package.json, manage.py or bin/rails). Add .konteks/preview.yaml with a serve.command that listens on $HOST:$PORT.", notes: [] };
+  return { ok: false, message: "Could not tell how to serve this working copy (no package.json, manage.py or bin/rails). Add .konteks/preview.yaml with a serve.command that listens on $HOST:$PORT.", reason: NOTHING_TO_SERVE_REASON, notes: [] };
 }
 
 const DEV_SCRIPTS = ["dev", "start", "serve"] as const;
@@ -137,11 +150,11 @@ function parsedPackage(text: string): PackageJson | null {
 
 async function inferNodePlan(cwd: string, packageText: string, deps: Required<PlanReadDeps>): Promise<PreviewPlanResult> {
   const pkg = parsedPackage(packageText);
-  if (pkg === null) return { ok: false, message: "package.json is not valid JSON, so the dev server command cannot be inferred. Fix it, or add serve.command to .konteks/preview.yaml.", notes: [] };
+  if (pkg === null) return { ok: false, message: "package.json is not valid JSON, so the dev server command cannot be inferred. Fix it, or add serve.command to .konteks/preview.yaml.", reason: "The project's package.json is not valid JSON, so there is nothing to run. Ask the agent to fix it.", notes: [] };
   const scripts = pkg.scripts && typeof pkg.scripts === "object" ? pkg.scripts : {};
   const script = DEV_SCRIPTS.find(name => typeof scripts[name] === "string" && (scripts[name] as string).trim().length > 0);
   if (!script) {
-    return { ok: false, message: "package.json has no dev, start or serve script. Add one, or add serve.command to .konteks/preview.yaml.", notes: [] };
+    return { ok: false, message: "package.json has no dev, start or serve script. Add one, or add serve.command to .konteks/preview.yaml.", reason: NOTHING_TO_SERVE_REASON, notes: [] };
   }
   const { manager, evidence } = await detectPackageManager(cwd, pkg, deps);
   const framework = frameworkFlags(scripts[script] as string);
@@ -166,6 +179,9 @@ function nodePlan(found: { script: string; manager: PackageManager; evidence: st
 /** What a conversation's agent is told when asked for a preview it cannot run itself. */
 export const CONVERSATION_HAS_NO_APP = "This conversation has no copy of the project's code, so nothing runs here. "
   + "When a delivery on this ticket built the app, Open preview at the top of the session shows it and starts it on this computer by itself.";
+
+/** What a viewer of a conversation's preview reads: nothing runs here, and where the app is. */
+export const CONVERSATION_HAS_NO_APP_REASON = "This conversation has no app of its own to run. Open the preview of the delivery that built it.";
 
 /** Added only to the agent's tool answer: what to tell the person. */
 export const CONVERSATION_HAS_NO_APP_AGENT_NOTE = "Tell the person that, in one sentence, instead of saying you cannot.";
@@ -221,7 +237,7 @@ export function substitutePreviewVariables(command: string, values: { host: stri
 
 /**
  * A deliberately small YAML reader for `.konteks/preview.yaml`: top-level
- * `serve:` with scalar `command`, `install`, `prepare`, `healthPath`, `port`
+ * `serve:` with scalar `command`, `install`, `prepare`, `healthPath`, `openPath`, `port`
  * and a nested `env:` map, plus top-level `readinessTimeoutMs`. Unknown keys
  * are noted and ignored. Scalars may be plain, 'single' or "double" quoted.
  */
@@ -314,6 +330,8 @@ class PreviewYamlReader {
         return this.commandField(key, value);
       case "healthPath":
         return this.healthPath(value);
+      case "openPath":
+        return this.openPath(value);
       case "port":
         this.notes.push(".konteks/preview.yaml: serve.port is ignored; the connector assigns the port and passes it as $PORT.");
         return undefined;
@@ -334,6 +352,18 @@ class PreviewYamlReader {
   private healthPath(value: string): string | undefined {
     if (!value.startsWith("/") || value.startsWith("//") || value.length > 500) return "serve.healthPath must be a path starting with /";
     this.plan.healthPath = value;
+    return undefined;
+  }
+
+  /**
+   * A path on the preview itself: starts with `/`, no scheme or host, no dot
+   * segments, at most 200 characters. A bad one is noted and the preview
+   * opens at `/`; the rest of the file still applies.
+   */
+  private openPath(value: string): undefined {
+    const checked = value.length > 0 && value.length <= MAX_OPEN_PATH && !/\s/.test(value) ? validatePreviewPath(value) : null;
+    if (checked?.ok) this.plan.openPath = checked.path;
+    else this.notes.push(`.konteks/preview.yaml: serve.openPath must be a path on the preview starting with / (at most ${MAX_OPEN_PATH} characters, no scheme or host); the preview opens at / instead.`);
     return undefined;
   }
 

@@ -63,7 +63,7 @@ const PREVIEW_TOOLS = [
   {
     name: "preview_start",
     title: "Start the live preview",
-    description: "Start (or reuse) the live preview of this session's working copy: a dev server this computer runs from the session's worktree. Takes no arguments. The command comes from .konteks/preview.yaml (serve.command, install, prepare, healthPath, env) or is inferred (the package.json dev/start script with the project's package manager, Django, Rails); the connector picks a free port and passes it as $PORT with HOST=127.0.0.1. Returns the state, the loopback URL (for a browser on this computer), the command used or inferred and the last log lines. People open the preview from the session in Konteks. It stops by itself after a long idle period.",
+    description: "Start (or reuse) the live preview of this session's working copy: a dev server this computer runs from the session's worktree. Takes no arguments. The command comes from .konteks/preview.yaml (serve.command, install, prepare, healthPath, openPath for the page people land on, env) or is inferred (the package.json dev/start script with the project's package manager, Django, Rails); the connector picks a free port and passes it as $PORT with HOST=127.0.0.1. Returns the state, the loopback URL (for a browser on this computer), the command used or inferred and the last log lines. People open the preview from the session in Konteks. It stops by itself after a long idle period.",
     inputSchema: NO_ARGUMENTS,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
@@ -255,6 +255,7 @@ const STATUS_LINES: readonly StatusLines[] = [
   status => lineIf(status.message === CONVERSATION_HAS_NO_APP, () => CONVERSATION_HAS_NO_APP_AGENT_NOTE),
   status => (status.startedBy === null ? [] : [STARTED_BY[status.startedBy]]),
   status => lineIf(status.url, () => `Loopback URL (a browser on this computer): ${status.url}`),
+  status => lineIf(status.url && status.openPath && status.openPath !== "/", () => `Viewers land on ${status.openPath} (serve.openPath): ${status.url}${status.openPath}`),
   (status, browser) => lineIf(status.url && browser, () => `Open it with ${BROWSER_MCP_SERVER_NAME} browser_navigate; that browser reaches only this URL (and what environment_open opens).`),
   status => lineIf(status.command, () => `Command: ${status.command}${status.explanation ? ` — ${status.explanation}` : ""}`),
   status => lineIf(status.install, () => `Install step: ${status.install}`),

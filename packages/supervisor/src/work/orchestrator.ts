@@ -151,6 +151,8 @@ export class WorkOrchestrator {
   readonly reports: ReportSender;
   private readonly sessions = new Map<string, RelayedSession>();
   private readonly channelOwners = new Map<string, RelayedSession>();
+  /** Idle completed channels being released now, so the reaper and a capacity reclaim never release one twice. */
+  private readonly releasingIdle = new Set<string>();
   private readonly pendingClaims = new Map<string, RemoteWorkAssignment>();
   private readonly pendingClaimFences = new Map<string, () => void>();
   private readonly admissionSetups = new Map<string, Promise<void>>();
@@ -1736,9 +1738,29 @@ export class WorkOrchestrator {
     const now = this.deps.clock.now();
     for (const [channelId, owner] of [...this.channelOwners]) {
       const idle = this.idleCompletedSession(owner, now, idleMs);
-      if (idle && await this.releaseIdleSession(channelId, owner, idle, now)) reaped += 1;
+      if (idle && await this.releaseIdleSession(channelId, owner, idle, now, "idle_reaper")) reaped += 1;
     }
     return reaped;
+  }
+
+  /**
+   * A new session of `agentId` found every execution slot held (D62: three
+   * parallel deliveries' reviews were refused while finished chats and
+   * reviews held all four slots, waiting out the reaper's 30 minutes).
+   * Release that agent's longest-idle completed session now, exactly as the
+   * reaper would later; its next turn starts a fresh session from the
+   * conversation Konteks supplies. `true` when one was released.
+   */
+  async reclaimIdleCompletedSession(agentId: string): Promise<boolean> {
+    const now = this.deps.clock.now();
+    const idle = [...this.channelOwners]
+      .map(([channelId, owner]) => ({ channelId, owner, idle: this.idleCompletedSession(owner, now, 0) }))
+      .filter((entry): entry is { channelId: string; owner: RelayedSession; idle: IdleCompletedSession } => entry.idle?.prior.agentId === agentId)
+      .sort((a, b) => a.idle.settledAt - b.idle.settledAt);
+    for (const { channelId, owner, idle: session } of idle) {
+      if (await this.releaseIdleSession(channelId, owner, session, now, "capacity_reclaim")) return true;
+    }
+    return false;
   }
 
   /** A closed, reported completion settled at least `idleMs` ago whose execution still holds its process. */
@@ -1764,7 +1786,14 @@ export class WorkOrchestrator {
     return completedTurnSettledAt && processOwner ? { processOwner, settledAt: Date.parse(completedTurnSettledAt) } : undefined;
   }
 
-  private async releaseIdleSession(channelId: string, owner: RelayedSession, idle: IdleCompletedSession, now: number): Promise<boolean> {
+  private async releaseIdleSession(channelId: string, owner: RelayedSession, idle: IdleCompletedSession, now: number, stage: "idle_reaper" | "capacity_reclaim"): Promise<boolean> {
+    if (this.releasingIdle.has(channelId)) return false;
+    this.releasingIdle.add(channelId);
+    try { return await this.releaseIdleSessionOnce(channelId, owner, idle, now, stage); }
+    finally { this.releasingIdle.delete(channelId); }
+  }
+
+  private async releaseIdleSessionOnce(channelId: string, owner: RelayedSession, idle: IdleCompletedSession, now: number, stage: "idle_reaper" | "capacity_reclaim"): Promise<boolean> {
     const { prior, ref, processOwner } = idle;
     const key = `${owner.assignment.id}:${owner.assignment.attempt}`;
     const assertCurrent = () => {
@@ -1774,7 +1803,7 @@ export class WorkOrchestrator {
       }
       this.deps.journal.execution.assertAdmission(prior);
     };
-    const log = { assignmentId: owner.assignment.id, attempt: owner.assignment.attempt, stage: "idle_reaper" };
+    const log = { assignmentId: owner.assignment.id, attempt: owner.assignment.attempt, stage };
     try {
       assertCurrent();
       if (channelId.startsWith("session:")) await this.deps.onSessionReleased?.(channelId.slice("session:".length));
