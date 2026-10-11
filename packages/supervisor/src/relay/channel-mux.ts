@@ -20,6 +20,7 @@ import {
 } from "@konteks/remote-common";
 import { createLogger } from "@konteks/remote-common";
 import { ReplayBuffer } from "./replay-buffer.js";
+import { HolderNumbering, laterIssuedAt, type HolderReceipt } from "./holder-numbering.js";
 import { RecoveryAuthority } from "../transport/recovery-authority.js";
 
 /**
@@ -37,8 +38,11 @@ import { RecoveryAuthority } from "../transport/recovery-authority.js";
  */
 export type OutboundBody = Extract<ToCoreRelayFrame, { channel: RelayChannel }>["body"];
 
+/** One channel's durable cursors; `lastReceivedIssuedAt` is the latest holder timestamp received (holder-bound channels). */
+export interface DurableCursor { to_core: number; to_runtime: number; allocated: number; lastReceivedIssuedAt?: string }
+
 export interface RelayDurableState {
-  cursors: Record<string, { to_core: number; to_runtime: number; allocated: number }>;
+  cursors: Record<string, DurableCursor>;
   outbound: Record<string, Array<{ frame: ToCoreRelayFrame; bytes: number; enqueuedAt: number }>>;
 }
 
@@ -63,7 +67,7 @@ export interface MuxOptions {
   onStall: (channelId: string) => void;
   onReset: (channelId: string) => void;
   /** Persist the durable receive cursor (the authoritative cursor for to_runtime). */
-  persistCursors: (cursors: Record<string, { to_core: number; to_runtime: number; allocated?: number | undefined }>) => Promise<void>;
+  persistCursors: (cursors: Record<string, { to_core: number; to_runtime: number; allocated?: number | undefined; lastReceivedIssuedAt?: string | undefined }>) => Promise<void>;
   /** Production durability boundary: allocation, replay bytes and cursors in one atomic write. */
   persistRelayState?: (state: RelayDurableState) => Promise<void>;
   logger?: Logger;
@@ -76,6 +80,13 @@ export interface MuxOptions {
  */
 function holderBound(channel: RelayChannel): boolean {
   return channel === "session" || channel === "preview";
+}
+
+/** A channel's durable cursor record; the holder timestamp only once one was received. */
+function durableCursor(state: ChannelState, toCore: number, toRuntime: number, lastReceivedIssuedAt: string | undefined): DurableCursor {
+  const cursor: DurableCursor = { to_core: toCore, to_runtime: toRuntime, allocated: state.nextSeq - 1 };
+  if (lastReceivedIssuedAt !== undefined) cursor.lastReceivedIssuedAt = lastReceivedIssuedAt;
+  return cursor;
 }
 
 /** Upper bound for repeated stalls of one unacknowledged channel. */
@@ -98,6 +109,8 @@ interface ChannelState {
   stallCursor: number;
   /** Last inbound frame or acknowledgement on this channel: evidence the peer is alive. */
   lastInboundAt: number;
+  /** A holder-bound channel's evidence about its holder's to_runtime numbering. */
+  numbering: HolderNumbering | null;
 }
 
 type ReplayFrames = NonNullable<ReturnType<ChannelState["buffer"]["after"]>>;
@@ -181,7 +194,7 @@ export class ChannelMux {
   }
 
   /** Restore durable cursors on start (before any handshake). */
-  restoreCursors(cursors: Record<string, { to_core: number; to_runtime: number; allocated?: number | undefined }>, channelOf: (channelId: string) => RelayChannel | null): void {
+  restoreCursors(cursors: Record<string, { to_core: number; to_runtime: number; allocated?: number | undefined; lastReceivedIssuedAt?: string | undefined }>, channelOf: (channelId: string) => RelayChannel | null): void {
     for (const [channelId, cursor] of Object.entries(cursors)) {
       const channel = channelOf(channelId);
       if (!channel) continue;
@@ -189,6 +202,7 @@ export class ChannelMux {
       const state = this.ensure(channelId, channel);
       state.receivedCursor = cursor.to_runtime;
       state.ackedByEndpoint = cursor.to_core;
+      if (state.numbering) state.numbering.lastIssuedAt = cursor.lastReceivedIssuedAt;
       // The allocation cursor is durable independently of the ACK cursor. A
       // frame allocated before a restart but never acknowledged here may still
       // have reached the holder durably (its ACK was in flight); reusing that
@@ -251,6 +265,7 @@ export class ChannelMux {
         stallStreak: 0,
         stallCursor: 0,
         lastInboundAt: this.options.clock.now(),
+        numbering: holderBound(channel) ? new HolderNumbering(undefined) : null,
       };
       this.channels.set(channelId, state);
     }
@@ -268,11 +283,11 @@ export class ChannelMux {
   }
 
   /** Generic replay cursor persistence excludes the assignment's independently durable stream. */
-  private genericCursors(): Record<string, { to_core: number; to_runtime: number; allocated: number }> {
-    const out: Record<string, { to_core: number; to_runtime: number; allocated: number }> = {};
+  private genericCursors(): Record<string, DurableCursor> {
+    const out: Record<string, DurableCursor> = {};
     for (const [channelId, state] of this.channels) {
       if (state.channel === "assignment" && this.options.assignmentCursors) continue;
-      out[channelId] = { to_core: state.ackedByEndpoint, to_runtime: state.receivedCursor, allocated: state.nextSeq - 1 };
+      out[channelId] = durableCursor(state, state.ackedByEndpoint, state.receivedCursor, state.numbering?.lastIssuedAt);
     }
     return out;
   }
@@ -647,7 +662,7 @@ export class ChannelMux {
   /** The endpoint acknowledged more: persist the cursor first, then free the replay it covers. */
   private async advanceAck(ack: RelayAck, state: ChannelState, generation: number, assertRecovery: () => void): Promise<void> {
     const cursors = this.genericCursors();
-    cursors[ack.channelId] = { to_core: ack.cumulativeSeq, to_runtime: state.receivedCursor, allocated: state.nextSeq - 1 };
+    cursors[ack.channelId] = durableCursor(state, ack.cumulativeSeq, state.receivedCursor, state.numbering?.lastIssuedAt);
     await this.persist(this.durableState(cursors, { channelId: ack.channelId, cumulativeSeq: ack.cumulativeSeq }));
     assertRecovery();
     if (!this.current(ack.channelId, state, generation)) return;
@@ -665,12 +680,13 @@ export class ChannelMux {
     // Reject rather than successfully return: the socket owner disconnects and
     // the sender retains this unacknowledged frame for replay after recovery.
     assertRecovery();
-    if (frame.seq <= state.receivedCursor) {
+    const receipt = this.receipt(frame, state);
+    if (receipt.kind === "duplicate") {
       this.counters.duplicates += 1;
       this.maybeAck(frame.channelId, state, true);
       return;
     }
-    if (frame.seq !== state.receivedCursor + 1) {
+    if (receipt.kind === "gap") {
       // A gap on the receive side means the relay lost frames we never acked;
       // the sender will replay from our cursor after a re-handshake.
       this.logger.warn({ channelId: frame.channelId, expected: state.receivedCursor + 1, got: frame.seq }, "to_runtime sequence gap; requesting re-handshake");
@@ -678,20 +694,42 @@ export class ChannelMux {
       this.options.onStall(frame.channelId);
       return;
     }
+    if (receipt.kind === "renumbered") this.logRenumbered(frame, state, receipt.evidence);
     await this.options.onFrame(frame);
     assertRecovery();
-    await this.serialize(async () => {
-      if (!this.current(frame.channelId, state, generation)) return;
-      assertRecovery();
-      const cursors = this.genericCursors();
-      cursors[frame.channelId] = { to_core: state.ackedByEndpoint, to_runtime: frame.seq, allocated: state.nextSeq - 1 };
-      await this.persist(this.durableState(cursors));
-      assertRecovery();
-      if (!this.current(frame.channelId, state, generation)) return;
-      state.receivedCursor = frame.seq;
-      state.framesSinceAck += 1;
-      this.maybeAck(frame.channelId, state, false);
-    });
+    await this.serialize(() => this.commitReceived(frame, state, receipt, generation, assertRecovery));
+  }
+
+  /** Holder-bound frames are judged on the holder's numbering evidence; any other frame on its sequence alone. */
+  private receipt(frame: ToRuntimeRelayFrame, state: ChannelState): HolderReceipt {
+    if (state.numbering) return state.numbering.receipt(frame, state.receivedCursor);
+    const kind = frame.seq <= state.receivedCursor ? "duplicate" : frame.seq === state.receivedCursor + 1 ? "next" : "gap";
+    return { kind, digest: "" };
+  }
+
+  /** Durably move the receive cursor to the delivered frame, then acknowledge on cadence. */
+  private async commitReceived(frame: ToRuntimeRelayFrame, state: ChannelState, receipt: HolderReceipt, generation: number, assertRecovery: () => void): Promise<void> {
+    if (!this.current(frame.channelId, state, generation)) return;
+    assertRecovery();
+    const cursors = this.genericCursors();
+    const issuedAt = state.numbering ? laterIssuedAt(state.numbering.lastIssuedAt, frame.issuedAt) : undefined;
+    cursors[frame.channelId] = durableCursor(state, state.ackedByEndpoint, frame.seq, issuedAt);
+    await this.persist(this.durableState(cursors));
+    assertRecovery();
+    if (!this.current(frame.channelId, state, generation)) return;
+    state.numbering?.accepted(frame, receipt);
+    // A renumbered holder is acknowledged in its new numbering.
+    if (receipt.kind === "renumbered") state.lastEmittedAckCursor = frame.seq - 1;
+    state.receivedCursor = frame.seq;
+    state.framesSinceAck += 1;
+    this.maybeAck(frame.channelId, state, false);
+  }
+
+  /** Only bounded protocol metadata; never bodies. */
+  private logRenumbered(frame: ToRuntimeRelayFrame, state: ChannelState, evidence: "digest" | "issued_at"): void {
+    this.logger.warn({ event: "relay.channel.peer_renumbered", channelId: frame.channelId, channel: state.channel, connectionEpoch: this.epoch,
+      receivedCursor: state.receivedCursor, seq: frame.seq, evidence, issuedAt: frame.issuedAt, lastReceivedIssuedAt: state.numbering?.lastIssuedAt ?? null },
+    "holder restarted its numbering; accepting it as new frames");
   }
 
   private current(channelId: string, state: ChannelState, generation: number): boolean {

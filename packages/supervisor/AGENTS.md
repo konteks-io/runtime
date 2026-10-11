@@ -68,6 +68,13 @@ QA browser, structured results, updates and doctor/support.
   update probation (`updateProbation`) takes no new work. Native runners stop
   side by side (`Promise.allSettled`). `reapStrayServers` touches only
   `<root>/releases/`.
+- **Holder renumbering** (`relay/holder-numbering.ts`): a holder-bound
+  to_runtime frame at or below the receive cursor is a replay unless it
+  starts a new numbering at seq 1 with evidence (a different frame at a
+  remembered seq, or a holder `issuedAt` later than any received, kept
+  durably as `lastReceivedIssuedAt`). Then the cursor rebases and
+  `relay.channel.peer_renumbered` is logged. A replay keeps its `issuedAt`
+  and body and is always dropped; Core-bound channels dedupe on seq alone.
 - **Host agents never fail the connector.** A listed host agent the load cannot
   find or verify is returned in `unavailableAgents` and parked with
   `NativeAgentRetry` (`parkUnavailableHostAgent`).

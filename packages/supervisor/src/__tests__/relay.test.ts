@@ -110,6 +110,92 @@ describe("channel mux", () => {
     expect(second.resets).toEqual([]);
   });
 
+  describe("holder renumbering (D64)", () => {
+    type Durable = import("../relay/channel-mux.js").RelayDurableState;
+    const at = (seconds: number) => new Date(Date.parse("2026-09-06T00:00:00Z") + seconds * 1_000).toISOString();
+    const cancel = (n: number) => ({ kind: "acp", method: "session/cancel", params: { sessionId: `acp-${n}` } });
+    const prompt = (id: string) => ({ kind: "acp", method: "session/prompt", id, params: { sessionId: "acp", prompt: [{ type: "text", text: "Next question." }] } });
+    const holderFrame = (seq: number, issuedAt: string, body: unknown, connectionEpoch = 1) =>
+      ({ channel: "session", direction: "to_runtime", channelId: "session:s", connectionEpoch, seq, issuedAt, body });
+    const delivered = (frames: ToRuntimeRelayFrame[]) => frames.map(frame => [frame.seq, (frame.body as { id?: string; params: { sessionId?: string } }).id ?? frame.body.params.sessionId]);
+    const acks = (emitted: ReturnType<typeof buildMux>["emitted"]) =>
+      emitted.filter(envelope => "kind" in envelope && envelope.kind === "ack" && envelope.dataDirection === "to_runtime").map(ack => (ack as RelayAck).cumulativeSeq);
+
+    async function receivedFive(overrides: Partial<MuxOptions> = {}) {
+      const f = buildMux(overrides);
+      await f.mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: [] });
+      for (let seq = 1; seq <= 5; seq += 1) await f.mux.receive(holderFrame(seq, at(seq), cancel(seq)));
+      return f;
+    }
+
+    it("delivers a restarted holder's seq 1 and 2 in order, acknowledges 2, and still drops a replay of the old seq 3", async () => {
+      const logger = createLogger({ name: "mux-test", silent: true });
+      const warn = vi.spyOn(logger, "warn");
+      const f = await receivedFive({ logger });
+      await f.mux.receive(holderFrame(3, at(3), cancel(3)));
+      expect(f.frames).toHaveLength(5);
+
+      await f.mux.receive(holderFrame(1, at(60), prompt("new-1")));
+      await f.mux.receive(holderFrame(2, at(61), cancel(99)));
+      await f.mux.receive(holderFrame(3, at(3), cancel(3)));
+      f.mux.tick();
+
+      expect(delivered(f.frames).slice(5)).toEqual([[1, "new-1"], [2, "acp-99"]]);
+      expect(acks(f.emitted).at(-1)).toBe(2);
+      expect(f.mux.handshakeCursors()["session:s"]?.to_runtime).toBe(2);
+      expect(f.mux.counters.duplicates).toBe(2);
+      expect(f.stalls).toEqual([]);
+      const renumbered = warn.mock.calls.find(([fields]) => (fields as { event?: string }).event === "relay.channel.peer_renumbered");
+      expect(renumbered?.[0]).toMatchObject({ channelId: "session:s", receivedCursor: 5, seq: 1, evidence: "digest", issuedAt: at(60), lastReceivedIssuedAt: at(5) });
+      expect(JSON.stringify(renumbered)).not.toContain("Next question");
+    });
+
+    it("after a connector restart, accepts a renumbered seq 1 with a later holder timestamp and drops an old one", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "kr-relay-renumber-"));
+      const store = new SupervisorStore(dir);
+      await store.init();
+      let durable: Durable | null = null;
+      try {
+        await receivedFive({ persistRelayState: state => store.saveRelayState(state) });
+        durable = await new SupervisorStore(dir).relayState();
+      } finally { await rm(dir, { recursive: true, force: true }); }
+      expect(durable?.cursors["session:s"]).toMatchObject({ to_runtime: 5, lastReceivedIssuedAt: at(5) });
+
+      let persisted: Durable | undefined;
+      const restarted = buildMux({ persistRelayState: async state => { persisted = structuredClone(state); } });
+      restarted.mux.restoreDurableState(durable!, () => "session");
+      await restarted.mux.applyHandshake({ connectionEpoch: 2, resume: {}, reset: [] });
+      await restarted.mux.receive(holderFrame(1, at(1), cancel(1), 2));
+      expect(restarted.frames).toEqual([]);
+
+      await restarted.mux.receive(holderFrame(1, at(60), prompt("new-1"), 2));
+      expect(delivered(restarted.frames)).toEqual([[1, "new-1"]]);
+      expect(persisted?.cursors["session:s"]).toMatchObject({ to_runtime: 1, lastReceivedIssuedAt: at(60) });
+      restarted.mux.tick();
+      expect(acks(restarted.emitted).at(-1)).toBe(1);
+    });
+
+    it("asks for a re-handshake when a new numbering's first frame is missing instead of skipping it", async () => {
+      const f = await receivedFive();
+      await f.mux.receive(holderFrame(2, at(61), cancel(99)));
+      expect(f.frames).toHaveLength(5);
+      expect(f.stalls).toEqual(["session:s"]);
+      expect(f.mux.handshakeCursors()["session:s"]?.to_runtime).toBe(5);
+    });
+
+    it("keeps sequence-only dedup on a Core-bound channel", async () => {
+      const f = buildMux();
+      await f.mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: [] });
+      const drain = (seq: number, issuedAt: string) => ({ ...toRuntime("control", seq, 1), channel: "control", issuedAt,
+        body: { type: "drain", instanceId: "i", reason: "user", issuedAt, signature: "c2ln" } });
+      await f.mux.receive(drain(1, at(1)));
+      await f.mux.receive(drain(2, at(2)));
+      await f.mux.receive(drain(1, at(60)));
+      expect(f.frames.map(frame => frame.seq)).toEqual([1, 2]);
+      expect(f.mux.counters.duplicates).toBe(1);
+    });
+  });
+
   it("replays a fresh holder's channel immediately without advancing durable acknowledgement", async () => {
     const { mux, emitted } = buildMux();
     await mux.applyHandshake({ connectionEpoch: 7, resume: {}, reset: [] });

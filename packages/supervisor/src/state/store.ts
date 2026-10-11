@@ -112,7 +112,9 @@ export const DEFAULT_CONFIG: ConfigRecord["configuration"] = {
 
 const CursorsSchema = z.record(z.string(), z.object({ to_core: z.number().int().nonnegative(), to_runtime: z.number().int().nonnegative(),
   /** Highest to_core sequence ever allocated; absent in files written before it existed. */
-  allocated: z.number().int().nonnegative().optional() }).strict());
+  allocated: z.number().int().nonnegative().optional(),
+  /** The latest holder timestamp received on a holder-bound channel; absent before one was, and in older files. */
+  lastReceivedIssuedAt: z.string().min(1).max(64).optional() }).strict());
 type Cursors = z.infer<typeof CursorsSchema>;
 
 // Epoch zero means queued before this process's first handshake. It is a
