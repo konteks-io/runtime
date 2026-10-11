@@ -22,8 +22,6 @@ describe("the worktrees a viewer may preview (09-30)", () => {
     expect(afterRestart.get("delivery-1")).toBe(kept);
     expect(afterRestart.get("delivery-2")).toBeUndefined();
 
-    afterRestart.delete("delivery-1");
-    expect(new PreviewWorktreePermits(file).get("delivery-1")).toBeUndefined();
   });
 
   it("moves a session to the worktree its newest bootstrap prepared, and keeps it across a restart (D96)", async () => {

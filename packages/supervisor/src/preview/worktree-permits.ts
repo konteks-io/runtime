@@ -9,7 +9,7 @@ import { dirname } from "node:path";
  * on disk). A session that ends any other way keeps its entry too (D96: a
  * ticket's QA that failed, a drain for an update or a cancelled turn keeps
  * the changes on disk); a later bootstrap of the session replaces it. An
- * entry whose worktree is gone is dropped when read.
+ * entry whose worktree is gone is dropped when the store is loaded.
  */
 export class PreviewWorktreePermits {
   readonly #entries = new Map<string, string>();
@@ -31,10 +31,6 @@ export class PreviewWorktreePermits {
     if (this.#entries.get(sessionId) === cwd) return;
     this.#entries.set(sessionId, cwd);
     this.#save();
-  }
-
-  delete(sessionId: string): void {
-    if (this.#entries.delete(sessionId)) this.#save();
   }
 
   #save(): void {
