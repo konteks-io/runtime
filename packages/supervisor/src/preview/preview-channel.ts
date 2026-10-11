@@ -72,17 +72,20 @@ export class PreviewChannel {
     if (sessionId === null || !parsed.success) return this.malformed(channelId, sessionId, body);
     const chunk = parsed.data;
     if (this.disposed || !this.deps.lease.canOpenChannel("preview")) return this.refuseDraining(channelId, chunk);
-    if (this.resyncing.delete(channelId) && chunk.kind === "request" && chunk.body !== undefined) {
-      // Only a request with a body can be the tail of one whose start was lost.
-      this.counters.refusedAfterGap += 1;
-      this.forwarderFor(channelId, sessionId).refuseAfterGap(chunk);
-      return;
-    }
+    if (this.refuseInterruptedRequest(channelId, sessionId, chunk)) return;
     if (this.startsSession(channelId, sessionId, chunk)) {
       void this.startForViewer(channelId, sessionId, chunk);
       return;
     }
     this.forwarderFor(channelId, sessionId).handle(chunk);
+  }
+
+  private refuseInterruptedRequest(channelId: string, sessionId: string, chunk: PreviewToRuntimeChunk): boolean {
+    if (!this.resyncing.delete(channelId) || chunk.kind !== "request" || chunk.body === undefined) return false;
+    // Only a request with a body can be the tail of one whose start was lost.
+    this.counters.refusedAfterGap += 1;
+    this.forwarderFor(channelId, sessionId).refuseAfterGap(chunk);
+    return true;
   }
 
   private malformed(channelId: string, sessionId: string | null, body: unknown): void {

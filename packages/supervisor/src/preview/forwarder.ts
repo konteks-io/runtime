@@ -200,10 +200,7 @@ export class PreviewForwarder {
 
   handle(chunk: PreviewToRuntimeChunk): void {
     this.options.onActivity?.();
-    if (this.abandoned.has(chunk.streamId)) {
-      if (chunk.kind === "close" || (chunk.kind === "request" && chunk.final)) this.abandoned.delete(chunk.streamId);
-      return;
-    }
+    if (this.ignoreAbandoned(chunk)) return;
     switch (chunk.kind) {
       case "request":
         this.onRequest(chunk);
@@ -215,6 +212,12 @@ export class PreviewForwarder {
         this.drop(chunk.streamId, chunk.code ?? 1000, "closed by viewer");
         return;
     }
+  }
+
+  private ignoreAbandoned(chunk: PreviewToRuntimeChunk): boolean {
+    if (!this.abandoned.has(chunk.streamId)) return false;
+    if (chunk.kind === "close" || (chunk.kind === "request" && chunk.final)) this.abandoned.delete(chunk.streamId);
+    return true;
   }
 
   private onRequest(chunk: RequestChunk): void {
