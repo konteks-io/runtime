@@ -63,6 +63,12 @@ export interface MuxOptions {
   assignmentCursors?: () => { channelId: string; to_core: number; to_runtime: number } | null;
   onStall: (channelId: string) => void;
   onReset: (channelId: string) => void;
+  /**
+   * The relay lost `to_runtime` frames on a channel that resynchronises on a
+   * gap (preview): the receive cursor already moved past them. The owner
+   * aborts that channel's open streams; nothing else is touched.
+   */
+  onResync?: (channelId: string, gap: { expected: number; got: number }) => void;
   /** Persist the durable receive cursor (the authoritative cursor for to_runtime). */
   persistCursors: (cursors: Record<string, { to_core: number; to_runtime: number; allocated?: number | undefined }>) => Promise<void>;
   /** Production durability boundary: allocation, replay bytes and cursors in one atomic write. */
@@ -85,6 +91,21 @@ export interface MuxOptions {
  */
 function holderBound(channel: RelayChannel): boolean {
   return channel === "session" || channel === "preview";
+}
+
+/**
+ * Preview traffic is stateless HTTP/WebSocket proxying, and its sender (Core's
+ * grant holder) keeps the `to_runtime` replay, re-sending it only when its own
+ * socket re-attaches. The relay drops a holder's frame without closing the
+ * holder (`no_runtime` while this runtime reconnects, the preview stream cap,
+ * quota), and `replay_request` names `to_core` only, so nothing this runtime
+ * does brings the lost frames back. Re-handshaking the shared socket for such
+ * a gap never closed it (every later frame showed the same hole) and only
+ * dropped more frames and every other channel's work with it (D100). A gap
+ * here resynchronises that channel alone.
+ */
+function resyncsOnGap(channel: RelayChannel): boolean {
+  return channel === "preview";
 }
 
 /**
@@ -176,6 +197,8 @@ interface MuxCounters {
   duplicates: number;
   resets: number;
   stalls: number;
+  /** Receive gaps a preview channel skipped instead of re-handshaking the socket. */
+  resyncs: number;
 }
 
 export class ChannelMux {
@@ -196,7 +219,7 @@ export class ChannelMux {
   private openSendBatch: PendingSend[] | null = null;
   private readonly logger: Logger;
   private readonly recovery: RecoveryAuthority;
-  readonly counters: MuxCounters = { epochStale: 0, invalidFrames: 0, duplicates: 0, resets: 0, stalls: 0 };
+  readonly counters: MuxCounters = { epochStale: 0, invalidFrames: 0, duplicates: 0, resets: 0, stalls: 0, resyncs: 0 };
 
   constructor(private readonly options: MuxOptions) {
     this.logger = options.logger ?? createLogger({ name: "relay-mux" });
@@ -601,12 +624,19 @@ export class ChannelMux {
     "session readiness retained for endpoint delivery");
   }
 
+  /**
+   * A preview frame that could not be written stays retained and is not a
+   * reason to roll the shared socket: its holder sees the hole at the next
+   * frame, re-attaches, and asks for the replay (`replay_request`).
+   */
   private sendBatchFailed(batch: PendingSend[], error: unknown): void {
     if (this.openSendBatch === batch) this.openSendBatch = null;
     const stalled = new Set<string>();
-    for (const { channelId, seq } of batch) {
+    for (const { channelId, channel, seq } of batch) {
       this.logger.warn({ err: error, channelId, seq }, "relay outbound durability failed; retaining the frame without emitting");
-      if (!stalled.has(channelId)) { stalled.add(channelId); this.options.onStall(channelId); }
+      if (resyncsOnGap(channel) || stalled.has(channelId)) continue;
+      stalled.add(channelId);
+      this.options.onStall(channelId);
     }
   }
 
@@ -760,12 +790,16 @@ export class ChannelMux {
       return;
     }
     if (frame.seq !== state.receivedCursor + 1) {
-      // A gap on the receive side means the relay lost frames we never acked;
-      // the sender will replay from our cursor after a re-handshake.
-      this.logger.warn({ channelId: frame.channelId, expected: state.receivedCursor + 1, got: frame.seq }, "to_runtime sequence gap; requesting re-handshake");
-      this.counters.stalls += 1;
-      this.options.onStall(frame.channelId);
-      return;
+      if (resyncsOnGap(state.channel)) {
+        this.resync(frame.channelId, state, frame.seq);
+      } else {
+        // A gap on the receive side means the relay lost frames we never acked;
+        // the sender will replay from our cursor after a re-handshake.
+        this.logger.warn({ channelId: frame.channelId, expected: state.receivedCursor + 1, got: frame.seq }, "to_runtime sequence gap; requesting re-handshake");
+        this.counters.stalls += 1;
+        this.options.onStall(frame.channelId);
+        return;
+      }
     }
     await this.options.onFrame(frame);
     assertRecovery();
@@ -781,6 +815,22 @@ export class ChannelMux {
       state.framesSinceAck += 1;
       this.maybeAck(frame.channelId, state, false);
     });
+  }
+
+  /**
+   * Skip the frames the relay lost on this channel and take this one: its
+   * owner aborts the channel's open streams, so Core and the browser retry,
+   * and the acknowledgement that follows frees Core's replay of the lost
+   * frames. The socket and every other channel are untouched; to_core
+   * numbering continues.
+   */
+  private resync(channelId: string, state: ChannelState, got: number): void {
+    const expected = state.receivedCursor + 1;
+    this.counters.resyncs += 1;
+    this.logger.warn({ event: "relay.channel.resync", channelId, channel: state.channel, connectionEpoch: this.epoch,
+      expected, got, skipped: got - expected }, "to_runtime sequence gap on a preview channel; resetting that channel only");
+    state.receivedCursor = got - 1;
+    this.options.onResync?.(channelId, { expected, got });
   }
 
   private current(channelId: string, state: ChannelState, generation: number): boolean {

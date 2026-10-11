@@ -119,6 +119,8 @@ interface PreviewForwarderCounters {
  * "No preview is running" it means nothing will appear until something changes.
  */
 export const COULD_NOT_START_PREFIX = "Preview could not start: ";
+/** The answer to a request that may have lost its start on the way here. */
+export const INTERRUPTED_MESSAGE = "The preview connection was interrupted. Reload to try again.";
 
 /** The plain 503 body for a session whose preview cannot be served: why it failed when it did, else that none runs. */
 export function notRunningMessage(failure: string | null, fallback: string): string {
@@ -137,6 +139,8 @@ const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
 export class PreviewForwarder {
   private readonly streams = new Map<string, HttpStream | WsStream>();
+  /** Streams this side closed, with when: a chunk Core sent before it saw the close is not a new request. */
+  private readonly abandoned = new Map<string, number>();
   private readonly logger: Logger;
   private readonly now: () => number;
   private readonly limits: PreviewForwarderLimits;
@@ -166,11 +170,25 @@ export class PreviewForwarder {
   }
 
   /** Close every stream (the preview stopped or the channel reset); each viewer stream is told. */
-  closeAll(code = 1001): void {
-    for (const id of [...this.streams.keys()]) {
-      this.drop(id, code, "preview stopped");
+  closeAll(code = 1001, reason = "preview stopped"): number {
+    const ids = [...this.streams.keys()];
+    for (const id of ids) {
+      this.drop(id, code, reason);
+      this.abandoned.set(id, this.now());
       this.options.send({ streamId: id, kind: "close", code, final: true });
     }
+    return ids.length;
+  }
+
+  /**
+   * The first request chunk after the relay lost frames on this channel may
+   * be the rest of a request whose start was lost: answer it with a 503 the
+   * viewer retries, and ignore the rest of that stream.
+   */
+  refuseAfterGap(chunk: RequestChunk): void {
+    if (this.abandoned.has(chunk.streamId) || this.streams.has(chunk.streamId)) return this.handle(chunk);
+    if (!chunk.final) this.abandoned.set(chunk.streamId, this.now());
+    this.reply(chunk.streamId, 503, INTERRUPTED_MESSAGE);
   }
 
   dispose(): void {
@@ -182,6 +200,10 @@ export class PreviewForwarder {
 
   handle(chunk: PreviewToRuntimeChunk): void {
     this.options.onActivity?.();
+    if (this.abandoned.has(chunk.streamId)) {
+      if (chunk.kind === "close" || (chunk.kind === "request" && chunk.final)) this.abandoned.delete(chunk.streamId);
+      return;
+    }
     switch (chunk.kind) {
       case "request":
         this.onRequest(chunk);
@@ -529,6 +551,7 @@ export class PreviewForwarder {
 
   private sweepIdle(): void {
     const cutoff = this.now() - this.limits.idleStreamTimeoutMs;
+    for (const [id, closedAt] of [...this.abandoned]) if (closedAt < cutoff) this.abandoned.delete(id);
     for (const [id, stream] of [...this.streams]) {
       if (stream.lastActivityAt >= cutoff) continue;
       this.counters.idleClosed += 1;

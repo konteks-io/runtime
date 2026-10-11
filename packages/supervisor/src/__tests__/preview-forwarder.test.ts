@@ -331,7 +331,7 @@ describe("preview channel on the supervisor", () => {
     f.setCanOpen(true);
     f.instance.onToRuntime("preview:s", { streamId: "m", kind: "request", method: "TRACE", path: "/", headers: {}, final: true });
     expect(bodies(f.sent)[1]).toMatchObject({ streamId: "m", status: 400 });
-    expect(f.instance.counters).toEqual({ malformed: 1, refusedDraining: 1, autoStarted: 0, couldNotStart: 0 });
+    expect(f.instance.counters).toEqual({ malformed: 1, refusedDraining: 1, autoStarted: 0, couldNotStart: 0, resyncs: 0, refusedAfterGap: 0 });
   });
 
   it("starts the preview for a viewer's first request when nothing runs, and says it is starting", async () => {

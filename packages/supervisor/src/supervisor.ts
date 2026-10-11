@@ -660,6 +660,8 @@ export class Supervisor {
         ? { assignmentCursors: () => this.assignmentSender?.relayCursors() ?? null }
         : {}),
       onStall: (channelId) => this.relay?.rehandshake(`stall:${channelId}`),
+      // A preview gap resets that channel's streams only; the socket stays (D100).
+      onResync: (channelId) => this.previewChannel?.resyncChannel(channelId),
       onReset: (channelId) => void this.onChannelReset(channelId)
         .catch(error => this.logger.error({ err: error, channelId }, "channel reset handling failed")),
       persistCursors: (cursors) => this.store.saveCursors(cursors),
