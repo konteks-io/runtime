@@ -18,6 +18,7 @@ import { renderStructuredOutputContract } from "@konteks/agent-core";
 import type { RunnerPort } from "../runner-port.js";
 import { TransportManager } from "../transport/relay-transport.js";
 import type { PreviewStatus } from "../preview/process-manager.js";
+import { PreviewWorktreePermits } from "../preview/worktree-permits.js";
 import type { OutboundMessage } from "../transport/transport.js";
 import { RunnerEventBus } from "../../../agent-runner/src/events.js";
 import { InMemorySessionRefStore, SessionManager } from "../../../agent-runner/src/sessions/manager.js";
@@ -267,7 +268,7 @@ describe("relayed session", () => {
   describe("preview tools (native preview)", () => {
     function previewAccess() {
       const status = (sessionId: string, state: "running" | "stopped"): PreviewStatus => ({ sessionId, state, phase: null, url: null, port: null, command: null, install: null, prepare: null, source: null, explanation: null, notes: [], message: state, startedAt: null, readyAt: null, idleStopMinutes: 30, logTail: [], startedBy: null });
-      return { start: vi.fn(async (sessionId: string) => status(sessionId, "running")), stop: vi.fn(async (sessionId: string) => status(sessionId, "stopped")), status: vi.fn((sessionId: string) => status(sessionId, "running")), touch: vi.fn(), permit: vi.fn(), forget: vi.fn() };
+      return { start: vi.fn(async (sessionId: string) => status(sessionId, "running")), stop: vi.fn(async (sessionId: string) => status(sessionId, "stopped")), status: vi.fn((sessionId: string) => status(sessionId, "running")), touch: vi.fn(), permit: vi.fn() };
     }
 
     it("mounts the session's preview tools beside the platform facade, bound to its session and worktree", async () => {
@@ -289,14 +290,26 @@ describe("relayed session", () => {
       await expect(fetch(tools.url, { method: "POST", headers: { authorization: tools.headers[0]!.value }, body: "{}" })).rejects.toThrow();
     });
 
-    it("lets a viewer start the preview in the session's worktree while the session lasts", async () => {
-      const preview = previewAccess();
-      const f = await build({ preview });
-      await f.session.bootstrap();
-      expect(preview.permit).toHaveBeenCalledWith("s", "/private/native/checkout");
-      expect(preview.forget).not.toHaveBeenCalled();
-      await f.session.close("cancelled");
-      expect(preview.forget).toHaveBeenCalledWith("s");
+    it("keeps the session's worktree openable by a viewer however the session ends, across a restart (D96)", async () => {
+      const data = await mkdtemp(join(tmpdir(), "permits-"));
+      try {
+        const file = join(data, "preview-worktrees.json");
+        // A delivery's QA that failed (agent exit), a drain for an update and a
+        // cancelled turn all keep the changes on disk: the dev server stops,
+        // the permit stays.
+        for (const reason of ["agent_exited", "drain", "cancelled"] as const) {
+          const permits = new PreviewWorktreePermits(file, () => true);
+          const preview = { ...previewAccess(), permit: vi.fn((sessionId: string, cwd: string) => permits.set(sessionId, cwd)) };
+          const f = await build({ preview });
+          await f.session.bootstrap();
+          expect(preview.permit).toHaveBeenCalledWith("s", "/private/native/checkout");
+          await f.session.close(reason);
+          expect(preview.stop).toHaveBeenCalledWith("s", reason);
+          expect(new PreviewWorktreePermits(file, () => true).get("s")).toBe("/private/native/checkout");
+        }
+      } finally {
+        await rm(data, { recursive: true, force: true });
+      }
     });
 
     it("gives planning sessions no preview tools", async () => {
@@ -314,7 +327,7 @@ describe("relayed session", () => {
   describe("QA browser (a connector capability: every agent)", () => {
     function access(origin: () => string | null) {
       const status = (sessionId: string) => ({ sessionId, state: "running" as const, phase: null, url: null, port: null, command: null, install: null, prepare: null, source: null, explanation: null, notes: [], message: "running", startedAt: null, readyAt: null, idleStopMinutes: 30, logTail: [], startedBy: null });
-      return { start: vi.fn(async (sessionId: string) => status(sessionId)), stop: vi.fn(async (sessionId: string) => status(sessionId)), status: vi.fn(status), touch: vi.fn(), permit: vi.fn(), forget: vi.fn(),
+      return { start: vi.fn(async (sessionId: string) => status(sessionId)), stop: vi.fn(async (sessionId: string) => status(sessionId)), status: vi.fn(status), touch: vi.fn(), permit: vi.fn(),
         origin: vi.fn((_sessionId: string) => origin()), browsersPath: "/private/native/browsers" };
     }
     const viaProxy = (proxyUrl: string, url: string) => new Promise<{ status: number; body: string }>((resolve, reject) => {
@@ -1131,7 +1144,7 @@ describe("relayed session", () => {
       await new Promise<void>(resolve => upstream.listen(0, "127.0.0.1", resolve));
       const origin = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
       const status = (sessionId: string) => ({ sessionId, state: "running" as const, phase: null, url: null, port: null, command: null, install: null, prepare: null, source: null, explanation: null, notes: [], message: "running", startedAt: null, readyAt: null, idleStopMinutes: 30, logTail: [], startedBy: null });
-      const preview = { start: vi.fn(async (sessionId: string) => status(sessionId)), stop: vi.fn(async (sessionId: string) => status(sessionId)), status: vi.fn(status), touch: vi.fn(), permit: vi.fn(), forget: vi.fn(),
+      const preview = { start: vi.fn(async (sessionId: string) => status(sessionId)), stop: vi.fn(async (sessionId: string) => status(sessionId)), status: vi.fn(status), touch: vi.fn(), permit: vi.fn(),
         origin: vi.fn((_sessionId: string) => origin), browsersPath: "/private/native/browsers" };
       const f = await build({ preview,
         policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true) }, { ...agyWork, kind: "qa", agentRoute: { requiredRole: "qa", agentId: "antigravity" } } as RemoteWorkAssignment);

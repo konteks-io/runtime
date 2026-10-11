@@ -24,8 +24,9 @@ interface PreviewChannelDeps {
      * A viewer asked for a preview that is not running. Start it (same process
      * manager, inference and caps as preview_start) when this session's
      * worktree exists and a preview is permitted; true while one is starting,
-     * `{ reason }` when it cannot start (it failed and is not retried yet, or
-     * there is nothing to serve), false when a start is not possible here.
+     * `{ reason }` when it cannot start (no worktree here, it failed and is
+     * not retried yet, nothing to serve, this computer takes no work), false
+     * to let the forwarder answer as it always has.
      */
     autoStart?(sessionId: string): Promise<boolean | { reason: string }>;
     /** The person's reason the session's last start failed, while it is failed; null otherwise. */
@@ -46,6 +47,8 @@ const CAPACITY_POLL_MS = 25;
  */
 export const STARTING_MESSAGE = "Starting preview. This page refreshes when it is ready.";
 const CAPACITY_WAIT_MS = 120_000;
+/** A viewer's start that threw: never "nothing yet", which would refresh forever. */
+const AUTO_START_FAILED_REASON = "This computer could not start the preview. Try again in a moment.";
 
 export class PreviewChannel {
   private readonly forwarders = new Map<string, PreviewForwarder>();
@@ -94,11 +97,12 @@ export class PreviewChannel {
   }
 
   private async startForViewer(channelId: string, sessionId: string, chunk: Extract<PreviewToRuntimeChunk, { kind: "request" }>): Promise<void> {
-    let started: boolean | { reason: string } = false;
+    let started: boolean | { reason: string };
     try {
       started = await this.deps.previews.autoStart!(sessionId);
     } catch (error) {
-      this.logger.warn({ event: "preview.auto_start_failed", err: error }, "a viewer's preview could not be started");
+      this.logger.warn({ event: "preview.auto_start_failed", sessionId, err: error }, "a viewer's preview could not be started");
+      started = { reason: AUTO_START_FAILED_REASON };
     }
     if (started === true) {
       this.counters.autoStarted += 1;
