@@ -171,6 +171,20 @@ async function fixture(sourceFiles: Record<string, string> = { "src/app.txt": "o
     revoke: () => {
       allowed = false;
     },
+    advanceSkillRevision: () => {
+      const skill = selection.skills.skills[0];
+      if (!skill) throw new Error("fixture has no selected Skill");
+      skill.version = "2";
+      selection.skills.catalogDigest = computeRemoteSkillCatalogDigest({
+        version: selection.skills.version,
+        binding: selection.skills.binding,
+        skills: selection.skills.skills,
+      });
+    },
+    nextClaim: () => {
+      claim = "claim-2";
+      selection.claimId = claim;
+    },
     unclaim: () => {
       claim = null;
     },
@@ -262,6 +276,38 @@ describe("native authorized input composition", () => {
       other = await createNativeInputPreparer(g.options)(assignment);
     g.unclaim();
     await expect(other.beforePrompt()).rejects.toThrow();
+  });
+  it("refuses a cached native Skill context when Core selects a newer revision", async () => {
+    const f = await fixture(),
+      prepared = await createNativeInputPreparer(f.options)(assignment);
+
+    f.advanceSkillRevision();
+
+    await expect(prepared.prepareNativeLoad!()).rejects.toMatchObject({
+      code: "capability_unavailable",
+      diagnostic: "session_inputs_changed",
+      message: expect.stringMatching(/replace this execution context/i),
+    });
+    await expect(prepared.admitNativeLoad!(prepared.readOnlyRoots ?? [])).rejects.toMatchObject({
+      code: "capability_unavailable",
+      diagnostic: "session_inputs_changed",
+      message: expect.stringMatching(/replace this execution context/i),
+    });
+  });
+  it("stages a newer Skill snapshot on the next claim without replacing the session workspace", async () => {
+    const f = await fixture(),
+      prepare = createNativeInputPreparer(f.options),
+      first = await prepare(assignment);
+    await writeFile(join(first.cwd, "session-note.md"), "preserved session work");
+
+    f.advanceSkillRevision();
+    f.nextClaim();
+    const next = await prepare(assignment);
+
+    expect(next.cwd).toBe(first.cwd);
+    expect(await readFile(join(next.cwd, "session-note.md"), "utf8")).toBe("preserved session work");
+    expect(next.nativeSkills).toEqual([{ skillId: "review", version: "2" }]);
+    expect(next.readOnlyRoots).not.toEqual(first.readOnlyRoots);
   });
   it("requires a local claim before fetching or staging", async () => {
     const f = await fixture();

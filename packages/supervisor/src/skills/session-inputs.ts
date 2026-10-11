@@ -135,8 +135,15 @@ async function observedSkillProof(skillId: string, evidence?: (skillId: string) 
 }
 
 /** Rebuild known freshness refusals from fixed copy; never relay adapter error text. */
-export function safeSkillFreshnessRejection(error: unknown): RemoteInstanceError | undefined {
+export function safeSessionInputRejection(error: unknown): RemoteInstanceError | undefined {
   if (!(error instanceof RemoteInstanceError) || error.code !== "capability_unavailable") return undefined;
+  if (error.diagnostic === "selection_digest_mismatch") {
+    return new RemoteInstanceError(
+      "capability_unavailable",
+      "The authorized session inputs changed. Replace this execution context before retrying.",
+      { diagnostic: "session_inputs_changed" },
+    );
+  }
   const failure = error.diagnostic?.replace(/^skill_freshness_/, "");
   if (!failure || error.diagnostic !== `skill_freshness_${failure}` || !Object.hasOwn(freshnessMessages, failure)) return undefined;
   return freshnessError(failure as SkillFreshnessFailure);

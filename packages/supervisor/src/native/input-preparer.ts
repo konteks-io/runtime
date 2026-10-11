@@ -21,7 +21,7 @@ import {
 import {
   prepareDirectSessionInputs,
   prepareOrganizationSkillSession,
-  safeSkillFreshnessRejection,
+  safeSessionInputRejection,
   type PreparedSessionInputs,
 } from "../skills/session-inputs.js";
 import { continuedSession, isDirectAssignment } from "../work/continued-session.js";
@@ -785,7 +785,7 @@ class InputPreparation {
           this.options.logger?.warn({ event: "native.inputs.recheck_failed", assignmentId: this.assignment.id,
             attempt: this.assignment.attempt, ...failureFields(error, "local_verification_failed") },
           "Inputs could not be rechecked before the prompt");
-          throw safeSkillFreshnessRejection(error) ?? unavailable();
+          throw safeSessionInputRejection(error) ?? unavailable();
         } finally {
           prompting = false;
         }
