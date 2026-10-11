@@ -486,6 +486,23 @@ describe("native runtime relay handshake validation boundary", () => {
     } finally { f.client.stop(); }
   });
 
+  it("leaves holder replay to the relay only when its upgrade response names holder-replay-request-v1 (D64)", async () => {
+    for (const [header, expected] of [["other-v1, holder-replay-request-v1", true], ["holder-replay-request-v2", false], [undefined, false]] as const) {
+      const socket = new Socket(), key = generateInstanceKey();
+      const mux = { connectionEpoch: 0, disconnected: vi.fn(), handshakeCursors: () => ({}), applyHandshake: vi.fn(async () => undefined), receive: vi.fn(async () => undefined), requestReplay: vi.fn(async () => undefined) };
+      const client = new RelayClient({ relayUrl: "wss://relay.example/runtime", instanceId: () => "instance", runnerIncarnation: () => "process",
+        lease: () => "lease", key: () => key, clock: new FixedClock(Date.parse(confirmed.runtimeReconciliation.acceptedAt)), mux: mux as never,
+        createWebSocket: () => socket as never });
+      try {
+        client.start();
+        socket.emit("upgrade", { headers: header === undefined ? {} : { "konteks-relay-features": header } });
+        socket.emit("open");
+        socket.message(confirmed); await flush();
+        expect(mux.applyHandshake).toHaveBeenCalledWith(confirmed, { holderReplayOnRequest: expected });
+      } finally { client.stop(); }
+    }
+  });
+
   it("waits for async validation before epoch adoption, outbound replay and connected notification", async () => {
     const gate = Promise.withResolvers<void>();
     const f = fixture({ validateHandshake: () => gate.promise });
@@ -494,7 +511,7 @@ describe("native runtime relay handshake validation boundary", () => {
       expect(f.mux.applyHandshake).not.toHaveBeenCalled(); expect(f.client.connected).toBe(false);
       expect(f.client.emit({} as never)).toBe(false);
       gate.resolve(); await flush();
-      expect(f.mux.applyHandshake).toHaveBeenCalledWith(confirmed); expect(f.onConnected).toHaveBeenCalledWith(confirmed);
+      expect(f.mux.applyHandshake).toHaveBeenCalledWith(confirmed, { holderReplayOnRequest: false }); expect(f.onConnected).toHaveBeenCalledWith(confirmed);
       expect(f.client.connected).toBe(true);
     } finally { f.client.stop(); }
   });

@@ -110,6 +110,168 @@ describe("channel mux", () => {
     expect(second.resets).toEqual([]);
   });
 
+  describe("holder-bound replay after a reconnect (D64)", () => {
+    type Durable = import("../relay/channel-mux.js").RelayDurableState;
+    const closed = (assignmentId: string) => ({ kind: "session_closed", assignmentId, reason: "completed" } as const);
+    const ready = (assignmentId: string) => ({ kind: "session_ready", assignmentId, acpSessionRef: "acp", agentId: "codex", resumed: true, capabilities: { forkSession: false, sessionUsage: false } }) as never;
+    const sessionSeqs = (emitted: ReturnType<typeof buildMux>["emitted"], channelId: string) =>
+      emitted.filter(frame => "seq" in frame && frame.channelId === channelId).map(frame => (frame as ToCoreRelayFrame).seq);
+    const holderAck = (channelId: string, cumulativeSeq: number, connectionEpoch: number) => ({ kind: "ack", channelId, connectionEpoch, cumulativeSeq,
+      issuedAt: "2026-09-06T00:00:00Z", dataDirection: "to_core", origin: "grant_holder", grantId: "grant" });
+    /** The App holder's rule (attach-holder/relay-session.ts onDataFrame): drop at or below its durable cursor, refuse a gap. */
+    const holder = (acked: number) => ({ acked, received: [] as number[], gap: false,
+      take(seqs: number[]) { for (const seq of seqs) { if (seq <= this.acked) continue; if (seq !== this.acked + 1) { this.gap = true; return; } this.received.push(seq); this.acked = seq; } } });
+
+    async function persistedMux(): Promise<{ f: ReturnType<typeof buildMux>; durable: () => Durable | undefined }> {
+      let durable: Durable | undefined;
+      const f = buildMux({ persistRelayState: async state => { durable = structuredClone(state); } });
+      await f.mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: [] });
+      return { f, durable: () => durable };
+    }
+
+    it("keeps a retained session's replay off the handshake and the recovery release, and sends it when a holder asks", async () => {
+      const { f, durable } = await persistedMux();
+      f.mux.send("session:ended", "session", ready("turn-body"));
+      f.mux.send("session:ended", "session", closed("turn-body"));
+      await vi.waitFor(() => expect(durable()?.outbound["session:ended"]).toHaveLength(2));
+      const logger = createLogger({ name: "mux-test", silent: true });
+      const info = vi.spyOn(logger, "info");
+      const restarted = buildMux({ logger });
+      restarted.clock.advance(6 * 24 * 60 * 60_000);
+      restarted.mux.restoreDurableState(durable()!, () => "session");
+
+      await restarted.mux.applyHandshake({ connectionEpoch: 2, reset: [], resume: { "session:ended": { to_core: 0, to_runtime: 0 } } }, { holderReplayOnRequest: true });
+      restarted.mux.resumeAfterRecovery();
+
+      expect(sessionSeqs(restarted.emitted, "session:ended")).toEqual([]);
+      expect(restarted.resets).toEqual([]);
+      const held = info.mock.calls.find(([fields]) => (fields as { event?: string }).event === "relay.holder_replay.held");
+      expect(held?.[0]).toEqual({ event: "relay.holder_replay.held", connectionEpoch: 2, channels: 1, frames: 2, oldestUnackedAgeMs: 6 * 24 * 60 * 60_000 });
+      expect(JSON.stringify(held)).not.toContain("turn-body");
+
+      await restarted.mux.requestReplay({ kind: "replay_request", channelId: "session:ended", dataDirection: "to_core", connectionEpoch: 2 });
+      expect(sessionSeqs(restarted.emitted, "session:ended")).toEqual([1, 2]);
+      expect(restarted.mux.handshakeCursors()["session:ended"]).toEqual({ to_core: 0, to_runtime: 0 });
+    });
+
+    it("gives the holder every frame of a new prompt, in order, after a direct session sat idle over 24 h with an unacknowledged frame", async () => {
+      const { f, durable } = await persistedMux();
+      f.mux.send("session:direct-s", "session", ready("turn-1"));
+      f.mux.send("session:direct-s", "session", closed("turn-1-update"));
+      await vi.waitFor(() => expect(sessionSeqs(f.emitted, "session:direct-s")).toEqual([1, 2]));
+      await f.mux.receive(holderAck("session:direct-s", 2, 1));
+      // The page closed before the turn's last frame reached the holder.
+      f.mux.send("session:direct-s", "session", closed("turn-1"));
+      await vi.waitFor(() => expect(durable()?.outbound["session:direct-s"]?.map(entry => entry.frame.seq)).toEqual([3]));
+
+      const restarted = buildMux({ persistRelayState: async () => undefined });
+      restarted.clock.advance(3 * 24 * 60 * 60_000);
+      restarted.mux.restoreDurableState(durable()!, () => "session");
+      await restarted.mux.applyHandshake({ connectionEpoch: 2, resume: { "session:direct-s": { to_core: 2, to_runtime: 0 } }, reset: [] }, { holderReplayOnRequest: true });
+      restarted.mux.resumeAfterRecovery();
+      expect(sessionSeqs(restarted.emitted, "session:direct-s")).toEqual([]);
+
+      // The person sends a new prompt: the new turn's frames are sent at once, the kept frame ahead of them.
+      expect([restarted.mux.send("session:direct-s", "session", ready("turn-2")),
+        restarted.mux.send("session:direct-s", "session", closed("turn-2-update")),
+        restarted.mux.send("session:direct-s", "session", closed("turn-2"))]).toEqual([4, 5, 6]);
+      await vi.waitFor(() => expect(sessionSeqs(restarted.emitted, "session:direct-s")).toEqual([3, 4, 5, 6]));
+      expect(restarted.emitted.every(frame => (frame as ToCoreRelayFrame).connectionEpoch === 2)).toBe(true);
+
+      // The holder (durable cursor 2) gets them from the relay's parked queue, then the replay it asks for on attach.
+      const page = holder(2);
+      page.take(sessionSeqs(restarted.emitted, "session:direct-s"));
+      restarted.emitted.length = 0;
+      await restarted.mux.requestReplay({ kind: "replay_request", channelId: "session:direct-s", dataDirection: "to_core", connectionEpoch: 2 });
+      page.take(sessionSeqs(restarted.emitted, "session:direct-s"));
+      expect(page).toMatchObject({ received: [3, 4, 5, 6], gap: false, acked: 6 });
+
+      await restarted.mux.receive(holderAck("session:direct-s", 6, 2));
+      expect(restarted.mux.snapshot().find(channel => channel.channelId === "session:direct-s")).toMatchObject({ unacked: 0, stalled: false });
+      expect(restarted.resets).toEqual([]);
+    });
+  });
+
+  it("still re-sends a retained session's replay on every handshake to a relay that does not ask for it (D64)", async () => {
+    const { mux, emitted } = buildMux();
+    await mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: [] });
+    mux.send("session:s", "session", { kind: "session_closed", assignmentId: "a", reason: "completed" });
+    await vi.waitFor(() => expect(emitted).toHaveLength(1));
+    await mux.applyHandshake({ connectionEpoch: 2, resume: { "session:s": { to_core: 0, to_runtime: 0 } }, reset: [] });
+    expect(emitted.map(frame => (frame as ToCoreRelayFrame).connectionEpoch)).toEqual([1, 2]);
+  });
+
+  describe("handshake channel cap (D64)", () => {
+    const frameOf = (channelId: string, seq: number) => ({ frame: { channel: "session", direction: "to_core", channelId, connectionEpoch: 1, seq,
+      issuedAt: "2026-09-06T00:00:00Z", body: { kind: "session_closed", assignmentId: "a", reason: "completed" } } as ToCoreRelayFrame, bytes: 100, enqueuedAt: Date.parse("2026-09-06T00:00:00Z") });
+    function crowded() {
+      const logger = createLogger({ name: "mux-test", silent: true });
+      const info = vi.spyOn(logger, "info");
+      const f = buildMux({ logger, assignmentCursors: () => ({ channelId: "assignment:i", to_core: 4, to_runtime: 2 }) });
+      const cursors: import("../relay/channel-mux.js").RelayDurableState["cursors"] = {
+        "control:i": { to_core: 1, to_runtime: 1, allocated: 1 }, "heartbeat:i": { to_core: 9, to_runtime: 0, allocated: 9 } };
+      const outbound: import("../relay/channel-mux.js").RelayDurableState["outbound"] = {};
+      for (let n = 0; n < 600; n += 1) cursors[`session:quiet-${n}`] = { to_core: 3, to_runtime: 1, allocated: 3 };
+      for (let n = 0; n < 5; n += 1) {
+        cursors[`session:replay-${n}`] = { to_core: 1, to_runtime: 0, allocated: 2 };
+        outbound[`session:replay-${n}`] = [frameOf(`session:replay-${n}`, 2)];
+      }
+      f.mux.restoreDurableState({ cursors, outbound }, channelId => channelId.split(":")[0] as never);
+      return { ...f, info };
+    }
+
+    it("names at most maxHandshakeChannels: every Core-bound channel and every channel with replay, leaving out the oldest quiet ones", async () => {
+      const f = crowded();
+      await f.mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: [] });
+      f.clock.advance(1);
+      await f.mux.receive({ kind: "ack", channelId: "session:quiet-0", connectionEpoch: 1, cumulativeSeq: 3,
+        issuedAt: "2026-09-06T00:00:00Z", dataDirection: "to_core", origin: "grant_holder", grantId: "grant" });
+
+      const named = f.mux.handshakeCursors();
+      const ids = Object.keys(named);
+      expect(ids).toHaveLength(512);
+      expect(ids).toEqual(expect.arrayContaining(["control:i", "heartbeat:i", "assignment:i", "session:quiet-0",
+        ...Array.from({ length: 5 }, (_, n) => `session:replay-${n}`)]));
+      expect(ids).not.toContain("session:quiet-1");
+      expect(named["session:replay-0"]).toEqual({ to_core: 1, to_runtime: 0 });
+      const omitted = f.info.mock.calls.find(([fields]) => (fields as { event?: string }).event === "relay.handshake.channels_omitted");
+      expect(omitted?.[0]).toEqual({ event: "relay.handshake.channels_omitted", channels: 607, named: 511, omittedQuiet: 96, omittedWithReplay: 0, maxHandshakeChannels: 512 });
+    });
+
+    it("carries a new turn both ways on a direct session left out of this connection's handshake: holder prompt and Stop delivered, reply at N+1", async () => {
+      const f = crowded();
+      await f.mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: [] });
+      expect(f.mux.handshakeCursors()).not.toHaveProperty("session:quiet-0");
+      const toRuntime = (seq: number, body: unknown) => ({ channel: "session", direction: "to_runtime", channelId: "session:quiet-0", connectionEpoch: 1,
+        seq, issuedAt: "2026-09-06T00:00:00Z", body });
+
+      // Holder cursor M = 1 to_runtime, N = 3 to_core.
+      await f.mux.receive(toRuntime(2, { kind: "acp", method: "session/prompt", id: "p2", params: { sessionId: "acp", prompt: [{ type: "text", text: "Next question." }] } }));
+      await f.mux.receive(toRuntime(3, { kind: "acp", method: "session/cancel", params: { sessionId: "acp" } }));
+
+      expect(f.frames.map(frame => [frame.channelId, frame.seq, (frame.body as { method?: string }).method]))
+        .toEqual([["session:quiet-0", 2, "session/prompt"], ["session:quiet-0", 3, "session/cancel"]]);
+      f.mux.tick();
+      expect(f.emitted.filter(envelope => "kind" in envelope && envelope.kind === "ack" && envelope.channelId === "session:quiet-0")
+        .map(ack => (ack as RelayAck).cumulativeSeq)).toEqual([3]);
+      expect(f.mux.send("session:quiet-0", "session", { kind: "session_closed", assignmentId: "turn-2", reason: "cancelled" })).toBe(4);
+      await vi.waitFor(() => expect(f.emitted.filter(frame => "seq" in frame && frame.channelId === "session:quiet-0").map(frame => (frame as ToCoreRelayFrame).seq)).toEqual([4]));
+      expect(f.stalls).toEqual([]);
+      expect(f.resets).toEqual([]);
+      expect(f.mux.counters).toMatchObject({ duplicates: 0, invalidFrames: 0, epochStale: 0, stalls: 0, resets: 0 });
+    });
+
+    it("keeps a left-out channel's cursor so its next frame continues the numbering", async () => {
+      const f = crowded();
+      await f.mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: [] });
+      expect(f.mux.handshakeCursors()).not.toHaveProperty("session:quiet-0");
+      expect(f.mux.send("session:quiet-0", "session", { kind: "session_closed", assignmentId: "next", reason: "completed" })).toBe(4);
+      await vi.waitFor(() => expect(f.emitted.filter(frame => "seq" in frame && frame.channelId === "session:quiet-0").map(frame => (frame as ToCoreRelayFrame).seq)).toEqual([4]));
+      expect(f.mux.handshakeCursors()["session:quiet-0"]).toEqual({ to_core: 3, to_runtime: 1 });
+      expect(f.resets).toEqual([]);
+    });
+  });
+
   it("replays a fresh holder's channel immediately without advancing durable acknowledgement", async () => {
     const { mux, emitted } = buildMux();
     await mux.applyHandshake({ connectionEpoch: 7, resume: {}, reset: [] });
