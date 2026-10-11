@@ -52,10 +52,13 @@ QA browser, structured results, updates and doctor/support.
   `agent_runner` component always advertises `core-contract-version-v1`.
   Supported-agent detection (`NotAddedAgentsDetector`) never runs on the
   heartbeat path.
-- **Execution gate** (`native/execution-gate.ts`): a running agent stops only
-  when Core answers (fenced, denied, revision fence), never on a timeout;
-  renewals retry with backoff. `CoreClient.executionSigningKeys` serves the
-  last confirmed key set for a bounded time, never an unknown key id.
+- **Execution gate** (`native/execution-gate.ts`): a running agent survives
+  timeouts; renewals retry with backoff. A signed check outside its time window
+  (`expired` or `not_yet_valid`) is retried without adopting its authority;
+  new dispatch still requires a current verified lease. Core refusals, revision
+  fences, invalid signatures and authority mismatches stop the execution.
+  `CoreClient.executionSigningKeys` serves the last confirmed key set for a
+  bounded time, never an unknown key id.
 - **Owner refresh.** `NativeEnrollment` signs `issuedAt` Unix seconds from
   `clock.coreNow()` with the instance-key body. Core and Common require that
   field within a ±300s window; release the matched cohort before enforcing it.

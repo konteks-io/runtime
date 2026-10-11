@@ -342,6 +342,53 @@ it("retries a genuine check lease that expired on its way from a slow Core inste
   expect(() => f.gate.assertDispatchCurrent(operation.authority)).not.toThrow();
 });
 
+it("retries a genuine not-yet-valid direct check without accepting it or stopping the running agent", async () => {
+  vi.useFakeTimers();
+  const f = await fixture();
+  await f.journal.assignments.put({ ...f.journal.assignments.get("assignment:1")!, kind: "direct" });
+  const gate = f.makeGate({ assignment: directTurn });
+  const operation = await gate.admit(f.envelope);
+  await gate.begin(operation);
+  const normalCheck = f.client.checkExecution.getMockImplementation()!;
+  f.client.checkExecution.mockImplementationOnce(async () => {
+    const result = await normalCheck();
+    const claims = JSON.parse(Buffer.from(result.lease.split(".")[1]!, "base64url").toString("utf8"));
+    return { ...result, lease: signed({ ...claims, iat: Math.floor(f.clock.coreNow() / 1000) + 3 }) };
+  });
+
+  // The old lease has lapsed and Core's signed answer is ahead of the local
+  // estimate. Neither answer authorizes new dispatch, but neither revokes work.
+  f.advance(31_000);
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(f.onAuthorityLost).not.toHaveBeenCalled();
+  expect(() => gate.assertDispatchCurrent(operation.authority)).toThrow();
+
+  f.advance(1_000);
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(f.client.checkExecution).toHaveBeenCalledTimes(3);
+  expect(f.onAuthorityLost).not.toHaveBeenCalled();
+  expect(() => gate.assertDispatchCurrent(operation.authority)).not.toThrow();
+});
+
+it("still fences a direct check with an invalid signature even when its issuance is in the future", async () => {
+  vi.useFakeTimers();
+  const f = await fixture();
+  await f.journal.assignments.put({ ...f.journal.assignments.get("assignment:1")!, kind: "direct" });
+  const gate = f.makeGate({ assignment: directTurn });
+  const operation = await gate.admit(f.envelope);
+  await gate.begin(operation);
+  const normalCheck = f.client.checkExecution.getMockImplementation()!;
+  const untrusted = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  f.client.checkExecution.mockImplementationOnce(async () => {
+    const result = await normalCheck();
+    const claims = JSON.parse(Buffer.from(result.lease.split(".")[1]!, "base64url").toString("utf8"));
+    return { ...result, lease: signed({ ...claims, iat: Math.floor(f.clock.coreNow() / 1000) + 3 }, untrusted.privateKey) };
+  });
+  f.advance(5_000);
+  await vi.advanceTimersByTimeAsync(1_000);
+  await vi.waitFor(() => expect(f.onAuthorityLost).toHaveBeenCalledTimes(1));
+});
+
 it("still stops at once on Core's durable revision fence while renewals are failing", async () => {
   vi.useFakeTimers();
   const f = await fixture();
