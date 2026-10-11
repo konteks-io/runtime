@@ -13,7 +13,12 @@ import { posix, win32 } from "node:path";
  *   background shell runs, subagents (their tool calls never reach ACP),
  *   plugin_manager (self-modification), the goal round driver, ralph and
  *   workflow; and pins `deepseek-flash`, the catalog model a session can
- *   switch back to.
+ *   switch back to. With background runs off, a foreground command that
+ *   reaches dsh's 10-minute cap is killed rather than kept as a job (a
+ *   40-minute run was cut at 10 minutes, 10-11), so the cap is lifted: no
+ *   deadline on the person's own agent; Stop still ends any command. A
+ *   patch replaces a row's config, so bash's default timeout becomes the
+ *   executor's 2 minutes (dsh's base set 1), as PowerShell's already was.
  * - `konteks-dsh-ask.patch.yml` + `konteks-hooks.json` insert dsh's Claude
  *   Code hook bridge with a PreToolUse hook answering `ask` for every tool
  *   outside a read-only allowlist, so each such call reaches the runtime's
@@ -53,6 +58,12 @@ const ROWS_SINCE_0_1_7: ReadonlySet<string> = new Set(["deepseek-account", "llm-
 const ROWS_SINCE_0_1_7_VERSION = "0.1.7-rc.2";
 
 const DSH_KONTEKS_MODEL = { provider: "deepseek-official", model: "deepseek-flash" } as const;
+
+/**
+ * The longest a command may ask to run in the foreground. dsh needs a finite
+ * cap, and a Node timer waits at most 2^31-1 ms (about 24.8 days).
+ */
+export const DSH_COMMAND_CAP_MS = 2_147_483_647;
 
 interface DshProfileRowExpectation {
   id: string;
@@ -103,6 +114,12 @@ export function renderDshKonteksProfile(dir: string, platform: NodeJS.Platform):
     "- id: tool-pwsh",
     "  config:",
     "    enableRunInBackground: false",
+    "- id: bash-sandbox",
+    "  config:",
+    `    maxTimeoutMs: ${DSH_COMMAND_CAP_MS}`,
+    "- id: pwsh-sandbox",
+    "  config:",
+    `    maxTimeoutMs: ${DSH_COMMAND_CAP_MS}`,
     "",
   ].join("\n");
   const ask = [
