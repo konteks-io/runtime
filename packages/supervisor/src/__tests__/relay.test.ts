@@ -238,6 +238,29 @@ describe("channel mux", () => {
       expect(omitted?.[0]).toEqual({ event: "relay.handshake.channels_omitted", channels: 607, named: 511, omittedQuiet: 96, omittedWithReplay: 0, maxHandshakeChannels: 512 });
     });
 
+    it("carries a new turn both ways on a direct session left out of this connection's handshake: holder prompt and Stop delivered, reply at N+1", async () => {
+      const f = crowded();
+      await f.mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: [] });
+      expect(f.mux.handshakeCursors()).not.toHaveProperty("session:quiet-0");
+      const toRuntime = (seq: number, body: unknown) => ({ channel: "session", direction: "to_runtime", channelId: "session:quiet-0", connectionEpoch: 1,
+        seq, issuedAt: "2026-09-06T00:00:00Z", body });
+
+      // Holder cursor M = 1 to_runtime, N = 3 to_core.
+      await f.mux.receive(toRuntime(2, { kind: "acp", method: "session/prompt", id: "p2", params: { sessionId: "acp", prompt: [{ type: "text", text: "Next question." }] } }));
+      await f.mux.receive(toRuntime(3, { kind: "acp", method: "session/cancel", params: { sessionId: "acp" } }));
+
+      expect(f.frames.map(frame => [frame.channelId, frame.seq, (frame.body as { method?: string }).method]))
+        .toEqual([["session:quiet-0", 2, "session/prompt"], ["session:quiet-0", 3, "session/cancel"]]);
+      f.mux.tick();
+      expect(f.emitted.filter(envelope => "kind" in envelope && envelope.kind === "ack" && envelope.channelId === "session:quiet-0")
+        .map(ack => (ack as RelayAck).cumulativeSeq)).toEqual([3]);
+      expect(f.mux.send("session:quiet-0", "session", { kind: "session_closed", assignmentId: "turn-2", reason: "cancelled" })).toBe(4);
+      await vi.waitFor(() => expect(f.emitted.filter(frame => "seq" in frame && frame.channelId === "session:quiet-0").map(frame => (frame as ToCoreRelayFrame).seq)).toEqual([4]));
+      expect(f.stalls).toEqual([]);
+      expect(f.resets).toEqual([]);
+      expect(f.mux.counters).toMatchObject({ duplicates: 0, invalidFrames: 0, epochStale: 0, stalls: 0, resets: 0 });
+    });
+
     it("keeps a left-out channel's cursor so its next frame continues the numbering", async () => {
       const f = crowded();
       await f.mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: [] });
