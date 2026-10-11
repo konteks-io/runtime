@@ -43,15 +43,25 @@ export class PreviewViewerStarts {
 
   async start(sessionId: string): Promise<true | { reason: string }> {
     if (this.deps.previews.status(sessionId).state === "starting") return true;
-    if (!this.deps.takingWork()) return this.decline(sessionId, "not_taking_work", NOT_TAKING_WORK_REASON);
-    const cwd = this.deps.permits.get(sessionId);
-    if (cwd === undefined) return this.decline(sessionId, "no_worktree", NO_WORKTREE_REASON);
-    if (!(this.deps.exists ?? existsSync)(cwd)) return this.decline(sessionId, "worktree_missing", WORKTREE_GONE_REASON);
+    const cwd = this.permittedWorktree(sessionId);
+    if (typeof cwd !== "string") return cwd;
     const now = this.deps.now?.() ?? Date.now();
     const pending = pendingViewerRetry(this.#lastStart.get(sessionId), this.deps.previews.lastFailureFor(sessionId), now, this.deps.retryMs);
     if (pending !== null) return this.decline(sessionId, "retry_pending", pending);
     this.#lastStart.set(sessionId, now);
     const started = await this.deps.previews.start(sessionId, cwd, "viewer");
+    return this.startResult(sessionId, started);
+  }
+
+  private permittedWorktree(sessionId: string): string | { reason: string } {
+    if (!this.deps.takingWork()) return this.decline(sessionId, "not_taking_work", NOT_TAKING_WORK_REASON);
+    const cwd = this.deps.permits.get(sessionId);
+    if (cwd === undefined) return this.decline(sessionId, "no_worktree", NO_WORKTREE_REASON);
+    if (!(this.deps.exists ?? existsSync)(cwd)) return this.decline(sessionId, "worktree_missing", WORKTREE_GONE_REASON);
+    return cwd;
+  }
+
+  private startResult(sessionId: string, started: PreviewStatus): true | { reason: string } {
     if (started.state !== "starting" && started.state !== "running") {
       const reason = started.reason ?? this.deps.previews.lastFailureFor(sessionId)?.reason ?? REFUSED_REASON;
       return this.decline(sessionId, "refused", reason, started.state);
