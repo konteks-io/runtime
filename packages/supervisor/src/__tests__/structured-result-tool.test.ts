@@ -23,7 +23,8 @@ afterEach(async () => {
 });
 
 async function started(relistWaitMs = 150, onAccepted?: () => void) {
-  server = new StructuredResultToolServer({ relistWaitMs, ...(onAccepted ? { onAccepted } : {}) });
+  server = new StructuredResultToolServer({ relistWaitMs });
+  if (onAccepted) server.attach({ context: {}, onAccepted });
   const entry = await server.start();
   const auth = entry.headers[0]!.value;
   const post = async (body: unknown) => (await fetch(entry.url, { method: "POST", headers: { authorization: auth, "content-type": "application/json", accept: "application/json, text/event-stream" }, body: JSON.stringify(body) })).json() as Promise<{ result: Record<string, unknown> & { tools?: Array<Record<string, unknown>>; content?: Array<{ text: string }>; isError?: boolean } }>;

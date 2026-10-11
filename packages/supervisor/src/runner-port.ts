@@ -87,6 +87,8 @@ export interface RunnerPort {
   readiness(): Promise<{ agent: ConnectedAgentView; utilization: { activeSessions: number; activeTurns: number } }>;
   createSession(input: RunnerSessionInput, lifecycle?: RunnerSessionLifecycle): Promise<RunnerSessionCreated>;
   closeSession(ref: string, options?: { completed: true }): Promise<unknown>;
+  /** A warm integration session (new, never prompted) now runs this assignment's task; throws for any other session. */
+  adoptSession?(ref: string, context: RunnerSessionInput["context"]): void;
   /** Native stage one: tracked ACP settlement only, NEVER quiescence.
    * Retains the fenced live owner; no close-only fallback or finalization. */
   stopForRecovery?(ref: string): Promise<void>;

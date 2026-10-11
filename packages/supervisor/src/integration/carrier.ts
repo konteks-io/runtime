@@ -1,10 +1,11 @@
 import type { z } from "zod";
-import { RemoteInstanceError, createLogger, jcsDigest, type AgentTurnUsageObservation, type BoundedJsonValue, type JsonValue, type Logger, type RemoteWorkAssignment } from "@konteks/remote-common";
+import { REMOTE_ASSIGNMENT_AVAILABLE_MIN_CORE_CONTRACT_VERSION, RemoteInstanceError, coreContractAtLeast, createLogger, jcsDigest, type AgentTurnUsageObservation, type BoundedJsonValue, type JsonValue, type Logger, type RemoteWorkAssignment } from "@konteks/remote-common";
 import type { RunnerEvent } from "@konteks/remote-agent-runner";
 import {
   IntegrationSetupResultSchema,
   IntegrationTaskResultSchema,
   IntegrationWorkloadSchema,
+  REMOTE_INTEGRATION_CALLS_COMPLETE_CAPABILITY,
   REMOTE_INTEGRATION_TASK_CAPABILITY,
   integrationWorkloadDigest,
   type IntegrationTaskResult,
@@ -15,6 +16,7 @@ import type { WorkloadDefinition } from "../work/workload.js";
 import type { IntegrationDiscovery } from "./discovery.js";
 import { IntegrationTaskError } from "./errors.js";
 import { IntegrationSession } from "./session.js";
+import { WarmIntegrationSessions } from "./warm.js";
 import type { IntegrationSetupRunner } from "./setup.js";
 import type { IntegrationWriteLedger } from "./tool-gate.js";
 
@@ -41,6 +43,8 @@ export interface IntegrationWorkCarrier {
   execute(assignment: IntegrationWorkAssignment, assertCurrent: () => void): Promise<IntegrationWorkOutcome>;
   /** Runner events, so the carrier's own ACP session hears its permission requests and tool results. */
   onRunnerEvent(event: RunnerEvent): Promise<void>;
+  /** Close this agent's warm read session so a session that needs its execution slot gets it; true when one was closed. */
+  releaseWarmSession(agentId: string): Promise<boolean>;
 }
 
 /** The terminal result: like an onboard result, the structured output is the whole outcome. */
@@ -52,9 +56,11 @@ export function integrationTerminalResult(outcome: IntegrationWorkOutcome): { cl
 const INTEGRATION_AGENT_IDS: ReadonlySet<string> = new Set(["claude-code", "codex"]);
 
 /** `integration-task-v1` for the `agent_runner` component when a Claude Code or Codex runner is installed. */
-export function integrationTaskCapabilities(agentIds: Iterable<string>): string[] {
-  for (const agentId of agentIds) if (INTEGRATION_AGENT_IDS.has(agentId)) return [REMOTE_INTEGRATION_TASK_CAPABILITY];
-  return [];
+export function integrationTaskCapabilities(agentIds: Iterable<string>, coreContractVersion: string | undefined): string[] {
+  if (![...agentIds].some(agentId => INTEGRATION_AGENT_IDS.has(agentId))) return [];
+  // A locked read's `completesWhenCalled`, announced only to a Core that sends it.
+  return coreContractAtLeast(coreContractVersion, REMOTE_ASSIGNMENT_AVAILABLE_MIN_CORE_CONTRACT_VERSION)
+    ? [REMOTE_INTEGRATION_TASK_CAPABILITY, REMOTE_INTEGRATION_CALLS_COMPLETE_CAPABILITY] : [REMOTE_INTEGRATION_TASK_CAPABILITY];
 }
 
 /** E2E only: the connector serves `fixture_mcp` bindings when its process runs with `KONTEKS_E2E_NATIVE_CONNECTOR=1`. */
@@ -77,6 +83,8 @@ interface IntegrationTaskCarrierDeps {
   now?: () => number;
   /** After a cancel, how long a turn gets to end before its session is closed anyway. */
   cancelGraceMs?: number;
+  /** Keep a warm read session per agent for the next read; `idleMs` defaults to `WARM_SESSION_IDLE_MS`. */
+  warmSessions?: { idleMs?: number };
   logger?: Logger;
 }
 
@@ -105,9 +113,17 @@ function assignedTask(assignment: IntegrationWorkAssignment, workload: WorkloadD
 export class IntegrationTaskCarrier implements IntegrationWorkCarrier {
   private readonly sessions = new Set<IntegrationSession>();
   private readonly logger: Logger;
+  private readonly warm: WarmIntegrationSessions | undefined;
 
   constructor(private readonly deps: IntegrationTaskCarrierDeps) {
     this.logger = deps.logger ?? createLogger({ name: "integration-carrier" });
+    const warm = deps.warmSessions;
+    this.warm = warm ? new WarmIntegrationSessions({ instanceId: deps.instanceId, workspaceRoot: deps.workspaceRoot, logger: this.logger,
+      ...(warm.idleMs !== undefined ? { idleMs: warm.idleMs } : {}) }) : undefined;
+  }
+
+  async releaseWarmSession(agentId: string): Promise<boolean> {
+    return (await this.warm?.release(agentId)) === true;
   }
 
   async execute(assignment: IntegrationWorkAssignment, assertCurrent: () => void): Promise<IntegrationWorkOutcome> {
@@ -158,6 +174,7 @@ export class IntegrationTaskCarrier implements IntegrationWorkCarrier {
       ...(this.deps.now ? { now: this.deps.now } : {}),
       ...(this.deps.onUsage ? { onUsage: this.deps.onUsage } : {}),
       ...(this.deps.cancelGraceMs !== undefined ? { cancelGraceMs: this.deps.cancelGraceMs } : {}),
+      ...(this.warm ? { warm: this.warm } : {}),
       logger: this.logger,
     });
   }}

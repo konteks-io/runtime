@@ -1,6 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { chmod, mkdtemp, rm } from "node:fs/promises";
-import { join } from "node:path";
 import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import {
   BoundedJsonValueSchema,
@@ -15,11 +13,13 @@ import { RemoteInstanceError, createLogger, plainRecord, type AgentTurnUsageObse
 import type { RunnerEvent } from "@konteks/remote-agent-runner";
 import type { RunnerPort, RunnerSessionInput } from "../runner-port.js";
 import { McpToolCallLedger } from "../session/permission-tool-identity.js";
-import { STRUCTURED_RESULT_MCP_SERVER_NAME, StructuredResultToolServer, compileResultSchema } from "../structured-result/result-tool-server.js";
+import { STRUCTURED_RESULT_MCP_SERVER_NAME, compileResultSchema } from "../structured-result/result-tool-server.js";
 import { IntegrationTaskError } from "./errors.js";
 import { buildIntegrationPrompt } from "./prompt.js";
 import { IntegrationToolGate, type IntegrationWriteLedger } from "./tool-gate.js";
 import { TurnTiming } from "./turn-timing.js";
+import { closeIntegrationSession, openIntegrationSession, settledWithin, type IntegrationSessionShape, type OpenedIntegrationSession } from "./opened-session.js";
+import type { WarmIntegrationSessions } from "./warm.js";
 
 interface IntegrationSessionDeps {
   runner: RunnerPort;
@@ -33,11 +33,13 @@ interface IntegrationSessionDeps {
   onUsage?: (observation: AgentTurnUsageObservation) => Promise<void>;
   /** After a cancel, how long the turn gets to end before the session is closed anyway. */
   cancelGraceMs?: number;
+  /** The warm session a read may take, and opens again after it. */
+  warm?: WarmIntegrationSessions;
   logger?: Logger;
 }
 
 /** `submitted`: the agent handed in its result and no allowed call is still running; its closing words are not waited for. */
-type TurnEnd = { kind: "result" } | { kind: "submitted" } | { kind: "error"; class: string } | { kind: "exited" } | { kind: "deadline" } | { kind: "ungated" };
+type TurnEnd = { kind: "result" } | { kind: "submitted" } | { kind: "calls_returned" } | { kind: "error"; class: string } | { kind: "exited" } | { kind: "deadline" } | { kind: "ungated" };
 
 const TERMINAL = new Set(["completed", "failed"]);
 
@@ -90,11 +92,13 @@ function compiledResultSchema(spec: IntegrationTaskSpec): Record<string, unknown
 }
 
 /** Which MCP sources the session admits: the account's connectors, or the bound personal server (a fixture is served directly). */
-function integrationAdmission(source: IntegrationSource, fixture: unknown, assignment: RemoteWorkAssignment): NonNullable<RunnerSessionInput["integration"]> {
+function sessionShape(spec: IntegrationTaskSpec, source: IntegrationSource, assignment: RemoteWorkAssignment): IntegrationSessionShape {
+  const fixture = source.kind === "fixture_mcp" ? spec.fixtureServer : undefined;
   const sources = source.kind === "account_connector"
     ? { admittedMcpServerNames: [], accountConnectors: true }
     : { admittedMcpServerNames: fixture ? [] : [source.serverName], accountConnectors: false };
-  return { ...sources, ...utilityTurn(assignment) };
+  return { agentId: spec.agentId, admission: { ...sources, ...utilityTurn(assignment) },
+    ...(fixture ? { fixture: { name: source.serverName, url: fixture.url } } : {}) };
 }
 
 /**
@@ -172,14 +176,6 @@ function boundedUtf8(text: string, maxBytes: number): { content: string; truncat
 /** How long a finished read waits for its last events and its session close before it reports anyway. */
 const SETTLE_GRACE_MS = 15_000;
 
-/** Whether `work` settled within `ms`; it keeps running either way. */
-async function settledWithin(work: Promise<unknown>, ms: number): Promise<boolean> {
-  let timer: NodeJS.Timeout | undefined;
-  const timeout = new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), ms); timer.unref(); });
-  const done = await Promise.race([work.then(() => true, () => true), timeout]);
-  clearTimeout(timer);
-  return done;
-}
 
 export class IntegrationSession {
   private readonly logger: Logger;
@@ -213,52 +209,39 @@ export class IntegrationSession {
     const spec = this.spec;
     const now = this.deps.now ?? Date.now;
     const deadlineAt = now() + spec.limits.deadlineMs;
-    const source = admittedSource(spec, this.deps.e2eFixtures);
+    const shape = sessionShape(spec, admittedSource(spec, this.deps.e2eFixtures), this.assignment);
     const schema = compiledResultSchema(spec);
-    const fixture = source.kind === "fixture_mcp" ? spec.fixtureServer : undefined;
-    const cwd = await mkdtemp(join(this.deps.workspaceRoot, ".integration-"));
-    await chmod(cwd, 0o700);
-    const resultTools = new StructuredResultToolServer({ logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt },
-      onAccepted: () => this.resultAccepted() });
-    let created = false;
     // Where a read's time goes, one line per task: the phases, and inside
     // the turn each allowed call's ask and end and the result (`turn`).
     const startedAt = now();
     const phasesMs: Record<string, number> = {};
     let mark = startedAt;
     const lap = (phase: string) => { const at = now(); phasesMs[phase] = at - mark; mark = at; };
+    let opened: OpenedIntegrationSession | undefined;
+    let warm = false;
     try {
-      const resultServer = await resultTools.start();
-      const mcpServers: RunnerSessionInput["mcpServers"] = [{ type: "http", ...resultServer }];
-      if (fixture) mcpServers.push({ type: "http", name: source.serverName, url: fixture.url, headers: [] });
-      this.gate = new IntegrationToolGate(spec, {
-        agentId: spec.agentId,
-        sessionServers: new Set(mcpServers.map(server => server.name)),
-        ledger: this.ledger,
-        writes: this.deps.writes,
-        now: () => new Date(now()).toISOString(),
-      });
       assertCurrent();
-      const session = await this.deps.runner.createSession({
-        context: { instanceId: this.deps.instanceId, assignmentId: this.assignment.id, attempt: this.assignment.attempt, agentId: spec.agentId },
-        readinessDeadlineAt: new Date(deadlineAt).toISOString(),
-        cwd,
-        mcpServers,
-        integration: integrationAdmission(source, fixture, this.assignment),
-      });
-      created = true;
+      const context = { instanceId: this.deps.instanceId, assignmentId: this.assignment.id, attempt: this.assignment.attempt, agentId: spec.agentId };
+      opened = await this.deps.warm?.take(this.deps.runner, shape, context);
+      warm = opened !== undefined;
+      opened ??= await openIntegrationSession({ runner: this.deps.runner, instanceId: this.deps.instanceId, workspaceRoot: this.deps.workspaceRoot,
+        context, readinessDeadlineAt: new Date(deadlineAt).toISOString(), shape, logger: this.logger });
       lap("session");
-      this.acpSessionRef = session.acpSessionRef;
+      this.acpSessionRef = opened.acpSessionRef;
+      this.gate = new IntegrationToolGate(spec, { agentId: spec.agentId, sessionServers: new Set(opened.sessionServers), ledger: this.ledger,
+        writes: this.deps.writes, now: () => new Date(now()).toISOString() });
+      opened.resultTools.attach({ context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt }, onAccepted: () => this.resultAccepted() });
       assertCurrent();
-      const definition = await resultTools.bind(schema);
-      const end = await this.promptTurn(session.acpSessionRef, () => buildIntegrationPrompt(spec, definition), deadlineAt, now);
+      const definition = await opened.resultTools.bind(schema);
+      const end = await this.promptTurn(opened.acpSessionRef, () => buildIntegrationPrompt(spec, definition), deadlineAt, now);
       lap("turn");
-      return this.result(end, resultTools.result()?.value);
+      return this.result(end, opened.resultTools.result()?.value);
     } finally {
-      await this.cleanUp(created, resultTools, cwd);
+      await this.cleanUp(opened);
       lap("cleanup");
-      this.logger.info({ event: "integration.task.timing", assignmentId: this.assignment.id, phase: spec.phase,
-        agentId: spec.agentId, totalMs: now() - startedAt, phasesMs, end: this.ended?.kind, turn: this.timing.fields() }, "integration task timing");
+      this.logger.info({ event: "integration.task.timing", assignmentId: this.assignment.id, phase: spec.phase, agentId: spec.agentId,
+        totalMs: now() - startedAt, phasesMs, warmSession: warm, end: this.ended?.kind, turn: this.timing.fields() }, "integration task timing");
+      if (spec.phase === "read") this.deps.warm?.offer(this.deps.runner, shape);
     }
   }
 
@@ -284,7 +267,8 @@ export class IntegrationSession {
     // The result is in and every allowed call has ended: stop the agent
     // instead of waiting for its closing message (~6 s of a ~35 s read, 10-11),
     // which nothing reads.
-    if (end.kind === "submitted") await this.deps.runner.cancel(acpSessionRef).catch(() => undefined);
+    // A locked read is done when its calls returned: nothing is handed in.
+    if (end.kind === "submitted" || end.kind === "calls_returned") await this.deps.runner.cancel(acpSessionRef).catch(() => undefined);
     this.ended = end;
     // Bounded like every other step of a read: one handler that never
     // settles must not hold the task (and its terminal report) open.
@@ -292,15 +276,10 @@ export class IntegrationSession {
     return this.ended;
   }
 
-  private async cleanUp(created: boolean, resultTools: StructuredResultToolServer, cwd: string): Promise<void> {
+  private async cleanUp(opened: OpenedIntegrationSession | undefined): Promise<void> {
     this.ended ??= { kind: "exited" };
     this.endTurn = null;
-    if (created && this.acpSessionRef) {
-      const closing = this.deps.runner.closeSession(this.acpSessionRef).catch(error => this.logger.warn({ err: error }, "integration session close failed"));
-      if (!(await settledWithin(closing, SETTLE_GRACE_MS))) this.logger.warn({ assignmentId: this.assignment.id }, "integration session close still running; reporting without waiting for it");
-    }
-    await resultTools.close().catch(() => undefined);
-    await rm(cwd, { recursive: true, force: true }).catch(() => undefined);
+    if (opened) await closeIntegrationSession(this.deps.runner, opened, this.logger, SETTLE_GRACE_MS);
   }
 
   /** Runner events for this session only. */
@@ -355,6 +334,15 @@ export class IntegrationSession {
     this.timing.ended(id);
     if (update.status === "completed") this.recordObservation(update, allowed);
     this.endOnceSubmitted();
+    this.endOnceCallsReturned();
+  }
+
+  /** A locked read (`completesWhenCalled`) ends once each named tool's own result was observed and no allowed call still runs. */
+  private endOnceCallsReturned(): void {
+    const names = this.spec.completesWhenCalled;
+    if (!names || this.callInFlight()) return;
+    const returned = new Set(this.observations.map(observation => observation.tool));
+    if (names.every(name => returned.has(name))) this.endTurn?.({ kind: "calls_returned" });
   }
 
   private resultAccepted(): void {

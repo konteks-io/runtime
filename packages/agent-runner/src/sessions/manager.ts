@@ -96,7 +96,12 @@ interface IntegrationSessionAdmission {
    * model when the agent offers it, the lowest effort it offers, no
    * extended thinking. Each is best effort: a refusal keeps the agent's own.
    */
-  utility?: { model?: string };
+  utility?: { model?: string | undefined } | undefined;
+}
+
+/** A new integration session with no durable owner may be taken over by the task that takes it warm. */
+function adoption(args: Pick<CreateSessionArgs, "integration" | "lifecycle">): { adoptable?: true } {
+  return args.integration && !args.lifecycle ? { adoptable: true } : {};
 }
 
 /** The `_meta` an integration session's `session/new` carries, versioned for the bridge patches. */
@@ -130,6 +135,8 @@ interface SessionRecord {
   assertCurrent?: () => void;
   /** Native turns started by a connector-sent prompt (bounded, oldest evicted). */
   connectorTurns?: Set<string>;
+  /** A new integration session no prompt has reached yet: another task may still adopt it. */
+  adoptable?: boolean;
   /** The session's current `model` value, as the agent last reported it. */
   modelValue?: string;
   /** The session's cumulative cost in USD as the agent last reported it (`usage_update.cost`); unknown until reported or a new session. */
@@ -651,6 +658,7 @@ export class SessionManager {
     if (this.sessions.has(acpSessionRef) || this.byBridgeId.has(bridgeSessionId)) throw new RemoteInstanceError("recovery_required", "bridge session already has a local owner");
     const modelValue = currentModel(opened.response.configOptions);
     const record: SessionRecord = { bridge, acpSessionRef, bridgeSessionId, context: args.context, cwd: args.cwd, pendingClientRequests: new Map(), activeTurns: 0, operations: new Set(), operationFailed: false, completedTurn: false, continuationSealed: false, recoveryStopping: false, recoveryStop: null, ...(args.lifecycle ? { assertCurrent: args.lifecycle.assertCurrent } : {}),
+      ...adoption(args),
       ...(modelValue === undefined ? {} : { modelValue }),
       // A new session has spent nothing; a resumed one's total is unknown until the agent reports it.
       ...(opened.newSession ? { sessionCostUsd: 0 } : {}) };
@@ -1162,6 +1170,7 @@ export class SessionManager {
       throw new RemoteInstanceError("operation_conflict", "Another prompt is already running on this session.");
     }
     if (this.refusedPrompt(record, requestId, params.prompt)) return;
+    record.adoptable = false;
     const publishMeasured = this.beginTurn(record, bridge);
     const send = () => this.sendPrompt(record, bridge, params);
     const prepared = this.options.beforePrompt?.(bridge);
@@ -1251,6 +1260,19 @@ export class SessionManager {
         throw error;
       });
     this.track(record, operation);
+  }
+
+  /**
+   * A warm integration session, opened ahead and never prompted, now belongs
+   * to the task that took it: its turn and usage are that assignment's. Only
+   * the same agent's own new integration session may be adopted.
+   */
+  adoptIntegrationSession(acpSessionRef: string, context: SessionContext): void {
+    const record = this.require(acpSessionRef);
+    if (!record.adoptable || record.activeTurns > 0 || record.context.agentId !== context.agentId || record.context.instanceId !== context.instanceId) {
+      throw new RemoteInstanceError("operation_conflict", "Only a new, never-prompted integration session of the same agent can be taken over.");
+    }
+    record.context = context;
   }
 
   setConfigOption(acpSessionRef: string, requestId: string, params: Omit<SetSessionConfigOptionRequest, "sessionId">): void {

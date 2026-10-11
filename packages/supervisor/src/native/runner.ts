@@ -310,6 +310,11 @@ export class NativeRunner implements RunnerPort {
     this.runtime.sessions.setConfigOption(ref, id, request.params);
   }
 
+  adoptSession(ref: string, context: RunnerSessionInput["context"]) {
+    this.requireStarted();
+    this.runtime.sessions.adoptIntegrationSession(ref, context);
+  }
+
   async cancel(ref: string) {
     this.requireStarted();
     this.runtime.sessions.cancel(ref);

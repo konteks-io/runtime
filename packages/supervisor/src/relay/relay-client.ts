@@ -12,6 +12,8 @@ import {
   type RuntimeAgentLoginDeliveryRequest,
   RuntimeUpdateDeliveryRequestSchema,
   type RuntimeUpdateDeliveryRequest,
+  RuntimeAssignmentAvailableDeliveryRequestSchema,
+  type RuntimeAssignmentAvailableDeliveryRequest,
   type RemoteExecutionRevisionControlDeliveryRequest,
   type RuntimePermissionAnswerDeliveryRequest,
   type DiagnosticCarrierCompanionDeliveryRequest,
@@ -60,7 +62,7 @@ type RelayState = "offline" | "connecting" | "handshaking" | "connected" | "reco
 /** What the relay may send once its handshake result has arrived, buffered until the handshake is adopted. */
 type InboundEnvelope = ToRuntimeRelayFrame | AssignmentReplyFrame | RelayAck | RelayReplayRequest | RuntimeCancellationDeliveryRequest
   | RuntimePermissionAnswerDeliveryRequest | RemoteExecutionRevisionControlDeliveryRequest | RuntimeAgentLoginDeliveryRequest | RuntimeUpdateDeliveryRequest
-  | DiagnosticCarrierCompanionDeliveryRequest;
+  | DiagnosticCarrierCompanionDeliveryRequest | RuntimeAssignmentAvailableDeliveryRequest;
 
 /** What a receiver made of a control delivery; a receiver that returns nothing handled it. */
 export type ControlDeliveryOutcome = "handled" | "duplicate";
@@ -106,6 +108,7 @@ function namesHolderReplayRequest(header: string | string[] | undefined): boolea
 /** Post-handshake envelopes in the order they are recognised; anything else must be a channel frame. */
 const POST_HANDSHAKE_SCHEMAS: ReadonlyArray<{ safeParse(value: unknown): { success: boolean; data?: unknown } }> = [
   RuntimePermissionAnswerDeliveryRequestSchema, RuntimeAgentLoginDeliveryRequestSchema, RuntimeUpdateDeliveryRequestSchema, RuntimeCancellationDeliveryRequestSchema,
+  RuntimeAssignmentAvailableDeliveryRequestSchema,
   RemoteExecutionRevisionControlDeliveryRequestSchema, DiagnosticCarrierCompanionDeliveryRequestSchema, RelayReplayRequestSchema, RelayAckSchema, AssignmentReplyFrameSchema,
 ];
 
@@ -197,6 +200,8 @@ export interface RelayClientOptions {
   onAgentLogin?: DeliveryReceiver<RuntimeAgentLoginDeliveryRequest>;
   /** A fixed signed runtime update, outside the work channel and its cursors. */
   onRuntimeUpdate?: DeliveryReceiver<RuntimeUpdateDeliveryRequest>;
+  /** Core's nudge that work is queued for this runtime: pull now. */
+  onAssignmentAvailable?: DeliveryReceiver<RuntimeAssignmentAvailableDeliveryRequest>;
   /** Dedicated safety-control intake; never a mux cursor or receipt ACK. */
   onExecutionRevisionControl?: DeliveryReceiver<RemoteExecutionRevisionControlDeliveryRequest>;
   /** Diagnostic-only sidecar; its failure must not interrupt work transport. */
@@ -596,6 +601,7 @@ export class RelayClient {
       this.receiverFor(this.options.onPermissionAnswer), "Permission answer receiver is unavailable")],
     ["runtime_agent_login_delivery", (attempt, value) => this.deliverLogin(attempt, value)],
     ["runtime_update_delivery", (attempt, value) => this.deliverRuntimeUpdate(attempt, value)],
+    ["runtime_assignment_available_delivery", (attempt, value) => this.deliverAssignmentAvailable(attempt, value)],
     ["runtime_cancellation_delivery", (attempt, value) => this.deliver(attempt, RuntimeCancellationDeliveryRequestSchema.parse(value), "Cancellation",
       this.receiverFor(this.options.onCancellation), "Cancellation receiver is unavailable")],
     ["runtime_diagnostic_carrier_companion_delivery", (attempt, value) => this.deliverDiagnostic(attempt, value)],
@@ -671,6 +677,20 @@ export class RelayClient {
       return await this.deliver(attempt, RuntimeAgentLoginDeliveryRequestSchema.parse(value), "Login", this.receiverFor(this.options.onAgentLogin), "Agent login receiver is unavailable", false);
     } catch (error) {
       this.logger.warn({ err: error }, "agent login delivery dropped");
+      return refused(error);
+    }
+  }
+
+  /**
+   * A nudge is a shortcut, never work transport: the 5 s pull stays the
+   * fallback, so whatever goes wrong with one is logged and dropped.
+   */
+  private async deliverAssignmentAvailable(attempt: SocketAttempt, value: unknown): Promise<ControlDeliveryResult> {
+    try {
+      return await this.deliver(attempt, RuntimeAssignmentAvailableDeliveryRequestSchema.parse(value), "Assignment available",
+        this.receiverFor(this.options.onAssignmentAvailable), "Assignment-available receiver is unavailable", false);
+    } catch (error) {
+      this.logger.warn({ event: "assignment_available.dropped", err: error }, "assignment-available nudge dropped; the next pull picks the work up");
       return refused(error);
     }
   }

@@ -158,15 +158,23 @@ export class StructuredResultToolServer {
   /** The agent was told the list changed and did not read it again: do not wait for it next time. */
   private relistIgnored = false;
 
-  constructor(private readonly options: {
-    logger?: Logger;
-    context?: Record<string, unknown>;
-    relistWaitMs?: number;
-    /** Called once, when the bound turn's first valid result is recorded. */
-    onAccepted?: () => void;
-  } = {}) {
+  private context: Record<string, unknown>;
+  private onAccepted: (() => void) | undefined;
+
+  constructor(options: { logger?: Logger; context?: Record<string, unknown>; relistWaitMs?: number } = {}) {
     this.logger = options.logger ?? createLogger({ name: "structured-result" });
     this.relistWaitMs = options.relistWaitMs ?? DEFAULT_RELIST_WAIT_MS;
+    this.context = options.context ?? {};
+  }
+
+  /**
+   * The turn this server now serves: its log context, and what to call once
+   * when its first valid result is recorded. A server started ahead for a
+   * warm session is attached when a task takes that session.
+   */
+  attach(turn: { context: Record<string, unknown>; onAccepted?: () => void }): void {
+    this.context = turn.context;
+    this.onAccepted = turn.onAccepted;
   }
 
   async start(): Promise<{ name: string; url: string; headers: Array<{ name: string; value: string }> }> {
@@ -209,7 +217,7 @@ export class StructuredResultToolServer {
     const { inputSchema, wrapped } = toolInputSchema(schema);
     this.turn = { validate, inputSchema, wrapped, accepted: null };
     const definition = await this.announce();
-    this.logger.info({ event: "structured_result.bound", toolDefinition: definition, wrapped, ...this.options.context }, "turn result tool bound");
+    this.logger.info({ event: "structured_result.bound", toolDefinition: definition, wrapped, ...this.context }, "turn result tool bound");
     return definition;
   }
 
@@ -370,12 +378,12 @@ export class StructuredResultToolServer {
     }
     turn.accepted = { value };
     this.logCall("accepted");
-    this.options.onAccepted?.();
+    this.onAccepted?.();
     return toolAnswer("Recorded. Your result for this turn is accepted; finish your turn now.");
   }
 
   private logCall(outcome: string, extra: Record<string, unknown> = {}): void {
-    this.logger.info({ event: "structured_result.call", outcome, ...extra, ...this.options.context }, "result tool called");
+    this.logger.info({ event: "structured_result.call", outcome, ...extra, ...this.context }, "result tool called");
   }
 
   private fail(response: ServerResponse, status: number, code: string): void {

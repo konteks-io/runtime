@@ -58,15 +58,25 @@ class FakeAgent {
   sink: (event: RunnerEvent) => Promise<void> = async () => undefined;
   private promptId = "";
   private counter = 0;
-  readonly ref = "acp-int-1";
+  /** Every session opened, in order (a warm one too); the prompted one is `ref`. */
+  readonly created: RunnerSessionInput[] = [];
+  readonly adopted = vi.fn();
+  ref = "acp-int-1";
 
   constructor(private readonly script: (agent: AgentContext) => Promise<void>) {}
 
   port(agentId: string): RunnerPort {
     return {
       agentId,
-      createSession: async (input: RunnerSessionInput) => { this.input = input; return { acpSessionRef: this.ref, resumed: false, capabilities: { forkSession: false, sessionResume: false } }; },
-      prompt: async (_ref: string, id: string, params: unknown) => {
+      createSession: async (input: RunnerSessionInput) => {
+        this.created.push(input);
+        if (this.created.length === 1) this.input = input;
+        return { acpSessionRef: `acp-int-${this.created.length}`, resumed: false, capabilities: { forkSession: false, sessionResume: false } };
+      },
+      adoptSession: (ref: string, context: unknown) => { this.adopted(ref, context); },
+      prompt: async (ref: string, id: string, params: unknown) => {
+        this.ref = ref;
+        this.input = this.created[Number(ref.split("-").at(-1)) - 1]!;
         this.promptId = id;
         this.promptText = ((params as { prompt: Array<{ text: string }> }).prompt[0]!.text);
         // A script that keeps going after the connector ended the session just stops.
@@ -238,6 +248,70 @@ describe("integration task carrier: a read through a Claude account connector", 
     const plain = reading();
     await run(task, plain);
     expect(plain.input!.integration).toEqual({ admittedMcpServerNames: [], accountConnectors: true });
+  });
+
+  it("ends a locked read when its calls returned, with no summary asked for or kept", async () => {
+    const agent = new FakeAgent(async a => {
+      await a.ask(claudeTool("t1", "mcp__claude_ai_Atlassian__getJiraIssue", { issueIdOrKey: "ENG-42" }));
+      await a.update(claudeDone("t1", "mcp__claude_ai_Atlassian__getJiraIssue", { key: "ENG-42" }));
+      // The agent would now write a summary; the connector does not wait for it.
+    });
+    const result = await run(spec({ completesWhenCalled: ["getJiraIssue"] }), agent);
+    expect(result.error).toBeUndefined();
+    expect(result.agentReport).toBeUndefined();
+    expect(result.observations).toEqual([expect.objectContaining({ tool: "getJiraIssue" })]);
+    expect(agent.cancelled).toHaveBeenCalledOnce();
+    expect(agent.promptText).toContain("The task ends by itself as soon as getJiraIssue returns");
+    expect(agent.promptText).not.toContain("submit_result once");
+  });
+
+  it("starts a warm session after a read, and the next read takes it under its own assignment", async () => {
+    const lines: Array<Record<string, unknown>> = [];
+    const logger = { info: (fields: Record<string, unknown>) => { lines.push(fields); }, warn: () => undefined, error: () => undefined, debug: () => undefined } as never;
+    const reading = (agent: () => FakeAgent) => async (a: AgentContext) => {
+      const n = agent().ref;
+      await a.ask(claudeTool(`${n}-t1`, "mcp__claude_ai_Atlassian__getJiraIssue", { issueIdOrKey: "ENG-42" }));
+      await a.update(claudeDone(`${n}-t1`, "mcp__claude_ai_Atlassian__getJiraIssue", { key: "ENG-42" }));
+      await a.submit({ summary: "Checkout fails on retry" });
+    };
+    const agent: FakeAgent = new FakeAgent(reading(() => agent));
+    const task = spec();
+    const lane = carrier(agent, task, { logger, warmSessions: {} });
+    const first = IntegrationTaskResultSchema.parse((await lane.execute(assignmentFor(task), () => undefined)).structuredOutput);
+    expect(first.error).toBeUndefined();
+    // Opened lazily after the read, for the same shape.
+    await vi.waitFor(() => expect(lines.some(line => line.event === "integration.warm_session" && line.outcome === "ready")).toBe(true));
+    expect(agent.created).toHaveLength(2);
+    expect(agent.created[1]).toMatchObject({ integration: agent.created[0]!.integration, context: { agentId: "claude-code" } });
+    const next = { ...assignmentFor(task), id: "asg-int-2" };
+    const second = IntegrationTaskResultSchema.parse((await lane.execute(next, () => undefined)).structuredOutput);
+    expect(second.error).toBeUndefined();
+    expect(second.observations).toHaveLength(1);
+    expect(agent.adopted).toHaveBeenCalledWith("acp-int-2", expect.objectContaining({ assignmentId: "asg-int-2", attempt: 1, agentId: "claude-code" }));
+    expect(agent.ref).toBe("acp-int-2");
+    expect(lines.filter(line => line.event === "integration.warm_session").map(line => line.outcome)).toEqual(expect.arrayContaining(["missed", "ready", "reused"]));
+    expect(lines.find(line => line.event === "integration.task.timing" && line.assignmentId === "asg-int-2")).toMatchObject({ warmSession: true });
+    // A session that needs its slot closes the warm one first.
+    await vi.waitFor(() => expect(agent.created).toHaveLength(3));
+    await vi.waitFor(() => expect(lines.filter(line => line.outcome === "ready")).toHaveLength(2));
+    expect(await lane.releaseWarmSession("claude-code")).toBe(true);
+    expect(await lane.releaseWarmSession("claude-code")).toBe(false);
+    expect(lines.at(-1)).toMatchObject({ event: "integration.warm_session", outcome: "closed", reason: "slot_needed" });
+  });
+
+  it("closes a warm session nobody took after its idle time", async () => {
+    const lines: Array<Record<string, unknown>> = [];
+    const logger = { info: (fields: Record<string, unknown>) => { lines.push(fields); }, warn: () => undefined, error: () => undefined, debug: () => undefined } as never;
+    const agent = new FakeAgent(async a => {
+      await a.ask(claudeTool("t1", "mcp__claude_ai_Atlassian__getJiraIssue", { issueIdOrKey: "ENG-42" }));
+      await a.update(claudeDone("t1", "mcp__claude_ai_Atlassian__getJiraIssue", { key: "ENG-42" }));
+      await a.submit({ summary: "Checkout fails on retry" });
+    });
+    const task = spec();
+    await carrier(agent, task, { logger, warmSessions: { idleMs: 50 } }).execute(assignmentFor(task), () => undefined);
+    await vi.waitFor(() => expect(lines.at(-1)).toMatchObject({ event: "integration.warm_session", outcome: "closed", reason: "idle" }));
+    expect(agent.closed).toHaveBeenCalledTimes(2);
+    await vi.waitFor(async () => expect(await readdir(workspace)).toEqual([]));
   });
 
   it("bounds what it keeps of a tool result by the task's byte limit", async () => {
