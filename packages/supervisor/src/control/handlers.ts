@@ -24,17 +24,19 @@ import {
   type VersionAcknowledgement,
   type VersionPolicy,
 } from "@konteks/remote-common";
+import {
+  RuntimeSkillSyncRequestSchema,
+  type RuntimeSkillSyncRequest,
+} from "@konteks/backstage-plugin-common/remote-instance-internal";
 import { compareAgentVersions } from "@konteks/remote-release";
 import type { CoreSignatureVerifier } from "./core-signature.js";
 import type { SupervisorStore } from "../state/store.js";
 import type { SupervisorJournal } from "../state/journal.js";
 
 /**
- * The closed control protocol: desired configuration, version policy, key
- * rotation, erase, and drain. Every directive is a strict shared schema, must
- * carry a verifying Core signature and a fresh (monotonic or unexpired)
- * revision/nonce, and is acknowledged with a signed body. There is no
- * arbitrary directive; anything else is dropped and counted.
+ * The closed control protocol: configuration, version, key, erase, drain, and
+ * signed Skill-sync requests. Unsupported messages are dropped and counted;
+ * sync completion uses the existing HTTPS receipt path.
  */
 interface ControlDeps {
   store: SupervisorStore;
@@ -44,6 +46,8 @@ interface ControlDeps {
   replaceKey: (next: InstanceKeyPair) => Promise<void>;
   verifier: CoreSignatureVerifier;
   instanceId: () => string;
+  workspaceId: () => string;
+  onRuntimeSkillSyncRequest: (request: RuntimeSkillSyncRequest) => void | Promise<void>;
   bundleVersion: string;
   protocolVersion: string;
   manifestDigest: () => string;
@@ -114,8 +118,30 @@ export class ControlHandlers {
     if (erase.success) return this.handleErase(erase.data);
     const drain = DrainDirectiveSchema.safeParse(body);
     if (drain.success) return this.handleDrain(drain.data);
+    const skillSync = RuntimeSkillSyncRequestSchema.safeParse(body);
+    if (skillSync.success) return this.handleRuntimeSkillSyncRequest(skillSync.data);
     this.counters.rejectedUnknown += 1;
     this.logger.warn("dropped an unknown control directive");
+  }
+
+  private async handleRuntimeSkillSyncRequest(request: RuntimeSkillSyncRequest): Promise<void> {
+    if (!this.deps.verifier.verifyRuntimeSkillSyncRequest(request)) {
+      this.counters.rejectedSignature += 1;
+      this.logger.warn("Skill sync control signature rejected");
+      return;
+    }
+    const now = Date.parse(this.deps.clock.nowIso());
+    if (
+      request.workspaceId !== this.deps.workspaceId() ||
+      request.instanceId !== this.deps.instanceId() ||
+      Date.parse(request.issuedAt) > now + 1_000 ||
+      Date.parse(request.expiresAt) <= now
+    ) {
+      this.counters.rejectedStale += 1;
+      this.logger.warn("stale or misbound Skill sync control request dropped");
+      return;
+    }
+    await this.deps.onRuntimeSkillSyncRequest(request);
   }
 
   handleDesiredConfiguration(envelope: DesiredConfigurationEnvelope): Promise<void> {

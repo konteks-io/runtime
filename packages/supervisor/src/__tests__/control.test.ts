@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FixedClock, canonicalize, ed25519Sign, generateEd25519, generateInstanceKey, jcsDigest, verifyBody, withoutMembers, type ControlAck, type JsonValue } from "@konteks/remote-common";
+import { runtimeSkillSyncRequestSigningBytes } from "@konteks/backstage-plugin-common/remote-instance-internal";
 import { CoreSignatureVerifier } from "../control/core-signature.js";
 import { ControlHandlers, compareSemver } from "../control/handlers.js";
 import { SupervisorJournal } from "../state/journal.js";
@@ -38,6 +39,8 @@ async function harness(overrides: Partial<ConstructorParameters<typeof ControlHa
     replaceKey: async () => undefined,
     verifier: new CoreSignatureVerifier(roots),
     instanceId: () => "inst-1",
+    workspaceId: () => "tenant",
+    onRuntimeSkillSyncRequest: () => undefined,
     bundleVersion: "1.2.0",
     protocolVersion: "1.0",
     manifestDigest: () => "digest",
@@ -63,6 +66,73 @@ const envelope = (revision: number, extra: Record<string, JsonValue> = {}) => {
   const value = { ...configuration, ...extra } as never;
   return signByCore({ type: "desired_configuration" as const, instanceId: "inst-1", revision, issuedAt: "2026-09-06T00:00:00Z", expiresAt: "2026-09-07T00:00:00Z", digest: jcsDigest(value), configuration: value });
 };
+
+const skillSyncRequest = (clock: FixedClock, overrides: Record<string, JsonValue> = {}) => {
+  const now = Date.parse(clock.nowIso());
+  const body = {
+    type: "runtime_skill_sync_request" as const,
+    workspaceId: "tenant",
+    instanceId: "inst-1",
+    requestId: "request-1",
+    issuedAt: clock.nowIso(),
+    expiresAt: new Date(now + 30_000).toISOString(),
+    ...overrides,
+  };
+  return {
+    ...body,
+    signature: ed25519Sign(coreKey.privateKey, runtimeSkillSyncRequestSigningBytes(body)),
+  };
+};
+
+describe("runtime Skill sync control", () => {
+  it("accepts a current Core-signed request bound to this tenant and runtime", async () => {
+    const onRuntimeSkillSyncRequest = vi.fn();
+    const f = await harness({
+      onRuntimeSkillSyncRequest,
+    });
+
+    await f.handlers.handle(skillSyncRequest(f.clock));
+
+    expect(onRuntimeSkillSyncRequest).toHaveBeenCalledOnce();
+    expect(onRuntimeSkillSyncRequest).toHaveBeenCalledWith(
+      expect.objectContaining({ requestId: "request-1", instanceId: "inst-1" }),
+    );
+    expect(f.handlers.counters.rejectedUnknown).toBe(0);
+  });
+
+  it("rejects a signed request for another tenant or runtime", async () => {
+    const onRuntimeSkillSyncRequest = vi.fn();
+    const f = await harness({
+      onRuntimeSkillSyncRequest,
+    });
+
+    await f.handlers.handle(skillSyncRequest(f.clock, { workspaceId: "other-tenant" }));
+    await f.handlers.handle(skillSyncRequest(f.clock, { instanceId: "other-instance" }));
+
+    expect(onRuntimeSkillSyncRequest).not.toHaveBeenCalled();
+    expect(f.handlers.counters.rejectedStale).toBe(2);
+  });
+
+  it("rejects expired or incorrectly signed requests", async () => {
+    const onRuntimeSkillSyncRequest = vi.fn();
+    const f = await harness({
+      onRuntimeSkillSyncRequest,
+    });
+    const now = Date.parse(f.clock.nowIso());
+    const expired = skillSyncRequest(f.clock, {
+      issuedAt: new Date(now - 30_000).toISOString(),
+      expiresAt: new Date(now - 1).toISOString(),
+    });
+    const invalidSignature = { ...skillSyncRequest(f.clock), signature: "invalid" };
+
+    await f.handlers.handle(expired);
+    await f.handlers.handle(invalidSignature);
+
+    expect(onRuntimeSkillSyncRequest).not.toHaveBeenCalled();
+    expect(f.handlers.counters.rejectedStale).toBe(1);
+    expect(f.handlers.counters.rejectedSignature).toBe(1);
+  });
+});
 
 describe("desired configuration", () => {
   it("serializes overlapping native deliveries so a slower write cannot roll back a newer revision", async () => {
