@@ -1,5 +1,5 @@
 import { LocalSkillExportIntentSchema, localSkillExportSigningBytes } from "@konteks/backstage-plugin-common/remote-instance-internal";
-import { RuntimeSkillSyncEnvelopeSchema, RuntimeSkillSyncRequestSchema, runtimeSkillSyncSigningBytes, runtimeSkillSyncRequestSigningBytes } from "@konteks/backstage-plugin-common/remote-instance-internal";
+import { RuntimeSkillCatalogChangedSchema, RuntimeSkillSyncEnvelopeSchema, RuntimeSkillSyncRequestSchema, runtimeSkillCatalogChangedSigningBytes, runtimeSkillSyncSigningBytes, runtimeSkillSyncRequestSigningBytes } from "@konteks/backstage-plugin-common/remote-instance-internal";
 import type { KeyObject } from "node:crypto";
 import { PlanningControllerTerminalDirectiveSchema, RemoteControlSigningKeySchema, planningControllerTerminalDirectiveSigningBytes, remoteControlSigningBytes, ed25519PublicKeyFromJwk, ed25519Verify, type JsonValue, type PlanningControllerTerminalDirective } from "@konteks/remote-common";
 import type { EmbeddedReleaseRoot } from "@konteks/remote-release";
@@ -163,6 +163,19 @@ export class CoreSignatureVerifier {
     if (!/^[A-Za-z0-9_-]{86}$/.test(signature) || Buffer.from(signature, "base64url").toString("base64url") !== signature) return false;
     try {
       const bytes = runtimeSkillSyncRequestSigningBytes(parsed.data);
+      for (const key of this.keys.values()) if (ed25519Verify(key, bytes, signature)) return true;
+    } catch { return false; }
+    return false;
+  }
+
+  /** A content-free catalog revision hint uses its own closed signature domain. */
+  verifyRuntimeSkillCatalogChanged(candidate: unknown): boolean {
+    const parsed = RuntimeSkillCatalogChangedSchema.safeParse(candidate);
+    if (!parsed.success || !this.configured) return false;
+    const { signature } = parsed.data;
+    if (!/^[A-Za-z0-9_-]{86}$/.test(signature) || Buffer.from(signature, "base64url").toString("base64url") !== signature) return false;
+    try {
+      const bytes = runtimeSkillCatalogChangedSigningBytes(parsed.data);
       for (const key of this.keys.values()) if (ed25519Verify(key, bytes, signature)) return true;
     } catch { return false; }
     return false;

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FixedClock, canonicalize, ed25519Sign, generateEd25519, generateInstanceKey, jcsDigest, verifyBody, withoutMembers, type ControlAck, type JsonValue } from "@konteks/remote-common";
-import { runtimeSkillSyncRequestSigningBytes } from "@konteks/backstage-plugin-common/remote-instance-internal";
+import { runtimeSkillCatalogChangedSigningBytes, runtimeSkillSyncRequestSigningBytes } from "@konteks/backstage-plugin-common/remote-instance-internal";
 import { CoreSignatureVerifier } from "../control/core-signature.js";
 import { ControlHandlers, compareSemver } from "../control/handlers.js";
 import { SupervisorJournal } from "../state/journal.js";
@@ -41,6 +41,7 @@ async function harness(overrides: Partial<ConstructorParameters<typeof ControlHa
     instanceId: () => "inst-1",
     workspaceId: () => "tenant",
     onRuntimeSkillSyncRequest: () => undefined,
+    onRuntimeSkillCatalogChanged: () => undefined,
     bundleVersion: "1.2.0",
     protocolVersion: "1.0",
     manifestDigest: () => "digest",
@@ -81,6 +82,25 @@ const skillSyncRequest = (clock: FixedClock, overrides: Record<string, JsonValue
   return {
     ...body,
     signature: ed25519Sign(coreKey.privateKey, runtimeSkillSyncRequestSigningBytes(body)),
+  };
+};
+
+const skillCatalogChanged = (clock: FixedClock, overrides: Record<string, JsonValue> = {}) => {
+  const now = Date.parse(clock.nowIso());
+  const body = {
+    type: "runtime_skill_catalog_changed" as const,
+    workspaceId: "tenant",
+    instanceId: "inst-1",
+    notificationId: "notice-1",
+    catalogRevision: `sha256:${"a".repeat(64)}`,
+    changeKind: "updated" as const,
+    issuedAt: clock.nowIso(),
+    expiresAt: new Date(now + 30_000).toISOString(),
+    ...overrides,
+  };
+  return {
+    ...body,
+    signature: ed25519Sign(coreKey.privateKey, runtimeSkillCatalogChangedSigningBytes(body)),
   };
 };
 
@@ -130,6 +150,38 @@ describe("runtime Skill sync control", () => {
 
     expect(onRuntimeSkillSyncRequest).not.toHaveBeenCalled();
     expect(f.handlers.counters.rejectedStale).toBe(1);
+    expect(f.handlers.counters.rejectedSignature).toBe(1);
+  });
+});
+
+describe("runtime Skill catalog-change control", () => {
+  it("schedules an authorized refresh once per notification ID", async () => {
+    const onRuntimeSkillCatalogChanged = vi.fn();
+    const f = await harness({ onRuntimeSkillCatalogChanged });
+    const notice = skillCatalogChanged(f.clock);
+
+    await f.handlers.handle(notice);
+    await f.handlers.handle(notice);
+
+    expect(onRuntimeSkillCatalogChanged).toHaveBeenCalledOnce();
+    expect(onRuntimeSkillCatalogChanged).toHaveBeenCalledWith(
+      expect.objectContaining({ catalogRevision: `sha256:${"a".repeat(64)}`, changeKind: "updated" }),
+    );
+    expect(f.handlers.counters.rejectedUnknown).toBe(0);
+  });
+
+  it("rejects a signed notice for another tenant or runtime and rejects expired or forged notices", async () => {
+    const onRuntimeSkillCatalogChanged = vi.fn();
+    const f = await harness({ onRuntimeSkillCatalogChanged });
+    const now = Date.parse(f.clock.nowIso());
+
+    await f.handlers.handle(skillCatalogChanged(f.clock, { workspaceId: "other-tenant" }));
+    await f.handlers.handle(skillCatalogChanged(f.clock, { instanceId: "other-instance" }));
+    await f.handlers.handle(skillCatalogChanged(f.clock, { issuedAt: new Date(now - 30_000).toISOString(), expiresAt: new Date(now - 1).toISOString() }));
+    await f.handlers.handle({ ...skillCatalogChanged(f.clock), signature: "invalid" });
+
+    expect(onRuntimeSkillCatalogChanged).not.toHaveBeenCalled();
+    expect(f.handlers.counters.rejectedStale).toBe(3);
     expect(f.handlers.counters.rejectedSignature).toBe(1);
   });
 });

@@ -981,6 +981,7 @@ export class Supervisor {
       instanceId: () => this.instanceId ?? "",
       workspaceId: () => this.workspaceId ?? "",
       onRuntimeSkillSyncRequest: () => this.requestAutomaticSkillSync(),
+      onRuntimeSkillCatalogChanged: () => this.requestAutomaticSkillSync(),
       bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION,
       protocolVersion: String(REMOTE_INSTANCE_PROTOCOL_VERSION),
       manifestDigest: () => this.manifestDigest,
