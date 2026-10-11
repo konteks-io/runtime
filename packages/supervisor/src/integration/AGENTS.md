@@ -52,6 +52,13 @@ is installed.
   tool is always loaded (`anthropic/alwaysLoad`), so Claude never spends a
   step finding it. `integration.task.timing` logs each allowed call's ask
   and end and the result, in ms after the prompt.
+- **A routed read is a utility turn.** When Core routes the assignment to a
+  model (`agentRoute.sessionConfig.model`, Core's per-workspace choice of the
+  agent's fastest offered model), the session takes that model if offered,
+  the lowest effort it offers (`thought_level`) and no extended thinking
+  (Claude `_meta.claudeCode.options.thinking`), each best effort
+  (`agent-runner/src/sessions/utility-turn.ts`). An unrouted read runs on the
+  agent's own settings.
 - The connector's own observation of each allowed call is the evidence
   (`connector_observed`, bounded, hashed); the agent's `submit_result` is only
   `agentReport`. An MCP call that completes without reaching the gate cancels

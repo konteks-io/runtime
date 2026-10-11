@@ -55,7 +55,12 @@ export interface RunnerSessionInput {
    * Claude may load the account's connectors. Every call still meets the
    * integration gate; this only decides what the agent can see.
    */
-  integration?: { admittedMcpServerNames: string[]; accountConnectors: boolean };
+  integration?: {
+    admittedMcpServerNames: string[];
+    accountConnectors: boolean;
+    /** A utility turn: the model Core routed (when offered), the lowest effort, no extended thinking. */
+    utility?: { model?: string };
+  };
 }
 
 export interface RunnerSessionCreated {

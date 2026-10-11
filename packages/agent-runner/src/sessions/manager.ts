@@ -24,6 +24,7 @@ import {
   assertConfirmedDirectModelSelection,
   prepareDirectModelSelection,
 } from "./model-selection.js";
+import { lowestEffortChange, routedModelChange, withUtilityTurnOptions } from "./utility-turn.js";
 import type { DirectModelSelection, DirectModelSelectionPolicy } from "@konteks/remote-common";
 
 /**
@@ -90,6 +91,12 @@ interface IntegrationSessionAdmission {
   admittedMcpServerNames: string[];
   /** Claude only: this session may load the account's claude.ai connectors (every call still meets the gate). */
   accountConnectors: boolean;
+  /**
+   * A Konteks utility turn (a read Core routed to a fast model): the routed
+   * model when the agent offers it, the lowest effort it offers, no
+   * extended thinking. Each is best effort: a refusal keeps the agent's own.
+   */
+  utility?: { model?: string };
 }
 
 /** The `_meta` an integration session's `session/new` carries, versioned for the bridge patches. */
@@ -416,7 +423,8 @@ export class SessionManager {
   private newSessionMeta(args: CreateSessionArgs, acpSessionRef: string): Record<string, unknown> {
     const naming = args.agentTitled ? konteksAgentTitledMetadata(args.context.agentId)
       : konteksSessionMetadata(konteksCodingSessionTitle(args.sessionLabel, acpSessionRef.slice(-8)), args.context.agentId);
-    return { ...naming, ...this.options.sessionMeta, ...(args.integration ? konteksIntegrationMeta(args.integration) : {}) };
+    const meta = { ...naming, ...this.options.sessionMeta, ...(args.integration ? konteksIntegrationMeta(args.integration) : {}) };
+    return args.integration?.utility ? withUtilityTurnOptions(meta) : meta;
   }
 
   async create(args: CreateSessionArgs): Promise<CreatedSession> {
@@ -555,7 +563,8 @@ export class SessionManager {
       try { this.options.verifySession(opened.response); }
       catch (error) { throw fenceRecord(record, error); }
     }
-    const modelSelection = await this.applySessionConfig(args, record, opened.response.configOptions, opened.resumed, bootstrapAttempt);
+    const { modelSelection, configOptions } = await this.applySessionConfig(args, record, opened.response.configOptions, opened.resumed, bootstrapAttempt);
+    await this.tuneUtilityTurn(args, record, configOptions, bootstrapAttempt);
     return { acpSessionRef, resumed: opened.resumed, capabilities,
       ...(modelSelection ? { modelSelection } : {}),
     };
@@ -661,7 +670,8 @@ export class SessionManager {
    * until the bridge explicitly echoes each selected value.
    */
   private async applySessionConfig(args: CreateSessionArgs, record: SessionRecord, configOptions: unknown, resumed: boolean, bootstrapAttempt: number,
-  ): Promise<DirectModelSelection | undefined> {
+  ): Promise<{ modelSelection: DirectModelSelection | undefined; configOptions: unknown }> {
+    let latest = configOptions;
     const confirmed = new Map<string, string>();
     const sessionConfig = { ...(args.sessionConfig ?? {}) };
     const modelSelection = this.directModelConfig(args, record, sessionConfig, configOptions);
@@ -674,6 +684,7 @@ export class SessionManager {
         const result = await this.boundedBootstrap("session_config", args, record.bridge,
           record.bridge.connection.setSessionConfigOption({ sessionId: record.bridgeSessionId, configId, value }), bootstrapAttempt);
         confirmed.set(configId, value);
+        latest = result.configOptions;
         const reportedModel = currentModel(result.configOptions);
         if (reportedModel !== undefined) record.modelValue = reportedModel;
         // ACP returns the full configuration. Later selections must not reset
@@ -691,7 +702,47 @@ export class SessionManager {
       this.requireBridge(record);
       args.lifecycle?.assertCurrent();
     }
-    return modelSelection;
+    return { modelSelection, configOptions: latest };
+  }
+
+  /**
+   * A utility turn's routed model and lowest effort, each from what the
+   * session offers. Best effort: a refused selection keeps the agent's own and
+   * never fails the read; only a dead or timed-out bridge stops it.
+   */
+  private async tuneUtilityTurn(args: CreateSessionArgs, record: SessionRecord, configOptions: unknown, bootstrapAttempt: number): Promise<void> {
+    const utility = args.integration?.utility;
+    if (!utility) return;
+    const options = await this.routeUtilityModel(args, record, configOptions, utility.model, bootstrapAttempt);
+    const effort = lowestEffortChange(options);
+    if (effort) await this.trySelect(args, record, effort, bootstrapAttempt);
+    this.logger.info({ event: "integration.utility_turn", assignmentId: args.context.assignmentId, agentId: args.context.agentId,
+      model: currentModel(options) ?? null, effort: effort?.value ?? null }, "utility turn configured");
+  }
+
+  /** The routed model when the session offers it; the configuration after it. */
+  private async routeUtilityModel(args: CreateSessionArgs, record: SessionRecord, configOptions: unknown, routed: string | undefined, bootstrapAttempt: number): Promise<unknown> {
+    const model = routedModelChange(configOptions, routed);
+    if (model === undefined) return configOptions;
+    return await this.trySelect(args, record, { configId: "model", value: model }, bootstrapAttempt) ?? configOptions;
+  }
+
+  /** One best-effort selection; the new configuration, or undefined when the agent refused it. */
+  private async trySelect(args: CreateSessionArgs, record: SessionRecord, selection: { configId: string; value: string }, bootstrapAttempt: number): Promise<unknown> {
+    try {
+      const result = await this.boundedBootstrap("session_config", args, record.bridge,
+        record.bridge.connection.setSessionConfigOption({ sessionId: record.bridgeSessionId, ...selection }), bootstrapAttempt);
+      const reportedModel = currentModel(result.configOptions);
+      if (reportedModel !== undefined) record.modelValue = reportedModel;
+      return result.configOptions;
+    } catch (error) {
+      if (error instanceof RemoteInstanceError || record.bridge.exited) throw error;
+      this.logger.info({ assignmentId: args.context.assignmentId, configId: selection.configId, err: classifyBridgeError(error).class },
+        "the agent refused a utility turn selection; keeping its own");
+      return undefined;
+    } finally {
+      this.requireBridge(record);
+    }
   }
 
   private directModelConfig(

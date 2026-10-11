@@ -220,6 +220,26 @@ describe("integration task carrier: a read through a Claude account connector", 
     expect(agent.cancelled).toHaveBeenCalledOnce();
   });
 
+  it("runs a read Core routed to a fast model as a utility turn, and an unrouted one on the agent's own", async () => {
+    const reading = () => new FakeAgent(async a => {
+      await a.ask(claudeTool("t1", "mcp__claude_ai_Atlassian__getJiraIssue", { issueIdOrKey: "ENG-42" }));
+      await a.update(claudeDone("t1", "mcp__claude_ai_Atlassian__getJiraIssue", { key: "ENG-42" }));
+      await a.submit({ summary: "Checkout fails on retry" });
+    });
+    const task = spec();
+    const routed = reading();
+    const assignment = assignmentFor(task);
+    const result = IntegrationTaskResultSchema.parse((await carrier(routed, task).execute(
+      { ...assignment, agentRoute: { ...assignment.agentRoute, sessionConfig: { model: "haiku" } } }, () => undefined)).structuredOutput);
+    expect(routed.input!.integration).toEqual({ admittedMcpServerNames: [], accountConnectors: true, utility: { model: "haiku" } });
+    // The provider call is still gated and observed the same way.
+    expect(result.toolCalls).toEqual([expect.objectContaining({ tool: "getJiraIssue", status: "allowed", outcome: "succeeded" })]);
+    expect(result.observations).toHaveLength(1);
+    const plain = reading();
+    await run(task, plain);
+    expect(plain.input!.integration).toEqual({ admittedMcpServerNames: [], accountConnectors: true });
+  });
+
   it("bounds what it keeps of a tool result by the task's byte limit", async () => {
     const agent = new FakeAgent(async a => {
       await a.ask(claudeTool("t1", "mcp__claude_ai_Atlassian__getJiraIssue", { issueIdOrKey: "ENG-42" }));

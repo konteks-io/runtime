@@ -49,6 +49,7 @@ const inputSchema = z.object({
   integration: z.object({
     admittedMcpServerNames: z.array(z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/)).max(8),
     accountConnectors: z.boolean(),
+    utility: z.object({ model: z.string().min(1).max(256).optional() }).strict().optional(),
   }).strict().optional(),
 }).strict().refine(value => value.acpSessionRef === undefined || value.restoreAcpSessionRef === undefined)
   .refine(

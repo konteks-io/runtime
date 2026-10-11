@@ -90,9 +90,21 @@ function compiledResultSchema(spec: IntegrationTaskSpec): Record<string, unknown
 }
 
 /** Which MCP sources the session admits: the account's connectors, or the bound personal server (a fixture is served directly). */
-function integrationAdmission(source: IntegrationSource, fixture: unknown): NonNullable<RunnerSessionInput["integration"]> {
-  if (source.kind === "account_connector") return { admittedMcpServerNames: [], accountConnectors: true };
-  return { admittedMcpServerNames: fixture ? [] : [source.serverName], accountConnectors: false };
+function integrationAdmission(source: IntegrationSource, fixture: unknown, assignment: RemoteWorkAssignment): NonNullable<RunnerSessionInput["integration"]> {
+  const sources = source.kind === "account_connector"
+    ? { admittedMcpServerNames: [], accountConnectors: true }
+    : { admittedMcpServerNames: fixture ? [] : [source.serverName], accountConnectors: false };
+  return { ...sources, ...utilityTurn(assignment) };
+}
+
+/**
+ * A read Core routed to the agent's fastest model (`agentRoute.sessionConfig`,
+ * per the workspace's choice) is a Konteks utility turn: that model, the
+ * lowest effort it offers and no extended thinking, each best effort.
+ */
+function utilityTurn(assignment: RemoteWorkAssignment): Pick<NonNullable<RunnerSessionInput["integration"]>, "utility"> {
+  const model = assignment.agentRoute.sessionConfig?.model;
+  return model ? { utility: { model } } : {};
 }
 
 /** How a turn that did not end with a result failed, if it did. */
@@ -232,7 +244,7 @@ export class IntegrationSession {
         readinessDeadlineAt: new Date(deadlineAt).toISOString(),
         cwd,
         mcpServers,
-        integration: integrationAdmission(source, fixture),
+        integration: integrationAdmission(source, fixture, this.assignment),
       });
       created = true;
       lap("session");
