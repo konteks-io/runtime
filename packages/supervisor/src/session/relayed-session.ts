@@ -1150,10 +1150,24 @@ export class RelayedSession {
     const released = new Promise<"waiting">(resolve => { waiting = () => resolve("waiting"); });
     const run = this.beginAndDispatch(context, assertDeliveryCurrent, waiting);
     if (await Promise.race([run.then(() => "done" as const), released]) === "done") return;
-    void this.track(() => run).catch(error => {
-      this.logger.warn({ event: "execution.dispatch_after_wait_failed", assignmentId: this.assignment.id, attempt: this.assignment.attempt,
-        code: error instanceof RemoteInstanceError ? error.code : "unexpected_error" }, "an operation that waited for Core's check did not settle");
+    void this.track(() => run).catch(error => this.afterWaitFailure(context, error)).catch(() => {
+      this.logger.warn({ event: "execution.dispatch_failure_report_failed", assignmentId: this.assignment.id,
+        attempt: this.assignment.attempt }, "a prompt that failed after waiting could not report its failure");
     });
+  }
+
+  /**
+   * The released frame can no longer carry a failure. A prompt this process
+   * began that the runner then failed ends visibly now, with its ACP error
+   * and an agent exit, rather than staying "Working" until Core's watch. The
+   * runner's busy refusal (operation_conflict) was already settled as a denial.
+   */
+  private async afterWaitFailure(context: { gate: NativeExecutionGate; operation: AuthorizedOperation }, error: unknown): Promise<void> {
+    this.logger.warn({ event: "execution.dispatch_after_wait_failed", assignmentId: this.assignment.id, attempt: this.assignment.attempt,
+      code: error instanceof RemoteInstanceError ? error.code : "unexpected_error" }, "an operation that waited for Core's check did not settle");
+    const message = context.operation.envelope.message;
+    if (this.closed || !isPromptMessage(message) || !context.gate.isDispatching(context.operation.key)) return;
+    await this.reportDenied(deniedCompletion(message, error), "agent_exited");
   }
 
   private async beginAndDispatch(context: { gate: NativeExecutionGate; operation: AuthorizedOperation; ref: string }, assertDeliveryCurrent: () => void, onWait: () => void): Promise<void> {

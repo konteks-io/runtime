@@ -720,6 +720,36 @@ describe("native session dispatch uses genuine execution admission", () => {
     expect(check).toHaveBeenCalledTimes(asked);
   });
 
+  it("ends a direct turn at once with the prompt's error when the runner fails it after a waited check", async () => {
+    const f = await sessionFixture(directTurn); vi.useFakeTimers();
+    f.client.checkExecution.mockRejectedValueOnce(new RemoteInstanceError("temporarily_unavailable", "Core request failed", { retryable: true }));
+    f.runner.prompt.mockRejectedValueOnce(new Error("bridge transport failed"));
+    await f.session.onToRuntime(f.envelope);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.waitFor(() => expect(f.session.isClosed).toBe(true));
+    expect(f.runner.prompt).toHaveBeenCalledOnce();
+    expect(f.send.mock.calls.map(call => call[0].body)).toEqual([
+      { kind: "acp_error", id: "request", method: "session/prompt",
+        error: { code: -32603, class: "internal", message: "bridge transport failed", retryable: false } },
+      { kind: "session_closed", assignmentId: "assignment", reason: "agent_exited" },
+    ]);
+  });
+
+  it("keeps the runner's busy refusal after a waited check a denial that leaves the session open", async () => {
+    const f = await sessionFixture(directTurn); vi.useFakeTimers();
+    f.client.checkExecution.mockRejectedValueOnce(new RemoteInstanceError("temporarily_unavailable", "Core request failed", { retryable: true }));
+    f.runner.prompt.mockRejectedValueOnce(new RemoteInstanceError("operation_conflict", "A prompt is already running."));
+    await f.session.onToRuntime(f.envelope);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.waitFor(() => expect(f.send).toHaveBeenCalled());
+    expect(f.journal.pendingRequests.get("acp:received:request")?.authorization?.state).toBe("denied");
+    expect(f.runner.prompt).toHaveBeenCalledOnce();
+    expect(f.session.isClosed).toBe(false);
+    expect(f.send.mock.calls.map(call => call[0].body)).toEqual([
+      expect.objectContaining({ kind: "acp_error", id: "request", error: expect.objectContaining({ class: "invalid_params" }) }),
+    ]);
+  });
+
   it.each([["an Assistant", assignment], ["a direct", directTurn]] as const)("closes %s turn still refused for a transient reason as an interruption, not a failure (D89)", async (_turn, work) => {
     let monotonic = 0;
     // A busy-host pause lapses the verified lease between Core's check and dispatch.
