@@ -507,12 +507,10 @@ export class NativeExecutionGate {
   }
 
   /**
-   * The check lease's verified claims. A genuine check that a slow Core
-   * answered after its own expiry says nothing about the execution: it is
-   * asked again rather than stopping the agent. Delivery, direct and
-   * Assistant turns alike are verified against the renewed view, so a lease
-   * Core renewed is adopted (10-09: a direct turn was fenced one hour after
-   * the session's first prompt).
+   * The check lease's verified claims. A genuine check outside its validity
+   * window is retried without adopting it or stopping the running agent.
+   * Delivery, direct and Assistant turns alike use the renewed authority
+   * view; signature, identity and revision failures remain fences.
    */
   private verifiedCheck(authority: Authority, lease: string, keys: ReadonlyMap<string, KeyObject>): CheckClaims {
     const checkInput = { lease, trustedKeys: keys, nowSeconds: Math.floor(this.options.clock.coreNow() / 1000), issuedAtToleranceSeconds: 1 };
@@ -525,7 +523,7 @@ export class NativeExecutionGate {
       this.logger.warn({ event: "execution.check_refused", assignmentId: authority.assignmentId, attempt: authority.attempt,
         claimId: authority.claimId, executionId: authority.executionId, executionRevision: authority.executionRevision,
         diagnostic: reason, skewMs: this.options.clock.skewMs(), issuedAtToleranceSeconds: 1 }, "Native execution check refused");
-      if (reason === "expired") throw new RemoteInstanceError("execution_authority_unavailable", "Execution check lease expired in transit", { diagnostic: reason, retryable: true });
+      if (reason === "expired" || reason === "not_yet_valid") throw new RemoteInstanceError("execution_authority_unavailable", "Execution check lease is outside its validity window", { diagnostic: reason, retryable: true });
       throw new RemoteInstanceError("execution_fenced", "Invalid execution check lease", { diagnostic: reason });
     }
   }
