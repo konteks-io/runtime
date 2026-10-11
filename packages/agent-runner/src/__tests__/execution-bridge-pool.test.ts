@@ -134,13 +134,23 @@ it("serves the next reference from the resident process with no second spawn or 
   expect(f.runtime.utilization().activeSessions).toBe(0);
 });
 
+/** A claimed session that finds every slot held waits for one (D64) instead of being refused. */
+async function expectWaitingForSlot(creating: Promise<unknown>) {
+  const settled = vi.fn();
+  creating.then(settled, settled);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  expect(settled).not.toHaveBeenCalled();
+}
+
 it("returns the capacity slot on the idle release exactly as a stop-proven finalization does", async () => {
   const f = await fixture({ limit: 1 });
   const first = await f.runtime.sessions.create(f.input);
-  await expect(f.runtime.sessions.create(f.input)).rejects.toThrow();
+  const waiting = f.runtime.sessions.create(f.input);
+  await expectWaitingForSlot(waiting);
   await completeAndRelease(f, first.acpSessionRef);
-  await f.runtime.sessions.create(f.input);
-  await expect(f.runtime.sessions.create(f.input)).rejects.toThrow();
+  await waiting;
+  const { lifecycle: _claim, ...unclaimed } = f.input;
+  await expect(f.runtime.sessions.create(unclaimed)).rejects.toMatchObject({ code: "recovery_required", diagnostic: "execution_capacity_full" });
   await expect(f.runtime.stopExecutionBridge("never-owned")).rejects.toThrow(/Unknown native execution bridge owner/);
 });
 
@@ -151,9 +161,10 @@ it("still stops the process on a recovery stop and keeps nothing resident", asyn
   await f.runtime.stopExecutionBridge(first.acpSessionRef);
   expect(f.execution().bridge.stop).toHaveBeenCalledOnce();
   // The slot stays held; no resident process could serve a new reference.
-  await expect(f.runtime.sessions.create(f.input)).rejects.toThrow();
+  const waiting = f.runtime.sessions.create(f.input);
+  await expectWaitingForSlot(waiting);
   await f.runtime.stopExecutionBridge(first.acpSessionRef, { finalize: true });
-  await f.runtime.sessions.create(f.input);
+  await waiting;
   expect(f.spawn).toHaveBeenCalledTimes(3);
 });
 

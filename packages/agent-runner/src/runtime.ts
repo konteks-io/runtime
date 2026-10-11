@@ -212,8 +212,35 @@ function startupErrorFields(error: unknown): { errorClass: string; errorCode: st
 
 /** Exponential backoff with jitter, at most 2 s, before a fresh process. */
 function freshProcessDelayMs(attempt: number, random: () => number): number {
+  return backoffDelayMs(attempt, random, 2_000);
+}
+
+/** Exponential backoff with jitter, at most 10 s, while every execution process is held. */
+function freeSlotDelayMs(wait: number, random: () => number): number {
+  return backoffDelayMs(wait, random, 10_000);
+}
+
+function backoffDelayMs(attempt: number, random: () => number, ceilingMs: number): number {
   const exponentialMs = 500 * 2 ** (attempt - 1);
-  return Math.min(2_000, Math.max(1, Math.round(exponentialMs * (0.75 + random() * 0.5))));
+  return Math.min(ceilingMs, Math.max(1, Math.round(exponentialMs * (0.75 + random() * 0.5))));
+}
+
+/** How a failed bootstrap bridge start continues; `null` ends it. */
+type BootstrapRecovery = "free_slot" | "fresh_bridge" | null;
+
+/**
+ * A full execution ceiling is transient (a session finishing or the idle
+ * reaper frees a slot) and nothing was reserved or spawned, so a claim that
+ * can end the wait waits it out with backoff, costing no attempt. Any other
+ * transient start failure gets a fresh bridge within the four attempts.
+ */
+function bootstrapRecovery(error: unknown, bootstrapAttempt: number, claimed: boolean): BootstrapRecovery {
+  if (claimed && executionCapacityFull(error)) return "free_slot";
+  return startupRetryable(error) && bootstrapAttempt < 4 ? "fresh_bridge" : null;
+}
+
+function executionCapacityFull(error: unknown): boolean {
+  return error instanceof RemoteInstanceError && error.diagnostic === "execution_capacity_full";
 }
 
 function runtimeDefaults(options: AgentRuntimeOptions): { events: RunnerEventBus; logger: Logger; now: () => Date } {
@@ -535,7 +562,10 @@ export class AgentRuntime {
     if (this.authRequired) return new RemoteInstanceError("agent_auth_required", "Sign in to the selected local agent.", { recoveryActions: [{ kind: "login_agent", agentId: this.family.agentId }] });
     if (this.activeLogin !== null) return new RemoteInstanceError("temporarily_unavailable", "The local agent is signing in.");
     if (this.stopping || !this.capacityFree(limit) || this.executionBridges.has(ref)) {
-      return new RemoteInstanceError("recovery_required", "Native execution owner capacity is unavailable; retained owners require qualified finalization.");
+      // One code for three checks; the diagnostic names which one refused.
+      return new RemoteInstanceError("recovery_required", "Native execution owner capacity is unavailable; retained owners require qualified finalization.", {
+        diagnostic: this.stopping ? "runtime_stopping" : this.executionBridges.has(ref) ? "execution_reference_reused" : "execution_capacity_full",
+      });
     }
     return null;
   }
@@ -697,13 +727,16 @@ export class AgentRuntime {
     return this.acquireOwnedBootstrapBridge(ref, firstAttempt, owners, lifecycle, cwd, readOnlyRoots);
   }
 
+  /** Tries until a bridge initializes or a failure ends the start; waits for a free slot do not consume attempts. */
   private async acquireOwnedBootstrapBridge(ref: string, firstAttempt: number, owners: { durablePrevious: RetainedProcessOwner | undefined }, lifecycle: SessionLifecycle | undefined, cwd: string | undefined, readOnlyRoots: readonly string[]): Promise<{ bridge: BridgeProcess; bootstrapAttempt: number }> {
-    for (let bootstrapAttempt = firstAttempt; bootstrapAttempt <= 4; bootstrapAttempt += 1) {
-      const bridge = await this.bootstrapAttempt(ref, bootstrapAttempt, owners, lifecycle, cwd, readOnlyRoots);
-      if (bridge) return { bridge, bootstrapAttempt };
-      await this.bootstrapPause(ref, bootstrapAttempt);
+    let bootstrapAttempt = firstAttempt;
+    for (let slotWait = 1; ;) {
+      const outcome = await this.bootstrapAttempt(ref, bootstrapAttempt, owners, lifecycle, cwd, readOnlyRoots);
+      if ("bridge" in outcome) return { bridge: outcome.bridge, bootstrapAttempt };
+      await this.bootstrapPause(ref, { bootstrapAttempt, slotWait, ...outcome }, lifecycle);
+      if (outcome.recovery === "free_slot") slotWait += 1;
+      else bootstrapAttempt += 1;
     }
-    throw new RemoteInstanceError("agent_unavailable", "Bootstrap bridge retry budget exhausted.", { retryable: true });
   }
 
   /** Fixed-authority children are replaced before the provider resumes with new roots. */
@@ -769,8 +802,8 @@ export class AgentRuntime {
     );
   }
 
-  /** The initialized candidate, or null when this attempt failed in a way worth a fresh one (its process already stopped). */
-  private async bootstrapAttempt(ref: string, bootstrapAttempt: number, owners: { durablePrevious: RetainedProcessOwner | undefined }, lifecycle: SessionLifecycle | undefined, cwd: string | undefined, readOnlyRoots: readonly string[]): Promise<BridgeProcess | null> {
+  /** The initialized candidate, or how a failure worth another try continues (any candidate process already stopped). */
+  private async bootstrapAttempt(ref: string, bootstrapAttempt: number, owners: { durablePrevious: RetainedProcessOwner | undefined }, lifecycle: SessionLifecycle | undefined, cwd: string | undefined, readOnlyRoots: readonly string[]): Promise<{ bridge: BridgeProcess } | { recovery: "free_slot" | "fresh_bridge"; error: unknown }> {
     const persisted: { candidate?: RetainedProcessOwner } = {};
     const initializeStartedAt = Date.now();
     try {
@@ -781,7 +814,7 @@ export class AgentRuntime {
         bootstrapAttempt,
         bridgeInitializeDurationMs: Date.now() - initializeStartedAt,
       }, bootstrapAttempt === 1 ? "bootstrap bridge initialized" : "fresh bootstrap bridge initialized");
-      return bridge;
+      return { bridge };
     } catch (error) {
       const failedOwner = this.executionBridges.get(ref);
       // An explicit stop/recovery owns this reference now. Its settlement
@@ -791,22 +824,26 @@ export class AgentRuntime {
       const stopConfirmed = await this.stopFailedBootstrapCandidate(failedOwner, ref, bootstrapAttempt, initializeStartedAt);
       if (persisted.candidate) owners.durablePrevious = persisted.candidate;
       this.finalizeFailedBootstrap(ref, failedOwner);
-      const retryable = startupRetryable(error);
-      const exhausted = !retryable || bootstrapAttempt === 4;
-      this.logger.warn({
-        agentId: this.family.agentId,
-        acpSessionRef: ref,
-        bootstrapAttempt,
-        maxBootstrapAttempts: 4,
-        bridgeInitializeDurationMs: Date.now() - initializeStartedAt,
-        stopConfirmed,
-        retryable,
-        exhausted,
-        ...startupErrorFields(error),
-      }, "bootstrap bridge initialization failed");
-      if (exhausted) throw error;
-      return null;
+      const recovery = bootstrapRecovery(error, bootstrapAttempt, lifecycle !== undefined);
+      // A wait for a free slot is logged once per wait, with its delay, by the pause.
+      if (recovery !== "free_slot") this.logBootstrapFailure(ref, { bootstrapAttempt, initializeStartedAt, stopConfirmed, recovery, error });
+      if (recovery === null) throw error;
+      return { recovery, error };
     }
+  }
+
+  private logBootstrapFailure(ref: string, failure: { bootstrapAttempt: number; initializeStartedAt: number; stopConfirmed: boolean; recovery: BootstrapRecovery; error: unknown }): void {
+    this.logger.warn({
+      agentId: this.family.agentId,
+      acpSessionRef: ref,
+      bootstrapAttempt: failure.bootstrapAttempt,
+      maxBootstrapAttempts: 4,
+      bridgeInitializeDurationMs: Date.now() - failure.initializeStartedAt,
+      stopConfirmed: failure.stopConfirmed,
+      retryable: startupRetryable(failure.error),
+      exhausted: failure.recovery === null,
+      ...startupErrorFields(failure.error),
+    }, "bootstrap bridge initialization failed");
   }
 
   private finalizeFailedBootstrap(ref: string, failedOwner: ExecutionOwner | undefined): void {
@@ -836,13 +873,21 @@ export class AgentRuntime {
     }
   }
 
-  /** Exponential backoff with jitter before a fresh bootstrap bridge. */
-  private async bootstrapPause(ref: string, bootstrapAttempt: number): Promise<void> {
-    const delayMs = freshProcessDelayMs(bootstrapAttempt, this.options.retryRandom ?? Math.random);
-    this.logger.warn({ agentId: this.family.agentId, acpSessionRef: ref, bootstrapAttempt,
-      nextBootstrapAttempt: bootstrapAttempt + 1, maxBootstrapAttempts: 4, delayMs, recovery: "fresh_bridge" },
-    "retrying bootstrap bridge initialization with exponential backoff");
+  /**
+   * Exponential backoff with jitter before the next try: a fresh bootstrap
+   * bridge, or another reservation once a slot may be free. The claim is
+   * checked after each pause, so a cancelled or moved turn stops waiting.
+   */
+  private async bootstrapPause(ref: string, step: { bootstrapAttempt: number; slotWait: number; recovery: "free_slot" | "fresh_bridge"; error: unknown }, lifecycle: SessionLifecycle | undefined): Promise<void> {
+    const random = this.options.retryRandom ?? Math.random;
+    const freeSlot = step.recovery === "free_slot";
+    const delayMs = freeSlot ? freeSlotDelayMs(step.slotWait, random) : freshProcessDelayMs(step.bootstrapAttempt, random);
+    this.logger.warn({ agentId: this.family.agentId, acpSessionRef: ref, bootstrapAttempt: step.bootstrapAttempt,
+      ...(freeSlot ? { slotWait: step.slotWait, limit: this.executionLimit(), held: this.heldExecutionOwners() } : { nextBootstrapAttempt: step.bootstrapAttempt + 1, maxBootstrapAttempts: 4 }),
+      delayMs, recovery: step.recovery, ...startupErrorFields(step.error) },
+    freeSlot ? "every execution process is held; waiting for a free one with exponential backoff" : "retrying bootstrap bridge initialization with exponential backoff");
     await this.retrySleep(delayMs);
+    lifecycle?.assertCurrent();
   }
 
   private retrySleep(delayMs: number): Promise<void> {
