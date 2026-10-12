@@ -1,7 +1,7 @@
 import { lstat, realpath } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { z } from "zod/v4";
-import { RemoteInstanceError, sha256Hex } from "@konteks/remote-common";
+import { RemoteInstanceError, sha256Hex, isFsErrorWithCode } from "@konteks/remote-common";
 import { privateWorkspaceDirectory, readWorkspaceControlFile } from "./workspace-storage.js";
 
 const digest = z.string().regex(/^sha256:[a-f0-9]{64}$/);
@@ -18,8 +18,14 @@ export async function inspectWorkspaceGitControl(scope: WorkspaceGitScope): Prom
   await privateWorkspaceDirectory(root);
   const roots = [root];
   if (scope.repositoryCacheRoot) {
-    const cache = await realpath(scope.repositoryCacheRoot);
-    await privateWorkspaceDirectory(cache); roots.push(cache);
+    // Restored repositories contain their own Git control state. A fresh
+    // runtime need not have fetched an object cache yet; absent caches grant
+    // no path authority to a linked worktree or its common directory.
+    const cache = await realpath(scope.repositoryCacheRoot).catch(error => {
+      if (isFsErrorWithCode(error, "ENOENT")) return null;
+      throw error;
+    });
+    if (cache) { await privateWorkspaceDirectory(cache); roots.push(cache); }
   }
   const cwd = await realpath(scope.cwd);
   assertInside(cwd, [root], true);
