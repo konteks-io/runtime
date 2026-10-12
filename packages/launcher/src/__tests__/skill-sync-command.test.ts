@@ -51,3 +51,25 @@ it("shows when a Skill sync replaced a concurrent revision", async () => {
     "Skill skill-a: concurrent revision revision-b was replaced (observed revision-a; accepted revision-c).",
   );
 });
+
+it("localizes concurrent revision replacement reports in Indonesian", async () => {
+  const report = {
+    complete: true,
+    loaded: "unknown",
+    skills: [],
+    profiles: [],
+    publicationReplacements: [{
+      skillId: "skill-a",
+      observedRevisionId: "revision-a",
+      replacedRevisionId: "revision-b",
+      acceptedRevisionId: "revision-c",
+    }],
+  };
+  const output: Output = { json: false, setupLocale: "id", line: vi.fn(), table: vi.fn(), result: vi.fn(), error: vi.fn() };
+
+  await syncSkills({ output, control: { call: vi.fn(async () => report) } as never });
+
+  expect(output.line).toHaveBeenCalledWith(
+    "Skill skill-a: revisi bersamaan revision-b digantikan (revisi awal revision-a; diterima revision-c).",
+  );
+});
