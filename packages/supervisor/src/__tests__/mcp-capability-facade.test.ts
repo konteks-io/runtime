@@ -10,6 +10,7 @@ const facades: McpCapabilityFacade[] = [];
 afterEach(async () => {
   await Promise.all(facades.splice(0).map(facade => facade.close()));
   await Promise.all(servers.splice(0).map(server => new Promise<void>(resolve => server.close(() => resolve()))));
+  vi.unstubAllGlobals();
 });
 
 async function upstream(handler: Parameters<typeof createServer>[0]): Promise<string> {
@@ -225,4 +226,61 @@ describe("browser access Core opens with environment_open", () => {
     await refused.call(open(10));
     expect(refused.onBrowserAccess).not.toHaveBeenCalled();
   });
+});
+
+it("retains every concurrent close until an aborted upstream request actually settles", async () => {
+  const actualFetch = globalThis.fetch;
+  const pending = Promise.withResolvers<Response>();
+  let upstreamSignal: AbortSignal | undefined;
+  vi.stubGlobal("fetch", vi.fn((input, init) => {
+    if (String(input) === "https://mcp.invalid/mcp") { upstreamSignal = init.signal; return pending.promise; }
+    return actualFetch(input, init);
+  }));
+  const { facade, entry } = await started({ initial: issue("https://mcp.invalid/mcp", "cloud-test", Date.now() + 300_000), renew: vi.fn() });
+  const call = actualFetch(entry.url, { method: "POST", headers: localHeaders(entry), body: "{}" }).catch(() => undefined);
+  await vi.waitFor(() => expect(upstreamSignal).toBeDefined());
+  let firstDone = false, secondDone = false;
+  const first = facade.close().then(() => { firstDone = true; });
+  const second = facade.close().then(() => { secondDone = true; });
+  try {
+    await vi.waitFor(() => expect(upstreamSignal?.aborted).toBe(true));
+    await new Promise<void>(resolve => setTimeout(resolve, 20));
+    expect(firstDone).toBe(false); expect(secondDone).toBe(false);
+    await expect(actualFetch(entry.url, { method: "POST", headers: localHeaders(entry), body: "{}" })).rejects.toThrow();
+  } finally { pending.reject(new Error("upstream finally settled")); await Promise.all([first, second, call]); }
+});
+
+it("never installs browser access from a tool reply that completes after the facade closes", async () => {
+  const actualFetch = globalThis.fetch;
+  const pending = Promise.withResolvers<Response>();
+  let startedRequest = false;
+  vi.stubGlobal("fetch", vi.fn((input, init) => {
+    if (String(input) === "https://mcp.invalid/mcp") { startedRequest = true; return pending.promise; }
+    return actualFetch(input, init);
+  }));
+  const onBrowserAccess = vi.fn();
+  const { facade, entry } = await started({ initial: issue("https://mcp.invalid/mcp", "cloud-test", Date.now() + 300_000), renew: vi.fn(), onBrowserAccess });
+  const call = actualFetch(entry.url, { method: "POST", headers: localHeaders(entry), body: JSON.stringify({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "platform__quality-assurance__environment_open", arguments: {} } }) }).catch(() => undefined);
+  await vi.waitFor(() => expect(startedRequest).toBe(true));
+  const closed = facade.close();
+  pending.resolve(new Response(JSON.stringify({ jsonrpc: "2.0", id: 7, result: { structuredContent: { target: { kind: "preview" }, browserAccess: { sessionId: "session", origins: [{ origin: "https://session.preview.example.com", expiresAt: new Date(Date.now() + 60_000).toISOString() }] } } } }), { headers: { "content-type": "application/json" } }));
+  await Promise.all([closed, call]);
+  await new Promise<void>(resolve => setTimeout(resolve, 20));
+  expect(onBrowserAccess).not.toHaveBeenCalled();
+});
+
+it("settles a real streaming response when recovery closes the local connection", async () => {
+  let upstreamClosed = false;
+  const url = await upstream((_request, response) => {
+    response.once("close", () => { upstreamClosed = true; });
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write("data: still running\n\n");
+  });
+  const { facade, entry } = await started({ initial: issue(url, "cloud-test", Date.now() + 300_000), renew: vi.fn() });
+  const answer = await fetch(entry.url, { method: "POST", headers: localHeaders(entry), body: "{}" });
+  const reader = answer.body!.getReader();
+  expect((await reader.read()).done).toBe(false);
+  await facade.close();
+  await vi.waitFor(() => expect(upstreamClosed).toBe(true));
+  await reader.cancel().catch(() => undefined);
 });

@@ -251,6 +251,7 @@ export class RelayedSession {
   private lastPromptCompletion: { usage: AgentTurnUsageObservation | null } = { usage: null };
   private deliveryAcceptance: RemoteDeliveryAcceptanceReceipt | null = null;
   private mcpFacade: McpCapabilityFacade | null = null;
+  private readonly mcpClosures = new Set<Promise<void>>();
   private previewTools: PreviewMcpServer | null = null;
   /** The session's `submit_result` tool (every session has one; it is generic until a turn asks for a result). */
   private resultTools: StructuredResultToolServer | null = null;
@@ -1952,7 +1953,10 @@ export class RelayedSession {
     if (this.recoveryStopTask) return this.recoveryStopTask;
     this.fenceForRecovery();
     this.recoveryStopTask = (async () => {
-      await this.closeMcpFacade();
+      // Fence tools immediately, but request ACP cancellation before awaiting
+      // their drain: an in-flight tool can itself be waiting for the agent.
+      const toolsStop = this.closeMcpFacade();
+      void toolsStop.catch(() => undefined);
       const previewStop = this.stopPreview("claim_lost");
       void previewStop.catch(() => undefined);
       const initialRef = this.creationReturned ? this.acpSessionRef : null;
@@ -1976,7 +1980,7 @@ export class RelayedSession {
       if (this.closeTask) await Promise.allSettled([this.closeTask]);
       const runnerStop = initialStop ?? (this.acpSessionRef !== null ? stop(this.acpSessionRef) :
         Promise.reject(new RemoteInstanceError("recovery_required", "Bridge session creation has an unknown outcome; recovery stop is unproven.")));
-      const stops = await Promise.allSettled([runnerStop, previewStop]);
+      const stops = await Promise.allSettled([runnerStop, previewStop, toolsStop]);
       const failure = stops.find((result): result is PromiseRejectedResult => result.status === "rejected");
       if (failure) throw failure.reason;
       // The execution is already `stopping` under this session's own recovery
@@ -2133,6 +2137,15 @@ export class RelayedSession {
   }
 
   private async closeMcpFacade(): Promise<void> {
+    const closing = this.closeMcpResources();
+    this.mcpClosures.add(closing);
+    // Retain failures for subsequent recovery; a second close must not skip
+    // another caller's pending or unconfirmed resource shutdown.
+    void closing.then(() => this.mcpClosures.delete(closing), () => undefined);
+    await Promise.all([...this.mcpClosures]);
+  }
+
+  private async closeMcpResources(): Promise<void> {
     const facade = this.mcpFacade;
     this.mcpFacade = null;
     const tools = this.previewTools;
