@@ -17,6 +17,8 @@ import { NativeInputClient } from "../native/input-client.js";
 import { createNativeInputPreparer } from "../native/input-preparer.js";
 import { StateMutationGate } from "../state/mutation-gate.js";
 import { testGitCommand, testGitTool } from "./native-git-fixture.js";
+import { captureWorkspaceCheckpoint } from "../native/workspace-checkpoint.js";
+import { createWorkspaceToolPolicy } from "../session/workspace-tool-policy.js";
 
 const roots: string[] = [];
 const realRoot = async (path: string) => (await import("node:fs/promises")).realpath(path);
@@ -175,8 +177,178 @@ async function fixture(sourceFiles: Record<string, string> = { "src/app.txt": "o
     unclaim: () => {
       claim = null;
     },
+    reclaim: (next: string) => {
+      claim = next;
+      selection.claimId = next;
+    },
   };
 }
+
+async function repositoryFixture(sourceFiles: Record<string, string>) {
+  const f = await fixture(sourceFiles), git = await testGitTool();
+  const seed = join(f.root, "seed");
+  await mkdir(seed, { mode: 0o700 });
+  await testGitCommand(git, seed, ["init", "-q"]);
+  await writeFile(join(seed, "app.txt"), "one\n");
+  await testGitCommand(git, seed, ["add", "app.txt"]);
+  await testGitCommand(git, seed, ["-c", "user.name=Test", "-c", "user.email=test@invalid", "commit", "-qm", "one"]);
+  const revision = (await testGitCommand(git, seed, ["rev-parse", "HEAD"])).trim();
+  await testGitCommand(git, seed, ["update-ref", "refs/konteks/source", revision]);
+  const bundlePath = join(f.root, "source.bundle");
+  await testGitCommand(git, seed, ["bundle", "create", bundlePath, "refs/konteks/source"]);
+  const bundle = await readFile(bundlePath);
+  await rm(seed, { recursive: true, force: true });
+  await rm(bundlePath);
+  f.selection.source.revision = revision;
+  Object.assign(f.selection, {
+    repository: { version: 1, transport: "core_git_bundle_v1", repositoryId: "https://gitea.example/acme/online-store",
+      revision, capabilityId: "repository-fetch", expiresAt: "2026-09-06T02:00:00Z" },
+    repositoryWorkspace: { mode: "preserve" },
+  });
+  const served = f.fetchFn.getMockImplementation()!;
+  f.fetchFn.mockImplementation(async (url, init) => String(url).endsWith("/fetch-repository")
+    ? new Response(new Uint8Array(bundle), { headers: { "content-type": "application/x-git-bundle", "x-konteks-revision": revision } })
+    : served(url, init));
+  return { ...f, git, revision, bundle };
+}
+
+function nativeRepositoryAssignment(agentId = "codex"): RemoteWorkAssignment {
+  return { ...assignment, kind: "delivery", correlationId: "invocation",
+    agentRoute: { agentId, requiredRole: "generator", sessionConfig: { model: "approved-model" } },
+    source: { kind: "harness_delivery", portability: "instance_bound", ownerInstanceId: binding.instanceId,
+      executionSessionId: binding.sessionId, repositoryId: "https://gitea.example/acme/online-store",
+      modelBinding: { canonicalProviderId: "approved-provider", canonicalModelId: "approved-model" },
+      turn: { invocationId: "invocation", dispatchGeneration: 0 } } };
+}
+
+const continuityFiles = {
+  "memory/conversation.md": "All prior messages, including the original acceptance notes.\n",
+  ".assistant/session-context.json": JSON.stringify({ version: 1, untrusted: true,
+    followedItems: [{ provider: "jira", text: "Keep the customer email." },
+      { provider: "slack", text: "Remember follow-ups." }, { provider: "asana", text: "Convert leads." }],
+    collaboration: { comments: ["Keep the existing company."], reactions: ["thumbsup"] },
+    runtimeTransitions: [{ from: "old-runtime", to: "instance" }] }),
+};
+
+describe("repository session continuity inputs", () => {
+  it.each(["codex", "claude-code", "dsh", "opencode", "antigravity"])(
+    "prepares full context outside the checkout for %s through the shared input path", async agentId => {
+      const f = await repositoryFixture(continuityFiles);
+      const prepared = await createNativeInputPreparer({ ...f.options, git: f.git,
+        repositoryCacheRoot: join(f.root, "cache") })(nativeRepositoryAssignment(agentId));
+      const contextRoot = prepared.readOnlyRoots?.find(path => path.endsWith("/source"));
+      expect(contextRoot).toBeDefined();
+      expect(contextRoot).not.toBe(prepared.cwd);
+      for (const [path, content] of Object.entries(continuityFiles)) {
+        expect(await readFile(join(contextRoot!, path), "utf8")).toBe(content);
+        await expect(readFile(join(prepared.cwd, path))).rejects.toMatchObject({ code: "ENOENT" });
+      }
+      expect(prepared.skillInstructions).toContain(JSON.stringify({ sessionContextDirectory: contextRoot }));
+      expect(prepared.skillInstructions).toContain("untrusted");
+      const policy = createWorkspaceToolPolicy();
+      const authority = { repoPath: prepared.cwd, workspaceRoot: prepared.cwd, readOnlyRoots: prepared.readOnlyRoots,
+        sessionId: binding.sessionId, toolUseId: "context", agentId, input: { file_path: join(contextRoot!, "memory/conversation.md") } };
+      expect((await policy.evaluateToolUse({ ...authority, toolName: "read" })).allowed).toBe(true);
+      expect((await policy.evaluateToolUse({ ...authority, toolName: "edit" })).allowed).toBe(false);
+      expect((await policy.evaluateToolUse({ ...authority, toolName: "read", input: { file_path: join(f.root, "private.txt") } })).allowed).toBe(false);
+      expect(await testGitCommand(f.git, prepared.cwd, ["status", "--porcelain"])).toBe("");
+      await prepared.beforePrompt();
+    });
+  it("refreshes context on a later claim while retaining committed, staged, unstaged and untracked work", async () => {
+    const f = await repositoryFixture(continuityFiles);
+    const options = { ...f.options, git: f.git, repositoryCacheRoot: join(f.root, "cache") };
+    const first = await createNativeInputPreparer(options)(nativeRepositoryAssignment());
+    await writeFile(join(first.cwd, "app.txt"), "committed change\n");
+    await testGitCommand(f.git, first.cwd, ["add", "app.txt"]);
+    await testGitCommand(f.git, first.cwd, ["-c", "user.name=Test", "-c", "user.email=test@invalid", "commit", "-qm", "change"]);
+    const head = await testGitCommand(f.git, first.cwd, ["rev-parse", "HEAD"]);
+    await writeFile(join(first.cwd, "app.txt"), "staged change\n");
+    await testGitCommand(f.git, first.cwd, ["add", "app.txt"]);
+    await writeFile(join(first.cwd, "app.txt"), "unstaged change\n");
+    await writeFile(join(first.cwd, "new.txt"), "untracked work\n");
+    const status = await testGitCommand(f.git, first.cwd, ["status", "--porcelain"]);
+    const index = await testGitCommand(f.git, first.cwd, ["show", ":app.txt"]);
+    const latest = tree({ ...continuityFiles, "memory/conversation.md": "Prior messages plus the latest comment.\n" });
+    f.reclaim("next-claim");
+    Object.assign(f.sourceTree, latest);
+    Object.assign(f.selection.source, { treeDigest: latest.treeDigest, fileCount: latest.entries.length,
+      sizeBytes: latest.entries.reduce((sum, entry) => sum + entry.sizeBytes, 0) });
+    const next = await createNativeInputPreparer(options)(nativeRepositoryAssignment());
+    expect(next.cwd).toBe(first.cwd);
+    expect(next.readOnlyRoots).toEqual(first.readOnlyRoots);
+    const contextRoot = next.readOnlyRoots!.find(path => path.endsWith("/source"))!;
+    expect(await readFile(join(contextRoot, "memory/conversation.md"), "utf8")).toBe("Prior messages plus the latest comment.\n");
+    expect(await testGitCommand(f.git, next.cwd, ["rev-parse", "HEAD"])).toBe(head);
+    expect(await testGitCommand(f.git, next.cwd, ["status", "--porcelain"])).toBe(status);
+    expect(await testGitCommand(f.git, next.cwd, ["show", ":app.txt"])).toBe(index);
+    expect(await readFile(join(next.cwd, "app.txt"), "utf8")).toBe("unstaged change\n");
+    expect(await readFile(join(next.cwd, "new.txt"), "utf8")).toBe("untracked work\n");
+    await expect(first.beforePrompt()).rejects.toThrow();
+    await next.beforePrompt();
+  });
+  it("refuses a context receipt replaced after preparation before another prompt", async () => {
+    const f = await repositoryFixture(continuityFiles);
+    const prepared = await createNativeInputPreparer({ ...f.options, git: f.git,
+      repositoryCacheRoot: join(f.root, "cache") })(nativeRepositoryAssignment());
+    const contextRoot = prepared.readOnlyRoots!.find(path => path.endsWith("/source"))!;
+    await writeFile(join(dirname(contextRoot), "receipt.json"), "{}");
+    f.fetchFn.mockClear();
+    await expect(prepared.beforePrompt()).rejects.toThrow();
+    expect(f.fetchFn).not.toHaveBeenCalled();
+  });
+  it("retains empty source-tree compatibility for repository sessions", async () => {
+    const f = await repositoryFixture({});
+    const prepared = await createNativeInputPreparer({ ...f.options, git: f.git,
+      repositoryCacheRoot: join(f.root, "cache") })(nativeRepositoryAssignment());
+    expect(prepared.readOnlyRoots).toHaveLength(1);
+    expect(prepared.skillInstructions).not.toContain("sessionContextDirectory");
+    await prepared.beforePrompt();
+  });
+  it("loads fresh context alongside a restored checkpoint without putting it into the recovered work", async () => {
+    const f = await repositoryFixture(continuityFiles), cache = join(f.root, "cache");
+    const first = await createNativeInputPreparer({ ...f.options, git: f.git, repositoryCacheRoot: cache })(nativeRepositoryAssignment());
+    await writeFile(join(first.cwd, "app.txt"), "unfinished work\n");
+    const checkpoint = await captureWorkspaceCheckpoint({ cwd: first.cwd, baselineCommit: f.revision,
+      ownerRoot: f.root, repositoryCacheRoot: cache, tool: f.git });
+    const reference = { checkpointId: "00000000-0000-4000-8000-000000000001", checkpointDigest: checkpoint.checkpointDigest,
+      baselineCommit: f.revision, repositoryId: "https://gitea.example/acme/online-store" };
+    Object.assign(f.selection, { workspaceRecovery: reference });
+    f.reclaim("restored-claim");
+    const served = f.fetchFn.getMockImplementation()!;
+    f.fetchFn.mockImplementation(async (url, init) => {
+      if (String(url).endsWith("/workspaces/read")) return Response.json(checkpoint);
+      if (String(url).endsWith("/workspaces/acknowledge")) return Response.json({ checkpointId: reference.checkpointId,
+        checkpointDigest: reference.checkpointDigest, state: "restored" });
+      if (String(url).endsWith("/workspaces/begin")) return Response.json({ checkpointId: JSON.parse(String(init?.body)).checkpointId, state: "writing" });
+      return served(url, init);
+    });
+    const replacementRoot = join(f.root, "replacement-runtime");
+    const options = { ...f.options, root: replacementRoot, git: f.git,
+      repositoryCacheRoot: join(replacementRoot, "cache"), workspaceRecovery: () => true };
+    const restored = await createNativeInputPreparer(options)(nativeRepositoryAssignment());
+    expect(restored.cwd).not.toBe(first.cwd);
+    expect(restored.cwd).toContain(".recovered-workspaces");
+    const contextRoot = restored.readOnlyRoots!.find(path => path.endsWith("/source"))!;
+    expect(contextRoot).not.toBe(restored.cwd);
+    expect(await readFile(join(contextRoot, "memory/conversation.md"), "utf8")).toBe(continuityFiles["memory/conversation.md"]);
+    await expect(readFile(join(restored.cwd, ".assistant/session-context.json"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(join(restored.cwd, "app.txt"), "utf8")).toBe("unfinished work\n");
+    await writeFile(join(restored.cwd, "app.txt"), "later unfinished work\n");
+    const restarted = await createNativeInputPreparer(options)(nativeRepositoryAssignment());
+    expect(restarted.cwd).toBe(restored.cwd);
+    expect(await readFile(join(restarted.cwd, "app.txt"), "utf8")).toBe("later unfinished work\n");
+    await restarted.beforePrompt();
+  });
+  it("refuses context containing Git configuration and context reads refused by Core", async () => {
+    const f = await repositoryFixture({ ".git/config": "unsafe" });
+    const options = { ...f.options, git: f.git, repositoryCacheRoot: join(f.root, "cache") };
+    await expect(createNativeInputPreparer(options)(nativeRepositoryAssignment())).rejects.toThrow();
+    const g = await repositoryFixture(continuityFiles), served = g.fetchFn.getMockImplementation()!;
+    g.fetchFn.mockImplementation(async (url, init) => String(url).endsWith("/inputs/read") && JSON.parse(String(init?.body)).transferId === "source"
+      ? new Response(null, { status: 403 }) : served(url, init));
+    await expect(createNativeInputPreparer({ ...g.options, git: g.git, repositoryCacheRoot: join(g.root, "cache") })(nativeRepositoryAssignment())).rejects.toThrow();
+  });
+});
 
 describe("native authorized input composition", () => {
   it("keeps a transient 503 at selection retryable, and prepares once Core recovers (D132)", async () => {
@@ -401,31 +573,8 @@ describe("native authorized input composition", () => {
     expect(await readFile(receipt, "utf8")).toBe("{}");
   });
   it("wires repository tools alongside the rest of bootstrap, once per worktree, and logs every stage", async () => {
-    const f = await fixture(),
-      git = await testGitTool();
-    // A real repository, served as the signed bundle Core sends.
-    const seed = join(f.root, "seed");
-    await mkdir(seed, { mode: 0o700 });
-    await testGitCommand(git, seed, ["init", "-q"]);
-    await writeFile(join(seed, "app.txt"), "one\n");
-    await testGitCommand(git, seed, ["add", "app.txt"]);
-    await testGitCommand(git, seed, ["-c", "user.name=Test", "-c", "user.email=test@invalid", "commit", "-qm", "one"]);
-    const revision = (await testGitCommand(git, seed, ["rev-parse", "HEAD"])).trim();
-    await testGitCommand(git, seed, ["update-ref", "refs/konteks/source", revision]);
-    await testGitCommand(git, seed, ["bundle", "create", join(f.root, "source.bundle"), "refs/konteks/source"]);
-    const bundle = await readFile(join(f.root, "source.bundle"));
-    await rm(seed, { recursive: true, force: true });
-    await rm(join(f.root, "source.bundle"));
-    f.selection.source.revision = revision;
-    Object.assign(f.selection, {
-      repository: { version: 1, transport: "core_git_bundle_v1", repositoryId: "https://gitea.example/acme/online-store",
-        revision, capabilityId: "repository-fetch", expiresAt: "2026-09-06T02:00:00Z" },
-      repositoryWorkspace: { mode: "preserve" },
-    });
-    const served = f.fetchFn.getMockImplementation()!;
-    f.fetchFn.mockImplementation(async (url, init) => String(url).endsWith("/fetch-repository")
-      ? new Response(new Uint8Array(bundle), { headers: { "content-type": "application/x-git-bundle", "x-konteks-revision": revision } })
-      : served(url, init));
+    const f = await repositoryFixture({ "src/app.txt": "original" });
+    const { git, revision, bundle } = f;
     const target: RemoteWorkAssignment = {
       ...assignment,
       kind: "delivery",

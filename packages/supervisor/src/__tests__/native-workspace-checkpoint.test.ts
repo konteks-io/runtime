@@ -42,6 +42,22 @@ async function unfinishedWork() {
 }
 
 describe('native workspace recovery checkpoint', () => {
+  it('preserves a standalone recovered repository before a replacement runtime has an object cache', async () => {
+    await unfinishedWork();
+    const checkpoint = await captureWorkspaceCheckpoint({ cwd: source, ownerRoot: root, tool, baselineCommit: baseline,
+      repositoryCacheRoot: join(root, 'not-created-yet') });
+    const restored = await restoreWorkspaceCheckpoint({ destination: join(root, 'replacement'), tool, checkpoint });
+    expect(await git(restored.cwd, 'show', ':kept.txt')).toBe('staged work\n');
+    expect(await readFile(join(restored.cwd, 'kept.txt'), 'utf8')).toBe('unstaged work\n');
+  });
+  it('still refuses an external worktree pointer when the selected cache is absent', async () => {
+    const ownerRoot = join(root, 'private-agent'); await mkdir(ownerRoot, { mode: 0o700 });
+    const linked = join(ownerRoot, 'linked');
+    await git(source, 'worktree', 'add', '--detach', linked, 'HEAD');
+    await expect(captureWorkspaceCheckpoint({ cwd: linked, ownerRoot, tool, baselineCommit: baseline,
+      repositoryCacheRoot: join(root, 'absent-cache') })).rejects.toThrow();
+    expect(await readFile(join(linked, 'kept.txt'), 'utf8')).toBe('base\n');
+  });
   it('restores local commits, staged versus unstaged edits, deletions, binary/untracked and ignored files on another runtime', async () => {
     await unfinishedWork();
     const before = await git(source, 'status', '--porcelain=v1', '-z');
