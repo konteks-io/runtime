@@ -71,6 +71,19 @@ describe("durable native output state", () => {
     expect((await store.read())?.candidate).toEqual(candidate);
   });
 
+  it("never replaces a different accepted local head while hydrating recovered history", async () => {
+    const head = new NativeOutputSessionHeadStore(dir, "session");
+    const old = { invocationId: "old", claimId: "old-claim" };
+    const accepted = fixture(old.invocationId, old.claimId);
+    await head.begin(old); await head.record(old).savePending(accepted.candidate, accepted.completion);
+    await head.record(old).saveAccepted(accepted.candidate, accepted.receipt); await head.promote(old);
+    const current = { invocationId: "next", claimId: "next-claim" };
+    const expected = { ...old, acceptanceId: accepted.receipt.acceptanceId, resultDigest: accepted.receipt.resultDigest };
+    await expect(head.recoverVerifiedAcceptance({ ...expected, invocationId: "foreign" }, current, `sha256:${"a".repeat(64)}`)).rejects.toThrow();
+    await head.verifyExpected(expected, current);
+    expect((await head.record(old).read())?.state).toBe("accepted");
+  });
+
   it("retains only the accepted session head and current pending turn", async () => {
     const head = new NativeOutputSessionHeadStore(dir, "session");
     const first = fixture("first", "claim-first");
@@ -90,6 +103,17 @@ describe("durable native output state", () => {
     await head.promote({ invocationId: "next", claimId: "claim-next" });
     expect(await head.record({ invocationId: "first", claimId: "claim-first" }).read()).toBeNull();
     expect((await head.record({ invocationId: "next", claimId: "claim-next" }).read())?.state).toBe("accepted");
+  });
+  it("recovers Core's verified accepted lineage without inventing an ACP completion or accepted candidate", async () => {
+    const head = new NativeOutputSessionHeadStore(dir, "session");
+    const first = fixture("first", "claim-first");
+    const expected = { invocationId: "first", claimId: "claim-first", acceptanceId: first.receipt.acceptanceId, resultDigest: first.receipt.resultDigest };
+    const current = { invocationId: "next", claimId: "claim-next" };
+    await head.recoverVerifiedAcceptance(expected, current, `sha256:${"a".repeat(64)}`);
+    expect(await head.record({ invocationId: "first", claimId: "claim-first" }).read()).toBeNull();
+    await head.begin(current);
+    await expect(head.verifyExpected(expected, current)).resolves.toBeUndefined();
+    await expect(head.verifyExpected({ ...expected, resultDigest: `sha256:${"b".repeat(64)}` }, current)).rejects.toBeDefined();
   });
 
   it("repairs a crash after durable acceptance but before session-head promotion", async () => {

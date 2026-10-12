@@ -54,6 +54,12 @@ QA browser, structured results, updates and doctor/support.
 - **Direct work** (`work/continued-session.ts`, `isDirectAssignment`): no
   preamble, no Konteks MCP servers, no preview/browser/result tool, policy root
   = the session's own folder, no repository selection.
+- **Workspace checkpoints** use the signed Core checkpoint contract gate.
+  Dirty ownership is retained before agent writes. A stopped execution can
+  retain an immutable snapshot for retry; this grants no new execution or
+  accepted-output authority. Restore into a fresh private folder, verify before
+  acknowledging, and retain every superseded checkout. An active recovered
+  folder keeps later uncommitted edits across preparation and supervisor restarts.
 - **Core contract gating.** `availableCommands`, `supportedAgents`,
   `connectorCommands`, pay-per-use and option billing go only to a 7.1 Core;
   `integration` work only from 7.3 (`work/accepted-kinds.ts`); a heartbeat's

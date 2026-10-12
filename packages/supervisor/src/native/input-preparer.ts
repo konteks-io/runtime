@@ -1,3 +1,5 @@
+import { NativeWorkspaceCheckpointStore } from "./workspace-preservation.js";
+import { NativeRecoveredWorkspaceStore } from "./workspace-recovery.js";
 import { constants, type Stats } from "node:fs";
 import { execFile } from "node:child_process";
 import { chmod, lstat, mkdir, mkdtemp, open, realpath, rename, rm } from "node:fs/promises";
@@ -42,6 +44,8 @@ import {
 import { NativeRepositoryCache } from "./repository-cache.js";
 
 interface NativeInputPreparerOptions {
+  /** Signed Core contract gate; older Core never receives checkpoint requests. */
+  workspaceRecovery?: () => boolean;
   /** Private, runner-specific connector workspace root, never a user checkout. */
   root: string;
   clock: Clock;
@@ -198,6 +202,8 @@ type WorkspaceReceipt = { version: 1; selectionDigest: string; source: RemoteAss
 
 /** A prepared source folder: where the agent works, the container it lives in, and the check run before every prompt. */
 interface SourceWorkspace {
+  recoveredCheckpointDigest?: string;
+  markWritable?: () => Promise<void>;
   cwd: string;
   container: string;
   verify: () => Promise<void>;
@@ -604,13 +610,14 @@ class InputPreparation {
     this.enter("source_workspace");
     const wiringOf: { task?: Promise<void> } = {};
     const source = await this.sourceWorkspace(inputs, root, wiringOf);
+    await this.beginWorkspacePreservation(inputs, source);
     this.enter("organization_skills");
     const prepared = await this.skills(inputs, root, source.cwd, direct);
     this.logStage("skills", this.elapsed());
     this.enter("source_verification");
     await source.verify();
     this.logStage("verify", this.elapsed());
-    const outputHead = await this.outputHead(inputs, root);
+    const outputHead = await this.outputHead(inputs, root, source);
     return {
       ...prepared,
       skillInstructions: skillInstructions(current, inputs.selection.repository, prepared.skillInstructions),
@@ -665,6 +672,9 @@ class InputPreparation {
     wiringOf: { task?: Promise<void> },
   ): Promise<SourceWorkspace> {
     const fetched: { record?: { bytes: number; durationMs: number } } = {};
+    const recovered = await new NativeRecoveredWorkspaceStore({ root, tool: repository.git, client: this.options.client }).prepare({
+      assignment: inputs.current, claimId: inputs.claimId, selectionDigest: inputs.digest, selection: inputs.selection });
+    if (recovered) return recovered;
     const repositoryWorkspace = inputs.selection.repositoryWorkspace;
     const worktree = await new NativeRepositoryCache({
       root: repository.cacheRoot,
@@ -737,15 +747,21 @@ class InputPreparation {
   }
 
   /** A harness delivery turn's session head; a preserved worktree must still hold the accepted result Core expects. */
-  private async outputHead(inputs: AuthorizedInputs, root: string): Promise<NativeOutputSessionHeadStore | undefined> {
+  private async outputHead(inputs: AuthorizedInputs, root: string, source: SourceWorkspace): Promise<NativeOutputSessionHeadStore | undefined> {
     const harnessTurn = harnessTurnOf(inputs.current);
     const outputHead = harnessTurn ? new NativeOutputSessionHeadStore(root, inputs.selection.binding.sessionId) : undefined;
     const repositoryWorkspace = inputs.selection.repositoryWorkspace;
     if (repositoryWorkspace?.mode === "preserve" && repositoryWorkspace.expectedAcceptedResult) {
       if (!outputHead || !harnessTurn) throw unavailable();
-      await outputHead.verifyExpected(repositoryWorkspace.expectedAcceptedResult, { invocationId: harnessTurn.invocationId, claimId: inputs.claimId });
+      await this.verifyOutputHead(outputHead, repositoryWorkspace.expectedAcceptedResult, { invocationId: harnessTurn.invocationId, claimId: inputs.claimId }, source.recoveredCheckpointDigest);
     }
     return outputHead;
+  }
+
+  private async verifyOutputHead(head: NativeOutputSessionHeadStore, expected: Parameters<NativeOutputSessionHeadStore["verifyExpected"]>[0],
+    current: Parameters<NativeOutputSessionHeadStore["verifyExpected"]>[1], checkpointDigest?: string): Promise<void> {
+    if (checkpointDigest) await head.recoverVerifiedAcceptance(expected, current, checkpointDigest);
+    await head.verifyExpected(expected, current);
   }
 
   private deliveryOutput(inputs: AuthorizedInputs, source: SourceWorkspace, outputHead: NativeOutputSessionHeadStore | undefined): Partial<PreparedSessionInputs> {
@@ -762,6 +778,15 @@ class InputPreparation {
     };
   }
 
+  private async beginWorkspacePreservation(inputs: AuthorizedInputs, source: SourceWorkspace): Promise<void> {
+    if (!this.options.workspaceRecovery?.() || !inputs.selection.repository || !source.baselineCommit || !this.options.git) return;
+    await new NativeWorkspaceCheckpointStore({ root: this.options.root, repositoryCacheRoot: this.options.repositoryCacheRoot, client: this.options.client }).begin({
+      assignment: inputs.current, claimId: inputs.claimId, selectionDigest: inputs.envelope.selectionDigest,
+      cwd: source.cwd, baselineCommit: source.baselineCommit, tool: this.options.git,
+    });
+    await source.markWritable?.();
+  }
+
   private beforePrompt(inputs: AuthorizedInputs, source: SourceWorkspace, prepared: PreparedSessionInputs): () => Promise<void> {
     let prompting = false;
     return () =>
@@ -775,6 +800,7 @@ class InputPreparation {
           // After local verification, so a local failure costs no call.
           await inputs.authorize();
           await source.verify();
+          await this.beginWorkspacePreservation(inputs, source);
         } catch (error) {
           // The turn fails as unavailable either way; keep why.
           this.options.logger?.warn({ event: "native.inputs.recheck_failed", assignmentId: this.assignment.id,

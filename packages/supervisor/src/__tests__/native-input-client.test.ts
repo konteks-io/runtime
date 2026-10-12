@@ -130,6 +130,14 @@ function fixture() {
 }
 
 describe("native claim-scoped input client", () => {
+  it("keeps unfinished workspace transport on its own private claim-bound endpoint", async () => {
+    const f = fixture();
+    const body = { attempt: 1, claimId: "claim", selectionDigest: f.envelope.selectionDigest, checkpointId: "00000000-0000-4000-8000-000000000001" };
+    f.fetchFn.mockResolvedValueOnce(f.response({ checkpointId: body.checkpointId, state: "writing" }));
+    expect(await new NativeInputClient(f.options).workspace(assignment, "begin", body)).toEqual({ checkpointId: body.checkpointId, state: "writing" });
+    expect(String(f.fetchFn.mock.calls[0]?.[0])).toBe("https://core.example/api/remote-instances/internal/remote-instances/instance/assignments/assignment/workspaces/begin");
+    expect(JSON.parse(String(f.fetchFn.mock.calls[0]?.[1]?.body))).toEqual(body);
+  });
   it("fetches an exact signed repository bundle without receiving a VCS credential or URL", async () => {
     const f = fixture();
     const repository = {
