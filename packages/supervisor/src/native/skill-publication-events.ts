@@ -7,6 +7,11 @@ export type SkillPublicationConcurrentReplacement = {
   acceptedRevisionId: string;
 };
 
+type AcceptedPublication = {
+  selection: { skillId?: string | undefined };
+  receipt: RuntimeSkillPublicationReceipt;
+};
+
 export function skillPublicationConcurrentReplacement(
   skillId: string,
   observedRevisionId: string | undefined,
@@ -25,4 +30,24 @@ export function skillPublicationConcurrentReplacement(
     replacedRevisionId: receipt.replacedRevisionId,
     acceptedRevisionId: receipt.revisionId,
   };
+}
+
+export function skillPublicationConcurrentReplacements(
+  records: readonly AcceptedPublication[],
+  limit = 20,
+): SkillPublicationConcurrentReplacement[] {
+  return records
+    .flatMap((record) => {
+      const skillId = record.selection.skillId;
+      if (!skillId) return [];
+      const replacement = skillPublicationConcurrentReplacement(
+        skillId,
+        record.receipt.baseRevisionId,
+        record.receipt,
+      );
+      return replacement ? [{ sequence: record.receipt.acceptedSequence, replacement }] : [];
+    })
+    .sort((left, right) => left.sequence - right.sequence)
+    .slice(-limit)
+    .map(({ replacement }) => replacement);
 }

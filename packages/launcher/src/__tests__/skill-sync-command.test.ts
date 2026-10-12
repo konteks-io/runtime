@@ -27,3 +27,27 @@ it("reports a configured agent without a discovery profile as a failed sync", as
   expect(output.result).toHaveBeenCalledWith(report);
   expect(output.line).toHaveBeenCalledWith("codex: failed (native_profile_unconfigured)");
 });
+
+it("shows when a Skill sync replaced a concurrent revision", async () => {
+  const report = {
+    complete: true,
+    loaded: "unknown",
+    skills: [],
+    profiles: [],
+    publicationReplacements: [{
+      skillId: "skill-a",
+      observedRevisionId: "revision-a",
+      replacedRevisionId: "revision-b",
+      acceptedRevisionId: "revision-c",
+    }],
+  };
+  const output: Output = { json: false, line: vi.fn(), table: vi.fn(), result: vi.fn(), error: vi.fn() };
+  const call = vi.fn(async () => report);
+
+  await expect(syncSkills({ output, control: { call } as never })).resolves.toBeUndefined();
+
+  expect(output.result).toHaveBeenCalledWith(report);
+  expect(output.line).toHaveBeenCalledWith(
+    "Skill skill-a: concurrent revision revision-b was replaced (observed revision-a; accepted revision-c).",
+  );
+});

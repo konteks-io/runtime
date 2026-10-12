@@ -5,6 +5,10 @@ import { exportLocalSkill, inspectLocalSkill, inspectLocalSkillPath } from "./sk
 import { runRequestedSkillSync } from "./native/requested-skill-sync.js";
 import { refreshSkillPublications } from "./native/skill-publication-refresh.js";
 import { syncPersonalSkills } from "./native/personal-skill-sync.js";
+import {
+  skillPublicationConcurrentReplacements,
+  type SkillPublicationConcurrentReplacement,
+} from "./native/skill-publication-events.js";
 import { refreshMachineSkills, machineSkillHomes, runnerSkillProfileHomes, MachineSkillPartialFailure, MachineSkillSyncFailure, type MachineSkillInventory } from "./native/skill-refresh.js";
 import { skillProfileFreshness } from "./native/skill-profile-freshness.js";
 import type { RuntimeSkillProfileFreshness } from "@konteks/backstage-plugin-common";
@@ -2432,15 +2436,12 @@ export class Supervisor {
       this.assertSkillSyncReady();
       if (this.workspaceId !== tenantId || this.instanceId !== runtimeId) throw new Error("Skill publication identity changed");
     };
-    const onConcurrentReplacement = (replacement: {
-      skillId: string;
-      observedRevisionId: string;
-      replacedRevisionId: string;
-      acceptedRevisionId: string;
-    }) => this.logger.warn(
-      { event: "skills.concurrent_revision_replaced", ...replacement },
-      "A Skill edit replaced a revision accepted by another runtime.",
-    );
+    const onConcurrentReplacement = (replacement: SkillPublicationConcurrentReplacement) => {
+      this.logger.warn(
+        { event: "skills.concurrent_revision_replaced", ...replacement },
+        "A Skill edit replaced a revision accepted by another runtime.",
+      );
+    };
     await refreshSkillPublications({ store: this.skillPublications, client, homes, tenantId, runtimeId, assertReady: assertIdentity, onConcurrentReplacement }, signal);
     await syncPersonalSkills({ store: this.skillPublications, client, homes, tenantId, runtimeId, assertReady: assertIdentity, onConcurrentReplacement }, signal);
     await exchangeLocalSkills({ client, homes, now: () => this.clock.coreNow(), assertReady: () => this.assertSkillSyncReady() }, signal);
@@ -2453,22 +2454,29 @@ export class Supervisor {
       const inventory = await coordinator.sync(reconcileAfterPending);
       this.lastSkillProfileFreshness = skillProfileFreshness({ agentIds, inventory,
         ...(this.lastSkillProfileFreshness ? { previous: this.lastSkillProfileFreshness } : {}) });
-      return { ...inventory, complete: true, loaded: "unknown" as const };
+      return { ...inventory, complete: true, loaded: "unknown" as const, ...await this.skillPublicationReplacementReport() };
     } catch (error) {
       return this.recordFailedSkillSync(error, agentIds);
     }
   }
 
-  private recordFailedSkillSync(error: unknown, agentIds: string[]) {
+  private async recordFailedSkillSync(error: unknown, agentIds: string[]) {
     if (error instanceof MachineSkillPartialFailure) {
       this.lastSkillProfileFreshness = skillProfileFreshness({ agentIds, inventory: error.inventory,
         ...(this.lastSkillProfileFreshness ? { previous: this.lastSkillProfileFreshness } : {}) });
-      return { ...error.inventory, complete: false, loaded: "unknown" as const };
+      return { ...error.inventory, complete: false, loaded: "unknown" as const, ...await this.skillPublicationReplacementReport() };
     }
     this.lastSkillProfileFreshness = skillProfileFreshness({ agentIds,
       ...(this.lastSkillProfileFreshness ? { previous: this.lastSkillProfileFreshness } : {}),
       unavailableReason: this.syncFailureReason(error) });
     throw error;
+  }
+
+  private async skillPublicationReplacementReport(): Promise<{ publicationReplacements?: SkillPublicationConcurrentReplacement[] }> {
+    if (!this.workspaceId || !this.instanceId) return {};
+    const records = await this.skillPublications.list(this.workspaceId, this.instanceId);
+    const publicationReplacements = skillPublicationConcurrentReplacements(records);
+    return publicationReplacements.length ? { publicationReplacements } : {};
   }
 
   private syncFailureReason(error: unknown): "skill_home_unavailable" | "catalog_unavailable" {

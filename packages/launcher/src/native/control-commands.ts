@@ -81,13 +81,34 @@ function skillContext(scope: SkillScope, id: boolean): string {
 
 const SkillSyncSchema = z.object({ complete: z.boolean(), loaded: z.literal("unknown"), catalogDigest: z.string().optional(),
   skills: z.array(RuntimeSkillSyncItemSchema), profiles: z.array(z.object({ home: z.string(), paths: z.array(z.string()),
-    status: z.enum(["installed", "failed"]), reason: z.string().optional(), agentId: z.string().optional() }).strict()) }).strict();
+    status: z.enum(["installed", "failed"]), reason: z.string().optional(), agentId: z.string().optional() }).strict()),
+  publicationReplacements: z.array(z.object({ skillId: z.string(), observedRevisionId: z.string(),
+    replacedRevisionId: z.string(), acceptedRevisionId: z.string() }).strict()).optional() }).strict();
+type SkillSyncReport = z.infer<typeof SkillSyncSchema>;
+
+function publicationReplacementLine(
+  replacement: NonNullable<SkillSyncReport["publicationReplacements"]>[number],
+  indonesian: boolean,
+): string {
+  return indonesian
+    ? `Skill ${replacement.skillId}: revisi bersamaan ${replacement.replacedRevisionId} digantikan (revisi awal ${replacement.observedRevisionId}; diterima ${replacement.acceptedRevisionId}).`
+    : `Skill ${replacement.skillId}: concurrent revision ${replacement.replacedRevisionId} was replaced (observed ${replacement.observedRevisionId}; accepted ${replacement.acceptedRevisionId}).`;
+}
+
+function printSkillSyncReport(context: ControlContext, value: SkillSyncReport): void {
+  const id = outputLocale(context.output) === "id";
+  context.output.line(id ? "Status pemuatan Skill belum terverifikasi." : "Skill load status is not yet verified.");
+  for (const profile of value.profiles) context.output.line(`${profile.agentId ?? profile.home}: ${profile.status}${profile.reason ? ` (${profile.reason})` : ""}`);
+  for (const replacement of value.publicationReplacements ?? []) {
+    context.output.line(publicationReplacementLine(replacement, id));
+  }
+}
+
 export async function syncSkills(context: ControlContext): Promise<void> {
   const value = await context.control.call({ op: "skills.sync" }, SkillSyncSchema, { timeoutMs: 95_000 });
   context.output.result(value);
   const id = outputLocale(context.output) === "id";
-  context.output.line(id ? "Status pemuatan Skill belum terverifikasi." : "Skill load status is not yet verified.");
-  for (const profile of value.profiles) context.output.line(`${profile.agentId ?? profile.home}: ${profile.status}${profile.reason ? ` (${profile.reason})` : ""}`);
+  printSkillSyncReport(context, value);
   if (!value.complete) throw new AlreadyToldError("capability_unavailable", id ? "Sinkronisasi Skill selesai sebagian." : "Skill synchronization partially failed.");
 }
 
