@@ -33,6 +33,7 @@ export const ControlRequestSchema = z.discriminatedUnion("op", [
   ]) }).strict(),
   z.object({ op: z.literal("skills.share"), selection: RuntimeSkillShareRequestSchema,
     sourcePath: z.string().min(1).max(4096).optional() }).strict(),
+  z.object({ op: z.literal("skills.unshare"), publicationId: z.string().uuid() }).strict(),
   z.object({ op: z.literal("status") }).strict(),
   z.object({ op: z.literal("agents") }).strict(),
   z.object({ op: z.literal("auth.status"), agentId: agentIdSchema.optional() }).strict(),

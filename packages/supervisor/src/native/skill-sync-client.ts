@@ -3,6 +3,8 @@ import { coreContractAtLeast } from "@konteks/remote-common";
 import {
   RuntimeSkillSharePublishRequestSchema, RuntimeSkillSharePublicationResultSchema,
   RUNTIME_SKILL_SHARE_MIN_CORE_CONTRACT_VERSION, RUNTIME_SKILL_REVISION_MIN_CORE_CONTRACT_VERSION, REMOTE_SKILL_OWNER_BODY_MAX_BYTES, type RuntimeSkillSharePublicationResult,
+  RuntimeSkillUnsharePublishRequestSchema, RuntimeSkillUnshareReceiptSchema,
+  RUNTIME_SKILL_UNSHARE_MIN_CORE_CONTRACT_VERSION, type RuntimeSkillUnshareReceipt,
   RuntimeSkillSyncEnvelopeSchema, RuntimeSkillSyncFileRequestSchema,
   RuntimeSkillSyncPublishRequestSchema, RemoteFileTreeSchema,
   RuntimeSkillSyncDeliveryResponseSchema, RuntimeSkillSyncReceiptSchema,
@@ -51,6 +53,21 @@ export class NativeSkillSyncClient {
         if (result.tenantId !== identity.workspaceId || result.metadata.runtimePromotionKey !== expected) throw unavailable();
         if (body.skillId && (result.id !== body.skillId || !result.runtimePublication)) throw unavailable();
         return result;
+      }, signal);
+    } catch (error) {
+      if (error instanceof NativeSkillSyncTransportFailure) throw error;
+      throw unavailable();
+    }
+  }
+  async unshare(value: unknown, signal?: AbortSignal): Promise<RuntimeSkillUnshareReceipt> {
+    try {
+      if (!coreContractAtLeast(this.options.coreContractVersion(), RUNTIME_SKILL_UNSHARE_MIN_CORE_CONTRACT_VERSION)) throw unavailable();
+      const body = RuntimeSkillUnsharePublishRequestSchema.parse(structuredClone(value));
+      if (Buffer.byteLength(JSON.stringify(body)) > REMOTE_SKILL_OWNER_BODY_MAX_BYTES) throw unavailable();
+      return await this.request("unshare", body, REMOTE_INPUT_METADATA_MAX_BYTES, candidate => {
+        const receipt = RuntimeSkillUnshareReceiptSchema.parse(candidate);
+        if (receipt.publicationId !== body.publicationId || receipt.skillId !== body.skillId) throw unavailable();
+        return receipt;
       }, signal);
     } catch (error) {
       if (error instanceof NativeSkillSyncTransportFailure) throw error;

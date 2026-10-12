@@ -8,7 +8,7 @@ import { EMBEDDED_RELEASE_ROOTS, findAgentBridge, resolveNativeConnectorExecutab
 import { createNativeService, hostAgentInstallAdapter, loadNativeInstallation, ownedByAnotherConnector, readNativeUpdateLedger, verifyInstalledNativeConnector, NATIVE_SHUTDOWN_RECEIPT_FILE, type HostAgentInstallAdapter, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { ReleaseAcceptedSchema, RemoteInstanceError, SupervisorStatusSchema, runCommand, sanitizeInheritedChildProcessEnv, writeSecretFile } from "@konteks/remote-common";
 import { syncSkills, listSkills, agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyList, gitKeyRemove, previewStatus, status, supportBundle, type ControlContext } from "./control-commands.js";
-import { shareSkill } from "./skill-share-command.js";
+import { shareSkill, unshareSkill } from "./skill-share-command.js";
 import { SupervisorControl } from "../control.js";
 import { addNativeAgent, fetchHostAgent, installNative, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, removeNativeAgent, restoreNativeRecord, stageNativeEnrollment } from "./install.js";
 import { terminalFetchConsent, type FetchConsent } from "./consent.js";
@@ -491,6 +491,7 @@ const CONTROL_OPERATIONS: Readonly<Record<ControlInput["operation"], ControlOper
   "skills.list": context => listSkills(context),
   "skills.sync": context => syncSkills(context),
   "skills.share": (context, input) => shareSkill(context, input.skillShare!),
+  "skills.unshare": (context, input) => unshareSkill(context, input.skillUnshare!),
   doctor: doctorOrSupport,
   support: doctorOrSupport,
   "preview.status": context => previewStatus(context),
@@ -505,7 +506,7 @@ const CONTROL_OPERATIONS: Readonly<Record<ControlInput["operation"], ControlOper
 };
 
 /** Operations that act through the running connector, and so wait for one that is starting. */
-const WAITS_FOR_CONNECTOR: ReadonlySet<string> = new Set(["skills.share", "skills.sync", "skills.list", "status", "preview.status", "agents", "auth.status", "auth.login", "auth.logout", "git.key.add", "git.key.list", "git.key.remove"]);
+const WAITS_FOR_CONNECTOR: ReadonlySet<string> = new Set(["skills.share", "skills.unshare", "skills.sync", "skills.list", "status", "preview.status", "agents", "auth.status", "auth.login", "auth.logout", "git.key.add", "git.key.list", "git.key.remove"]);
 
 const productionNativeStopDeps: NativeStopDeps = {
   definition: serviceDefinition,

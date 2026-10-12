@@ -7,7 +7,7 @@ import { createOutput, type Output } from "../output.js";
 import { setVerbose } from "../verbose.js";
 import { setupLocale } from "../setup-locale.js";
 import type { SetupForeground } from "../foreground-progress.js";
-import type { SkillShareOptions } from "./skill-share-command.js";
+import type { SkillShareOptions, SkillUnshareOptions } from "./skill-share-command.js";
 
 /**
  * The agents a native runtime runs: Claude Code and Codex from signed
@@ -30,7 +30,7 @@ export interface NativeCliActions {
   stop(input: NativeCommandContext): Promise<void>;
   update(input: NativeCommandContext & { check: boolean; unattended: boolean }): Promise<void>;
   uninstall(input: NativeCommandContext): Promise<void>;
-  control(input: NativeCommandContext & { operation: "skills.share" | "skills.sync" | "skills.list" | "status" | "agents" | "doctor" | "support" | "preview.status" | "auth.status" | "auth.login" | "auth.logout" | "git.key.add" | "git.key.list" | "git.key.remove"; skillShare?: SkillShareOptions; agent?: string; organization?: boolean; provider?: string; method?: string; reuse?: boolean; project?: string; location?: string; title?: string; keyRef?: string }): Promise<void>;
+  control(input: NativeCommandContext & { operation: "skills.share" | "skills.unshare" | "skills.sync" | "skills.list" | "status" | "agents" | "doctor" | "support" | "preview.status" | "auth.status" | "auth.login" | "auth.logout" | "git.key.add" | "git.key.list" | "git.key.remove"; skillShare?: SkillShareOptions; skillUnshare?: SkillUnshareOptions; agent?: string; organization?: boolean; provider?: string; method?: string; reuse?: boolean; project?: string; location?: string; title?: string; keyRef?: string }): Promise<void>;
 }
 
 /** One customer architecture: the native connector. No provider-key or cloud-agent fallback switch. */
@@ -142,6 +142,11 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     .action(async (skill: string, options: { organization: boolean; system: string[]; initiative: string[]; confirmOngoingPublication: boolean }) =>
       actions.control({ ...context(), operation: "skills.share", skillShare: { skill, organization: options.organization,
         systems: options.system, initiatives: options.initiative, confirmOngoingPublication: options.confirmOngoingPublication } }));
+  skills.command("unshare").description("withdraw a shared publication without deleting the local Skill folder")
+    .argument("<publication-id>", "publication ID shown by the share command")
+    .option("--confirm-unshare", "confirm revoking shared-catalog access and automatic publication", false)
+    .action(async (publicationId: string, options: { confirmUnshare: boolean }) =>
+      actions.control({ ...context(), operation: "skills.unshare", skillUnshare: { publicationId, confirmUnshare: options.confirmUnshare } }));
   const preview = program.command("preview").description("live previews of sessions' work, served from this computer");
   preview.command("status").description("list this computer's session previews and why any of them stopped")
     .action(async () => actions.control({ ...context(), operation: "preview.status" }));

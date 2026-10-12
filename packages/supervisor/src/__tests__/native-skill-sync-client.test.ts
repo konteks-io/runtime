@@ -143,6 +143,25 @@ it.each(["7.5", undefined])("refuses sharing to a Core without the publication c
   await expect(client.share(f.body)).rejects.toThrow("unavailable");
   expect(f.fetchFn).not.toHaveBeenCalled();
 });
+
+it("unshares only a confirmed publication through the minimum-version owner path", async () => {
+  const f = publicationFixture();
+  const request = {
+    requestId: "44444444-4444-4444-8444-444444444444",
+    publicationId: "55555555-5555-4555-8555-555555555555",
+    skillId: f.result.id,
+    confirmation: { revokePublication: true },
+  };
+  const receipt = { publicationId: request.publicationId, skillId: request.skillId, revokedAt: new Date(f.options.now()).toISOString() };
+  const client = new NativeSkillSyncClient({ ...f.options, coreContractVersion: () => "7.8" });
+  f.fetchFn.mockImplementation(async () => new Response(JSON.stringify(receipt), { headers: { "content-type": "application/json" } }));
+  expect(await client.unshare(request)).toEqual(receipt);
+  expect(f.fetchFn.mock.calls[0]![0]).toBe("https://core.test/api/remote-instances/internal/remote-instances/machine-a/skills/sync/unshare");
+  expect(JSON.parse(f.fetchFn.mock.calls[0]![1]!.body as string)).toEqual(request);
+  const old = new NativeSkillSyncClient({ ...f.options, coreContractVersion: () => "7.7" });
+  await expect(old.unshare(request)).rejects.toThrow("unavailable");
+  expect(f.fetchFn).toHaveBeenCalledOnce();
+});
 it.each(["foreign-tenant", "wrong-artifact"])("refuses an unrelated publication result: %s", async kind => {
   const f = publicationFixture();
   const result = kind === "foreign-tenant" ? { ...f.result, tenantId: "tenant-b" } : { ...f.result, metadata: { runtimePromotionKey: "another-source" } };

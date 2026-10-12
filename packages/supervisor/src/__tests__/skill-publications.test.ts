@@ -67,6 +67,17 @@ it("enumerates only consent retained for the exact tenant and runtime", async ()
   ).toEqual([]);
 });
 
+it("removes only the confirmed source publication record for its exact tenant and runtime", async () => {
+  const store = new SkillPublicationStore(dir);
+  await store.save(record());
+  await store.save(record(1, "tenant-b"));
+  await store.save({ ...record(), runtimeId: "runtime-b" });
+  await store.remove("tenant-a", "runtime-a", record().selection.localId);
+  expect(await store.list("tenant-a", "runtime-a")).toEqual([]);
+  expect(await store.list("tenant-b", "runtime-a")).toEqual([record(1, "tenant-b")]);
+  expect(await store.list("tenant-a", "runtime-b")).toEqual([{ ...record(), runtimeId: "runtime-b" }]);
+});
+
 it("accepts a repeated publication with a fresh request ID without rewriting consent", async () => {
   const store = new SkillPublicationStore(dir);
   await store.save(record());

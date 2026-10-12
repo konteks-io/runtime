@@ -2516,6 +2516,28 @@ export class Supervisor {
     return result;
   }
 
+  private async unshareSkill(request: Extract<ControlRequest, { op: "skills.unshare" }>, signal: AbortSignal) {
+    this.assertSkillSyncReady();
+    const tenantId = this.workspaceId!, runtimeId = this.instanceId!;
+    const [publication] = (await this.skillPublications.list(tenantId, runtimeId))
+      .filter(record => record.receipt.publicationId === request.publicationId);
+    if (!publication?.selection.skillId)
+      throw new RemoteInstanceError("prerequisite_missing", "This Skill publication is not owned by this runtime.");
+    const unshare = {
+      requestId: randomUUID(),
+      publicationId: request.publicationId,
+      skillId: publication.selection.skillId,
+      confirmation: { revokePublication: true as const },
+    };
+    const receipt = await this.machineSkillSyncClient().unshare(unshare, signal);
+    this.assertSkillSyncReady();
+    if (this.workspaceId !== tenantId || this.instanceId !== runtimeId ||
+        receipt.publicationId !== request.publicationId || receipt.skillId !== publication.selection.skillId)
+      throw new Error("Skill unsharing identity changed");
+    await this.skillPublications.remove(tenantId, runtimeId, publication.selection.localId);
+    return receipt;
+  }
+
   private skillSyncReady(): boolean {
     return !this.stopping && !!this.options.native && !!this.nativeOwnership && this.reconciliation.isComplete && this.lease.mode() === "active" && coreContractAtLeast(this.coreContractVersion, "7.5");
   }
@@ -2572,6 +2594,7 @@ export class Supervisor {
           : inspectLocalSkill(machineSkillHomes(this.options.native!.runners), request.source.name);
       },
       "skills.share": (request, emit) => this.shareSkill(request, emit.signal),
+      "skills.unshare": (request, emit) => this.unshareSkill(request, emit.signal),
       agents: () => {
         const agents = this.lastSnapshot?.agents ?? this.inventory.agents();
         return { agents: [...agents, ...this.leftOutAgents(agents)], roles: this.heartbeat?.roles() ?? [], roleBindings: this.roleBindings };

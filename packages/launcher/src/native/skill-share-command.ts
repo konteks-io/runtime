@@ -4,6 +4,7 @@ import {
   LocalSkillSummarySchema,
   RuntimeSkillShareRequestSchema,
   RuntimeSkillSharePublicationResultSchema,
+  RuntimeSkillUnshareReceiptSchema,
 } from "@konteks/backstage-plugin-common/remote-instance-internal";
 import { RemoteInstanceError } from "@konteks/remote-common";
 import { confirm, promptLine } from "../prompt.js";
@@ -16,6 +17,11 @@ export interface SkillShareOptions {
   systems?: string[];
   initiatives?: string[];
   confirmOngoingPublication?: boolean;
+}
+
+export interface SkillUnshareOptions {
+  publicationId: string;
+  confirmUnshare?: boolean;
 }
 
 function interactive(context: ControlContext): boolean {
@@ -159,5 +165,39 @@ export async function shareSkill(
     outputLocale(context.output) === "id"
       ? "Publikasi awal diterima. Publikasi berkelanjutan dan pemuatan agen belum terverifikasi."
       : "Initial publication accepted. Ongoing publication and agent loading are not yet verified.",
+  );
+}
+
+async function unshareConsent(context: ControlContext, options: SkillUnshareOptions): Promise<void> {
+  if (options.confirmUnshare) return;
+  const id = outputLocale(context.output) === "id";
+  if (!interactive(context))
+    throw new RemoteInstanceError(
+      "prerequisite_missing",
+      "Explicit confirmation is required: --confirm-unshare.",
+    );
+  const ask = context.confirm ?? ((question) => confirm(question, {
+    input: context.input ?? process.stdin,
+    locale: outputLocale(context.output),
+  }));
+  const message = id
+    ? `Tarik publikasi Skill ${options.publicationId}? Ini menghapus akses katalog bersama dan menghentikan publikasi otomatis. Folder Skill lokal tetap ada di runtime ini.`
+    : `Withdraw the shared Skill publication ${options.publicationId}? This removes shared-catalog access and stops automatic edits from publishing. The local Skill folder remains on this runtime.`;
+  if (!(await ask(message)))
+    throw new RemoteInstanceError("prerequisite_missing", id ? "Penarikan publikasi dibatalkan." : "Skill unsharing cancelled.");
+}
+
+export async function unshareSkill(context: ControlContext, options: SkillUnshareOptions): Promise<void> {
+  await unshareConsent(context, options);
+  const receipt = await context.control.call(
+    { op: "skills.unshare", publicationId: options.publicationId },
+    RuntimeSkillUnshareReceiptSchema,
+    { timeoutMs: 95_000 },
+  );
+  context.output.result({ receipt, localSource: "retained", loaded: "unknown" });
+  context.output.line(
+    outputLocale(context.output) === "id"
+      ? "Publikasi bersama ditarik. Folder Skill lokal tetap ada; konten yang sudah dimuat ke konteks agen tidak dapat dihapus dari memori."
+      : "Shared publication withdrawn. The local Skill folder remains; content already loaded into an agent context cannot be erased from its memory.",
   );
 }

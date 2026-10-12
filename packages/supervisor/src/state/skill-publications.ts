@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFile, readdir } from "node:fs/promises";
+import { readFile, readdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod/v4";
 import { isFsErrorWithCode, writeSecretFile } from "@konteks/remote-common";
@@ -52,15 +52,18 @@ export class SkillPublicationStore {
     private readonly directory: string,
     private readonly mutate: StateMutation = unrestrictedStateMutation,
   ) {}
-  private path(value: Pick<Record, "tenantId" | "runtimeId" | "selection">): string {
+  private path(value: { tenantId: string; runtimeId: string; localId: string }): string {
     const key = createHash("sha256")
-      .update(JSON.stringify([value.tenantId, value.runtimeId, value.selection.localId]))
+      .update(JSON.stringify([value.tenantId, value.runtimeId, value.localId]))
       .digest("hex");
     return join(this.directory, `${key}.json`);
   }
+  private recordPath(value: Record): string {
+    return this.path({ tenantId: value.tenantId, runtimeId: value.runtimeId, localId: value.selection.localId });
+  }
   private async previous(value: Record): Promise<Record | null> {
     try {
-      return recordSchema.parse(JSON.parse(await readFile(this.path(value), "utf8")));
+      return recordSchema.parse(JSON.parse(await readFile(this.recordPath(value), "utf8")));
     } catch (error) {
       if (isFsErrorWithCode(error, "ENOENT")) return null;
       throw error;
@@ -76,7 +79,7 @@ export class SkillPublicationStore {
       const record = recordSchema.parse(
         JSON.parse(await readFile(join(this.directory, file.name), "utf8")),
       );
-      if (this.path(record) !== join(this.directory, file.name))
+      if (this.recordPath(record) !== join(this.directory, file.name))
         throw new Error("Skill publication record identity changed");
       if (record.tenantId === tenantId && record.runtimeId === runtimeId) records.push(record);
     }
@@ -94,7 +97,7 @@ export class SkillPublicationStore {
     if (!sameAcceptance(previous, current)) throw new Error("Skill publication revision changed");
     if (previous.selection.skillId || !current.selection.skillId) return;
     await writeSecretFile(
-      this.path(previous),
+      this.recordPath(previous),
       `${JSON.stringify({
         ...previous,
         selection: {
@@ -116,9 +119,21 @@ export class SkillPublicationStore {
           await this.retainRepeated(previous, record);
           return;
         }
-        await writeSecretFile(this.path(record), `${JSON.stringify(record)}\n`);
+        await writeSecretFile(this.recordPath(record), `${JSON.stringify(record)}\n`);
       }),
     );
+    this.tail = task.catch(() => undefined);
+    return task;
+  }
+  remove(tenantId: string, runtimeId: string, localId: string): Promise<void> {
+    if (!/^[a-f0-9]{64}$/.test(localId)) throw new Error("Skill publication source identity is invalid");
+    const task = this.tail.then(() => this.mutate(async () => {
+      try {
+        await unlink(this.path({ tenantId, runtimeId, localId }));
+      } catch (error) {
+        if (!isFsErrorWithCode(error, "ENOENT")) throw error;
+      }
+    }));
     this.tail = task.catch(() => undefined);
     return task;
   }

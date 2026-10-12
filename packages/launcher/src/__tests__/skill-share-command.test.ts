@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { resolve } from "node:path";
-import { shareSkill } from "../native/skill-share-command.js";
+import { shareSkill, unshareSkill } from "../native/skill-share-command.js";
 import { createNativeProgram } from "../native/cli.js";
 import type { ControlContext } from "../native/control-commands.js";
 
@@ -74,6 +74,18 @@ describe("Skill sharing CLI", () => {
       systems: ["system-a", "system-b"],
       initiatives: ["initiative-a", "initiative-b"],
       confirmOngoingPublication: true,
+    });
+  });
+  it("parses an explicit publication ID and unsharing confirmation", async () => {
+    const control = vi.fn();
+    const program = createNativeProgram({ control } as never);
+    await program.parseAsync(
+      ["skills", "unshare", "55555555-5555-4555-8555-555555555555", "--confirm-unshare"],
+      { from: "user" },
+    );
+    expect(control.mock.calls[0]![0]).toMatchObject({
+      operation: "skills.unshare",
+      skillUnshare: { publicationId: "55555555-5555-4555-8555-555555555555", confirmUnshare: true },
     });
   });
   it("fails without a noninteractive audience and rejects mixed audiences before reading a folder", async () => {
@@ -164,5 +176,47 @@ describe("Skill sharing CLI", () => {
     ).rejects.toThrow("connection lost");
     expect(second.call).toHaveBeenCalledTimes(2);
     expect(second.output.result).not.toHaveBeenCalled();
+  });
+});
+
+describe("Skill unsharing CLI", () => {
+  const receipt = {
+    publicationId: "55555555-5555-4555-8555-555555555555",
+    skillId: "66666666-6666-4666-8666-666666666666",
+    revokedAt: "2026-10-03T00:00:01Z",
+  };
+  function unshareFixture(tty = false, json = false) {
+    const call = vi.fn().mockResolvedValue(receipt);
+    const output = { json, line: vi.fn(), result: vi.fn() };
+    const context = {
+      control: { call }, output, input: { isTTY: tty },
+      confirm: vi.fn().mockResolvedValue(true),
+    } as unknown as ControlContext;
+    return { context, call, output };
+  }
+  it("requires explicit noninteractive confirmation and keeps local content", async () => {
+    const { context, call } = unshareFixture();
+    await expect(unshareSkill(context, { publicationId: receipt.publicationId })).rejects.toThrow("Explicit confirmation");
+    expect(call).not.toHaveBeenCalled();
+    await unshareSkill(context, { publicationId: receipt.publicationId, confirmUnshare: true });
+    expect(call).toHaveBeenCalledOnce();
+    expect(call.mock.calls[0]![0]).toEqual({ op: "skills.unshare", publicationId: receipt.publicationId });
+  });
+  it("explains the withdrawal and refuses an interactive cancellation", async () => {
+    const first = unshareFixture(true);
+    vi.mocked(first.context.confirm!).mockResolvedValue(false);
+    await expect(unshareSkill(first.context, { publicationId: receipt.publicationId })).rejects.toThrow("cancelled");
+    expect(first.call).not.toHaveBeenCalled();
+    const second = unshareFixture(true);
+    await unshareSkill(second.context, { publicationId: receipt.publicationId });
+    const prompt = vi.mocked(second.context.confirm!).mock.calls[0]![0];
+    expect(prompt).toContain("Withdraw");
+    expect(second.output.line).toHaveBeenCalledWith(expect.stringContaining("local Skill folder remains"));
+  });
+  it("never asks for confirmation in JSON mode", async () => {
+    const { context, call } = unshareFixture(true, true);
+    await expect(unshareSkill(context, { publicationId: receipt.publicationId })).rejects.toThrow("Explicit confirmation");
+    expect(context.confirm).not.toHaveBeenCalled();
+    expect(call).not.toHaveBeenCalled();
   });
 });
