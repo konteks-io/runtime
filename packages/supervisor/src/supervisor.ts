@@ -17,7 +17,7 @@ import {
   REMOTE_ASSIGNMENT_AVAILABLE_DELIVERY_CAPABILITY,
   REMOTE_ASSIGNMENT_AVAILABLE_MIN_CORE_CONTRACT_VERSION,
   REMOTE_DIRECT_MODEL_FALLBACK_MIN_CORE_CONTRACT_VERSION,
-  REMOTE_WORKSPACE_CHECKPOINT_MIN_CORE_CONTRACT_VERSION,
+  REMOTE_WORKSPACE_CHECKPOINT_MIN_CORE_CONTRACT_VERSION, REMOTE_WORKSPACE_CHUNK_MIN_CORE_CONTRACT_VERSION,
   allEqual,
   SystemClock,
   connectorGit,
@@ -1043,6 +1043,7 @@ export class Supervisor {
         if (sessionId) await this.previews.stop(sessionId, "workspace_checkpoint");
         assertCurrent();
         await new NativeWorkspaceCheckpointStore({ root: runner.RUNNER_WORKSPACE_DIR, repositoryCacheRoot: native.repositoryCacheRoot,
+          chunksSupported: () => coreContractAtLeast(this.coreContractVersion, REMOTE_WORKSPACE_CHUNK_MIN_CORE_CONTRACT_VERSION),
           client: () => new NativeInputClient({ baseUrl: this.config.SUPERVISOR_CORE_URL, roots: this.roots, clock: this.clock,
             credential: () => this.lease.mode() === "active" ? (this.lease.current()?.lease ?? null) : null }) }).seal(admission, assertCurrent);
       },
@@ -1151,6 +1152,7 @@ export class Supervisor {
         }),
         prepareInputs: native.prepareInputs ?? createNativeInputPreparer({
           workspaceRecovery: () => coreContractAtLeast(this.coreContractVersion, REMOTE_WORKSPACE_CHECKPOINT_MIN_CORE_CONTRACT_VERSION),
+          workspaceChunks: () => coreContractAtLeast(this.coreContractVersion, REMOTE_WORKSPACE_CHUNK_MIN_CORE_CONTRACT_VERSION),
           logger: this.logger,
           root: native.runners.find(config => config.RUNNER_AGENT_ID === runner.agentId)!.RUNNER_WORKSPACE_DIR,
           clock: this.clock,

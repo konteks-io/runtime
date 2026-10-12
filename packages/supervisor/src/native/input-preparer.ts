@@ -46,6 +46,7 @@ import { NativeRepositoryCache } from "./repository-cache.js";
 interface NativeInputPreparerOptions {
   /** Signed Core contract gate; older Core never receives checkpoint requests. */
   workspaceRecovery?: () => boolean;
+  workspaceChunks?: () => boolean;
   /** Private, runner-specific connector workspace root, never a user checkout. */
   root: string;
   clock: Clock;
@@ -780,9 +781,10 @@ class InputPreparation {
 
   private async beginWorkspacePreservation(inputs: AuthorizedInputs, source: SourceWorkspace): Promise<void> {
     if (!this.options.workspaceRecovery?.() || !inputs.selection.repository || !source.baselineCommit || !this.options.git) return;
-    await new NativeWorkspaceCheckpointStore({ root: this.options.root, repositoryCacheRoot: this.options.repositoryCacheRoot, client: this.options.client }).begin({
+    await new NativeWorkspaceCheckpointStore({ root: this.options.root, repositoryCacheRoot: this.options.repositoryCacheRoot, client: this.options.client, chunksSupported: this.options.workspaceChunks }).begin({
       assignment: inputs.current, claimId: inputs.claimId, selectionDigest: inputs.envelope.selectionDigest,
       cwd: source.cwd, baselineCommit: source.baselineCommit, tool: this.options.git,
+      ...checkpointFormat(this.options.workspaceChunks),
     });
     await source.markWritable?.();
   }
@@ -849,4 +851,8 @@ export function createNativeInputPreparer(
         busy.delete(key);
       }
     });
+}
+
+function checkpointFormat(supported: (() => boolean) | undefined): { format?: "konteks-workspace-checkpoint-v2" } {
+  return supported?.() ? { format: "konteks-workspace-checkpoint-v2" } : {};
 }

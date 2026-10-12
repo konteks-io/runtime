@@ -5,7 +5,7 @@ import {
   RemoteRepositoryFetchRequestSchema,
   RemoteWorkAssignmentSchema,
   RemoteFileTreeSchema,
-  RemoteWorkspaceBeginRequestSchema, RemoteWorkspaceSealRequestSchema, RemoteWorkspaceAcknowledgeRequestSchema, RemoteWorkspaceCheckpointSchema,
+  RemoteWorkspaceBeginRequestSchema, RemoteWorkspaceAnySealRequestSchema, RemoteWorkspaceAcknowledgeRequestSchema, RemoteWorkspaceAnyCheckpointSchema, RemoteWorkspaceChunkSchema, RemoteWorkspaceChunkWriteRequestSchema, RemoteWorkspaceChunkReadRequestSchema,
   RemoteInstanceError,
   allEqual,
   createLogger,
@@ -51,13 +51,14 @@ const CORE_HTTP_DATE_UNCERTAINTY_MS = 1_000;
 /** Artifact transport has tighter body/redirect/error rules than ordinary control JSON. */
 export class NativeInputClient {
   /** Unfinished workspace retention is independent of successful output. */
-  async workspace(assignment: RemoteWorkAssignment, operation: "begin" | "seal" | "read" | "acknowledge", raw: unknown): Promise<unknown> {
-    const schemas = { begin: RemoteWorkspaceBeginRequestSchema, seal: RemoteWorkspaceSealRequestSchema,
+  async workspace(assignment: RemoteWorkAssignment, operation: "begin" | "seal" | "read" | "acknowledge" | "write-chunk" | "read-chunk", raw: unknown): Promise<unknown> {
+    const schemas = { "write-chunk": RemoteWorkspaceChunkWriteRequestSchema, "read-chunk": RemoteWorkspaceChunkReadRequestSchema, begin: RemoteWorkspaceBeginRequestSchema, seal: RemoteWorkspaceAnySealRequestSchema,
       read: RemoteWorkspaceBeginRequestSchema, acknowledge: RemoteWorkspaceAcknowledgeRequestSchema };
     const body = schemas[operation].parse(raw);
     const result = await this.withTransientRetry(`workspace.${operation}`, () => this.requestAttempt(assignment,
-      operation, body, operation === "read" ? 90 * 1024 * 1024 : 128 * 1024, "workspaces"));
-    return operation === "read" ? RemoteWorkspaceCheckpointSchema.parse(result) : result;
+      operation, body, workspaceResponseLimit(operation), "workspaces"));
+    if (operation === "read") return RemoteWorkspaceAnyCheckpointSchema.parse(result);
+    return operation === "read-chunk" ? RemoteWorkspaceChunkSchema.parse(result) : result;
   }
 
   private readonly verifier: CoreSignatureVerifier;
@@ -518,4 +519,9 @@ function bindingMatchesAssignment(binding: RemoteAssignmentInputsEnvelope["selec
     [binding.assignmentId, assignment.id],
     [binding.attempt, assignment.attempt],
   ]) && (continued === null || binding.sessionId === continued.sessionId);
+}
+
+function workspaceResponseLimit(operation: string): number {
+  if (operation === "read") return 90 * 1024 * 1024;
+  return operation === "read-chunk" ? 2 * 1024 * 1024 : 128 * 1024;
 }
