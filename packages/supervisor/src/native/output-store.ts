@@ -27,7 +27,9 @@ const RecordSchema = z.discriminatedUnion("state", [
   .refine(record => record.state !== "accepted" || receiptMatches(record.receipt, record.candidate), "Output acceptance must match the frozen candidate");
 export type NativeOutputRecord = z.infer<typeof RecordSchema>;
 const TurnIdentitySchema = z.object({ sessionId: z.string().min(1).max(256), invocationId: z.string().min(1).max(256), claimId: z.string().min(1).max(256) }).strict();
-const SessionHeadSchema = z.object({ version: z.literal(1), latest: TurnIdentitySchema.optional(),
+const ExpectedAcceptanceSchema = TurnIdentitySchema.omit({ sessionId: true }).extend({ acceptanceId: z.string().min(1).max(256), resultDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/) });
+const RecoveredAcceptanceSchema = z.object({ acceptance: ExpectedAcceptanceSchema, checkpointDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/) }).strict();
+const SessionHeadSchema = z.object({ version: z.literal(1), recovered: RecoveredAcceptanceSchema.optional(), latest: TurnIdentitySchema.optional(),
   pending: TurnIdentitySchema.optional(), cleanup: TurnIdentitySchema.optional() }).strict()
   .refine(value => value.latest !== undefined || value.pending !== undefined,
     "An output session head must retain an accepted or pending turn");
@@ -173,6 +175,20 @@ export class NativeOutputSessionHeadStore {
     if (abandoned) await rmRecord(this.record(pending));
   }
 
+  /** The caller has verified the restored checkpoint and Core's signed
+   * expected acceptance. This retains historical lineage, never a fabricated
+   * candidate, completion or new delivery acceptance. Existing records stay. */
+  async recoverVerifiedAcceptance(expected: ExpectedAcceptance, current: Omit<TurnIdentity, "sessionId">, checkpointDigest: string): Promise<void> {
+    const recovered = RecoveredAcceptanceSchema.parse({ acceptance: expected, checkpointDigest });
+    const before = await this.settled();
+    if (turnIs(before?.latest, current)) { await this.verifyExpected(expected, current); return; }
+    assertRecoveryCompatible(before, expected, current);
+    if (before?.latest) await this.assertAccepted(expected);
+    const latest = TurnIdentitySchema.parse({ sessionId: this.sessionId, invocationId: expected.invocationId, claimId: expected.claimId });
+    const pending = before?.pending;
+    await this.write({ version: 1, latest, recovered, ...(pending ? { pending } : {}) });
+  }
+
   async verifyExpected(expected: ExpectedAcceptance, current: Omit<TurnIdentity, "sessionId">): Promise<void> {
     let head = await this.required();
     await this.cleanup(head);
@@ -198,6 +214,7 @@ export class NativeOutputSessionHeadStore {
   }
 
   private async assertAccepted(expected: ExpectedAcceptance): Promise<void> {
+    if (recoveredAcceptanceMatches(await this.read(), expected)) return;
     const record = await this.record({ invocationId: expected.invocationId, claimId: expected.claimId }).read();
     if (!record || record.state !== "accepted" || record.receipt.acceptanceId !== expected.acceptanceId ||
         record.receipt.resultDigest !== expected.resultDigest) throw unavailable();
@@ -259,7 +276,7 @@ export class NativeOutputSessionHeadStore {
 }
 
 type SessionHead = z.infer<typeof SessionHeadSchema>;
-type ExpectedAcceptance = Omit<TurnIdentity, "sessionId"> & { acceptanceId: string; resultDigest: string };
+type ExpectedAcceptance = z.infer<typeof ExpectedAcceptanceSchema>;
 
 /** A private, singly linked regular file of at most `maxBytes`, readable and writable by its owner only. */
 function privateRecordFile(info: Stats, maxBytes: number): boolean {
@@ -291,8 +308,8 @@ function sameCandidate(existing: NativeOutputRecord, candidate: RemoteDeliveryRe
   return canonicalize(existing.candidate as never) === canonicalize(candidate as never) && canonicalize(existing.completion as never) === canonicalize(completion as never);
 }
 
-function latestOf(head: SessionHead | null): { latest?: TurnIdentity } {
-  return head?.latest ? { latest: head.latest } : {};
+function latestOf(head: SessionHead | null): Pick<SessionHead, "latest" | "recovered"> {
+  return { ...(head?.latest ? { latest: head.latest } : {}), ...(head?.recovered ? { recovered: head.recovered } : {}) };
 }
 
 /** Whether a head entry names this invocation and claim. */
@@ -318,4 +335,14 @@ function receiptMatches(receipt: RemoteDeliveryAcceptanceReceipt, candidate: Rem
   return receipt.invocationRef === candidate.invocationRef && receipt.claimId === candidate.claimId && receipt.resultId === candidate.resultId &&
     receipt.resultDigest === candidate.resultDigest && receipt.inputSelectionDigest === candidate.inputSelectionDigest && receipt.baseRevision === candidate.baseRevision &&
     canonicalize(receipt.binding as never) === canonicalize(candidate.binding as never);
+}
+
+function recoveredAcceptanceMatches(head: SessionHead | null, expected: ExpectedAcceptance): boolean {
+  return Boolean(head?.recovered && turnIs(head.latest, expected) &&
+    canonicalize(head.recovered.acceptance) === canonicalize(expected));
+}
+
+function assertRecoveryCompatible(head: SessionHead | null, expected: ExpectedAcceptance, current: Omit<TurnIdentity, "sessionId">): void {
+  if (head?.latest && !turnIs(head.latest, expected)) throw unavailable();
+  if (head?.pending && !turnIs(head.pending, current)) throw unavailable();
 }
