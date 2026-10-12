@@ -82,6 +82,24 @@ describe('native workspace recovery checkpoint', () => {
     expect(await git(restored.cwd, 'for-each-ref', '--format=%(refname)')).toBe('');
   });
 
+  it.each([false, true])('retains stash stacks until their metadata can be preserved (linked=%s)', async linked => {
+    let checkout = source; let ownerRoot = root; let cacheRoot: string | undefined;
+    if (linked) {
+      cacheRoot = join(root, 'stash-cache'); await mkdir(cacheRoot, { mode: 0o700 });
+      ownerRoot = join(root, 'stash-agent'); await mkdir(ownerRoot, { mode: 0o700 });
+      const cache = join(cacheRoot, 'repository.git'); await git(root, 'clone', '--bare', source, cache);
+      checkout = join(ownerRoot, 'linked'); await git(cache, 'worktree', 'add', '--detach', checkout, 'HEAD');
+    }
+    await writeFile(join(checkout, 'kept.txt'), 'unfinished stashed work');
+    await git(checkout, '-c', 'user.name=Test', '-c', 'user.email=test@invalid', 'stash', 'push', '-m', 'saved unfinished work');
+    await writeFile(join(checkout, 'kept.txt'), 'second stashed work');
+    await git(checkout, '-c', 'user.name=Test', '-c', 'user.email=test@invalid', 'stash', 'push', '-m', 'another saved change');
+    const original = await git(checkout, 'stash', 'list', '-p');
+    await expect(captureWorkspaceCheckpoint({ cwd: checkout, ownerRoot, repositoryCacheRoot: cacheRoot, tool, baselineCommit: baseline })).rejects.toMatchObject({ code: 'capability_unavailable' });
+    expect(await git(checkout, 'stash', 'list', '-p')).toBe(original);
+    expect(original).toContain('unfinished stashed work'); expect(original).toContain('second stashed work');
+  });
+
   it.each(['MERGE_HEAD', 'rebase-merge', 'sharedindex.0123456789'])('refuses unsupported Git operation metadata %s and keeps the original checkout', async name => {
     await unfinishedWork();
     await writeFile(join(source, '.git', name), baseline);
