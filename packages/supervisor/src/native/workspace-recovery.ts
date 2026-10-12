@@ -1,7 +1,7 @@
 import { lstat, mkdir, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod/v4";
-import { canonicalize, RemoteInstanceError, RemoteWorkspaceCheckpointSchema, RemoteWorkspaceRecoveryReferenceSchema, sha256Hex,
+import { canonicalize, RemoteWorkspaceChunkSchema, RemoteInstanceError, RemoteWorkspaceAnyCheckpointSchema, RemoteWorkspaceRecoveryReferenceSchema, sha256Hex,
   type RemoteAssignmentInputsEnvelope, type RemoteWorkAssignment } from "@konteks/remote-common";
 import { restoreWorkspaceCheckpoint, verifyRestoredWorkspaceCheckpoint } from "./workspace-checkpoint.js";
 import { privateWorkspaceDirectory, readPrivateWorkspaceFile, readWorkspaceControlFile, writePrivateWorkspaceJson } from "./workspace-storage.js";
@@ -53,11 +53,12 @@ export class NativeRecoveredWorkspaceStore {
   private async restore(input: Input, target: { folder: string; key: string; pointer: string }): Promise<Workspace> {
     const reference = RemoteWorkspaceRecoveryReferenceSchema.parse(input.selection.workspaceRecovery);
     if (reference.repositoryId !== input.selection.repository?.repositoryId) throw unavailable();
-    const checkpoint = RemoteWorkspaceCheckpointSchema.parse(await this.options.client().workspace(input.assignment, "read", this.request(input, reference.checkpointId)));
-    if (checkpoint.checkpointDigest !== reference.checkpointDigest || checkpoint.baselineCommit !== reference.baselineCommit) throw unavailable();
+    const checkpoint = RemoteWorkspaceAnyCheckpointSchema.parse(await this.options.client().workspace(input.assignment, "read", this.request(input, reference.checkpointId)));
+    if (checkpoint.checkpointDigest !== reference.checkpointDigest || checkpoint.baselineCommit !== reference.baselineCommit || checkpoint.format !== (reference.format ?? "konteks-workspace-checkpoint-v1")) throw unavailable();
     const container = join(target.folder, `${target.key}-${reference.checkpointId}`);
     const cwd = join(container, "source");
-    if (!await exists(container)) await restoreWorkspaceCheckpoint({ destination: container, tool: this.options.tool, checkpoint });
+    if (!await exists(container)) await restoreWorkspaceCheckpoint({ destination: container, tool: this.options.tool, checkpoint,
+      chunks: { get: digest => this.readChunk(input, reference.checkpointId, digest) } });
     await privateWorkspaceDirectory(container); await privateWorkspaceDirectory(cwd);
     await verifyRestoredWorkspaceCheckpoint({ cwd, tool: this.options.tool, checkpoint });
     await writePrivateWorkspaceJson(container, join(container, "checkpoint.json"), checkpoint);
@@ -65,6 +66,13 @@ export class NativeRecoveredWorkspaceStore {
       reference, configDigest: `sha256:${sha256Hex(await requiredGitConfig(cwd))}`, writing: false, retired: false });
     await writePrivateWorkspaceJson(target.folder, target.pointer, receipt);
     return this.workspace(input, target.folder, target.key, target.pointer, receipt);
+  }
+
+  private async readChunk(input: Input, checkpointId: string, chunkDigest: string): Promise<Buffer> {
+    const chunk = RemoteWorkspaceChunkSchema.parse(await this.options.client().workspace(input.assignment, "read-chunk", {
+      ...this.request(input, checkpointId), chunkDigest }));
+    if (chunk.digest !== chunkDigest) throw unavailable();
+    return Buffer.from(chunk.contentBase64, "base64");
   }
 
   private async workspace(input: Input, folder: string, key: string, pointer: string, receipt: Receipt): Promise<Workspace> {
@@ -76,7 +84,7 @@ export class NativeRecoveredWorkspaceStore {
     if (!receipt.writing) {
       const bytes = await readPrivateWorkspaceFile(join(container, "checkpoint.json"), 90 * 1024 * 1024);
       if (!bytes) throw unavailable();
-      const checkpoint = RemoteWorkspaceCheckpointSchema.parse(JSON.parse(bytes.toString("utf8")));
+      const checkpoint = RemoteWorkspaceAnyCheckpointSchema.parse(JSON.parse(bytes.toString("utf8")));
       if (checkpoint.checkpointDigest !== receipt.reference.checkpointDigest) throw unavailable();
       await verifyRestoredWorkspaceCheckpoint({ cwd, tool: this.options.tool, checkpoint });
       const acknowledgement = await this.options.client().workspace(input.assignment, "acknowledge", {

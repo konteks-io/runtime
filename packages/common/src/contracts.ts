@@ -469,3 +469,8 @@ export type { RemoteWorkspaceCheckpoint } from "@konteks/backstage-plugin-common
 export { RemoteWorkspaceBeginRequestSchema, RemoteWorkspaceSealRequestSchema, RemoteWorkspaceAcknowledgeRequestSchema } from "@konteks/backstage-plugin-common/remote-instance-internal";
 
 export { RemoteWorkspaceRecoveryReferenceSchema, REMOTE_WORKSPACE_CHECKPOINT_CAPABILITY, REMOTE_WORKSPACE_CHECKPOINT_MIN_CORE_CONTRACT_VERSION, type RemoteWorkspaceRecoveryReference } from "@konteks/backstage-plugin-common/remote-instance-internal";
+
+export { RemoteWorkspaceAnyCheckpointSchema, RemoteWorkspaceCheckpointV2Schema, RemoteWorkspaceAnySealRequestSchema,
+  RemoteWorkspaceChunkSchema, RemoteWorkspaceChunkWriteRequestSchema, RemoteWorkspaceChunkReadRequestSchema,
+  REMOTE_WORKSPACE_CHUNK_LIMITS, REMOTE_WORKSPACE_CHUNK_CAPABILITY, REMOTE_WORKSPACE_CHUNK_MIN_CORE_CONTRACT_VERSION,
+  type RemoteWorkspaceCheckpointV2, type RemoteWorkspaceAnyCheckpoint } from "@konteks/backstage-plugin-common/remote-instance-internal";

@@ -6,7 +6,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { NativeWorkspaceCheckpointStore } from '../native/workspace-preservation.js';
 import { NativeRecoveredWorkspaceStore } from '../native/workspace-recovery.js';
 import { captureWorkspaceCheckpoint } from '../native/workspace-checkpoint.js';
-import { RemoteWorkspaceBeginRequestSchema, RemoteWorkspaceSealRequestSchema, computeRemoteFileTreeDigest, computeRemoteSkillCatalogDigest,
+import { RemoteWorkspaceBeginRequestSchema, RemoteWorkspaceSealRequestSchema, RemoteWorkspaceAnySealRequestSchema, RemoteWorkspaceChunkWriteRequestSchema, computeRemoteFileTreeDigest, computeRemoteSkillCatalogDigest,
   type RemoteWorkAssignment, type RemoteAssignmentInputsEnvelope } from '@konteks/remote-common';
 import type { NativeInputClient } from '../native/input-client.js';
 let root: string; let cwd: string; let baseline: string;
@@ -110,3 +110,27 @@ function fileContent(entries: ReturnType<typeof RemoteWorkspaceSealRequestSchema
   if (entry?.kind !== 'file') throw new Error('Expected preserved file');
   return entry.contentBase64;
 }
+
+it('replays the same durable chunks after an uncertain upload and a restart without the original checkout', async () => {
+  const saved = new Map<string, string>(); let fail = true;
+  const api = { workspace: vi.fn(async (...[_assignment, operation, raw]: Parameters<NativeInputClient['workspace']>) => {
+    if (operation === 'begin') return { checkpointId: RemoteWorkspaceBeginRequestSchema.parse(raw).checkpointId, state: 'writing' };
+    if (operation === 'write-chunk') {
+      const request = RemoteWorkspaceChunkWriteRequestSchema.parse(raw); saved.set(request.chunk.digest, request.chunk.contentBase64);
+      if (fail) { fail = false; throw new Error('upload reply lost'); }
+      return { checkpointId: request.checkpointId, chunkDigest: request.chunk.digest, sizeBytes: request.chunk.sizeBytes, state: 'stored' };
+    }
+    const request = RemoteWorkspaceAnySealRequestSchema.parse(raw);
+    return { checkpointId: request.checkpointId, checkpointDigest: request.checkpoint.checkpointDigest, state: 'sealed' };
+  }) };
+  const store = new NativeWorkspaceCheckpointStore({ root, client: () => api, chunksSupported: () => true });
+  await store.begin({ assignment, claimId: 'claim', selectionDigest, cwd, baselineCommit: baseline, tool, format: 'konteks-workspace-checkpoint-v2' });
+  await writeFile(join(cwd, 'file.txt'), 'keep this unfinished work');
+  await expect(store.seal(admission, () => undefined)).rejects.toThrow('upload reply lost');
+  await rm(cwd, { recursive: true });
+  await new NativeWorkspaceCheckpointStore({ root, client: () => api, chunksSupported: () => true }).seal(admission, () => undefined);
+  const request = RemoteWorkspaceAnySealRequestSchema.parse(api.workspace.mock.calls.at(-1)![2]);
+  const file = request.checkpoint.entries.find(entry => entry.path === 'file.txt');
+  if (request.checkpoint.format !== 'konteks-workspace-checkpoint-v2' || file?.kind !== 'file' || !('chunks' in file)) throw new Error('Expected chunked work');
+  expect(Buffer.from(saved.get(file.chunks[0]!.digest)!, 'base64').toString()).toBe('keep this unfinished work');
+});

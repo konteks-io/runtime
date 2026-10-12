@@ -43,11 +43,15 @@ async function syncDirectory(path: string): Promise<void> {
   try { await handle.sync(); } finally { await handle.close(); }
 }
 
-export async function writePrivateWorkspaceJson(folder: string, path: string, value: unknown): Promise<void> {
+export function writePrivateWorkspaceJson(folder: string, path: string, value: unknown): Promise<void> {
+  return writePrivateWorkspaceBytes(folder, path, Buffer.from(JSON.stringify(value)));
+}
+
+export async function writePrivateWorkspaceBytes(folder: string, path: string, value: Buffer): Promise<void> {
   await privateWorkspaceDirectory(folder);
   const temporary = join(folder, `.pending-${randomUUID()}`);
   const handle = await open(temporary, "wx", 0o600);
-  try { await handle.writeFile(JSON.stringify(value)); await handle.sync(); } finally { await handle.close(); }
+  try { await handle.writeFile(value); await handle.sync(); } finally { await handle.close(); }
   try {
     await rename(temporary, path);
     await syncDirectory(folder);
