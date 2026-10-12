@@ -9,6 +9,10 @@ import {
   inspectLocalSkillPath,
 } from "../skills/local-skills.js";
 import type { NativeSkillSyncClient } from "./skill-sync-client.js";
+import {
+  skillPublicationConcurrentReplacement,
+  type SkillPublicationConcurrentReplacement,
+} from "./skill-publication-events.js";
 
 /** Independent source failures; runtime authority and cancellation were rechecked. */
 export class SkillPublicationPartialFailure extends AggregateError {
@@ -44,6 +48,7 @@ type RefreshOptions = {
   homes: readonly string[];
   tenantId: string;
   runtimeId: string;
+  onConcurrentReplacement?: (event: SkillPublicationConcurrentReplacement) => void;
 };
 
 async function revokeDeletedPersonalSource(
@@ -98,7 +103,21 @@ async function publishChangedSource(
   const result = await options.client.share({ ...selection, tree }, signal);
   check();
   if (!result.runtimePublication) throw new Error("Shared Skill revision was not acknowledged");
-  await options.store.save({ ...record, selection, receipt: result.runtimePublication });
+  const acceptedSelection = {
+    ...selection,
+    expectedRevision: result.runtimePublication.revisionId,
+  };
+  await options.store.save({
+    ...record,
+    selection: acceptedSelection,
+    receipt: result.runtimePublication,
+  });
+  const replacement = skillPublicationConcurrentReplacement(
+    record.selection.skillId,
+    selection.expectedRevision,
+    result.runtimePublication,
+  );
+  if (replacement) options.onConcurrentReplacement?.(replacement);
 }
 
 async function refreshPublicationRecord(
@@ -126,6 +145,7 @@ export async function refreshSkillPublications(
     tenantId: string;
     runtimeId: string;
     assertReady: () => void;
+    onConcurrentReplacement?: (event: SkillPublicationConcurrentReplacement) => void;
   },
   signal: AbortSignal,
 ): Promise<void> {

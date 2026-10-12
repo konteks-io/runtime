@@ -2432,8 +2432,17 @@ export class Supervisor {
       this.assertSkillSyncReady();
       if (this.workspaceId !== tenantId || this.instanceId !== runtimeId) throw new Error("Skill publication identity changed");
     };
-    await refreshSkillPublications({ store: this.skillPublications, client, homes, tenantId, runtimeId, assertReady: assertIdentity }, signal);
-    await syncPersonalSkills({ store: this.skillPublications, client, homes, tenantId, runtimeId, assertReady: assertIdentity }, signal);
+    const onConcurrentReplacement = (replacement: {
+      skillId: string;
+      observedRevisionId: string;
+      replacedRevisionId: string;
+      acceptedRevisionId: string;
+    }) => this.logger.warn(
+      { event: "skills.concurrent_revision_replaced", ...replacement },
+      "A Skill edit replaced a revision accepted by another runtime.",
+    );
+    await refreshSkillPublications({ store: this.skillPublications, client, homes, tenantId, runtimeId, assertReady: assertIdentity, onConcurrentReplacement }, signal);
+    await syncPersonalSkills({ store: this.skillPublications, client, homes, tenantId, runtimeId, assertReady: assertIdentity, onConcurrentReplacement }, signal);
     await exchangeLocalSkills({ client, homes, now: () => this.clock.coreNow(), assertReady: () => this.assertSkillSyncReady() }, signal);
     this.assertSkillSyncReady();
   }

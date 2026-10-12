@@ -94,6 +94,38 @@ it("publishes changed consented content against the accepted base and retains th
   );
   expect(f.store.save).toHaveBeenCalledWith(expect.objectContaining({ receipt: f.receipt }));
 });
+
+it("reports a concurrent revision replacement and advances its next edit base", async () => {
+  const f = fixture();
+  const onConcurrentReplacement = vi.fn();
+  const receipt = {
+    publicationId: f.record.receipt.publicationId,
+    revisionId: "accepted-after-race",
+    acceptedSequence: 3,
+    treeDigest: "new",
+    baseRevisionId: "accepted-base",
+    replacedRevisionId: "concurrent-revision",
+  };
+  f.client.share.mockResolvedValue({ runtimePublication: receipt } as never);
+
+  await refreshSkillPublications(
+    { ...f.options, onConcurrentReplacement } as never,
+    new AbortController().signal,
+  );
+
+  expect(onConcurrentReplacement).toHaveBeenCalledWith({
+    skillId: f.record.selection.skillId,
+    observedRevisionId: "accepted-base",
+    replacedRevisionId: "concurrent-revision",
+    acceptedRevisionId: "accepted-after-race",
+  });
+  expect(f.store.save).toHaveBeenCalledWith(
+    expect.objectContaining({
+      selection: expect.objectContaining({ expectedRevision: "accepted-after-race" }),
+      receipt,
+    }),
+  );
+});
 it.each(["unchanged", "missing"])("does not publish or delete a %s source", async (kind) => {
   const f = fixture();
   vi.mocked(discoverLocalSkills).mockResolvedValue(

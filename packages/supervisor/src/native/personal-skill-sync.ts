@@ -6,6 +6,10 @@ import {
 import type { SkillPublicationStore } from "../state/skill-publications.js";
 import type { NativeSkillSyncClient } from "./skill-sync-client.js";
 import {
+  skillPublicationConcurrentReplacement,
+  type SkillPublicationConcurrentReplacement,
+} from "./skill-publication-events.js";
+import {
   discoverLocalSkills,
   exportLocalSkill,
   findLocalSkillPath,
@@ -54,6 +58,7 @@ async function publishPersonalSkill(
     homes: readonly string[];
     tenantId: string;
     runtimeId: string;
+    onConcurrentReplacement?: (event: SkillPublicationConcurrentReplacement) => void;
   },
   skill: Awaited<ReturnType<typeof discoverLocalSkills>>[number],
   targets: PersonalSkillTargets,
@@ -86,6 +91,12 @@ async function publishPersonalSkill(
     receipt,
     sourcePath,
   });
+  const replacement = skillPublicationConcurrentReplacement(
+    result.id,
+    selection.expectedRevision,
+    receipt,
+  );
+  if (replacement) options.onConcurrentReplacement?.(replacement);
   targets.set(skill.name, [
     {
       name: skill.name,
@@ -105,6 +116,7 @@ export async function syncPersonalSkills(
     tenantId: string;
     runtimeId: string;
     assertReady: () => void;
+    onConcurrentReplacement?: (event: SkillPublicationConcurrentReplacement) => void;
   },
   signal: AbortSignal,
 ): Promise<void> {
