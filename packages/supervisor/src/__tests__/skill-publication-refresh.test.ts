@@ -48,11 +48,22 @@ function fixture() {
       context: { kind: "global" },
       confirmation: { ongoingPublication: true },
     },
-    receipt: { revisionId: "accepted-base", treeDigest: "old" },
+    receipt: {
+      publicationId: "11111111-1111-4111-8111-111111111111",
+      revisionId: "accepted-base",
+      treeDigest: "old",
+    },
   };
-  const store = { list: vi.fn(async () => [record]), save: vi.fn() };
+  const store = { list: vi.fn(async () => [record]), save: vi.fn(), remove: vi.fn() };
   const receipt = { revisionId: "new-revision", treeDigest: "new" };
-  const client = { share: vi.fn(async () => ({ runtimePublication: receipt })) };
+  const client = {
+    share: vi.fn(async () => ({ runtimePublication: receipt })),
+    unshare: vi.fn(async () => ({
+      publicationId: record.receipt.publicationId,
+      skillId: record.selection.skillId,
+      revokedAt: "2026-10-12T02:00:00.000Z",
+    })),
+  };
   vi.mocked(discoverLocalSkills).mockResolvedValue([
     { localId: "local-a", treeDigest: "new" },
   ] as never);
@@ -144,6 +155,42 @@ it("retains shared publication when its explicit source folder has been removed"
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+it("revokes the private personal copy when its tracked source folder is deleted", async () => {
+  const f = fixture();
+  const root = await mkdtemp(join(tmpdir(), "kr-missing-personal-skill-"));
+  try {
+    f.record.selection.audience = { kind: "personal" } as never;
+    Object.assign(f.record, { sourcePath: join(root, "review") });
+    await refreshSkillPublications(f.options as never, new AbortController().signal);
+    expect(f.client.unshare).toHaveBeenCalledWith(
+      expect.objectContaining({
+        publicationId: f.record.receipt.publicationId,
+        skillId: f.record.selection.skillId,
+        confirmation: { revokePublication: true },
+      }),
+      expect.any(AbortSignal),
+    );
+    expect(f.store.remove).toHaveBeenCalledWith(
+      "tenant-a",
+      "runtime-a",
+      f.record.selection.localId,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+it("does not revoke a personal publication when its skill home is unavailable", async () => {
+  const f = fixture();
+  f.record.selection.audience = { kind: "personal" } as never;
+  Object.assign(f.record, { sourcePath: join(tmpdir(), "missing-skill-home", "review") });
+  await expect(
+    refreshSkillPublications(f.options as never, new AbortController().signal),
+  ).rejects.toThrow("One or more Skill publications failed");
+  expect(f.client.unshare).not.toHaveBeenCalled();
+  expect(f.store.remove).not.toHaveBeenCalled();
 });
 
 it("reports an incomplete existing source instead of treating it as removed", async () => {

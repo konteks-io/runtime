@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { z } from "zod/v4";
 import { isFsErrorWithCode, writeSecretFile } from "@konteks/remote-common";
 import {
-  RuntimeSkillShareRequestSchema,
+  RuntimeSkillPublicationSelectionSchema,
   RuntimeSkillPublicationReceiptSchema,
 } from "@konteks/backstage-plugin-common/remote-instance-internal";
 import { unrestrictedStateMutation, type StateMutation } from "./mutation-gate.js";
@@ -14,7 +14,7 @@ const recordSchema = z
     version: z.literal(1),
     tenantId: z.string().min(1).max(256),
     runtimeId: z.string().min(1).max(256),
-    selection: RuntimeSkillShareRequestSchema,
+    selection: RuntimeSkillPublicationSelectionSchema,
     receipt: RuntimeSkillPublicationReceiptSchema,
     sourcePath: z.string().min(1).max(4096).optional(),
   })

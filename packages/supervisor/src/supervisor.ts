@@ -4,6 +4,7 @@ import { exchangeLocalSkills } from "./native/local-skill-exchange.js";
 import { exportLocalSkill, inspectLocalSkill, inspectLocalSkillPath } from "./skills/local-skills.js";
 import { runRequestedSkillSync } from "./native/requested-skill-sync.js";
 import { refreshSkillPublications } from "./native/skill-publication-refresh.js";
+import { syncPersonalSkills } from "./native/personal-skill-sync.js";
 import { refreshMachineSkills, machineSkillHomes, runnerSkillProfileHomes, MachineSkillPartialFailure, MachineSkillSyncFailure, type MachineSkillInventory } from "./native/skill-refresh.js";
 import { skillProfileFreshness } from "./native/skill-profile-freshness.js";
 import type { RuntimeSkillProfileFreshness } from "@konteks/backstage-plugin-common";
@@ -2432,6 +2433,7 @@ export class Supervisor {
       if (this.workspaceId !== tenantId || this.instanceId !== runtimeId) throw new Error("Skill publication identity changed");
     };
     await refreshSkillPublications({ store: this.skillPublications, client, homes, tenantId, runtimeId, assertReady: assertIdentity }, signal);
+    await syncPersonalSkills({ store: this.skillPublications, client, homes, tenantId, runtimeId, assertReady: assertIdentity }, signal);
     await exchangeLocalSkills({ client, homes, now: () => this.clock.coreNow(), assertReady: () => this.assertSkillSyncReady() }, signal);
     this.assertSkillSyncReady();
   }

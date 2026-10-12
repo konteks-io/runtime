@@ -115,6 +115,15 @@ export async function discoverLocalSkills(homes: readonly string[]): Promise<Loc
   }
   return result;
 }
+
+/** Resolve an already discovered source to its canonical local folder for durable change tracking. */
+export async function findLocalSkillPath(
+  homes: readonly string[],
+  localId: string,
+): Promise<string | undefined> {
+  return (await candidates(homes)).find((item) => item.localId === localId)?.directory;
+}
+
 export async function exportLocalSkill(
   homes: readonly string[],
   selection: Pick<LocalSkillSummary, "localId" | "treeDigest">,

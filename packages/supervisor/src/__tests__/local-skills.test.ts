@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   discoverLocalSkills,
   exportLocalSkill,
+  findLocalSkillPath,
   inspectLocalSkill,
   inspectLocalSkillPath,
 } from "../skills/local-skills.js";
@@ -67,7 +68,9 @@ describe("personal Skill discovery and explicit export", () => {
       const skills = await discoverLocalSkills([home]);
       expect(skills).toHaveLength(1);
       expect(JSON.stringify(skills)).not.toContain(home);
-      const tree = await exportLocalSkill([home], skills[0]!);
+      const sourcePath = await findLocalSkillPath([home], skills[0]!.localId);
+      expect(sourcePath).toBeDefined();
+      const tree = await exportLocalSkill([home], skills[0]!, sourcePath);
       expect(tree.entries.find((entry) => entry.path === "assets/image.bin")?.contentBase64).toBe(
         "AP8=",
       );

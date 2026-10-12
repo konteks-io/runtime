@@ -21,7 +21,7 @@ test("the shipped common contract supports scoped Skill synchronization", () => 
     symlinkSync(dirname(require.resolve("zod/package.json")), join(temporary, "node_modules", "zod"), "junction");
     const contract = require(join(temporary, "package", "dist", "remote-instance-internal.js"));
     for (const name of ["RuntimeSkillSyncItemSchema", "RuntimeSkillSyncEnvelopeSchema", "RuntimeSkillShareOwnerRequestSchema",
-      "RuntimeSkillSharePublishRequestSchema", "RuntimeSkillShareRequestSchema", "RuntimeSkillSharePublicationResultSchema", "RuntimeSkillPublicationReceiptSchema",
+      "RuntimeSkillSharePublishRequestSchema", "RuntimeSkillShareRequestSchema", "RuntimeSkillPublicationSelectionSchema", "RuntimeSkillSharePublicationResultSchema", "RuntimeSkillPublicationReceiptSchema",
       "LocalSkillExportIntentSchema", "RuntimeSkillStatusSchema", "RuntimeSkillProfileFreshnessSchema", "RuntimeSkillCatalogChangedSchema",
       "runtimeSkillCatalogChangedSigningBytes", "skillScopeAllows", "skillFreshnessFailure"]) {
       assert.ok(contract[name], `Vendored common@${version} is missing ${name}`);
@@ -34,6 +34,10 @@ test("the shipped common contract supports scoped Skill synchronization", () => 
       expectedRevision: "33333333-3333-4333-8333-333333333333" };
     assert.deepEqual(contract.RuntimeSkillShareRequestSchema.parse(selection), selection);
     assert.throws(() => contract.RuntimeSkillShareRequestSchema.parse({ ...selection, expectedRevision: "revision-a" }));
+    const { confirmation: _confirmation, ...privateBase } = selection;
+    const personal = { ...privateBase, audience: { kind: "personal" } };
+    assert.deepEqual(contract.RuntimeSkillPublicationSelectionSchema.parse(personal), personal);
+    assert.throws(() => contract.RuntimeSkillShareRequestSchema.parse(personal));
     const digest = `sha256:${"a".repeat(64)}`;
     const receipt = { publicationId: "11111111-1111-4111-8111-111111111111", revisionId: "22222222-2222-4222-8222-222222222222", acceptedSequence: 1, treeDigest: digest };
     const result = { id: receipt.publicationId, tenantId: "tenant-a", type: "skill", metadata: { runtimePromotionKey: `runtime-a:local-a:${digest}` }, runtimePublication: receipt };
