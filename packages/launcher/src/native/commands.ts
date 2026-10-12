@@ -442,11 +442,16 @@ function controlSocketUnavailable(error: unknown): boolean {
 }
 
 /** A stopped connector is an answer, not an error. */
-async function statusOrStopped(context: ControlContext, input: ControlInput): Promise<void> {
+export async function statusOrStopped(
+  context: ControlContext,
+  input: ControlInput,
+  deps: { running?: (root: string) => Promise<boolean> } = {},
+): Promise<void> {
   try {
     return await status(context);
   } catch (error) {
-    if (!controlSocketUnavailable(error) || (await serviceRunning(input.root))) throw error;
+    if (!controlSocketUnavailable(error) || (await (deps.running ?? serviceRunning)(input.root))) throw error;
+    if (input.output.json) return reportStoppedService(input, false);
     setupLine(input.output, "serviceStoppedStatus");
   }
 }
