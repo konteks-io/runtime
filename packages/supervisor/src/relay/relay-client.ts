@@ -1,5 +1,9 @@
 import { WebSocket as NodeWebSocket } from "ws";
 import {
+  RuntimeSkillCatalogChangedSchema,
+  type RuntimeSkillCatalogChanged,
+} from "@konteks/backstage-plugin-common/remote-instance-internal";
+import {
   ReconnectBackoff,
   RelayRuntimeHandshakeResultSchema,
   RelayAckSchema,
@@ -59,7 +63,8 @@ type RelayState = "offline" | "connecting" | "handshaking" | "connected" | "reco
 
 /** What the relay may send once its handshake result has arrived, buffered until the handshake is adopted. */
 type InboundEnvelope = ToRuntimeRelayFrame | AssignmentReplyFrame | RelayAck | RelayReplayRequest | RuntimeCancellationDeliveryRequest
-  | RuntimePermissionAnswerDeliveryRequest | RemoteExecutionRevisionControlDeliveryRequest | RuntimeAgentLoginDeliveryRequest | RuntimeUpdateDeliveryRequest;
+  | RuntimePermissionAnswerDeliveryRequest | RemoteExecutionRevisionControlDeliveryRequest | RuntimeAgentLoginDeliveryRequest | RuntimeUpdateDeliveryRequest
+  | RuntimeSkillCatalogChanged;
 
 type DeliveryReceiver<R> = (request: R, connection: { connectionEpoch: number; assertCurrent(): void }) => Promise<void>;
 
@@ -97,7 +102,7 @@ function namesHolderReplayRequest(header: string | string[] | undefined): boolea
 
 /** Post-handshake envelopes in the order they are recognised; anything else must be a channel frame. */
 const POST_HANDSHAKE_SCHEMAS: ReadonlyArray<{ safeParse(value: unknown): { success: boolean; data?: unknown } }> = [
-  RuntimePermissionAnswerDeliveryRequestSchema, RuntimeAgentLoginDeliveryRequestSchema, RuntimeUpdateDeliveryRequestSchema, RuntimeCancellationDeliveryRequestSchema,
+  RuntimeSkillCatalogChangedSchema, RuntimePermissionAnswerDeliveryRequestSchema, RuntimeAgentLoginDeliveryRequestSchema, RuntimeUpdateDeliveryRequestSchema, RuntimeCancellationDeliveryRequestSchema,
   RemoteExecutionRevisionControlDeliveryRequestSchema, RelayReplayRequestSchema, RelayAckSchema, AssignmentReplyFrameSchema,
 ];
 
@@ -176,6 +181,8 @@ export interface RelayClientOptions {
     connectionEpoch: number;
     assertCurrent(): void;
   }) => Promise<void>;
+  /** Content-free signed hint; the control handler verifies and deduplicates it. */
+  onRuntimeSkillCatalogChanged?: (notice: RuntimeSkillCatalogChanged) => Promise<void>;
   handshakeTimeoutMs?: number;
   outboundHighWaterBytes?: number;
   outboundLowWaterBytes?: number;
@@ -479,7 +486,7 @@ export class RelayClient {
   /** Envelopes that arrive while the handshake is being adopted wait, bounded, for that adoption. */
   private bufferDuringHandshake(attempt: SocketAttempt, parsed: unknown, bytes: number): void {
     const envelope = postHandshakeEnvelope(parsed);
-    if (envelope === null || envelope.connectionEpoch !== attempt.validatedEpoch) {
+    if (envelope === null || ("connectionEpoch" in envelope && envelope.connectionEpoch !== attempt.validatedEpoch)) {
       return this.rejectProtocol(attempt, "protocol", "relay sent an invalid post-handshake envelope");
     }
     if (attempt.pending.length >= HANDSHAKE_BUFFER_MAX_FRAMES || attempt.pendingBytes + bytes > HANDSHAKE_BUFFER_MAX_BYTES) {
@@ -576,6 +583,17 @@ export class RelayClient {
         return this.deliverDiagnostic(attempt, value);
       case "runtime_execution_revision_control_delivery":
         return this.deliver(attempt, RemoteExecutionRevisionControlDeliveryRequestSchema.parse(value), "Revision-control", this.receiverFor(this.options.onExecutionRevisionControl), "Revision-control receiver is unavailable");
+      case "runtime_skill_catalog_changed": {
+        const notice = RuntimeSkillCatalogChangedSchema.parse(value);
+        if (!this.options.onRuntimeSkillCatalogChanged || !this.socketCurrent(attempt)) {
+          throw new RemoteInstanceError("temporarily_unavailable", "Skill catalog notification receiver is unavailable");
+        }
+        await this.options.onRuntimeSkillCatalogChanged(notice);
+        if (!this.socketCurrent(attempt)) {
+          throw new RemoteInstanceError("recovery_required", "Skill catalog notification socket changed during receipt");
+        }
+        return;
+      }
       default:
         await this.options.mux.receive(value);
     }

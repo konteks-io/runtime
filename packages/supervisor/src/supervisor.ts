@@ -688,6 +688,7 @@ export class Supervisor {
       onCancellation: (request, connection) => this.receiveCancellation(request, connection, verifier),
       onDiagnosticCompanion: (request, connection) => this.receiveDiagnosticCompanion(request, connection, verifier),
       onExecutionRevisionControl: (request, connection) => this.receiveExecutionRevisionControl(request, connection, verifier),
+      onRuntimeSkillCatalogChanged: notice => this.onControlMessage(notice),
         });
   }
 

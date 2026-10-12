@@ -86,6 +86,62 @@ describe("relay socket lease rotation (2026-10-03)", () => {
 });
 
 describe("native runtime relay handshake validation boundary", () => {
+  it("routes a signed Skill catalog-change notice through the control handler", async () => {
+    const onRuntimeSkillCatalogChanged = vi.fn(async () => undefined);
+    const f = fixture({ onRuntimeSkillCatalogChanged });
+    const notice = {
+      type: "runtime_skill_catalog_changed",
+      workspaceId: "workspace",
+      instanceId: "instance",
+      notificationId: "notice-a",
+      catalogRevision: `sha256:${"a".repeat(64)}`,
+      changeKind: "updated",
+      issuedAt: confirmed.runtimeReconciliation.acceptedAt,
+      expiresAt: "2026-09-06T00:00:30.000Z",
+      signature: "c2lnbmVk",
+    };
+    try {
+      f.socket.message(confirmed);
+      await flush();
+      f.socket.message(notice);
+      await flush();
+      expect(onRuntimeSkillCatalogChanged).toHaveBeenCalledOnce();
+      expect(onRuntimeSkillCatalogChanged).toHaveBeenCalledWith(notice);
+      expect(f.mux.receive).not.toHaveBeenCalled();
+    } finally {
+      f.client.stop();
+    }
+  });
+
+  it("buffers a Skill catalog-change notice until durable handshake adoption completes", async () => {
+    const onRuntimeSkillCatalogChanged = vi.fn(async () => undefined);
+    const f = delayedAdoption({ onRuntimeSkillCatalogChanged });
+    const notice = {
+      type: "runtime_skill_catalog_changed",
+      workspaceId: "workspace",
+      instanceId: "instance",
+      notificationId: "notice-buffered",
+      catalogRevision: `sha256:${"b".repeat(64)}`,
+      changeKind: "deleted",
+      issuedAt: confirmed.runtimeReconciliation.acceptedAt,
+      expiresAt: "2026-09-06T00:00:30.000Z",
+      signature: "c2lnbmVk",
+    };
+    try {
+      await flush();
+      f.socket.message(notice);
+      await flush();
+      expect(onRuntimeSkillCatalogChanged).not.toHaveBeenCalled();
+      f.adoption.resolve();
+      await flush();
+      expect(onRuntimeSkillCatalogChanged).toHaveBeenCalledOnce();
+      expect(onRuntimeSkillCatalogChanged).toHaveBeenCalledWith(notice);
+      expect(f.onFrame).not.toHaveBeenCalled();
+    } finally {
+      f.client.stop();
+    }
+  });
+
   const runtimeUpdate = () => ({ type: "runtime_update_delivery", method: "POST", path: { instanceId: "instance" },
     nodeId: "node", connectionRef: "connection", connectionEpoch: 7,
     intent: { updateId: "update", tenantId: "tenant", instanceId: "instance", leaseId: "lease", runnerIncarnation: "process",
