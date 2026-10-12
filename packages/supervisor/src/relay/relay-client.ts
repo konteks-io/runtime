@@ -583,17 +583,8 @@ export class RelayClient {
         return this.deliverDiagnostic(attempt, value);
       case "runtime_execution_revision_control_delivery":
         return this.deliver(attempt, RemoteExecutionRevisionControlDeliveryRequestSchema.parse(value), "Revision-control", this.receiverFor(this.options.onExecutionRevisionControl), "Revision-control receiver is unavailable");
-      case "runtime_skill_catalog_changed": {
-        const notice = RuntimeSkillCatalogChangedSchema.parse(value);
-        if (!this.options.onRuntimeSkillCatalogChanged || !this.socketCurrent(attempt)) {
-          throw new RemoteInstanceError("temporarily_unavailable", "Skill catalog notification receiver is unavailable");
-        }
-        await this.options.onRuntimeSkillCatalogChanged(notice);
-        if (!this.socketCurrent(attempt)) {
-          throw new RemoteInstanceError("recovery_required", "Skill catalog notification socket changed during receipt");
-        }
-        return;
-      }
+      case "runtime_skill_catalog_changed":
+        return this.deliverSkillCatalogChanged(attempt, value);
       default:
         await this.options.mux.receive(value);
     }
@@ -621,6 +612,17 @@ export class RelayClient {
     if (!receiver) throw new RemoteInstanceError("recovery_required", unavailable);
     await receiver(request, { connectionEpoch: request.connectionEpoch, assertCurrent });
     if (checkAfter) assertCurrent();
+  }
+
+  private async deliverSkillCatalogChanged(attempt: SocketAttempt, value: unknown): Promise<void> {
+    const notice = RuntimeSkillCatalogChangedSchema.parse(value);
+    if (!this.options.onRuntimeSkillCatalogChanged || !this.socketCurrent(attempt)) {
+      throw new RemoteInstanceError("temporarily_unavailable", "Skill catalog notification receiver is unavailable");
+    }
+    await this.options.onRuntimeSkillCatalogChanged(notice);
+    if (!this.socketCurrent(attempt)) {
+      throw new RemoteInstanceError("recovery_required", "Skill catalog notification socket changed during receipt");
+    }
   }
 
   /**
