@@ -75,6 +75,40 @@ async function realOwnedWork() {
 }
 
 describe("proven per-session recovery stop", () => {
+  it.each(["codex", "claude-code", "dsh", "opencode", "antigravity"])("requests ACP cancellation while higher-layer tool cleanup is pending (%s)", async agentId => {
+    const f = await sessionFixture();
+    f.deps.registerReady = async (_assignment, binding, ref) => ({ ...binding, claimId: "claim", recoveryEpoch: 0, runnerIncarnation: "process", channelId: "session:cloud-session", agentId, acpSessionRef: ref, readyRevision: 1, registeredAt: clock.nowIso() });
+    const session = new RelayedSession({ ...assignment, agentRoute: { ...assignment.agentRoute, agentId } }, f.deps);
+    await session.bootstrap();
+    const drain = Promise.withResolvers<void>();
+    const close = vi.fn(() => drain.promise);
+    (session as unknown as { mcpFacade: { close: typeof close } }).mcpFacade = { close };
+    let settled = false;
+    const stopped = session.stopForRecovery().then(() => { settled = true; });
+    try {
+      await vi.waitFor(() => expect(close).toHaveBeenCalledOnce());
+      await vi.waitFor(() => expect(f.runner.stopForRecovery).toHaveBeenCalledWith("acp"));
+      expect(settled).toBe(false);
+    } finally { drain.resolve(); await stopped; }
+  });
+
+  it("joins higher-layer cleanup already started by failed-bootstrap disposal", async () => {
+    const f = await sessionFixture(); await f.session.bootstrap();
+    const drain = Promise.withResolvers<void>();
+    const close = vi.fn(() => drain.promise);
+    (f.session as unknown as { mcpFacade: { close: typeof close } }).mcpFacade = { close };
+    const disposed = f.session.disposeFailedBootstrap();
+    await vi.waitFor(() => expect(close).toHaveBeenCalledOnce());
+    let settled = false;
+    const stopped = f.session.stopForRecovery().then(() => { settled = true; });
+    try {
+      await vi.waitFor(() => expect(f.runner.stopForRecovery).toHaveBeenCalledWith("acp"));
+      await new Promise<void>(resolve => setTimeout(resolve, 20));
+      expect(settled).toBe(false);
+      expect(close).toHaveBeenCalledTimes(1);
+    } finally { drain.resolve(); await Promise.all([disposed, stopped]); }
+  });
+
   it.each(["cancel", "closeSession"] as const)("late creation after ordinary close rechecks authority after %s cleanup", async method => {
     let generation = "accepted-A";
     const f = await sessionFixture();
