@@ -97,6 +97,9 @@ async function gitState(git: Git, cwd: string, linked = false, chunks?: Workspac
   const refValue = ascii(await git(cwd, ["rev-parse", "--symbolic-full-name", "HEAD"]));
   const allRefs = ascii(await git(cwd, ["for-each-ref", "--format=%(refname) %(objectname)"])).split("\n").filter(Boolean)
     .map(row => { const [name, oid] = row.split(" "); return { name: name!, oid: oid! }; });
+  // Stash stacks require their reflogs, which ordinary refs cannot preserve.
+  // A linked repository also shares that stack with other sessions.
+  if (allRefs.some(ref => ref.name === "refs/stash")) throw unavailable();
   const refs = linked ? allRefs.filter(ref => ref.name === refValue) : allRefs;
   const indexPath = ascii(await git(cwd, ["rev-parse", "--git-path", "index"]));
   const index = await readCheckpointBytes(isAbsolute(indexPath) ? indexPath : join(cwd, indexPath), undefined, chunks);
