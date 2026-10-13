@@ -267,6 +267,28 @@ describe("native control commands", () => {
     expect(older.text()).not.toContain("updates");
   });
 
+  it("says in status which git runs and why, and leaves the line out for a connector without git.choice (D123)", async () => {
+    const withGit = (report: unknown) => {
+      const f = fake();
+      const call = f.context.control.call;
+      f.context.control.call = (async (request: ControlRequest, schema: { parse: (value: unknown) => unknown }, options?: { onEvent?: (event: unknown) => void }) =>
+        request.op === "git.choice" ? schema.parse(report) : call(request, schema as never, options)) as typeof f.context.control.call;
+      return f;
+    };
+    const tools = withGit({ git: "command_line_tools", path: "/Library/Developer/CommandLineTools/usr/bin/git", reason: "xcode_license_pending", blocked: null });
+    await status(tools.context);
+    expect(tools.text()).toContain("/Library/Developer/CommandLineTools/usr/bin/git (Command Line Tools: the Xcode license is not accepted yet)");
+    const blocked = withGit({ git: "default", path: "/usr/bin/git", reason: "xcode_license_pending", blocked: "Git on this Mac needs the Xcode license accepted. Run: sudo xcodebuild -license accept" });
+    await status(blocked.context);
+    expect(blocked.text()).toContain("Git on this Mac needs the Xcode license accepted. Run: sudo xcodebuild -license accept");
+    const standard = withGit({ git: "default", path: "/usr/bin/git", reason: "default", blocked: null });
+    await status(standard.context);
+    expect(standard.text()).toMatch(/git\s+\/usr\/bin\/git/);
+    const older = fake();
+    await status(older.context);
+    expect(older.text()).not.toMatch(/^git\b/m);
+  });
+
   it("exposes only the public lease summary in machine-readable status", async () => {
     const f = fake({ json: true });
     await status(f.context);

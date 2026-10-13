@@ -6,7 +6,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { FixedClock, RemoteInstanceError, SECRET_CANARIES, generateInstanceKey, type PendingPermissionView, type RemoteWorkAssignment, type RelayAck, type ToCoreRelayFrame } from "@konteks/remote-common";
+import { FixedClock, RemoteInstanceError, SECRET_CANARIES, generateInstanceKey, gitXcodeLicenseError, type PendingPermissionView, type RemoteWorkAssignment, type RelayAck, type ToCoreRelayFrame } from "@konteks/remote-common";
 import { ChannelMux } from "../relay/channel-mux.js";
 import { SupervisorJournal } from "../state/journal.js";
 import { PermissionBroker, answerIsValid, registerDeferral, sanitizeElicitationRequest, sanitizePermissionRequest } from "../session/permissions.js";
@@ -1234,6 +1234,14 @@ describe("relayed session", () => {
       retryable: false,
     }), "native session bootstrap stage failed");
     expect(JSON.stringify(warn.mock.calls)).not.toContain("secret-body");
+  });
+
+  it("keeps the plain Xcode license finding from input preparation, and only that one (D123)", async () => {
+    const license = await build({ prepareInputs: async () => { throw gitXcodeLicenseError(); } });
+    await expect(license.session.bootstrap()).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "git_xcode_license_pending",
+      message: "Git on this Mac needs the Xcode license accepted. Run: sudo xcodebuild -license accept" });
+    const other = await build({ prepareInputs: async () => { throw new RemoteInstanceError("prerequisite_missing", "something else", { diagnostic: "ssh_keygen_missing" }); } });
+    await expect(other.session.bootstrap()).rejects.toMatchObject({ code: "capability_unavailable", message: "Required local session inputs are unavailable." });
   });
 
   it("finishes fallible cloud preparation before activating local execution ownership", async () => {

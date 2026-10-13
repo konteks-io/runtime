@@ -9,6 +9,8 @@ import {
   RemoteInstanceError,
   canonicalize,
   computeRemoteDeliveryOutputDigest,
+  connectorGit,
+  connectorGitEnv,
   computeRemoteFileTreeDigest,
   createLogger,
   type Logger,
@@ -56,6 +58,8 @@ function gitEnv(executable: string, overrides: NodeJS.ProcessEnv = {}): NodeJS.P
     PATH: dirname(executable), GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null",
     GIT_ATTR_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0", GIT_ALLOW_PROTOCOL: "", GIT_OPTIONAL_LOCKS: "0", ...overrides,
     ...(process.platform === "win32" && process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+    // The Command Line Tools' git while Xcode's license is pending (git-choice.ts).
+    ...connectorGitEnv(),
   };
 }
 
@@ -128,6 +132,7 @@ export async function captureNativeDeliveryOutput(options: CaptureOptions): Prom
   try {
     const root = await checkedDirectory(options.cwd);
     if (!isAbsolute(options.gitExecutable) || !oidPattern.test(options.baselineCommit)) throw unavailable();
+    await connectorGit(options.gitExecutable);
     await runGit(options.gitExecutable, root, ["cat-file", "-e", `${options.baselineCommit}^{commit}`]);
     const objectDirectory = await commonObjectDirectory(options.gitExecutable, root);
     temporary = await mkdtemp(join(dirname(root), ".output-capture-")); await chmod(temporary, 0o700);

@@ -6,7 +6,7 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { z } from "zod";
-import { isFsErrorWithCode, writeSecretFile } from "@konteks/remote-common";
+import { connectorGitEnv, isFsErrorWithCode, writeSecretFile } from "@konteks/remote-common";
 import { readNativeRecord } from "./install.js";
 
 const run = promisify(execFile);
@@ -156,7 +156,7 @@ async function unpackGraft(record: GraftRecord, bytes: Buffer, node: string, dir
 
 /** Every Graft run: statistics off, and its own .gitignore edit off (we exclude locally). */
 function graftEnv(): NodeJS.ProcessEnv {
-  return { ...process.env, DO_NOT_TRACK: "1", GRAFT_NO_GITIGNORE: "1", NO_UPDATE_NOTIFIER: "1" };
+  return { ...process.env, ...connectorGitEnv(), DO_NOT_TRACK: "1", GRAFT_NO_GITIGNORE: "1", NO_UPDATE_NOTIFIER: "1" };
 }
 
 /**
@@ -201,7 +201,8 @@ function lastLine(text: string): string | undefined {
 }
 
 async function git(repo: string, args: string[]): Promise<string> {
-  return (await run("git", ["-C", repo, ...args], { maxBuffer: 16 * 1024 * 1024, windowsHide: true })).stdout;
+  // The Command Line Tools' git while Xcode's license is pending, as already chosen (git-choice.ts).
+  return (await run("git", ["-C", repo, ...args], { env: { ...process.env, ...connectorGitEnv() }, maxBuffer: 16 * 1024 * 1024, windowsHide: true })).stdout;
 }
 
 /** Whether this repository already has the Graft wiring onboarding sets up. */

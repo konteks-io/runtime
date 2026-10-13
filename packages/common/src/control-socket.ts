@@ -71,6 +71,8 @@ export const ControlRequestSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("update.status") }).strict(),
   /** Where the unattended update reads releases (host only), an override, and the last read's failure. */
   z.object({ op: z.literal("update.channel") }).strict(),
+  /** Which git the connector and its agents run, and why (git-choice.ts). */
+  z.object({ op: z.literal("git.choice") }).strict(),
   /** The release Konteks accepts for this machine, asked with this machine's lease. */
   z.object({ op: z.literal("release.accepted") }).strict(),
   z
@@ -555,6 +557,17 @@ export const UpdateChannelReportSchema = z
   .strict()
   .nullable();
 export type UpdateChannelReport = z.infer<typeof UpdateChannelReportSchema>;
+
+/** `git.choice`'s answer: which git runs, its path (the home folder as `~`), why, and the license finding when git cannot run. */
+export const GitChoiceReportSchema = z
+  .object({
+    git: z.enum(["default", "command_line_tools"]),
+    path: z.string().max(4_096).nullable(),
+    reason: z.enum(["default", "xcode_license_pending"]),
+    blocked: z.string().max(1_024).nullable(),
+  })
+  .strict();
+export type GitChoiceReport = z.infer<typeof GitChoiceReportSchema>;
 
 export const DoctorCheckSchema = z
   .object({

@@ -127,6 +127,11 @@ Node 22 (`.nvmrc`; CI and releases use 22.23.2). From the repo root:
   never `launchctl setenv` or a shell profile, which silently points the
   owner's real connector at a dead local channel. `status` and `doctor` report
   an active override.
+- **One git choice.** Every git the connector runs, and every coding agent's
+  environment, takes `connectorGitEnv()` from `common/src/git-choice.ts`: the
+  Command Line Tools' git only while Xcode's license refuses `git --version`
+  on macOS, chosen once at supervisor start. Any other git failure surfaces
+  unchanged; Linux and Windows are never probed.
 - **No AGPL code, no secret literals.** `scripts/check-agpl.mjs` refuses
   Shellular (AGPL-3.0) code (design reading only, see `THIRD_PARTY_NOTICES.md`);
   `scripts/check-secret-canary.mjs` refuses canary markers and credential-shaped

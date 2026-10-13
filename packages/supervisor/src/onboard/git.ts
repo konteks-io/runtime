@@ -1,6 +1,6 @@
 import { mkdir, readFile, readdir, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { RemoteInstanceError, createLogger, runCommand, sanitizeInheritedChildProcessEnv, sha256Hex, type Logger } from "@konteks/remote-common";
+import { RemoteInstanceError, connectorGitEnv, createLogger, runCommand, sanitizeInheritedChildProcessEnv, sha256Hex, type Logger } from "@konteks/remote-common";
 
 /**
  * The onboard role's git access.
@@ -267,7 +267,8 @@ export class LocalGit implements GitAccess {
 
   private env(identityFile?: string): NodeJS.ProcessEnv {
     const env = sanitizeInheritedChildProcessEnv({ env: process.env });
-    Object.assign(env, NON_INTERACTIVE_ENV);
+    // The Command Line Tools' git while Xcode's license is pending, as chosen at startup (git-choice.ts).
+    Object.assign(env, NON_INTERACTIVE_ENV, connectorGitEnv());
     if (identityFile) {
       // Managed git is the one place the runtime's own key is the credential.
       // `IdentitiesOnly` stops ssh from offering every agent key first

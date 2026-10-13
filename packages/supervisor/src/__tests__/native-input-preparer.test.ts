@@ -9,6 +9,7 @@ import {
   computeRemoteFileTreeDigest,
   computeRemoteSkillCatalogDigest,
   computeRemoteAssignmentInputSelectionDigest,
+  connectorGit,
   remoteControlSigningBytes,
   type RemoteWorkAssignment,
 } from "@konteks/remote-common";
@@ -210,6 +211,23 @@ describe("native authorized input composition", () => {
     expect(JSON.parse(await readFile(receiptPath, "utf8")).git).toEqual(receipt.git);
     expect(await readFile(join(resumed.cwd, "src/app.txt"), "utf8")).toBe("local edits");
     await resumed.beforePrompt();
+  });
+  it("fails a repository source with the plain Xcode license finding when git cannot run until it is accepted (D123)", async () => {
+    const f = await fixture();
+    f.selection.source.revision = "a".repeat(40);
+    const target: RemoteWorkAssignment = {
+      ...assignment,
+      kind: "delivery",
+      agentRoute: { agentId: "codex", requiredRole: "generator" },
+      source: { kind: "repository_snapshot", portability: "portable_before_claim", repositoryRef: "repository", revision: f.selection.source.revision },
+    };
+    // Its own executable, so the choice made here reaches no other test.
+    const git = { executable: join(tmpdir(), "d123-license-git"), digest: "sha256:" + "0".repeat(64) };
+    const license = vi.fn(async () => ({ code: 69, signal: null, stdout: "", stderr: "You have not agreed to the Xcode license agreements. Please run 'sudo xcodebuild -license'" }));
+    await connectorGit(git.executable, { platform: "darwin", env: { PATH: "" }, run: license as never, isFile: () => false });
+    await expect(createNativeInputPreparer({ ...f.options, git })(target)).rejects.toMatchObject({
+      code: "prerequisite_missing", diagnostic: "git_xcode_license_pending", message: "Git on this Mac needs the Xcode license accepted. Run: sudo xcodebuild -license accept",
+    });
   });
   it("refuses a repository source without installer-selected Git", async () => {
     const f = await fixture();

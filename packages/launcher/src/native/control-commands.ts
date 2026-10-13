@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { DoctorReportSchema, PreviewStatusReportSchema, RemoteInstanceError, SupervisorStatusSchema, UpdateChannelReportSchema, type ControlLoginEvent, type UpdateChannelReport } from "@konteks/remote-common";
+import { DoctorReportSchema, GitChoiceReportSchema, PreviewStatusReportSchema, RemoteInstanceError, SupervisorStatusSchema, UpdateChannelReportSchema, type ControlLoginEvent, type GitChoiceReport, type UpdateChannelReport } from "@konteks/remote-common";
 import type { SupervisorControl } from "../control.js";
 import { isHostAgentId } from "@konteks/remote-release";
 import { AlreadyToldError, type Output } from "../output.js";
@@ -39,6 +39,8 @@ export async function status(context: ControlContext): Promise<void> {
   const value = await context.control.call({ op: "status" }, SupervisorStatusSchema);
   // A connector from before `update.channel` refuses the op: the line is simply left out.
   const channel = await context.control.call({ op: "update.channel" }, UpdateChannelReportSchema).catch(() => null);
+  // Likewise `git.choice`, from a connector before it.
+  const git = await context.control.call({ op: "git.choice" }, GitChoiceReportSchema).catch(() => null);
   // `lease` is intentionally bearer-redacted by generic output. Publish a
   // separate, explicit public summary; never exempt bearer fields from redaction.
   context.output.result({ ...value, leaseStatus: { mode: value.lease.mode, expiresAt: value.lease.expiresAt, drainDeadline: value.lease.drainDeadline } });
@@ -49,6 +51,7 @@ export async function status(context: ControlContext): Promise<void> {
     ["lease", `${value.lease.mode}${value.lease.expiresAt ? `, expires ${value.lease.expiresAt}` : ""}`],
     ["bundle", bundleLine(value.version)],
     ...(channel ? [["updates", releaseChannelLine(channel)] as [string, string]] : []),
+    ...(git ? [["git", gitLine(git)] as [string, string]] : []),
     ["roles", value.roles.join(", ") || "(none advertised — log in an agent and tag roles in App/MCP)"],
     ["utilization", utilizationLine(value.utilization)],
     ["components", value.components.map((component) => `${component.kind}=${component.healthStatus}`).join(" ")],
@@ -58,6 +61,12 @@ export async function status(context: ControlContext): Promise<void> {
 }
 
 type SupervisorStatus = z.infer<typeof SupervisorStatusSchema>;
+
+function gitLine(git: GitChoiceReport): string {
+  if (git.blocked) return git.blocked;
+  if (git.git === "command_line_tools") return `${git.path} (Command Line Tools: the Xcode license is not accepted yet)`;
+  return git.path ?? "not found";
+}
 
 function connectivityLine(connectivity: SupervisorStatus["connectivity"]): string {
   return `${connectivity.transport}${connectivity.relayConnected ? " (relay connected)" : ""}${connectivity.reconciliationComplete ? "" : " — reconciling"}`;

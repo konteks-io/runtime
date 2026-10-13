@@ -3,6 +3,7 @@ import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
+import { connectorGit } from "@konteks/remote-common";
 import { findAgentBridge, installOfflineAgentPackage } from "@konteks/remote-release";
 import { RunnerConfigSchema } from "../config.js";
 import { bridgeEnvironment, resolveBridgeSpawnSpec, resolveToolingCommand, verifyNativeRunnerPackage } from "../bridge/spec.js";
@@ -261,5 +262,21 @@ describe("runner event schema", () => {
   it("is closed and carries no stdio", () => {
     expect(RunnerEventSchema.safeParse({ kind: "stdout", text: "x" }).success).toBe(false);
     expect(RunnerEventSchema.safeParse({ kind: "bridge_exited", code: 1, signal: null, extra: true }).success).toBe(false);
+  });
+});
+
+// Last in this file: the choice is process-wide once made.
+describe("the agent's git while Xcode's license is pending (D123)", () => {
+  it("hands every agent the Command Line Tools' DEVELOPER_DIR once the connector chose it, and nothing before", async () => {
+    const family = findAgentBridge("codex")!;
+    const config = RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "codex" });
+    expect(bridgeEnvironment(config, family).DEVELOPER_DIR).toBeUndefined();
+    const tools = join("/fake", "CommandLineTools");
+    const run = vi.fn(async (request: { env?: NodeJS.ProcessEnv }) => request.env?.DEVELOPER_DIR === tools
+      ? { code: 0, signal: null, stdout: "git version 2.50.1\n", stderr: "" }
+      : { code: 69, signal: null, stdout: "", stderr: "You have not agreed to the Xcode license agreements. Please run 'sudo xcodebuild -license'" });
+    await connectorGit("bridge-spec-git", { platform: "darwin", env: { PATH: "" }, commandLineTools: tools, run: run as never, isFile: path => path === join(tools, "usr", "bin", "git") });
+    expect(bridgeEnvironment(config, family).DEVELOPER_DIR).toBe(tools);
+    expect(bridgeEnvironment(RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "claude-code" }), findAgentBridge("claude-code")!).DEVELOPER_DIR).toBe(tools);
   });
 });

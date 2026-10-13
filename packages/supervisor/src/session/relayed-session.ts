@@ -9,6 +9,7 @@ import {
   RemoteTransferBindingSchema,
   RemoteExecutionReadyResultSchema,
   RemoteInstanceError,
+  isGitXcodeLicenseError,
   directModelSelectionsEqual,
   allEqual,
   createLogger,
@@ -378,7 +379,11 @@ export class RelayedSession {
     if (this.closed) throw sessionClosed();
     let prepared: PreparedSessionInputs;
     try { prepared = await this.bootstrapStage("input_preparation", () => this.deps.prepareInputs(this.assignment)); }
-    catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
+    catch (error) {
+      // Xcode's license gate keeps its plain finding (git-choice.ts); anything else stays unexplained here.
+      if (isGitXcodeLicenseError(error)) throw error;
+      throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable.");
+    }
     this.deps.assertExecutionOwned?.();
     const binding = this.verifiedBinding(prepared);
     const readOnlyRoots = Object.freeze([...(prepared.readOnlyRoots ?? [])]);
@@ -1082,7 +1087,11 @@ export class RelayedSession {
 
   private async runBeforePrompt(): Promise<void> {
     try { await this.preparedInputs?.beforePrompt(); }
-    catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
+    catch (error) {
+      // Xcode's license gate keeps its plain finding (git-choice.ts); anything else stays unexplained here.
+      if (isGitXcodeLicenseError(error)) throw error;
+      throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable.");
+    }
   }
 
   /** The staged skills line goes in front of the person's text. */
