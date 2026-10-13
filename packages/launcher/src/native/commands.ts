@@ -16,7 +16,7 @@ import { confirm } from "../prompt.js";
 import { spawnEnrollmentStaging } from "./enrollment-staging.js";
 import { onboardCoreUrl, onboardFailureStep, runOnboard } from "./onboard.js";
 import { runnableStep, type OnboardStep } from "./onboard-session.js";
-import { describeServiceFailure, encodeServiceDefinition, nativePlatform, nativeServiceDefinition, NativeServiceCommandError, parseLoadedService, parseServiceExits, serviceRun, startNativeServiceDefinition, type HostOs, type NativeServiceCommand, type NativeServiceDefinition, type NativeServiceExecute, type NativeServiceRun } from "./service.js";
+import { describeServiceFailure, encodeServiceDefinition, nativePlatform, nativeServiceDefinition, NativeServiceCommandError, parseLoadedService, parseServiceExits, parseWindowsUserSid, serviceRun, startNativeServiceDefinition, type HostOs, type NativeServiceCommand, type NativeServiceDefinition, type NativeServiceExecute, type NativeServiceRun, windowsUserSidCommand } from "./service.js";
 import { outputLocale,
   setupDetail,
   setupError, setupFailureText, setupLine, setupLocale, setupText, setupWords,
@@ -64,8 +64,10 @@ async function serviceDefinition(root: string) {
   await readNativeRecord(root);
   let userId: string | undefined;
   if (platform.os === "windows") {
-    const result = await runServiceCommand({ command: "whoami.exe", args: ["/user", "/fo", "csv", "/nh"] }, 10_000);
-    userId = result.code === 0 ? result.stdout?.match(/S-1-\d+(?:-\d+)+/)?.[0] : undefined;
+    const command = windowsUserSidCommand();
+    const result = await runServiceCommand(command, 10_000);
+    userId = result.code === 0 ? parseWindowsUserSid(result.stdout) : undefined;
+    if (!userId) throw new NativeServiceCommandError("register", command, result);
   }
   // One path on every release: `start` and `serve` put the record's connector there.
   return nativeServiceDefinition({ os: platform.os, home: homedir(), root, executable: nativeServiceExecutable(root, platform.os), uid: process.getuid?.(), ...(userId ? { userId } : {}) });

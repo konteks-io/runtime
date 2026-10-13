@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { runInNewContext } from "node:vm";
-import { nativePlatform, nativePaths, nativeServiceDefinition, parseLoadedService, parseServiceExits, startNativeServiceDefinition, type NativeServiceCommand } from "../native/service.js";
+import { execFileSync } from "node:child_process";
+import { nativePlatform, nativePaths, nativeServiceDefinition, parseLoadedService, parseServiceExits, parseWindowsUserSid, startNativeServiceDefinition, windowsUserSidCommand, type NativeServiceCommand } from "../native/service.js";
 
 describe("native install layout", () => {
   it.each([['darwin', 'macos'], ['win32', 'windows'], ['linux', 'debian']] as const)("supports %s x64 and arm64 without a container backend", (os, expected) => {
@@ -205,5 +206,24 @@ describe("reloading a service onto a rewritten definition", () => {
     expect(parseLoadedService('debian', 'MainPID=812\nNeedDaemonReload=no\n', expected)).toEqual({ pid: 812, current: true });
     expect(parseLoadedService('debian', 'MainPID=0\nNeedDaemonReload=yes\n', expected)).toEqual({ pid: null, current: false });
     expect(parseLoadedService('windows', 'anything', expected)).toBeNull();
+  });
+});
+
+describe("the Windows user a login service is registered for", () => {
+  it("asks System32's whoami by its absolute path, never the first whoami on PATH (Git for Windows ships a Unix one)", () => {
+    expect(windowsUserSidCommand({ SystemRoot: "C:\\Windows" })).toEqual({ command: "C:\\Windows\\System32\\whoami.exe", args: ["/user", "/fo", "csv", "/nh"] });
+    expect(windowsUserSidCommand({ SYSTEMROOT: "D:\\WINNT" }).command).toBe("D:\\WINNT\\System32\\whoami.exe");
+    expect(windowsUserSidCommand({}).command).toBe("C:\\Windows\\System32\\whoami.exe");
+  });
+
+  it("reads the SID from whoami's CSV line and nothing from a Unix whoami's refusal", () => {
+    expect(parseWindowsUserSid('"fv-az1\\runneradmin","S-1-5-21-3456-7890-1234-500"\r\n')).toBe("S-1-5-21-3456-7890-1234-500");
+    expect(parseWindowsUserSid("whoami: extra operand '/user'\nTry 'whoami --help' for more information.\n")).toBeUndefined();
+    expect(parseWindowsUserSid(undefined)).toBeUndefined();
+  });
+
+  it.runIf(process.platform === "win32")("finds this Windows user's SID", () => {
+    const command = windowsUserSidCommand();
+    expect(parseWindowsUserSid(execFileSync(command.command, command.args, { encoding: "utf8" }))).toMatch(/^S-1-\d+(?:-\d+)+$/);
   });
 });
