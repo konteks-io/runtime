@@ -368,8 +368,15 @@ describe("channel mux", () => {
         .toEqual(Array.from({ length: burst }, (_, index) => [index + 1, 2]));
       expect(restarted.mux.send("s", "session", { kind: "session_closed", assignmentId: "next", reason: "completed" })).toBe(burst + 1);
     } finally {
-      for (let settled = 0; settled < saves.length; settled = saves.length) await Promise.allSettled(saves.slice(settled));
-      await rm(dir, { recursive: true, force: true });
+      // A mux may start its last save a tick after the test's final send, so
+      // settle until no new save appears for a macrotask; rm retries the race
+      // with a write that still lands (ENOTEMPTY failed CI and the v0.14.0 release).
+      for (let seen = -1; seen !== saves.length;) {
+        seen = saves.length;
+        await Promise.allSettled(saves);
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     }
   });
 
