@@ -405,6 +405,15 @@ not yet Authenticode-signed: `install.ps1` verifies the Ed25519 signature on
 against it, and installs nothing if either fails; Windows then shows "Unknown
 publisher".
 
+Publisher signing of the connector itself is opt-in per OS and switches on
+when the release has that OS's secrets (`scripts/sign-connector.mjs`):
+Developer ID + notarization on macOS (one identifier,
+`dev.konteks.connector`), Authenticode on Windows, a detached Ed25519
+signature with a key baked into the connector on Linux. Until then the job
+summary marks the connector "unsigned (deferred)". Once an installed
+connector is signed, an update signed by another publisher, or not signed, is
+refused; an unsigned connector accepts the update and says so.
+
 ### Updates
 
 The connector runs as a user service (launchd, user systemd or Task
@@ -412,7 +421,11 @@ Scheduler), checks the stable channel every 6 hours (every 15 minutes to an
 hour while a newer release waits for Konteks to accept it), and updates
 transactionally: the new release is staged, work is drained, the service is
 swapped and health-gated, and the previous release is restored if the gate
-fails. A release that is being checked takes no new work. Konteks can also
+fails. The service always runs one file, `bin/konteks-connector` (`.exe` on
+Windows) in the connector's folder: an update or rollback replaces that file
+in place, so the OS keeps seeing the same program (firewall and folder-access
+rules, privacy grants on a signed connector). Each release folder keeps its
+copy only to roll back to. A release that is being checked takes no new work. Konteks can also
 require an update when a release is below its minimum.
 
 On a connected runtime's page, choose **Update this computer** to request the
@@ -437,7 +450,10 @@ MSI command and can require elevation.
 Pushing a tag `vX.Y.Z` runs `.github/workflows/release.yaml`: it builds the
 macOS `.pkg`, Windows `.msi` and Debian `.deb` packages and the offline agent
 packages, signs the manifest and checksums, and publishes an immutable GitHub
-Release. `ci.yaml` checks every pull request; `agent-os-proof.yaml` proves
+Release. `ci.yaml` checks every pull request, and on each OS installs a
+connector, lets it update itself and proves the service still runs the same
+path with the same publisher identity (`scripts/stable-path-proof.mjs`);
+`agent-os-proof.yaml` proves
 each agent (Claude Code, Codex, DeepSeek Harness, OpenCode) on macOS, Linux
 and Windows through the connector's own code, with a scripted model and no
 credentials (`node scripts/agent-os-proof.mjs --agent <agent> --out result.json`

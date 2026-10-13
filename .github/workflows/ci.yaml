@@ -92,6 +92,60 @@ jobs:
           KONTEKS_TEST_POWERSHELL: pwsh.exe
         run: node --test scripts/bootstrap-progress.test.mjs
 
+  stable-path:
+    # Install N, let it update itself to N+1, and prove the OS keeps running one
+    # path with one publisher identity (scripts/stable-path-proof.mjs). Without
+    # this OS's signing secrets (pull requests, forks, until the owner adds
+    # them) the identity checks report "unsigned (deferred)" in the summary.
+    name: stable executed path across a self-update on ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, macos-15-intel, ubuntu-24.04, ubuntu-24.04-arm, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.2
+      - name: Point the contract links at vendor/
+        shell: bash
+        run: |
+          node scripts/ci-vendored-contracts.mjs
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+      - name: Install (shared contracts are vendored under vendor/)
+        run: npm ci --ignore-scripts
+      - name: Give the runner's user a systemd user manager, as a person's login has
+        if: runner.os == 'Linux'
+        run: |
+          sudo loginctl enable-linger "$USER"
+          uid="$(id -u)"
+          for _ in $(seq 1 30); do [ -S "/run/user/$uid/bus" ] && break; sleep 1; done
+          echo "XDG_RUNTIME_DIR=/run/user/$uid" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" >> "$GITHUB_ENV"
+      - name: Build N and N+1, install N, self-update to N+1, check path and identity
+        shell: bash
+        env:
+          APPLE_DEVELOPER_ID_P12: ${{ secrets.APPLE_DEVELOPER_ID_P12 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          WINDOWS_CODESIGN_PFX: ${{ secrets.WINDOWS_CODESIGN_PFX }}
+          WINDOWS_CODESIGN_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
+          LINUX_SIGNING_KEY: ${{ secrets.LINUX_SIGNING_KEY }}
+        run: node scripts/stable-path-proof.mjs
+      - name: Keep the connector's logs from the proof
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stable-path-proof-${{ matrix.os }}
+          path: ${{ runner.temp }}/konteks-stable-path-*/logs
+          if-no-files-found: ignore
+          retention-days: 7
+
   windows-native:
     name: native runtime on ${{ matrix.os }}
     timeout-minutes: 180
@@ -129,7 +183,7 @@ jobs:
       - name: Verify foreground setup and update language on each native OS
         run: npx vitest run --maxWorkers=1 packages/launcher/src/__tests__/setup-locale.test.ts packages/launcher/src/__tests__/foreground-progress.test.ts packages/launcher/src/__tests__/native-install.test.ts packages/launcher/src/__tests__/agent-setup.test.ts packages/launcher/src/__tests__/prompt-output.test.ts packages/launcher/src/__tests__/prompt-interruption.test.ts
       - name: Verify native service, updates and background process ownership
-        run: npx vitest run --maxWorkers=1 packages/common/src/__tests__/process-spawn.test.ts packages/common/src/__tests__/retained-process-owner.test.ts packages/common/src/__tests__/secret-file.test.ts packages/launcher/src/__tests__/native-service.test.ts packages/launcher/src/__tests__/native-service-refresh.test.ts packages/launcher/src/__tests__/native-service-diagnostics.test.ts packages/launcher/src/__tests__/native-stop-completion.test.ts packages/launcher/src/__tests__/native-update.test.ts packages/launcher/src/__tests__/native-update-progress.test.ts packages/launcher/src/__tests__/native-agent-add.test.ts packages/launcher/src/__tests__/windows-service-owner.test.ts packages/launcher/src/__tests__/windows-background-setup.test.ts packages/launcher/src/__tests__/launcher-delegate.test.ts packages/supervisor/src/__tests__/native-installation.test.ts packages/supervisor/src/__tests__/native-update-coordinator.test.ts packages/supervisor/src/__tests__/runtime-update.test.ts packages/supervisor/src/__tests__/runtime-update-ownership.test.ts packages/supervisor/src/__tests__/runtime-update-capability.test.ts packages/supervisor/src/__tests__/runtime-relay-handshake.test.ts packages/supervisor/src/__tests__/windows-launcher.test.ts packages/supervisor/src/__tests__/windows-background-probes.test.ts packages/agent-runner/src/__tests__/windows-background-spawn.test.ts
+        run: npx vitest run --maxWorkers=1 packages/common/src/__tests__/process-spawn.test.ts packages/common/src/__tests__/retained-process-owner.test.ts packages/common/src/__tests__/secret-file.test.ts packages/launcher/src/__tests__/native-service.test.ts packages/launcher/src/__tests__/native-service-refresh.test.ts packages/launcher/src/__tests__/native-service-diagnostics.test.ts packages/launcher/src/__tests__/native-stop-completion.test.ts packages/launcher/src/__tests__/native-update.test.ts packages/launcher/src/__tests__/native-update-progress.test.ts packages/launcher/src/__tests__/native-agent-add.test.ts packages/launcher/src/__tests__/windows-service-owner.test.ts packages/launcher/src/__tests__/windows-background-setup.test.ts packages/launcher/src/__tests__/launcher-delegate.test.ts packages/release/src/__tests__/code-identity.test.ts packages/supervisor/src/__tests__/native-installation.test.ts packages/supervisor/src/__tests__/native-update-coordinator.test.ts packages/supervisor/src/__tests__/runtime-update.test.ts packages/supervisor/src/__tests__/runtime-update-ownership.test.ts packages/supervisor/src/__tests__/runtime-update-capability.test.ts packages/supervisor/src/__tests__/runtime-relay-handshake.test.ts packages/supervisor/src/__tests__/windows-launcher.test.ts packages/supervisor/src/__tests__/windows-background-probes.test.ts packages/agent-runner/src/__tests__/windows-background-spawn.test.ts
       - name: Verify Windows legacy migration and command diagnostics on each native OS
         run: npx vitest run --maxWorkers=1 packages/launcher/src/__tests__/windows-background.test.ts packages/launcher/src/__tests__/windows-command-output.test.ts
       - name: Verify current Codex tooling, model choice and fresh readiness on each native OS

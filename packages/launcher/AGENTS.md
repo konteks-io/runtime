@@ -18,7 +18,9 @@ uninstall. It talks to the running supervisor over the local control socket
   step shares, `onboard-connect.ts` / `onboard-system.ts` / `onboard-closing.ts`
   the steps; `graft.ts`: Graft wiring.
 - `src/native/service.ts`: service definitions and errors.
-- `src/native/update-transaction.ts`, `update.ts`: stage, drain, swap, verify, roll back.
+- `src/native/update-transaction.ts`, `update.ts`: stage (with the publisher
+  identity check), drain, swap, verify, roll back.
+- `src/native/service-executable.ts`: the one executable the service runs.
 - `src/native/launcher-delegate.ts`: the Windows MSI launcher hand-off.
 - `src/verbose.ts`: `--verbose` / `KONTEKS_REMOTE_VERBOSE=1` output on stderr.
 
@@ -65,13 +67,22 @@ uninstall. It talks to the running supervisor over the local control socket
   service pid and process group. An abort cancels draining or restarts the
   unchanged release. `keepLauncherCurrent` keeps
   `<root>/bin/konteks-remote` on the running release.
+- **Service executable.** Every service definition runs
+  `<root>/bin/konteks-connector(.exe)`. `start` (once the service is stopped)
+  and `serve` copy the record's release connector there, checked against its
+  signed digest and renamed into place (on Windows the running file is
+  renamed aside first, and deleted once nothing runs it); a `serve` whose own
+  bytes were just replaced exits 75 so the service manager starts the new
+  ones. An install whose service still names a release folder moves on its
+  next `serve`. Rollback is the same activation from the previous release.
 - **Windows launcher.** The MSI's `konteks-remote.exe` (not writable without
-  elevation) runs `releases\<id>\konteks-connector.exe` from
+  elevation) runs the installed release's connector from
   `native-runtime.json` with the same argv and exit code, setting
-  `KONTEKS_REMOTE_VIA_LAUNCHER=1` on the child. It runs its own code for
+  `KONTEKS_REMOTE_VIA_LAUNCHER=1` on the child: `bin\konteks-connector.exe`,
+  else `releases\<id>\konteks-connector.exe`. It runs its own code for
   `install`, `uninstall`, `stage-enrollment`, with nothing or a `pending`
   record installed, when its own version is newer, or when the target is not a
-  regular file at exactly `releases\<id>\<name>` under the root's real path.
+  regular file at exactly its place under the root's real path.
 - **Hints name the command that runs here.** Human text written through
   `createOutput` rewrites `konteks-remote <command>` to the running
   executable's quoted path when the first `konteks-remote` on PATH is not it

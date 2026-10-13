@@ -41,6 +41,8 @@ switch (command) {
     const connectorName = `konteks-remote-${args.os}-${args.architecture}${args.os === "windows" ? ".exe" : ""}`;
     if (args.os === "macos") assertMacOsArtifact(args.executable, macOsArtifactOptions(args.architecture));
     copyFileSync(args.executable, join(out, connectorName));
+    // A Linux connector's detached signature rides next to it: updates fetch `<connector URL>.sig`.
+    if (existsSync(`${args.executable}.sig`)) copyFileSync(`${args.executable}.sig`, join(out, `${connectorName}.sig`));
     node("scripts/native-artifact-index.mjs", ["--file", join(out, connectorName), "--id", `konteks-remote-${args.os}-${args.architecture}`, "--kind", "connector", "--format", "executable", "--os", args.os, "--architecture", args.architecture, "--url", url(connectorName), "--out", join(out, `konteks-remote-${args.os}-${args.architecture}.artifact.json`)]);
     for (const agent of AGENTS) {
       const name = `${agent}-${args.os}-${args.architecture}.tgz`, profile = join("dist", "profiles", `${agent}-${args.os}-${args.architecture}.profile.json`);

@@ -13,6 +13,7 @@ const npx = shell ? "npx.cmd" : "npx";
 import { copyFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { assertMacOsArtifact, macOsArtifactOptions } from "./macos-artifact-compatibility.mjs";
+import { CONNECTOR_CODE_IDENTIFIER, linuxSigningKeysJson } from "./sign-connector.mjs";
 
 const args = Object.fromEntries(process.argv.slice(2).map((value, index, all) => (value.startsWith("--") ? [value.slice(2), all[index + 1]] : [])).filter((pair) => pair.length === 2));
 const os = args.os;
@@ -32,8 +33,9 @@ JSON.parse(roots); // must be valid
 execFileSync(npx, ["tsc", "--build", "packages/launcher"], { stdio: "inherit", shell });
 const work = join("dist", "launcher-build");
 mkdirSync(work, { recursive: true });
-// Embed the roots and version as build-time constants: the SEA reads them
-// from process.env-equivalent defaults baked into the entry stub.
+// Embed the roots, the Linux connector signing keys and the version as
+// build-time constants: the SEA reads them from process.env-equivalent
+// defaults baked into the entry stub.
 const entry = join(work, "entry.cjs");
 writeFileSync(
   entry,
@@ -42,7 +44,7 @@ writeFileSync(
   // KONTEKS_CORE_URL / KONTEKS_RELAY_URL in the environment still wins at run
   // time (the e2e stack relies on that). The ones filled in here are listed,
   // so the Windows command hands a release only what the person set.
-  `process.env.KONTEKS_RELEASE_ROOTS_JSON = ${JSON.stringify(roots)};\nprocess.env.KONTEKS_LAUNCHER_VERSION = ${JSON.stringify(process.env.KONTEKS_LAUNCHER_VERSION ?? "0.0.0")};\nglobalThis.__konteksLauncherBakedEnv = [];\nif (process.env.KONTEKS_CORE_URL === undefined) { process.env.KONTEKS_CORE_URL = ${JSON.stringify(process.env.KONTEKS_DEFAULT_CORE_URL ?? "https://api.konteks.io")}; globalThis.__konteksLauncherBakedEnv.push("KONTEKS_CORE_URL"); }\nif (process.env.KONTEKS_RELAY_URL === undefined) { process.env.KONTEKS_RELAY_URL = ${JSON.stringify(process.env.KONTEKS_DEFAULT_RELAY_URL ?? "wss://relay.konteks.io/relay/runtime")}; globalThis.__konteksLauncherBakedEnv.push("KONTEKS_RELAY_URL"); }\nimport("../../packages/launcher/dist/cli.js");\n`,
+  `process.env.KONTEKS_RELEASE_ROOTS_JSON = ${JSON.stringify(roots)};\nprocess.env.KONTEKS_LINUX_SIGNING_KEYS_JSON = ${JSON.stringify(linuxSigningKeysJson())};\nprocess.env.KONTEKS_LAUNCHER_VERSION = ${JSON.stringify(process.env.KONTEKS_LAUNCHER_VERSION ?? "0.0.0")};\nglobalThis.__konteksLauncherBakedEnv = [];\nif (process.env.KONTEKS_CORE_URL === undefined) { process.env.KONTEKS_CORE_URL = ${JSON.stringify(process.env.KONTEKS_DEFAULT_CORE_URL ?? "https://api.konteks.io")}; globalThis.__konteksLauncherBakedEnv.push("KONTEKS_CORE_URL"); }\nif (process.env.KONTEKS_RELAY_URL === undefined) { process.env.KONTEKS_RELAY_URL = ${JSON.stringify(process.env.KONTEKS_DEFAULT_RELAY_URL ?? "wss://relay.konteks.io/relay/runtime")}; globalThis.__konteksLauncherBakedEnv.push("KONTEKS_RELAY_URL"); }\nimport("../../packages/launcher/dist/cli.js");\n`,
 );
 execFileSync(npx, [
   "esbuild",
@@ -64,10 +66,11 @@ const executable = join(work, os === "windows" ? "konteks-remote.exe" : "konteks
 copyFileSync(process.execPath, executable);
 execFileSync(npx, ["postject", executable, "NODE_SEA_BLOB", join(work, "launcher.blob"), "--sentinel-fuse", "NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2", ...(os === "macos" ? ["--macho-segment-name", "NODE_SEA"] : [])], { stdio: "inherit", shell });
 // Injection invalidates the Mach-O signature; an unsigned arm64 binary will not
-// launch at all. Ad-hoc sign here so the artifact runs; sign-launcher.mjs
-// replaces this with the Developer ID signature when one is configured.
+// launch at all. Ad-hoc sign here, with the connector's one identifier, so the
+// artifact runs; sign-launcher.mjs replaces this with the Developer ID
+// signature when one is configured.
 if (os === "macos") {
-  execFileSync("codesign", ["--force", "--sign", "-", executable], { stdio: "inherit" });
+  execFileSync("codesign", ["--force", "--sign", "-", "--identifier", CONNECTOR_CODE_IDENTIFIER, executable], { stdio: "inherit" });
   assertMacOsArtifact(executable, macOptions);
 }
 // The MSI installs this beside konteks-remote.exe: the connector's doctor

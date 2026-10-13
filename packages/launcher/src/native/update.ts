@@ -83,7 +83,7 @@ export async function stageNativeUpdate(options: { root: string; output: Output;
     const stopProgress = setupProgress(options.output, "phaseDownload");
     try {
       const staged = await stageNativeRelease({ release, target: { ...platform, agentIds: agents }, releasesDir: join(root, "releases"), fetchFn: options.deps?.fetchFn ?? fetch });
-    const { releaseId, directory } = await completeStagedRelease({ root, release, platform, agents, artifacts, staged, lock, current, output: options.output, codeIdentity: options.deps?.codeIdentity ?? readCodeIdentity });
+    const { releaseId, directory } = await completeStagedRelease({ root, release, platform, agents, artifacts, staged, lock, current, output: options.output, deps });
       setupDetail(options.output, "updateStaged", { version: release.manifest.bundleVersion, release: releaseId });
     return { status: "staged", current, release, releaseId, directory };
     } finally {
@@ -126,7 +126,7 @@ function assertOfflineArtifacts(artifacts: readonly SelectedArtifact[]): void {
 async function completeStagedRelease(candidate: {
   root: string; release: VerifiedNativeRelease; platform: NativePlatform; agents: readonly string[]; artifacts: readonly SelectedArtifact[];
   staged: Awaited<ReturnType<typeof stageNativeRelease>>; lock: ReturnType<typeof acquireNativeRootLock>;
-  current: NativeRuntimeRecord; output: Output; codeIdentity: NonNullable<NativeUpdateDeps["codeIdentity"]>;
+  current: NativeRuntimeRecord; output: Output; deps: NativeUpdateDeps | undefined;
 }): Promise<{ releaseId: string; directory: string }> {
   const { staged } = candidate;
   let directory: string | null = null;
@@ -158,12 +158,13 @@ async function completeStagedRelease(candidate: {
  * update and says so. The bytes are trusted either way through the signed
  * manifest's digest.
  */
-async function admitConnectorIdentity(candidate: { root: string; platform: NativePlatform; current: NativeRuntimeRecord; output: Output; codeIdentity: NonNullable<NativeUpdateDeps["codeIdentity"]> }, connector: string): Promise<void> {
+async function admitConnectorIdentity(candidate: { root: string; platform: NativePlatform; current: NativeRuntimeRecord; output: Output; deps: NativeUpdateDeps | undefined }, connector: string): Promise<void> {
   const { os } = candidate.platform;
+  const identity = candidate.deps?.codeIdentity ?? readCodeIdentity;
   const unsigned = (): CodeIdentity => ({ signed: false });
-  const installed = await candidate.codeIdentity(await installedConnector(candidate.root, os, candidate.current.releaseId), os).catch(unsigned);
+  const installed = await identity(await installedConnector(candidate.root, os, candidate.current.releaseId), os).catch(unsigned);
   if (!installed.signed) return setupDetail(candidate.output, "updateIdentityUnsigned");
-  const offered = await candidate.codeIdentity(connector, os).catch(unsigned);
+  const offered = await identity(connector, os).catch(unsigned);
   if (!offered.signed || offered.publisher !== installed.publisher) throw setupError("bundle_untrusted", "updateIdentityChanged");
   setupDetail(candidate.output, "updateIdentitySame");
 }
