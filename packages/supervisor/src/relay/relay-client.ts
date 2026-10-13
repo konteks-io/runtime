@@ -620,10 +620,12 @@ export class RelayClient {
   private async deliverRuntimeUpdate(attempt: SocketAttempt, value: unknown): Promise<void> {
     try {
       await this.deliver(attempt, RuntimeUpdateDeliveryRequestSchema.parse(value), "Runtime update", this.receiverFor(this.options.onRuntimeUpdate), "Runtime update receiver is unavailable", false);
-    } catch {
-      // The operation carries no diagnostics or secrets back to the browser.
-      // A refusal never tears down ordinary work transport.
-      this.logger.warn({ event: "runtime.update_delivery_refused" }, "runtime update delivery refused");
+    } catch (error) {
+      // The operation carries no diagnostics or secrets back to the browser,
+      // but the local log says why (10-13: three refusals of the owner's
+      // Update now left no reason). A refusal never tears down ordinary work
+      // transport.
+      this.logger.warn({ event: "runtime.update_delivery_refused", err: error }, "runtime update delivery refused");
     }
   }
 

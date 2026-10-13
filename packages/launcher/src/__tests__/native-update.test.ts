@@ -192,7 +192,7 @@ describe("native update staging and commit", () => {
     await expect(stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, roots: [], manifest: f.manifest } })).rejects.toMatchObject({ code: "bundle_untrusted" });
     // A digest mismatch during download leaves no candidate behind.
     const corrupt = vi.fn<typeof fetch>().mockImplementation(async (input, init) => requestUrl(input).endsWith("connector-1.1.0") ? new Response(Buffer.from("tampered-bytes-of-the-same-length")) : f.fetchFn(input, init));
-    await expect(stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, fetchFn: corrupt, manifest: f.manifest } })).rejects.toThrow();
+    await expect(stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, fetchFn: corrupt, manifest: f.manifest, retryDelayMs: 0 } })).rejects.toThrow(/connector-1\.1\.0: native artifact size or digest mismatch/);
     expect((await readdir(join(f.root, "releases"))).filter(name => name.startsWith(".candidate-"))).toEqual([]);
     expect(await readNativeRecord(f.root)).toEqual(f.installed);
     // A staged release whose connector bytes change before commit is refused.

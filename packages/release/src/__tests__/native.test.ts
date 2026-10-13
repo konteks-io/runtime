@@ -156,11 +156,28 @@ describe('signed native executable staging', () => {
     expect(await readdir(staged.directory)).toEqual(['konteks-connector.tgz']);
   });
 
-  it.each(['corrupt', 'oversized', 'truncated', 'redirect'])('rejects %s downloads and leaves no executable candidate', async failure => {
+  it.each(['corrupt', 'oversized', 'truncated', 'redirect'])('rejects %s downloads after retrying, names why, and leaves no executable candidate', async failure => {
     const parent = await mkdtemp(join(tmpdir(), 'native-artifact-test-')); folders.push(parent);
-    const response = failure === 'redirect' ? new Response(null, { status: 302, headers: { location: 'http://evil.test' } }) : new Response(failure === 'corrupt' ? Buffer.alloc(bytes.length) : failure === 'oversized' ? Buffer.concat([bytes, bytes]) : bytes.subarray(0, 2));
-    const fetchFn = vi.fn(async () => response);
-    await expect(stageNativeRelease({ release: verifyNativeRelease(signed(), roots, now), target, releasesDir: parent, fetchFn: fetchFn as typeof fetch })).rejects.toThrow();
+    const response = () => failure === 'redirect' ? new Response(null, { status: 302, headers: { location: 'http://evil.test' } }) : new Response(failure === 'corrupt' ? Buffer.alloc(bytes.length) : failure === 'oversized' ? Buffer.concat([bytes, bytes]) : bytes.subarray(0, 2));
+    const fetchFn = vi.fn(async () => response());
+    await expect(stageNativeRelease({ release: verifyNativeRelease(signed(), roots, now), target, releasesDir: parent, fetchFn: fetchFn as typeof fetch, retryDelayMs: 0 }))
+      .rejects.toThrow(/^native artifacts were not staged \(.+: native artifact (download failed|exceeds|size or digest)/);
+    expect(fetchFn).toHaveBeenCalledTimes(4);
     expect(await readdir(parent)).toEqual([]);
+  });
+
+  it('downloads an artifact again after a dropped connection instead of failing the update', async () => {
+    const parent = await mkdtemp(join(tmpdir(), 'native-artifact-test-')); folders.push(parent);
+    let calls = 0;
+    const fetchFn = vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) throw new TypeError('fetch failed');
+      if (calls === 2) return new Response(bytes.subarray(0, 2));
+      return new Response(bytes);
+    });
+    const staged = await stageNativeRelease({ release: verifyNativeRelease(signed(), roots, now), target, releasesDir: parent, fetchFn: fetchFn as typeof fetch, retryDelayMs: 0 });
+    expect(await readFile(staged.connector)).toEqual(bytes);
+    expect(await readFile(staged.bridges['claude-code']!)).toEqual(bytes);
+    expect(fetchFn).toHaveBeenCalledTimes(4);
   });
 });
