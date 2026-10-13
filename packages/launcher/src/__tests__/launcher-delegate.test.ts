@@ -34,6 +34,17 @@ describe("the Windows konteks-remote command runs the installed release's own co
     await expect(installedReleaseLauncher(input(root, ["--help"]))).resolves.toEqual({ executable, bundleVersion: "0.10.12" });
   });
 
+  it("runs the service's stable executable once the installed release has one, the path every installed connector runs from", async () => {
+    const { root } = await installedRoot();
+    await mkdir(join(root, "bin"));
+    await writeFile(join(root, "bin", "konteks-connector.exe"), "stable-executable");
+    await expect(installedReleaseLauncher(input(root, ["status"]))).resolves.toEqual({ executable: join(root, "bin", "konteks-connector.exe"), bundleVersion: "0.10.12" });
+    // A directory or link in its place is not followed, and is not passed over for the release folder's copy.
+    await rm(join(root, "bin", "konteks-connector.exe"));
+    await mkdir(join(root, "bin", "konteks-connector.exe"));
+    await expect(installedReleaseLauncher(input(root, ["status"]))).resolves.toBeNull();
+  });
+
   it("finds a release staged before the rename by its old file name", async () => {
     const { root, executable } = await installedRoot({ file: "connector.exe" });
     await expect(installedReleaseLauncher(input(root, ["status"]))).resolves.toEqual({ executable, bundleVersion: "0.10.12" });

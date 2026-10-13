@@ -6,7 +6,7 @@ import type { NativeUpdateTarget } from "./update.js";
 
 interface NativeUpdateLaunchOptions {
   root: string;
-  /** The installed connector executable of the release currently serving. */
+  /** The installed connector executable the service runs (its stable path). */
   executable: string;
   os: "macos" | "windows" | "debian";
   /** Where the detached transaction writes its own output; never the supervisor's stdio. */

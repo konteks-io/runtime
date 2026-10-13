@@ -24,7 +24,7 @@ const INSTALLER_COMMANDS = new Set(["install", "uninstall", "stage-enrollment"])
 const RELEASE_ID = /^release-[A-Za-z0-9_-]+$/;
 
 /** Values the release build's entry fills in itself; each release bakes its own (`build-launcher.mjs`). */
-const ENTRY_VALUES = ["KONTEKS_RELEASE_ROOTS_JSON", "KONTEKS_LAUNCHER_VERSION"] as const;
+const ENTRY_VALUES = ["KONTEKS_RELEASE_ROOTS_JSON", "KONTEKS_LINUX_SIGNING_KEYS_JSON", "KONTEKS_LAUNCHER_VERSION"] as const;
 
 interface InstalledReleaseInput {
   platform: NodeJS.Platform;
@@ -45,8 +45,9 @@ interface InstalledReleaseInput {
  * MSI's copy sits under Program Files, which the running connector cannot
  * replace without elevation, so every command it ran kept the code of the
  * first MSI the person installed whatever release the connector ran. Now it
- * resolves `<root>\native-runtime.json` → `releases\<releaseId>\konteks-connector.exe`
- * (the release's executable is the same program) and runs that.
+ * reads `<root>\native-runtime.json` and runs the installed release's
+ * connector (the same program): `<root>\bin\konteks-connector.exe`, or
+ * `releases\<releaseId>\konteks-connector.exe` before the service made that.
  *
  * Null, and this process runs its own code, when: another OS (macOS and
  * Linux refresh `<root>/bin/konteks-remote`), not the installed
@@ -54,8 +55,8 @@ interface InstalledReleaseInput {
  * (first install, onboarding), the record names no release, this copy is
  * newer than the installed release (a person who installs a newer MSI to
  * repair an older release gets the newer code), or the path is anything but
- * a regular file at exactly `<root>\releases\<releaseId>\<name>` after every
- * link is resolved. Nothing outside the per-user root is ever followed.
+ * a regular file at exactly its place under the root after every link is
+ * resolved. Nothing outside the per-user root is ever followed.
  */
 export async function installedReleaseLauncher(input: InstalledReleaseInput): Promise<{ executable: string; bundleVersion: string } | null> {
   if (!delegationApplies(input)) return null;
@@ -79,25 +80,36 @@ async function installedReleaseExecutable(input: InstalledReleaseInput): Promise
   const record = await readRecord(join(root, "native-runtime.json"));
   if (!record || !ownCodeIsNotNewer(record.bundleVersion, input.launcherVersion)) return null;
   const realRoot = await realpath(root);
-  for (const name of nativeConnectorFileNames("windows")) {
-    const found = await releaseExecutable({ root, realRoot, record, name, execPath: input.execPath });
+  for (const place of connectorPlaces(record.releaseId)) {
+    const found = await releaseExecutable({ root, realRoot, record, place, execPath: input.execPath });
     if (found !== "absent") return found;
   }
   return null;
 }
 
 /**
- * The release's connector under this name: "absent" when there is none,
+ * Where the installed release's connector is, relative to the root, first
+ * found first: the service's stable executable (`bin\konteks-connector.exe`,
+ * the one path an installed connector runs from), then the release folder's
+ * own under both names, for an install whose service has not made it yet.
+ */
+function connectorPlaces(releaseId: string): string[] {
+  const names = nativeConnectorFileNames("windows");
+  return [join("bin", names[0]), ...names.map(name => join("releases", releaseId, name))];
+}
+
+/**
+ * The release's connector at this place: "absent" when there is none,
  * null when it is not a regular file at exactly its place or is this very
  * executable.
  */
-async function releaseExecutable(at: { root: string; realRoot: string; record: { releaseId: string; bundleVersion: string }; name: string; execPath: string }): Promise<{ executable: string; bundleVersion: string } | null | "absent"> {
-  const candidate = join(at.root, "releases", at.record.releaseId, at.name);
+async function releaseExecutable(at: { root: string; realRoot: string; record: { releaseId: string; bundleVersion: string }; place: string; execPath: string }): Promise<{ executable: string; bundleVersion: string } | null | "absent"> {
+  const candidate = join(at.root, at.place);
   const info = await lstat(candidate).catch(() => null);
   if (!info) return "absent";
   if (!info.isFile() || info.isSymbolicLink()) return null;
   const real = await realpath(candidate);
-  const expected = join("releases", at.record.releaseId, at.name);
+  const expected = at.place;
   // Windows paths are case-insensitive; any link or junction on the way makes them differ.
   if (relative(at.realRoot, real).toLowerCase() !== expected.toLowerCase()) return null;
   if (await realpath(at.execPath).then(self => self.toLowerCase() === real.toLowerCase(), () => false)) return null;

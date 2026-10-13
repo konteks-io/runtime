@@ -1,15 +1,17 @@
+import { spawn } from "node:child_process";
 import { createHash, sign } from "node:crypto";
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { NATIVE_UPDATE_TARGET_ENV, bundleManifestSigningBytes, computeBundleManifestDigest, RemoteInstanceError, writeSecretFile } from "@konteks/remote-common";
-import { buildReleaseFixture, resolveNativeConnectorExecutable } from "@konteks/remote-release";
+import { buildReleaseFixture, nativeServiceExecutable, resolveNativeConnectorExecutable, verifyNativeRelease, type CodeIdentity } from "@konteks/remote-release";
 import { acquireNativeRootLock, loadNativeInstallation, OPENCODE_MIN_BINARY_BYTES, readNativeUpdateLedger, SupervisorStore, verifyInstalledNativeConnector, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { installNative, readNativeRecord, restoreNativeRecord } from "../native/install.js";
 import { checkNativeUpdate, commitNativeUpdate, stageNativeUpdate } from "../native/update.js";
 import { earlierFailure, earlierFailureNote, keepLauncherCurrent, refreshInstalledLauncher, runNativeUpdate, selfUpdateNote, type NativeUpdateTransactionDeps } from "../native/update-transaction.js";
 import { createOutput } from "../output.js";
+import { activateServiceExecutable } from "../native/service-executable.js";
 import { nativeServiceDefinition, startNativeServiceDefinition, type NativeServiceCommand } from "../native/service.js";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
 
@@ -200,6 +202,142 @@ describe("native update staging and commit", () => {
     await expect(commitNativeUpdate({ root: f.root, releaseId: staged.releaseId, output: f.output, deps: f.deps })).rejects.toMatchObject({ code: "bundle_untrusted" });
     expect(await readNativeRecord(f.root)).toEqual(f.installed);
     await expect(commitNativeUpdate({ root: f.root, releaseId: "../escape", output: f.output, deps: f.deps })).rejects.toMatchObject({ code: "install_state_corrupt" });
+  });
+});
+
+describe("the publisher identity an update must keep", () => {
+  const signedBy = (publisher: string): CodeIdentity => ({ signed: true, publisher });
+  /** The installed connector reads as `installed`, the staged candidate as `candidate`. */
+  const identities = (installed: CodeIdentity, candidate: CodeIdentity) => vi.fn(async (file: string) => (file.includes(".candidate-") ? candidate : installed));
+  const capture = (f: Awaited<ReturnType<typeof fixture>>) => {
+    const lines: string[] = [];
+    return { lines, output: { ...f.output, line: (line: string) => { lines.push(line); } } };
+  };
+
+  it("stages an update signed by the installed connector's publisher", async () => {
+    const f = await fixture();
+    const { lines, output } = capture(f);
+    const codeIdentity = identities(signedBy("macos identifier \"dev.konteks.connector\" and anchor apple generic and certificate leaf[subject.OU] = TEAM"), signedBy("macos identifier \"dev.konteks.connector\" and anchor apple generic and certificate leaf[subject.OU] = TEAM"));
+    await expect(stageNativeUpdate({ root: f.root, output, deps: { ...f.deps, manifest: f.manifest, codeIdentity } })).resolves.toMatchObject({ status: "staged" });
+    expect(lines).toContain("The update is signed by the same publisher as this connector.");
+    expect(codeIdentity.mock.calls.map(call => call[1])).toEqual(["macos", "macos"]);
+  });
+
+  it("refuses an update from another publisher, or an unsigned one, once the installed connector is signed, and changes nothing", async () => {
+    const f = await fixture();
+    for (const candidate of [signedBy("macos another team"), { signed: false } as const]) {
+      const codeIdentity = identities(signedBy("macos konteks team"), candidate);
+      await expect(stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, manifest: f.manifest, codeIdentity } }))
+        .rejects.toThrow("The update is not signed by the same publisher as this connector, so it was not installed. Nothing changed.");
+    }
+    expect(await readdir(join(f.root, "releases"))).toEqual([f.installed.releaseId]);
+    expect(await readNativeRecord(f.root)).toEqual(f.installed);
+  });
+
+  it("accepts the update of an unsigned connector and says the identity was not compared", async () => {
+    const f = await fixture();
+    const { lines, output } = capture(f);
+    const codeIdentity = identities({ signed: false }, signedBy("macos konteks team"));
+    await expect(stageNativeUpdate({ root: f.root, output, deps: { ...f.deps, manifest: f.manifest, codeIdentity } })).resolves.toMatchObject({ status: "staged" });
+    expect(lines).toContain("This connector is not publisher-signed yet, so the update's signature was not compared.");
+  });
+
+  it("reads the installed identity from the service's stable executable once it exists", async () => {
+    const f = await fixture();
+    const installed = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
+    await activateServiceExecutable({ root: f.root, platform: f.platform, releaseId: f.installed.releaseId, release: installed.release });
+    const codeIdentity = identities({ signed: false }, { signed: false });
+    await stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, manifest: f.manifest, codeIdentity } });
+    expect(codeIdentity.mock.calls[0]![0]).toBe(nativeServiceExecutable(f.root, "macos"));
+  });
+});
+
+describe("the one executable path the service runs", () => {
+  const stable = (root: string) => nativeServiceExecutable(root, "macos");
+
+  it("puts the record's connector at the stable path, replaces it on update and returns the previous one on rollback", async () => {
+    const f = await fixture();
+    const before = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
+    expect(stable(f.root)).toBe(join(f.root, "bin", "konteks-connector"));
+    expect(await activateServiceExecutable({ root: f.root, platform: f.platform, releaseId: f.installed.releaseId, release: before.release })).toBe(true);
+    expect(await readFile(stable(f.root))).toEqual(Buffer.from("test-native-executable-not-run-1.0.0"));
+    // Already current: nothing is rewritten.
+    expect(await activateServiceExecutable({ root: f.root, platform: f.platform, releaseId: f.installed.releaseId, release: before.release })).toBe(false);
+
+    const staged = await stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, manifest: f.manifest } });
+    if (staged.status !== "staged") throw new Error("unreachable");
+    const successor = await commitNativeUpdate({ root: f.root, releaseId: staged.releaseId, output: f.output, deps: f.deps });
+    const after = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
+    expect(await activateServiceExecutable({ root: f.root, platform: f.platform, releaseId: successor.releaseId, release: after.release })).toBe(true);
+    expect(await readFile(stable(f.root))).toEqual(Buffer.from("test-native-executable-not-run-1.1.0"));
+    // The service definition names the same path on both releases.
+    const definition = (root: string) => nativeServiceDefinition({ os: "macos", home: tmpdir(), root, executable: stable(root), uid: 501 });
+    expect(definition(f.root).contents).toContain(`<string>${stable(f.root)}</string>`);
+
+    await restoreNativeRecord(f.root, successor.releaseId, f.installed, { roots: f.trust, platform: f.platform });
+    const restored = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
+    expect(await activateServiceExecutable({ root: f.root, platform: f.platform, releaseId: restored.record.releaseId, release: restored.release })).toBe(true);
+    expect(await readFile(stable(f.root))).toEqual(Buffer.from("test-native-executable-not-run-1.0.0"));
+    // Rollback copies stay in their release folders.
+    expect(await readFile(join(f.root, "releases", successor.releaseId, "konteks-connector"))).toEqual(Buffer.from("test-native-executable-not-run-1.1.0"));
+    expect((await readdir(join(f.root, "bin"))).sort()).toEqual(["konteks-connector"]);
+  });
+
+  it("refuses a release folder whose connector no longer matches its signed digest, leaving the stable executable as it was", async () => {
+    const f = await fixture();
+    const before = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
+    await activateServiceExecutable({ root: f.root, platform: f.platform, releaseId: f.installed.releaseId, release: before.release });
+    await writeFile(join(f.root, "releases", f.installed.releaseId, "konteks-connector"), "test-native-executable-not-run-9.9.9", { mode: 0o700 });
+    await writeFile(stable(f.root), "something else", { mode: 0o700 });
+    await expect(activateServiceExecutable({ root: f.root, platform: f.platform, releaseId: f.installed.releaseId, release: before.release }))
+      .rejects.toMatchObject({ code: "bundle_untrusted" });
+    expect(await readFile(stable(f.root), "utf8")).toBe("something else");
+    expect((await readdir(join(f.root, "bin"))).sort()).toEqual(["konteks-connector"]);
+  });
+
+  it("keeps a Linux connector's detached signature beside the stable executable, and drops it when the release has none", async () => {
+    const f = await fixture();
+    const before = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
+    const release = join(f.root, "releases", f.installed.releaseId);
+    await writeFile(join(release, "konteks-connector.sig"), "signature-document\n", { mode: 0o600 });
+    await activateServiceExecutable({ root: f.root, platform: f.platform, releaseId: f.installed.releaseId, release: before.release });
+    expect(await readFile(`${stable(f.root)}.sig`, "utf8")).toBe("signature-document\n");
+    await rm(join(release, "konteks-connector.sig"));
+    await activateServiceExecutable({ root: f.root, platform: f.platform, releaseId: f.installed.releaseId, release: before.release });
+    expect(await readdir(join(f.root, "bin"))).toEqual(["konteks-connector"]);
+  });
+
+  it.runIf(process.platform === "win32")("on Windows renames the running executable aside instead of overwriting it, and deletes that copy once nothing runs it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "native-stable-windows-")); roots.push(root);
+    const platform = { os: "windows", architecture: "amd64" } as const;
+    // A real program, so the stable executable can be running while it is replaced.
+    const program = await readFile(process.execPath);
+    const releases = { "release-old": program, "release-new": Buffer.concat([program, Buffer.from("konteks-next")]) };
+    const verified: Record<string, ReturnType<typeof verifyNativeRelease>> = {};
+    const keys = buildReleaseFixture();
+    for (const [releaseId, bytes] of Object.entries(releases)) {
+      await mkdir(join(root, "releases", releaseId), { recursive: true });
+      await writeFile(join(root, "releases", releaseId, "konteks-connector.exe"), bytes);
+      const artifact = { id: "connector", kind: "connector", format: "executable", ...platform, url: `https://releases.example/${releaseId}.exe`, digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}`, sizeBytes: bytes.byteLength };
+      const body = { protocol: { min: "1.0", max: "1.0" }, deploymentKind: "native_connector", components: ["agent_runner"], images: [], agentBridges: [], expiresAt: "2027-01-01T00:00:00Z", bundleVersion: releaseId === "release-old" ? "1.0.0" : "1.1.0", nativeArtifacts: [artifact] };
+      const unsigned = { ...body, digest: computeBundleManifestDigest(body as never) };
+      const manifest = { ...unsigned, signature: { algorithm: "Ed25519", keyId: keys.keyId, value: sign(null, bundleManifestSigningBytes(unsigned as never), keys.privateKey).toString("base64url") } };
+      verified[releaseId] = verifyNativeRelease(manifest, [keys.root]);
+    }
+    const target = nativeServiceExecutable(root, "windows");
+    await activateServiceExecutable({ root, platform, releaseId: "release-old", release: verified["release-old"]! });
+    const running = spawn(target, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+    await new Promise(resolve => running.once("spawn", resolve));
+    try {
+      await activateServiceExecutable({ root, platform, releaseId: "release-new", release: verified["release-new"]! });
+      expect(createHash("sha256").update(await readFile(target)).digest("hex")).toBe(createHash("sha256").update(releases["release-new"]).digest("hex"));
+      expect((await readdir(join(root, "bin"))).filter(name => name.endsWith(".replaced"))).toHaveLength(1);
+    } finally {
+      running.kill();
+      await new Promise(resolve => running.once("exit", resolve));
+    }
+    await activateServiceExecutable({ root, platform, releaseId: "release-new", release: verified["release-new"]! });
+    expect(await readdir(join(root, "bin"))).toEqual(["konteks-connector.exe"]);
   });
 });
 
