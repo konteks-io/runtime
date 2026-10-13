@@ -149,6 +149,24 @@ describe("signed HTTPS heartbeat lifecycle", () => {
     await older.start();
     expect(Object.keys(await older.publish())).not.toContain("supportedAgents");
   });
+  it("includes per-agent Skill freshness in the signed body without inferring a native load", async () => {
+    const f = await fixture();
+    const revision = `sha256:${"a".repeat(64)}`;
+    f.options.skillStatus = () => ({ syncing: false, profiles: [{ agentId: "codex", desiredRevision: revision,
+      installedRevision: revision, loadedRevision: null, state: "current" }],
+      lastSuccess: { syncedAt: "2026-09-06T00:00:00.000Z", catalogRevision: revision, skills: [] } });
+    const publisher = new HeartbeatPublisher({ ...f.options, runnerIncarnation: () => "process" } as HeartbeatOptions); publishers.push(publisher);
+    await publisher.start();
+    const message = await publisher.publish();
+    expect(message.skillStatus).toMatchObject({ profiles: [{ agentId: "codex", desiredRevision: revision,
+      installedRevision: revision, loadedRevision: null, state: "current" }] });
+
+    f.options.skillStatus = () => { throw new Error("projection unavailable"); };
+    const resilient = new HeartbeatPublisher({ ...f.options, runnerIncarnation: () => "process" } as HeartbeatOptions); publishers.push(resilient);
+    await resilient.start();
+    expect((await resilient.publish()).skillStatus).toBeUndefined();
+    expect(f.heartbeat).toHaveBeenCalledTimes(2);
+  });
   it("sends the release's connector commands on the first accepted heartbeat of an incarnation and again only when they change", async () => {
     const f = await fixture();
     let manifest: { version: string; commands: Array<{ id: string; command: string; description: string; os: Array<"macos" | "windows" | "debian"> }> } | undefined =

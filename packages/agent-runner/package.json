@@ -30,6 +30,7 @@
     "@konteks/backstage-plugin-common": "file:../../../packages/packages/backstage-plugin-common",
     "@konteks/remote-common": "*",
     "@konteks/remote-release": "*",
+    "gray-matter": "4.0.3",
     "ws": "^8.18.0",
     "zod": "^4.0.0"
   },

@@ -1,3 +1,4 @@
+import { nativeSkillLoadObservations, type NativeSkillLoad } from "./native-skill-load-observation.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
@@ -33,7 +34,7 @@ import type { TransportManager } from "../transport/relay-transport.js";
 import { deferredPermissionBody, PermissionBroker, registerDeferral, sanitizeElicitationRequest, sanitizePermissionRequest, type PendingHumanRequest, type SanitizedElicitation, type SanitizedPermission } from "./permissions.js";
 import type { CapabilityTokenIssue, DeferredPermissionBody } from "../core/client.js";
 import { deferredPermissionRequest, type AdmittedMcpTool, type PolicyDecision, type PolicyResponder } from "./policy-responder.js";
-import type { PreparedSessionInputs } from "../skills/session-inputs.js";
+import { safeSessionInputRejection, type PreparedSessionInputs } from "../skills/session-inputs.js";
 import { McpCapabilityFacade, type McpLocalTransportIdentity } from "../mcp/capability-facade.js";
 import { PREVIEW_WORK_KINDS, PreviewMcpServer, type SessionPreviewAccess } from "../preview/mcp-server.js";
 import { PreviewBrowserGateway } from "../preview/browser-gateway.js";
@@ -168,6 +169,7 @@ export interface RelayedSessionDeps {
   /** Rechecked immediately before a local prompt crosses into the bridge. */
   assertPromptAllowed?: () => void;
   onUsage: (observation: AgentTurnUsageObservation) => Promise<void>;
+  onSkillUsage?: (observation: import("@konteks/remote-common").AgentSkillReadObservation) => Promise<void>;
   /** A turn started or ended: the computer's busy state changed. */
   onTurnActivity?: () => void;
   onClosed: (session: RelayedSession, reason: SessionClosedReason) => Promise<void>;
@@ -378,7 +380,7 @@ export class RelayedSession {
     if (this.closed) throw sessionClosed();
     let prepared: PreparedSessionInputs;
     try { prepared = await this.bootstrapStage("input_preparation", () => this.deps.prepareInputs(this.assignment)); }
-    catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
+    catch (error) { throw safeSessionInputRejection(error) ?? new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
     this.deps.assertExecutionOwned?.();
     const binding = this.verifiedBinding(prepared);
     const readOnlyRoots = Object.freeze([...(prepared.readOnlyRoots ?? [])]);
@@ -602,6 +604,8 @@ export class RelayedSession {
         await this.deps.replaceExecutionProcessOwner(previous, replacement);
       },
       assertCurrent: () => this.assertLifecycleCurrent(),
+      admitSkillLoad: authority => this.admitNativeSkillLoad(authority),
+      recordSkillLoad: load => this.recordNativeSkillLoad(load),
     };
   }
 
@@ -1080,9 +1084,42 @@ export class RelayedSession {
     await this.promptRunner(ref, request.id, this.withInstructions(request.params as PromptParams));
   }
 
+  private async admitNativeSkillLoad(authority: { acpSessionRef: string; requestId: string; readOnlyRoots: readonly string[] }): Promise<void> {
+    this.assertLifecycleCurrent();
+    this.deps.assertPromptAllowed?.();
+    if (authority.acpSessionRef !== this.acpSessionRef || !this.nativeSkillLoadAvailable()) throw sessionClosed();
+    await this.preparedInputs!.admitNativeLoad!(authority.readOnlyRoots);
+    this.assertLifecycleCurrent();
+    this.deps.assertPromptAllowed?.();
+  }
+
+  private async recordNativeSkillLoad(load: NativeSkillLoad): Promise<void> {
+    this.assertLifecycleCurrent();
+    this.deps.assertPromptAllowed?.();
+    if (load.acpSessionRef !== this.acpSessionRef || !this.deps.onSkillUsage || !this.preparedInputs?.nativeSkills) throw sessionClosed();
+    this.assertNativeLoadRoots(load.readOnlyRoots);
+    const request = this.deps.journal.pendingRequests.get(`${load.acpSessionRef}:received:${load.requestId}`);
+    const observations = nativeSkillLoadObservations(request, load, this.preparedInputs.nativeSkills);
+    for (const observation of observations) await this.deps.onSkillUsage(observation);
+    this.assertLifecycleCurrent();
+  }
+
+  private assertNativeLoadRoots(observed: readonly string[]): void {
+    const roots = this.preparedInputs?.readOnlyRoots ?? [];
+    if (observed.length !== roots.length || roots.some((root, index) => observed[index] !== root)) throw sessionClosed();
+  }
+
+  private nativeSkillLoadAvailable(): boolean {
+    return this.assignment.agentRoute.agentId === "opencode" && Boolean(this.deps.reserveExecutionReference) &&
+      Boolean(this.preparedInputs?.prepareNativeLoad && this.preparedInputs.admitNativeLoad);
+  }
+
   private async runBeforePrompt(): Promise<void> {
-    try { await this.preparedInputs?.beforePrompt(); }
-    catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
+    try {
+      if (this.nativeSkillLoadAvailable()) await this.preparedInputs!.prepareNativeLoad!();
+      else await this.preparedInputs?.beforePrompt();
+    }
+    catch (error) { throw safeSessionInputRejection(error) ?? new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
   }
 
   /** The staged skills line goes in front of the person's text. */

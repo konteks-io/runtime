@@ -24,17 +24,21 @@ import {
   type VersionAcknowledgement,
   type VersionPolicy,
 } from "@konteks/remote-common";
+import {
+  RuntimeSkillCatalogChangedSchema,
+  RuntimeSkillSyncRequestSchema,
+  type RuntimeSkillCatalogChanged,
+  type RuntimeSkillSyncRequest,
+} from "@konteks/backstage-plugin-common/remote-instance-internal";
 import { compareAgentVersions } from "@konteks/remote-release";
 import type { CoreSignatureVerifier } from "./core-signature.js";
 import type { SupervisorStore } from "../state/store.js";
 import type { SupervisorJournal } from "../state/journal.js";
 
 /**
- * The closed control protocol: desired configuration, version policy, key
- * rotation, erase, and drain. Every directive is a strict shared schema, must
- * carry a verifying Core signature and a fresh (monotonic or unexpired)
- * revision/nonce, and is acknowledged with a signed body. There is no
- * arbitrary directive; anything else is dropped and counted.
+ * The closed control protocol: configuration, version, key, erase, drain, and
+ * signed Skill-sync requests and catalog-change notifications. Unsupported
+ * messages are dropped and counted; catalog contents stay on HTTPS.
  */
 interface ControlDeps {
   store: SupervisorStore;
@@ -44,6 +48,9 @@ interface ControlDeps {
   replaceKey: (next: InstanceKeyPair) => Promise<void>;
   verifier: CoreSignatureVerifier;
   instanceId: () => string;
+  workspaceId: () => string;
+  onRuntimeSkillSyncRequest: (request: RuntimeSkillSyncRequest) => void | Promise<void>;
+  onRuntimeSkillCatalogChanged: (change: RuntimeSkillCatalogChanged) => void | Promise<void>;
   bundleVersion: string;
   protocolVersion: string;
   manifestDigest: () => string;
@@ -68,6 +75,7 @@ export class ControlHandlers {
   readonly counters: ControlCounters = { rejectedSignature: 0, rejectedStale: 0, rejectedUnknown: 0 };
   private readonly logger: Logger;
   private pendingRotation: { rotationId: string; next: InstanceKeyPair } | null = null;
+  private readonly seenSkillCatalogNotifications = new Set<string>();
   private appliedRevision = 0;
   private configurationQueue: Promise<void> = Promise.resolve();
   /** The last verified `version_policy`; surfaces `updateAvailable`/`targetBundle` to status (Core cannot send a shell command). */
@@ -114,8 +122,70 @@ export class ControlHandlers {
     if (erase.success) return this.handleErase(erase.data);
     const drain = DrainDirectiveSchema.safeParse(body);
     if (drain.success) return this.handleDrain(drain.data);
+    const skillSync = RuntimeSkillSyncRequestSchema.safeParse(body);
+    if (skillSync.success) return this.handleRuntimeSkillSyncRequest(skillSync.data);
+    const catalogChange = RuntimeSkillCatalogChangedSchema.safeParse(body);
+    if (catalogChange.success) return this.handleRuntimeSkillCatalogChanged(catalogChange.data);
     this.counters.rejectedUnknown += 1;
     this.logger.warn("dropped an unknown control directive");
+  }
+
+  private async handleRuntimeSkillSyncRequest(request: RuntimeSkillSyncRequest): Promise<void> {
+    if (!this.deps.verifier.verifyRuntimeSkillSyncRequest(request)) {
+      this.counters.rejectedSignature += 1;
+      this.logger.warn("Skill sync control signature rejected");
+      return;
+    }
+    const now = Date.parse(this.deps.clock.nowIso());
+    if (
+      request.workspaceId !== this.deps.workspaceId() ||
+      request.instanceId !== this.deps.instanceId() ||
+      Date.parse(request.issuedAt) > now + 1_000 ||
+      Date.parse(request.expiresAt) <= now
+    ) {
+      this.counters.rejectedStale += 1;
+      this.logger.warn("stale or misbound Skill sync control request dropped");
+      return;
+    }
+    await this.deps.onRuntimeSkillSyncRequest(request);
+  }
+
+  private async handleRuntimeSkillCatalogChanged(change: RuntimeSkillCatalogChanged): Promise<void> {
+    if (!this.deps.verifier.verifyRuntimeSkillCatalogChanged(change)) {
+      this.counters.rejectedSignature += 1;
+      this.logger.warn("Skill catalog change signature rejected");
+      return;
+    }
+    const now = Date.parse(this.deps.clock.nowIso());
+    if (this.isStaleSkillCatalogChange(change, now)) {
+      this.counters.rejectedStale += 1;
+      this.logger.warn("stale or misbound Skill catalog change dropped");
+      return;
+    }
+    if (!this.rememberSkillCatalogNotification(change.notificationId)) return;
+    try {
+      await this.deps.onRuntimeSkillCatalogChanged(change);
+    } catch (error) {
+      this.seenSkillCatalogNotifications.delete(change.notificationId);
+      throw error;
+    }
+  }
+
+  private isStaleSkillCatalogChange(change: RuntimeSkillCatalogChanged, now: number): boolean {
+    return change.workspaceId !== this.deps.workspaceId() ||
+      change.instanceId !== this.deps.instanceId() ||
+      Date.parse(change.issuedAt) > now + 1_000 ||
+      Date.parse(change.expiresAt) <= now;
+  }
+
+  private rememberSkillCatalogNotification(notificationId: string): boolean {
+    if (this.seenSkillCatalogNotifications.has(notificationId)) return false;
+    if (this.seenSkillCatalogNotifications.size >= 512) {
+      const oldest = this.seenSkillCatalogNotifications.values().next().value;
+      if (oldest) this.seenSkillCatalogNotifications.delete(oldest);
+    }
+    this.seenSkillCatalogNotifications.add(notificationId);
+    return true;
   }
 
   handleDesiredConfiguration(envelope: DesiredConfigurationEnvelope): Promise<void> {

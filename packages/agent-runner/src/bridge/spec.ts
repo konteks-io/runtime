@@ -96,6 +96,7 @@ function usePersonalClaude(config: RunnerConfig, family: AgentBridgeFamily, prof
   }
   const operator = userInfo();
   env.CLAUDE_CODE_EXECUTABLE = executable;
+  bindClaudeConfigDirectory(config.RUNNER_NATIVE_CLAUDE_CONFIG_DIR, env);
   env.HOME = operator.homedir;
   env.USER = operator.username;
   env.LOGNAME = operator.username;
@@ -107,6 +108,12 @@ function usePersonalClaude(config: RunnerConfig, family: AgentBridgeFamily, prof
   // delay the tools, never take them away.
   env.MCP_TIMEOUT = CLAUDE_MCP_STARTUP_TIMEOUT_MS;
   if (profile.os === "windows") useGitBash(env);
+}
+
+function bindClaudeConfigDirectory(directory: string | undefined, env: NodeJS.ProcessEnv): void {
+  if (directory === undefined) return;
+  if (!localAbsolutePath(directory)) throw new RemoteInstanceError("agent_unavailable", "A personal Claude profile requires an absolute locally bound config directory.");
+  env.CLAUDE_CONFIG_DIR = directory;
 }
 
 /**

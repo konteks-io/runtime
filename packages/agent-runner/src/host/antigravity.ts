@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
-import { chmod, lstat, mkdir, readFile, rm, stat } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, rm, stat, symlink } from "node:fs/promises";
 import { isAbsolute, posix, win32 } from "node:path";
 import { pathToFileURL } from "node:url";
 import { z } from "zod";
@@ -250,21 +250,28 @@ export async function antigravityTokenPresent(file: string): Promise<boolean> {
  * MCP servers or skills from anyone else). Token files are the server's; the
  * connector never reads them.
  */
+/** Receipt-owned Skill storage survives discovery/config resets. */
+export function antigravitySkillHome(credentialDir: string, platform: NodeJS.Platform = process.platform): string {
+  return (platform === "win32" ? win32 : posix).join(antigravityRuntimePaths(credentialDir, platform).geminiHome, "konteks-skills");
+}
 export async function prepareAntigravityHome(credentialDir: string, platform: NodeJS.Platform = process.platform): Promise<AntigravityRuntimePaths> {
   const paths = antigravityRuntimePaths(credentialDir, platform);
   const path = platform === "win32" ? win32 : posix;
   const acp = path.join(paths.geminiHome, "antigravity-acp");
   const config = path.join(paths.geminiHome, "config");
   const cliSkills = path.join(paths.geminiHome, "antigravity-cli", "skills");
-  for (const folder of [paths.root, paths.home, paths.geminiHome, acp]) await ensurePrivateFolder(folder, platform);
+  const skillHome = antigravitySkillHome(credentialDir, platform);
+  const managedSkills = path.join(skillHome, "skills");
+  for (const folder of [paths.root, paths.home, paths.geminiHome, acp, skillHome, managedSkills, path.dirname(cliSkills)]) await ensurePrivateFolder(folder, platform);
   // A sign-in under way owns settings.json until it ends (the server writes it too).
   if (!signInsUnderWay.has(paths.home)) await writeSecretFile(paths.settingsFile, renderAntigravitySettings(await readAntigravitySignIn(credentialDir, platform)));
   await rm(paths.trustFile, { force: true, recursive: true });
-  for (const owned of [config, cliSkills]) {
-    await rm(owned, { force: true, recursive: true });
-    await mkdir(owned, { recursive: true, mode: 0o700 });
+  await rm(config, { force: true, recursive: true });
+  await mkdir(config, { recursive: true, mode: 0o700 });
+  await rm(cliSkills, { force: true, recursive: true });
+  for (const discovery of [path.join(config, "skills"), cliSkills]) {
+    await symlink(managedSkills, discovery, platform === "win32" ? "junction" : "dir");
   }
-  await mkdir(path.join(config, "skills"), { recursive: true, mode: 0o700 });
   return paths;
 }
 

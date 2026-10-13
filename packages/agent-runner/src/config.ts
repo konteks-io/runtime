@@ -36,6 +36,9 @@ export const RunnerConfigSchema = z
     RUNNER_NATIVE_CODEX_SOCKET: z.string().min(1).optional(),
     /** Local operator's installed Claude Code CLI and personal login, resolved by native installation only. */
     RUNNER_NATIVE_CLAUDE_EXECUTABLE: z.string().min(1).optional(),
+    RUNNER_NATIVE_CLAUDE_CONFIG_DIR: absolutePath.optional(),
+    /** Discovery targets retained from the local installer. */
+    RUNNER_NATIVE_SKILL_HOMES: z.array(absolutePath).optional(),
     /** The person's own installed DeepSeek Harness package root, resolved by native installation only. */
     RUNNER_NATIVE_DSH_ROOT: z.string().min(1).optional(),
     /** Its `bin.dsh` launcher inside that root, and the person's Node that runs it. */

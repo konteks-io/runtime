@@ -1,3 +1,5 @@
+import { openCodeSkillSources } from "./opencode-skill-sources.js";
+import { createOpenCodeActivation } from "./opencode-activation.js";
 import type { Stats } from "node:fs";
 import { createHash } from "node:crypto";
 import { copyFile, lstat, mkdir, readlink, rm, symlink } from "node:fs/promises";
@@ -197,9 +199,18 @@ export function openCodeWorkingCopyKey(workingCopy: string): string {
   return createHash("sha256").update(resolve(workingCopy)).digest("hex").slice(0, 16);
 }
 
-/** `XDG_CONFIG_HOME` of the OpenCode process serving `workingCopy`. */
-export function openCodeWorkingCopyConfig(credentialDir: string, workingCopy: string, platform: NodeJS.Platform = process.platform): string {
-  return (platform === "win32" ? win32 : posix).join(openCodeRuntimePaths(credentialDir, platform).configs, openCodeWorkingCopyKey(workingCopy));
+/** `XDG_CONFIG_HOME` bound to the working copy and its authorized immutable Skill roots. */
+export function openCodeWorkingCopyConfig(credentialDir: string, workingCopy: string, platform: NodeJS.Platform = process.platform, readOnlyRoots: readonly string[] = []): string {
+  const path = platform === "win32" ? win32 : posix;
+  const key = openCodeWorkingCopyKey(workingCopy);
+  if (!readOnlyRoots.length) return path.join(openCodeRuntimePaths(credentialDir, platform).configs, key);
+  const roots = normalizedSkillRoots(readOnlyRoots, path);
+  const digest = createHash("sha256").update(JSON.stringify(roots)).digest("hex");
+  return path.join(openCodeRuntimePaths(credentialDir, platform).configs, `${key}-skills-${digest}`);
+}
+function normalizedSkillRoots(roots: readonly string[], path: typeof posix): string[] {
+  if (roots.some(root => !path.isAbsolute(root) || CONTROL.test(root))) throw new RemoteInstanceError("agent_unavailable", "OpenCode Skill roots must be absolute local paths.");
+  return [...new Set(roots.map(root => path.normalize(root)))].sort();
 }
 
 /** How a config folder carries the working copy's `AGENTS.md`. */
@@ -272,25 +283,40 @@ function serial<T>(configHome: string, work: (hold: { count: number }) => Promis
   return run;
 }
 
-/** Prepare the config folder of one OpenCode execution process for `workingCopy`. */
-export async function bindOpenCodeWorkingCopy(credentialDir: string, workingCopy: string, deps: OpenCodeInstructionsDeps & { inherited?: NodeJS.ProcessEnv } = {}): Promise<HostWorkingCopyBinding> {
+/** Prepare one OpenCode execution profile, isolated by working copy and authorized Skill roots. */
+export async function bindOpenCodeWorkingCopy(credentialDir: string, workingCopy: string, deps: OpenCodeInstructionsDeps & { inherited?: NodeJS.ProcessEnv } = {}, readOnlyRoots: readonly string[] = []): Promise<HostWorkingCopyBinding> {
   if (!isAbsolute(workingCopy) || CONTROL.test(workingCopy)) throw new RemoteInstanceError("agent_unavailable", "An OpenCode working copy must be an absolute local path.");
-  const configHome = openCodeWorkingCopyConfig(credentialDir, workingCopy);
+  const skillRoots = Object.freeze([...readOnlyRoots]);
+  const configHome = openCodeWorkingCopyConfig(credentialDir, workingCopy, process.platform, skillRoots);
+  const sources = await openCodeSkillSources(skillRoots);
+  const activation = skillRoots.length ? await createOpenCodeActivation(configHome, skillRoots) : undefined;
   const env = openCodeProcessEnvironment(credentialDir, configHome, deps.inherited);
+  env.OPENCODE_CONFIG_CONTENT = JSON.stringify({ ...renderOpenCodeKonteksConfig(), skills: sources, ...(activation ? { plugins: [activation.plugin] } : {}) });
   await serial(configHome, async hold => {
     hold.count += 1;
     try { await syncOpenCodeInstructions(configHome, workingCopy, deps); }
-    catch (error) { hold.count -= 1; throw error; }
+    catch (error) { hold.count -= 1; await activation?.release(); throw error; }
   });
   let released = false;
   return {
     env,
-    beforePrompt: () => serial(configHome, async () => { if (!released) await syncOpenCodeInstructions(configHome, workingCopy, deps); }),
+    beforePrompt: async turn => {
+      if (released) throw new RemoteInstanceError("agent_unavailable", "The OpenCode execution context has been released. Start a new execution context before retrying.");
+      await activation?.wait();
+      return serial(configHome, async () => {
+        if (released) throw new RemoteInstanceError("agent_unavailable", "The OpenCode execution context has been released. Start a new execution context before retrying.");
+        await openCodeSkillSources(skillRoots);
+        await syncOpenCodeInstructions(configHome, workingCopy, deps);
+        activation?.prepareTurn(turn);
+      });
+    },
+    afterPrompt: turn => activation?.finishTurn(turn),
     release: () => {
       if (released) return Promise.resolve();
       released = true;
       return serial(configHome, async hold => {
         hold.count -= 1;
+        await activation?.release();
         if (hold.count === 0) await rm(configHome, { recursive: true, force: true });
       });
     },
@@ -369,9 +395,9 @@ export const openCodeRunnerAdapter: HostAgentRunnerAdapter = {
     }
     await prepareOpenCodeHome(config);
   },
-  bindWorkingCopy: async (config, family, workingCopy) => {
+  bindWorkingCopy: async (config, family, workingCopy, readOnlyRoots = []) => {
     binary(config, family);
-    return bindOpenCodeWorkingCopy(config.RUNNER_CREDENTIAL_DIR, workingCopy);
+    return bindOpenCodeWorkingCopy(config.RUNNER_CREDENTIAL_DIR, workingCopy, {}, readOnlyRoots);
   },
   // OpenCode's own `auth login`, driven and relayed (link and code for a
   // subscription, OpenCode's own key prompt for an API key); the one-time

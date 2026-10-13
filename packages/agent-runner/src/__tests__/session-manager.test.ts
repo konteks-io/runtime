@@ -51,6 +51,35 @@ async function nextEvent(bus: RunnerEventBus, kind: RunnerEvent["kind"]): Promis
 }
 
 describe("session manager bootstrap", () => {
+  it("binds native Skill admission to the current owner and invalidates it after settlement", async () => {
+    const { bridge } = fakeBridge();
+    const events = new RunnerEventBus();
+    const admitSkillLoad = vi.fn(async () => {});
+    const recordSkillLoad = vi.fn(async () => {});
+    const load = { loadId: "load", readOnlyRoots: ["/verified/skill"], observedAt: "2026-10-10T00:00:00Z" };
+    let turnRecorder: ((value: typeof load) => Promise<void>) | undefined;
+    let turnAdmission: ((roots: readonly string[]) => Promise<void>) | undefined;
+    const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore(),
+      beforePrompt: async (_bridge, turn) => {
+        turnAdmission = turn.admitSkillLoad;
+        await turnAdmission!(["/verified/skill"]);
+        turnRecorder = turn.recordSkillLoad;
+        await turnRecorder!(load);
+      } });
+    const { acpSessionRef } = await manager.create({ context, cwd: "/w", mcpServers: [],
+      lifecycle: { beforeCreate: async () => {}, recordProcessOwner: async () => {}, assertCurrent: () => {}, admitSkillLoad, recordSkillLoad } });
+    const completed = nextEvent(events, "prompt_result");
+    manager.prompt(acpSessionRef, "native-turn", { prompt: [] });
+    await completed;
+    await manager.sealCompletedTurn(acpSessionRef);
+    expect(admitSkillLoad).toHaveBeenCalledExactlyOnceWith({ acpSessionRef, requestId: "native-turn", readOnlyRoots: ["/verified/skill"] });
+    await expect(turnAdmission!(["/verified/skill"])).rejects.toThrow(/settled/);
+    expect(admitSkillLoad).toHaveBeenCalledTimes(1);
+    expect(recordSkillLoad).toHaveBeenCalledExactlyOnceWith({ ...load, acpSessionRef, requestId: "native-turn" });
+    await expect(turnRecorder!(load)).rejects.toThrow(/settled/);
+    expect(recordSkillLoad).toHaveBeenCalledTimes(1);
+  });
+
   it("applies the governed session baseline to create and live continuation", async () => {
     const { bridge, calls } = fakeBridge({}, { agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {} } } });
     const events = new RunnerEventBus();
@@ -1013,4 +1042,37 @@ describe("restoring a conversation after its turn was stopped for recovery", () 
     expect(loadSession).toHaveBeenCalledTimes(2);
     expect(await store.get(refused.acpSessionRef)).toBe("bridge-new-2");
   });
+});
+
+
+it("settles a synchronous pre-prompt refusal without sending or retaining an active turn", async () => {
+  const { bridge, calls } = fakeBridge();
+  const events = new RunnerEventBus();
+  const beforePrompt = vi.fn(() => { throw new RemoteInstanceError("capability_unavailable", "Required Skill admission is unavailable."); });
+  const afterPrompt = vi.fn((_bridge: unknown, _turn: unknown) => undefined);
+  const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore(), beforePrompt, afterPrompt });
+  const { acpSessionRef } = await manager.create({ context, cwd: "/w", mcpServers: [] });
+  const failed = nextEvent(events, "request_error");
+  expect(() => manager.prompt(acpSessionRef, "blocked-turn", { prompt: [] })).not.toThrow();
+  expect(await failed).toMatchObject({ requestId: "blocked-turn", method: "session/prompt" });
+  await vi.waitFor(() => expect(manager.activeTurns).toBe(0));
+  expect(calls.prompt).toBeUndefined();
+  expect(beforePrompt).toHaveBeenCalledWith(bridge, { acpSessionRef, bridgeSessionId: "bridge-s1", requestId: "blocked-turn" });
+  expect(afterPrompt).toHaveBeenCalledWith(bridge, { acpSessionRef, bridgeSessionId: "bridge-s1", requestId: "blocked-turn" });
+});
+
+it("invalidates the same immutable host turn after a successful prompt", async () => {
+  const { bridge } = fakeBridge();
+  const events = new RunnerEventBus();
+  const beforePrompt = vi.fn(async () => undefined);
+  const afterPrompt = vi.fn((_bridge: unknown, _turn: unknown) => undefined);
+  const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore(), beforePrompt, afterPrompt });
+  const { acpSessionRef } = await manager.create({ context, cwd: "/w", mcpServers: [] });
+  const result = nextEvent(events, "prompt_result");
+  manager.prompt(acpSessionRef, "completed-turn", { prompt: [] });
+  await result;
+  await vi.waitFor(() => expect(manager.activeTurns).toBe(0));
+  const turn = afterPrompt.mock.calls[0][1];
+  expect(beforePrompt).toHaveBeenCalledWith(bridge, turn);
+  expect(Object.isFrozen(turn)).toBe(true);
 });

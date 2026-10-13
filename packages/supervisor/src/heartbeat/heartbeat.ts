@@ -35,6 +35,8 @@ export interface HeartbeatOptions {
    * older Core, or nothing detected yet). Never throws the heartbeat away.
    */
   supportedAgents?: (agents: HeartbeatMessage["agents"]) => readonly SupportedAgentEntry[] | undefined;
+  /** Last catalog/install evidence; a missing loadedRevision remains unknown. */
+  skillStatus?: () => HeartbeatMessage["skillStatus"];
   /**
    * The `konteks-remote` commands this installed release has;
    * undefined to leave it out (an older Core, or no table). Sent on the
@@ -226,6 +228,7 @@ export class HeartbeatPublisher {
     const utilization = this.utilization(snapshot, pending);
     const supportedAgents = this.supportedAgents(snapshot.agents);
     const commands = this.unsentConnectorCommands(runnerIncarnation);
+    const skillStatus = this.skillStatus();
     this.stage = "sequence";
     const sequence = await this.options.store.allocateHeartbeatSequence();
     assertCurrent();
@@ -242,7 +245,7 @@ export class HeartbeatPublisher {
       activeAssignmentIds: this.options.activeAssignmentIds().slice(0, 256),
       configRevision: this.options.configRevision(),
       bundleVersion: this.options.bundleVersion,
-      ...this.optionalReports(supportedAgents, commands.manifest),
+      ...this.optionalReports(supportedAgents, commands.manifest, skillStatus),
     });
     // The wire carries a top-level `signature` and no `proof` envelope, but the
     // bytes signed are the instance proof's: binding the audience, the
@@ -293,6 +296,15 @@ export class HeartbeatPublisher {
     }
   }
 
+  private skillStatus(): HeartbeatMessage["skillStatus"] {
+    try {
+      return this.options.skillStatus?.();
+    } catch (error) {
+      this.logger.warn({ err: error }, "Skill synchronization status not reported on this heartbeat");
+      return undefined;
+    }
+  }
+
   /** The connector commands when this incarnation has not sent them yet, with the key that records them as sent. */
   private unsentConnectorCommands(runnerIncarnation: string): { manifest?: ConnectorCommandsManifest; key: string | null } {
     try {
@@ -305,10 +317,11 @@ export class HeartbeatPublisher {
     return { key: null };
   }
 
-  private optionalReports(supportedAgents: readonly SupportedAgentEntry[] | undefined, connectorCommands: ConnectorCommandsManifest | undefined): Record<string, unknown> {
+  private optionalReports(supportedAgents: readonly SupportedAgentEntry[] | undefined, connectorCommands: ConnectorCommandsManifest | undefined, skillStatus: HeartbeatMessage["skillStatus"]): Record<string, unknown> {
     return {
       ...(this.options.modelCapabilitySnapshots ? { modelCapabilitySnapshots: this.options.modelCapabilitySnapshots() } : {}),
       ...(supportedAgents ? { supportedAgents } : {}),
       ...(connectorCommands ? { connectorCommands } : {}),
+      ...(skillStatus ? { skillStatus } : {}),
     };
   }}

@@ -17,6 +17,21 @@ afterEach(async () => {
 const token = "t".repeat(32);
 
 describe("loopback control socket", () => {
+  it("requires explicit ongoing-publication consent and refuses caller-supplied Skill contents", () => {
+    const selection = { localId: "a".repeat(64), treeDigest: `sha256:${"b".repeat(64)}`,
+      requestId: "12345678-1234-4234-8234-123456789abc", audience: { kind: "organization" },
+      context: { kind: "global" }, confirmation: { ongoingPublication: true } };
+    expect(ControlRequestSchema.safeParse({ op: "skills.share", selection }).success).toBe(true);
+    expect(ControlRequestSchema.safeParse({ op: "skills.share", selection: { ...selection, confirmation: { ongoingPublication: false } } }).success).toBe(false);
+    expect(ControlRequestSchema.safeParse({ op: "skills.share", selection: { ...selection, tree: {} } }).success).toBe(false);
+    expect(ControlRequestSchema.safeParse({ op: "skills.share", selection: { ...selection, tenantId: "other" } }).success).toBe(false);
+  });
+  it("accepts only a publication identity for confirmed owner-side unsharing", () => {
+    const request = { op: "skills.unshare", publicationId: "55555555-5555-4555-8555-555555555555" };
+    expect(ControlRequestSchema.safeParse(request).success).toBe(true);
+    expect(ControlRequestSchema.safeParse({ ...request, skillId: "66666666-6666-4666-8666-666666666666" }).success).toBe(false);
+    expect(ControlRequestSchema.safeParse({ ...request, publicationId: "invalid" }).success).toBe(false);
+  });
   it("notifies an active login when its authenticated client disconnects", async () => {
     let started!: () => void;
     const handled = new Promise<void>(resolve => { started = resolve; });
