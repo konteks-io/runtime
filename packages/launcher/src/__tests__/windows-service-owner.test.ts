@@ -65,6 +65,17 @@ describe("Windows connector service ownership", () => {
     expect(await captureWindowsServiceOwner(root, { read: async () => [process], terminate: vi.fn() })).toBeNull();
   });
 
+  it("owns the service's stable executable, the one path an installed connector runs from, and not the updater running the same file", async () => {
+    const stable = `${root}\\bin\\konteks-connector.exe`;
+    const service = { ...connector, executable: stable, command: `"${stable}" serve --root "${root}"` };
+    const updater = { ...connector, pid: 50, startToken: "30000", executable: stable, command: `"${stable}" --root "${root}" --json update --unattended` };
+    const owner = await captureWindowsServiceOwner(root, { read: async () => [updater, service], terminate: vi.fn(), excludePid: 50 });
+    expect(owner?.pid).toBe(42);
+    // A connector of the same name elsewhere under the root is not the service's.
+    const stray = { ...service, executable: `${root}\\bin\\old\\konteks-connector.exe`, command: `"${root}\\bin\\old\\konteks-connector.exe" serve --root "${root}"` };
+    expect(await captureWindowsServiceOwner(root, { read: async () => [stray], terminate: vi.fn() })).toBeNull();
+  });
+
   it("accepts the older connector file name and literal root paths", async () => {
     const old = `${root}\\releases\\old\\connector.exe`;
     const process = { ...connector, executable: old, command: `"${old}" serve --root "${root}"` };

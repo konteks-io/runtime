@@ -80,7 +80,11 @@ async function retireThenRemoveService(control: Pick<SupervisorControl, "call">,
   const receiptBefore = deps.receipt ? await deps.receipt().catch(() => null) : null;
   await drainForRemoval(control, deps, output);
   const retired = await retireRuntime(control, deps);
-  await removeService(deps);
+  const service = await removeService(deps);
+  // On Windows the stop only tells the login host not to start the connector
+  // again; one that Konteks could not retire (offline) is asked to shut down,
+  // as the update's stop does, or it kept its log open and the folder stayed.
+  if (service?.windowsBackground) await control.call({ op: "shutdown" }, z.unknown()).catch(() => undefined);
   await waitForShutdown(deps, receiptBefore);
   return retired;
 }
@@ -157,12 +161,13 @@ async function retireRuntime(control: Pick<SupervisorControl, "call">, deps: Uni
  * Stop and unregister; either may fail simply because it is not running or
  * was never registered, which is the state being asked for.
  */
-async function removeService(deps: UninstallDeps): Promise<void> {
+async function removeService(deps: UninstallDeps): Promise<NativeServiceDefinition | null> {
   const service = await deps.serviceDefinition().catch(() => null);
-  if (!service) return;
+  if (!service) return null;
   await deps.execute(service.stop).catch(() => null);
   for (const command of service.remove) await deps.execute(command).catch(() => null);
   await rm(service.path, { force: true });
+  return service;
 }
 
 /**

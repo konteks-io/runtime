@@ -1,7 +1,7 @@
 import { win32 } from "node:path";
 import { RemoteInstanceError, runCommand, sanitizeInheritedChildProcessEnv } from "@konteks/remote-common";
 import { setupDuration, setupLine } from "../setup-locale.js";
-import { nativeConnectorFileNames } from "@konteks/remote-release";
+import { nativeConnectorFileNames, nativeServiceExecutable } from "@konteks/remote-release";
 import { serviceRun, type NativeServiceDefinition, type NativeServiceExecute } from "./service.js";
 
 /** Captured before shutdown, so a task host disappearing is never exit proof. */
@@ -31,7 +31,7 @@ const samePath = (a: string, b: string) => win32.normalize(a).toLowerCase() === 
 const sameIdentity = (a: WindowsServiceProcess, b: WindowsServiceProcess) => a.pid === b.pid && a.startToken === b.startToken && samePath(a.executable, b.executable) && a.command === b.command;
 const uncertain = (message: string) => new RemoteInstanceError("temporarily_unavailable", message);
 
-/** Find only a release connector whose complete parsed argv serves this root.
+/** Find only this root's connector (its stable executable or a release folder's) whose complete parsed argv serves this root.
  * The background host's state does not describe surviving child processes. */
 export async function captureWindowsServiceOwner(root: string, deps: WindowsServiceOwnerDeps = { read: readWindowsServiceProcesses, terminate: terminateWindowsServiceProcesses }): Promise<NativeServiceProcessOwner | null> {
   const initial = await deps.read();
@@ -175,7 +175,16 @@ function predatesParent(child: WindowsServiceProcess, parent: WindowsServiceProc
 
 function belongsToService(process: WindowsServiceProcess, root: string): boolean {
   if (!hasServiceCommand(process)) return false;
-  return releaseConnector(process.executable, root) && servesRoot(process, root);
+  return serviceConnector(process.executable, root) && servesRoot(process, root);
+}
+
+/**
+ * The service's stable executable (`<root>\\bin\\konteks-connector.exe`, what
+ * every installed connector runs), or a release folder's connector, which an
+ * install from before the stable path still runs until its next start.
+ */
+function serviceConnector(executable: string, root: string): boolean {
+  return samePath(executable, nativeServiceExecutable(root, "windows")) || releaseConnector(executable, root);
 }
 
 function hasServiceCommand(process: WindowsServiceProcess): boolean {

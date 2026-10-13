@@ -54,6 +54,21 @@ describe("uninstall", () => {
     };
   }
 
+  it("on Windows asks a connector Konteks could not retire to shut down, since the login host's stop does not end it", async () => {
+    const calls: Array<{ op: string }> = [];
+    const d = { ...deps(calls, { "drain.status": [{ draining: true, reason: "remove", activeAssignments: 0, openSessions: 0 }] }), serviceDefinition: async () => ({ ...service, windowsBackground: true }) };
+    const control = await d.control();
+    vi.mocked(control!.call).mockImplementation(async (request: { op: string }) => {
+      calls.push(request);
+      if (request.op === "instance.retire") throw new Error("Konteks is unreachable");
+      return request.op === "drain.status" ? { draining: true, reason: "remove", activeAssignments: 0, openSessions: 0 } : {};
+    });
+    const result = await uninstallNative({ root, output: output() }, { ...d, control: async () => control });
+    expect(calls.map(call => call.op)).toEqual(["drain", "drain.status", "instance.retire", "shutdown"]);
+    expect(result).toMatchObject({ runtime: "not_told" });
+    await expect(stat(root)).rejects.toThrow();
+  });
+
   it("drains, has Konteks remove the runtime, unregisters the service and deletes only the connector folder", async () => {
     const calls: Array<{ op: string }> = [];
     const d = deps(calls, {

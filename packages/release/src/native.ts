@@ -1,6 +1,6 @@
 import { createHash, createPublicKey, type KeyObject } from "node:crypto";
 import { chmod, constants as fsConstants, copyFile, lstat, mkdir, mkdtemp, open, rm } from "node:fs/promises";
-import { isAbsolute, join, posix, win32 } from "node:path";
+import { isAbsolute, join, win32 } from "node:path";
 import {
   RemoteInstanceError, RemoteSignedBundleManifestSchema, bundleManifestSigningBytes,
   agentModelCapabilityMappingSigningBytes, computeAgentModelCapabilityMappingDigest,
@@ -220,7 +220,8 @@ export function nativeConnectorFileNames(os: NativeArtifactTarget["os"]): [strin
  * keep the copies it is replaced from.
  */
 export function nativeServiceExecutable(root: string, os: NativeArtifactTarget["os"]): string {
-  return (os === "windows" ? win32 : posix).join(root, "bin", nativeConnectorFileNames(os)[0]);
+  // Windows paths are built as Windows paths anywhere; every other OS's in this host's own form.
+  return (os === "windows" ? win32.join : join)(root, "bin", nativeConnectorFileNames(os)[0]);
 }
 
 /** Every connector executable present in a release folder, the Konteks name first. */
