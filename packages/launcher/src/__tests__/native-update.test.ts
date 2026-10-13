@@ -12,7 +12,7 @@ import { checkNativeUpdate, commitNativeUpdate, stageNativeUpdate } from "../nat
 import { earlierFailure, earlierFailureNote, keepLauncherCurrent, refreshInstalledLauncher, runNativeUpdate, selfUpdateNote, type NativeUpdateTransactionDeps } from "../native/update-transaction.js";
 import { createOutput } from "../output.js";
 import { activateServiceExecutable } from "../native/service-executable.js";
-import { nativeServiceDefinition, startNativeServiceDefinition, type NativeServiceCommand } from "../native/service.js";
+import { nativePlatform, nativeServiceDefinition, startNativeServiceDefinition, type NativeServiceCommand } from "../native/service.js";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
 
 function requestUrl(input: Parameters<typeof fetch>[0]): string {
@@ -271,8 +271,10 @@ describe("the one executable path the service runs", () => {
     expect(await activateServiceExecutable({ root: f.root, platform: f.platform, releaseId: successor.releaseId, release: after.release })).toBe(true);
     expect(await readFile(stable(f.root))).toEqual(Buffer.from("test-native-executable-not-run-1.1.0"));
     // The service definition names the same path on both releases.
-    const definition = (root: string) => nativeServiceDefinition({ os: "macos", home: tmpdir(), root, executable: stable(root), uid: 501 });
-    expect(definition(f.root).contents).toContain(`<string>${stable(f.root)}</string>`);
+    // The service definition is always rendered for the host it runs on, and names the same path on both releases.
+    const host = nativePlatform().os;
+    const definition = nativeServiceDefinition({ os: host, home: tmpdir(), root: f.root, executable: stable(f.root), uid: 501, userId: "S-1-5-21-1-2-3-1001" });
+    expect(definition.contents).toContain(host === "windows" ? JSON.stringify(stable(f.root)).slice(1, -1) : stable(f.root));
 
     await restoreNativeRecord(f.root, successor.releaseId, f.installed, { roots: f.trust, platform: f.platform });
     const restored = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
