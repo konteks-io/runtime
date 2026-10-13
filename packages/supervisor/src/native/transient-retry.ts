@@ -45,3 +45,19 @@ export function logNativeRetryExhausted(options: {
     maxRetries: NATIVE_TRANSIENT_MAX_ATTEMPTS - 1, classification: options.classification,
     ...(options.status === undefined ? {} : { status: options.status }) }, "transient native transport request retry exhausted");
 }
+
+/**
+ * Backoff between whole deferrals of a native step whose quick in-request
+ * retries were spent on a transient failure: 2 s doubling to a 5 min ceiling,
+ * with ±25% jitter, and no limit on how many (owner 09-24: a transient error
+ * resumes on its own). The holder's Stop or a lost claim ends the wait.
+ */
+export const NATIVE_DEFERRAL_BASE_DELAY_MS = 2_000;
+export const NATIVE_DEFERRAL_MAX_DELAY_MS = 300_000;
+
+export function nativeDeferralDelayMs(deferral: number, random: () => number = Math.random): number {
+  const exponent = Math.min(30, Math.max(0, Math.floor(deferral) - 1));
+  const exponentialDelayMs = Math.min(NATIVE_DEFERRAL_MAX_DELAY_MS, NATIVE_DEFERRAL_BASE_DELAY_MS * 2 ** exponent);
+  const jitterFactor = 0.75 + Math.min(1, Math.max(0, random())) * 0.5;
+  return Math.max(1, Math.floor(exponentialDelayMs * jitterFactor));
+}

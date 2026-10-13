@@ -44,6 +44,7 @@ import type { TransportManager } from "../transport/relay-transport.js";
 import { RecoveryAuthority } from "../transport/recovery-authority.js";
 import type { RunnerPort } from "../runner-port.js";
 import { RelayedSession, type RelayedSessionDeps, type SessionClosedReason } from "../session/relayed-session.js";
+import { transientInputFailure } from "../native/input-client.js";
 import type { PendingHumanRequest } from "../session/permissions.js";
 import { intersectEvidencePolicy } from "./evidence.js";
 import { ReportSender } from "./report-sender.js";
@@ -2569,10 +2570,12 @@ function sameDispatchOwner(current: JournalEntry | undefined, entry: JournalEntr
 }
 
 /** An ownership refusal interrupts the attempt; anything else is a failed dispatch (agent sign-in named as such). */
-function dispatchFailureOutcome(error: unknown): { class: "interrupted"; reason: "agent_session_lost" | "not_resumable" } | { class: "failed"; reason: "agent_auth_required" | "internal" } {
+function dispatchFailureOutcome(error: unknown): { class: "interrupted"; reason: "agent_session_lost" | "not_resumable" | "lease_lost" } | { class: "failed"; reason: "agent_auth_required" | "internal" } {
   if (error instanceof RemoteInstanceError && error.code === "recovery_required") {
     return { class: "interrupted", reason: error.diagnostic === "agent_session_lost" ? "agent_session_lost" : "not_resumable" };
   }
+  // A transient Core failure is never the agent's: Core issues a successor (D132).
+  if (transientInputFailure(error)) return { class: "interrupted", reason: "lease_lost" };
   return { class: "failed", reason: error instanceof RemoteInstanceError && error.code === "agent_auth_required" ? "agent_auth_required" : "internal" };
 }
 

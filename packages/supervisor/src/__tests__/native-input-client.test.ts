@@ -9,7 +9,7 @@ import {
   remoteControlSigningBytes,
   type RemoteWorkAssignment,
 } from "@konteks/remote-common";
-import { NativeInputClient } from "../native/input-client.js";
+import { NativeInputClient, transientInputFailure } from "../native/input-client.js";
 // Cross-repository interoperability proof: the actual Core producer beside the
 // actual connector consumer. It runs only next to a Core checkout; the public
 // repository ships without one, so the proof is skipped there, never faked.
@@ -269,7 +269,8 @@ describe("native claim-scoped input client", () => {
         .prepare(assignment, "claim")
         .catch((error) => error);
       await vi.advanceTimersByTimeAsync(401_000);
-      expect((await outcome).code).toBe("capability_unavailable");
+      // A deadline is transient: it stays retryable for the session to resume (D132).
+      expect(await outcome).toMatchObject({ code: "temporarily_unavailable", retryable: true, diagnostic: "request_deadline" });
       // The first outer attempt safely reauthorizes once after the lease
       // rotates, followed by the remaining three transient retries.
       expect(f.fetchFn).toHaveBeenCalledTimes(5);
@@ -371,7 +372,7 @@ describe("native claim-scoped input client", () => {
         .prepare(assignment, "claim")
         .catch((error) => error);
       await vi.advanceTimersByTimeAsync(401_000);
-      expect((await outcome).code).toBe("capability_unavailable");
+      expect(await outcome).toMatchObject({ code: "temporarily_unavailable", retryable: true, diagnostic: "request_deadline" });
       expect(cancel).toHaveBeenCalledTimes(4);
       expect(vi.getTimerCount()).toBe(0);
     } finally {
@@ -570,6 +571,34 @@ describe("native claim-scoped input client", () => {
       expect(result.cause).toBeUndefined();
     },
   );
+  it.each([502, 503, 504, 429])("keeps a %i at input preparation retryable once its quick retries are spent (D132)", async (status) => {
+    const f = fixture();
+    const delays: number[] = [];
+    f.fetchFn.mockImplementation(async () => new Response("upstream body", { status }));
+    const error = await new NativeInputClient({ ...f.options, retrySleep: async (ms) => void delays.push(ms) })
+      .prepare(assignment, "claim").catch((caught) => caught);
+    expect(error).toMatchObject({ code: "temporarily_unavailable", retryable: true, diagnostic: `response_transient_${status}` });
+    expect(transientInputFailure(error)).toEqual({ classification: status === 429 ? "rate_limited" : "upstream",
+      status, diagnostic: `response_transient_${status}` });
+    expect(f.fetchFn).toHaveBeenCalledTimes(4);
+    expect(delays).toHaveLength(3);
+    expect(String(error)).not.toContain("upstream body");
+  });
+  it("keeps a lost connection at input preparation retryable", async () => {
+    const f = fixture();
+    f.fetchFn.mockRejectedValue(new Error("socket hang up"));
+    const error = await new NativeInputClient(f.options).prepare(assignment, "claim").catch((caught) => caught);
+    expect(transientInputFailure(error)).toEqual({ classification: "transport", diagnostic: "request_transport" });
+  });
+  it.each([400, 403, 404, 409])("ends a permanent %i refusal at once, as terminal", async (status) => {
+    const f = fixture();
+    f.fetchFn.mockImplementation(async () => new Response(null, { status }));
+    const error = await new NativeInputClient({ ...f.options, renewalWaitMs: 1 }).prepare(assignment, "claim").catch((caught) => caught);
+    expect(error).toMatchObject({ code: "capability_unavailable", retryable: false });
+    expect(transientInputFailure(error)).toBeNull();
+    // 401/403 may reauthorize once with a renewed lease; nothing retries a refusal.
+    expect(f.fetchFn).toHaveBeenCalledTimes(1);
+  });
   it("does not permit concurrent input requests on one preparer", async () => {
     const f = fixture();
     let respond!: (value: Response) => void;

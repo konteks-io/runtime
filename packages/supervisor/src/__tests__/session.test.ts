@@ -1244,6 +1244,76 @@ describe("relayed session", () => {
     await expect(other.session.bootstrap()).rejects.toMatchObject({ code: "capability_unavailable", message: "Required local session inputs are unavailable." });
   });
 
+  const transient503 = () => new RemoteInstanceError("temporarily_unavailable", "Required assignment inputs are temporarily unavailable.",
+    { retryable: true, diagnostic: "response_transient_503" });
+  const preparedInputs = () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 },
+    cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined });
+  const quietLogger = (warn = vi.fn(), info = vi.fn()) =>
+    ({ warn, info, error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn() }) as never;
+
+  it("resumes input preparation after a transient 503 with growing delays, then starts the agent (D132)", async () => {
+    const warn = vi.fn(), info = vi.fn();
+    let recover!: (value: ReturnType<typeof preparedInputs>) => void;
+    const prepareInputs = vi.fn()
+      .mockRejectedValueOnce(transient503()).mockRejectedValueOnce(transient503()).mockRejectedValueOnce(transient503())
+      .mockImplementationOnce(() => new Promise(resolve => { recover = resolve; }));
+    const { session, runner } = await build({ prepareInputs, inputDeferralRandom: () => 0.5, logger: quietLogger(warn, info),
+      redeemCapabilityToken: async () => ({ mcpServer: { name: "konteks", url: "https://mcp.example", headers: [{ name: "authorization", value: "Bearer cap-token" }] },
+        expiresAt: "2026-09-07T00:00:00Z" }),
+      reserveChannel: () => () => undefined, activateExecution: async () => ({}) });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let booting!: Promise<unknown>;
+    try {
+      booting = session.bootstrap();
+      void booting.catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(prepareInputs).toHaveBeenCalledTimes(1);
+      for (const [delayMs, calls] of [[2_000, 2], [4_000, 3], [8_000, 4]] as const) {
+        await vi.advanceTimersByTimeAsync(delayMs - 1);
+        expect(prepareInputs).toHaveBeenCalledTimes(calls - 1);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(prepareInputs).toHaveBeenCalledTimes(calls);
+      }
+    } finally { vi.useRealTimers(); }
+    recover(preparedInputs());
+    await expect(booting).resolves.toMatchObject({ acpSessionRef: "acp-1" });
+    expect(runner.createSession).toHaveBeenCalledOnce();
+    const deferrals = warn.mock.calls.filter(([fields]) => fields.event === "native.inputs.prepare_deferred").map(([fields]) => fields);
+    expect(deferrals).toEqual([1, 2, 3].map((preparationAttempt, index) => ({ event: "native.inputs.prepare_deferred", assignmentId: "asg",
+      attempt: 1, preparationAttempt, delayMs: 2_000 * 2 ** index, classification: "upstream", diagnostic: "response_transient_503", status: 503 })));
+    // Every failed try stays retryable; none ends as capability_unavailable.
+    const stageFailures = warn.mock.calls.filter(([, message]) => message === "native session bootstrap stage failed").map(([fields]) => fields);
+    expect(stageFailures).toHaveLength(3);
+    for (const fields of stageFailures) expect(fields).toMatchObject({ stage: "input_preparation", code: "temporarily_unavailable", retryable: true });
+    expect(info).toHaveBeenCalledWith(expect.objectContaining({ event: "native.inputs.prepare_resumed", preparationAttempt: 4 }), expect.any(String));
+  });
+
+  it("keeps a permanent input refusal terminal without waiting (D132)", async () => {
+    const warn = vi.fn();
+    const prepareInputs = vi.fn(async () => {
+      throw new RemoteInstanceError("capability_unavailable", "refused", { diagnostic: "response_status_invalid" });
+    });
+    const { session } = await build({ prepareInputs, logger: quietLogger(warn) });
+    await expect(session.bootstrap()).rejects.toMatchObject({ code: "capability_unavailable", retryable: false });
+    expect(prepareInputs).toHaveBeenCalledOnce();
+    expect(warn.mock.calls.some(([fields]) => fields.event === "native.inputs.prepare_deferred")).toBe(false);
+  });
+
+  it("ends a transient input wait at once when the session closes, and keeps it retryable (D132)", async () => {
+    const prepareInputs = vi.fn(async () => { throw transient503(); });
+    const { session } = await build({ prepareInputs, inputDeferralRandom: () => 0.5, logger: quietLogger() });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const booting = session.bootstrap().catch(error => error);
+      await vi.advanceTimersByTimeAsync(2_000 + 4_000);
+      expect(prepareInputs).toHaveBeenCalledTimes(3);
+      void session.close("cancelled").catch(() => undefined);
+      expect(await booting).toMatchObject({ code: "temporarily_unavailable", retryable: true });
+      await vi.advanceTimersByTimeAsync(600_000);
+      expect(prepareInputs).toHaveBeenCalledTimes(3);
+    } finally { vi.useRealTimers(); }
+  });
+
   it("finishes fallible cloud preparation before activating local execution ownership", async () => {
     const order: string[] = [];
     const activateExecution = vi.fn(async () => {

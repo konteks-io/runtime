@@ -27,7 +27,7 @@ import {
   type PreparedSessionInputs,
 } from "../skills/session-inputs.js";
 import { continuedSession, isDirectAssignment } from "../work/continued-session.js";
-import type { NativeInputClient } from "./input-client.js";
+import { transientInputFailure, type NativeInputClient } from "./input-client.js";
 import type { NativeOutputClient } from "./output-client.js";
 import { captureNativeDeliveryOutput } from "./output-capture.js";
 import { NativeOutputSessionHeadStore, type NativeOutputRecord, type NativeOutputStore } from "./output-store.js";
@@ -562,9 +562,10 @@ function skillInstructions(assignment: RemoteWorkAssignment, repository: unknown
     .join("\n");
 }
 
-function failureFields(error: unknown, fallback: string): { code: string; diagnostic?: string } {
+function failureFields(error: unknown, fallback: string): { code: string; retryable: boolean; diagnostic?: string } {
   return {
     code: error instanceof RemoteInstanceError ? error.code : fallback,
+    retryable: transientInputFailure(error) !== null,
     ...(error instanceof RemoteInstanceError && error.diagnostic ? { diagnostic: error.diagnostic } : {}),
   };
 }
@@ -815,7 +816,9 @@ export function createNativeInputPreparer(
         return await preparation.prepare();
       } catch (error) {
         preparation.logFailure(error);
-        throw isGitXcodeLicenseError(error) ? error : unavailable();
+        // A transient upstream failure stays retryable for the session to
+        // resume (D132); anything else is withheld behind one refusal.
+        throw isGitXcodeLicenseError(error) || transientInputFailure(error) ? error : unavailable();
       } finally {
         busy.delete(key);
       }
