@@ -14,9 +14,13 @@ export interface NativeUpdateDeps {
   platform?: NativePlatform;
   manifest?: unknown;
   fetchFn?: typeof fetch;
+  /** First wait before a failed artifact download is tried again. */
+  retryDelayMs?: number;
   /** Reads a connector's publisher identity; the OS's own tools by default. */
   codeIdentity?: (file: string, os: NativePlatform["os"]) => Promise<CodeIdentity>;
 }
+
+const retryDelayOf = (deps: NativeUpdateDeps | undefined) => deps?.retryDelayMs === undefined ? {} : { retryDelayMs: deps.retryDelayMs };
 
 type NativeUpdateCheck =
   | { status: "current"; current: NativeRuntimeRecord; bundleVersion: string }
@@ -82,7 +86,7 @@ export async function stageNativeUpdate(options: { root: string; output: Output;
     setupDetail(options.output, "updateStaging", { version: release.manifest.bundleVersion, current: current.bundleVersion });
     const stopProgress = setupProgress(options.output, "phaseDownload");
     try {
-      const staged = await stageNativeRelease({ release, target: { ...platform, agentIds: agents }, releasesDir: join(root, "releases"), fetchFn: options.deps?.fetchFn ?? fetch });
+      const staged = await stageNativeRelease({ release, target: { ...platform, agentIds: agents }, releasesDir: join(root, "releases"), fetchFn: options.deps?.fetchFn ?? fetch, ...retryDelayOf(options.deps) });
     const { releaseId, directory } = await completeStagedRelease({ root, release, platform, agents, artifacts, staged, lock, current, output: options.output, deps });
       setupDetail(options.output, "updateStaged", { version: release.manifest.bundleVersion, release: releaseId });
     return { status: "staged", current, release, releaseId, directory };
