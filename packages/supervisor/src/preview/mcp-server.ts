@@ -29,11 +29,10 @@ export interface SessionPreviewAccess {
   touch(sessionId: string): void;
   /**
    * The session's worktree may be previewed: a viewer opening the preview in
-   * Konteks starts it when nothing runs. Remembered until `forget`.
+   * Konteks starts it when nothing runs. Kept while the worktree exists,
+   * however the session ends (a later bootstrap of the session replaces it).
    */
   permit?(sessionId: string, cwd: string): void;
-  /** The session ended: no viewer starts its preview any more. */
-  forget?(sessionId: string): void;
   /** The loopback origin of the session's preview while it answers (what its browser may reach), else null. */
   origin?(sessionId: string): string | null;
   /** Where Playwright's own Chromium is installed when this computer has no Chrome; absent = no browsers. */

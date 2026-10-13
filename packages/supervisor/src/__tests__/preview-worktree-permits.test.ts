@@ -22,8 +22,21 @@ describe("the worktrees a viewer may preview (09-30)", () => {
     expect(afterRestart.get("delivery-1")).toBe(kept);
     expect(afterRestart.get("delivery-2")).toBeUndefined();
 
-    afterRestart.delete("delivery-1");
-    expect(new PreviewWorktreePermits(file).get("delivery-1")).toBeUndefined();
+  });
+
+  it("moves a session to the worktree its newest bootstrap prepared, and keeps it across a restart (D96)", async () => {
+    const data = await mkdtemp(join(tmpdir(), "permits-")); dirs.push(data);
+    const first = join(data, "worktree-cycle-1"); await mkdir(first);
+    const second = join(data, "worktree-cycle-2"); await mkdir(second);
+    const file = join(data, "preview-worktrees.json");
+    const permits = new PreviewWorktreePermits(file);
+    permits.set("qa-session", first);
+    permits.set("qa-session", second);
+    permits.set("generator-session", first);
+
+    const afterRestart = new PreviewWorktreePermits(file);
+    expect(afterRestart.get("qa-session")).toBe(second);
+    expect(afterRestart.get("generator-session")).toBe(first);
   });
 
   it("starts empty when nothing was kept", async () => {

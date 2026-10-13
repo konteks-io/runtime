@@ -2094,11 +2094,17 @@ export class RelayedSession {
       outputDir ? rm(outputDir, { recursive: true, force: true }).catch(() => undefined) : undefined]);
   }
 
-  /** The session's preview goes with the session (not with a completed turn). */
+  /**
+   * The session's dev server goes with the session (not with a completed
+   * turn). Its worktree stays openable by a viewer while it exists: a
+   * delivery's QA that failed, a drain for an update or a cancelled turn
+   * keeps the changes on disk, and the person must still be able to try
+   * them (D96: forgetting it here left a ticket's preview on "Nothing to
+   * preview yet" for good).
+   */
   private async stopPreview(reason: string): Promise<void> {
     const sessionId = this.previewSessionId;
     if (sessionId === null || !this.deps.preview) return;
-    this.deps.preview.forget?.(sessionId);
     await this.deps.preview.stop(sessionId, reason);
   }
 
