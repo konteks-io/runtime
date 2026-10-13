@@ -268,7 +268,7 @@ describe("relayed session", () => {
   describe("preview tools (native preview)", () => {
     function previewAccess() {
       const status = (sessionId: string, state: "running" | "stopped"): PreviewStatus => ({ sessionId, state, phase: null, url: null, port: null, command: null, install: null, prepare: null, source: null, explanation: null, notes: [], message: state, startedAt: null, readyAt: null, idleStopMinutes: 30, logTail: [], startedBy: null });
-      return { start: vi.fn(async (sessionId: string) => status(sessionId, "running")), stop: vi.fn(async (sessionId: string) => status(sessionId, "stopped")), status: vi.fn((sessionId: string) => status(sessionId, "running")), touch: vi.fn(), permit: vi.fn() };
+      return { start: vi.fn(async (sessionId: string) => status(sessionId, "running")), stop: vi.fn(async (sessionId: string) => status(sessionId, "stopped")), status: vi.fn((sessionId: string) => status(sessionId, "running")), touch: vi.fn(), touchByAgent: vi.fn(), permit: vi.fn() };
     }
 
     it("mounts the session's preview tools beside the platform facade, bound to its session and worktree", async () => {
@@ -283,8 +283,15 @@ describe("relayed session", () => {
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "preview_start", arguments: {} } }) })).json();
       expect(answer).toMatchObject({ result: { structuredContent: { sessionId: "s", state: "running" } } });
       expect(preview.start).toHaveBeenCalledWith("s", "/private/native/checkout");
+      // The agent reading its preview is the agent using it.
+      await (await fetch(tools.url, { method: "POST", headers: { authorization: tools.headers[0]!.value, "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "preview_status", arguments: {} } }) })).json();
+      expect(preview.touchByAgent).toHaveBeenCalledWith("s");
+      expect(preview.touch).not.toHaveBeenCalled();
+      // A working session only keeps its preview from idling.
       await f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hi" } } } });
       expect(preview.touch).toHaveBeenCalledWith("s");
+      expect(preview.touchByAgent).toHaveBeenCalledOnce();
       await f.session.close("cancelled");
       expect(preview.stop).toHaveBeenCalledWith("s", "cancelled");
       await expect(fetch(tools.url, { method: "POST", headers: { authorization: tools.headers[0]!.value }, body: "{}" })).rejects.toThrow();
@@ -327,7 +334,7 @@ describe("relayed session", () => {
   describe("QA browser (a connector capability: every agent)", () => {
     function access(origin: () => string | null) {
       const status = (sessionId: string) => ({ sessionId, state: "running" as const, phase: null, url: null, port: null, command: null, install: null, prepare: null, source: null, explanation: null, notes: [], message: "running", startedAt: null, readyAt: null, idleStopMinutes: 30, logTail: [], startedBy: null });
-      return { start: vi.fn(async (sessionId: string) => status(sessionId)), stop: vi.fn(async (sessionId: string) => status(sessionId)), status: vi.fn(status), touch: vi.fn(), permit: vi.fn(),
+      return { start: vi.fn(async (sessionId: string) => status(sessionId)), stop: vi.fn(async (sessionId: string) => status(sessionId)), status: vi.fn(status), touch: vi.fn(), touchByAgent: vi.fn(), permit: vi.fn(),
         origin: vi.fn((_sessionId: string) => origin()), browsersPath: "/private/native/browsers" };
     }
     const viaProxy = (proxyUrl: string, url: string) => new Promise<{ status: number; body: string }>((resolve, reject) => {
@@ -354,7 +361,8 @@ describe("relayed session", () => {
       expect(input.browser).toMatchObject({ proxyUrl: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+$/), browsersPath: "/private/native/browsers" });
       expect(existsSync(input.browser!.outputDir)).toBe(true);
       await expect(viaProxy(input.browser!.proxyUrl, `${origin}/`)).resolves.toEqual({ status: 200, body: "the preview" });
-      expect(preview.touch).toHaveBeenCalledWith("s");
+      // The agent's browser on its preview is the agent using it.
+      expect(preview.touchByAgent).toHaveBeenCalledWith("s");
       expect((await viaProxy(input.browser!.proxyUrl, "http://127.0.0.1:1/")).status).toBe(403);
       await f.session.close("cancelled");
       await expect(viaProxy(input.browser!.proxyUrl, `${origin}/`)).rejects.toThrow();
@@ -609,7 +617,7 @@ describe("relayed session", () => {
 
     it("gives the agent nothing of Konteks: no platform tools even when named, no result tool, no preview; it continues its own transcript", async () => {
       const redeemCapabilityToken = vi.fn(async () => { throw new Error("a direct session never redeems platform tools"); });
-      const preview = { start: vi.fn(), stop: vi.fn(), status: vi.fn(), touch: vi.fn(), permit: vi.fn() };
+      const preview = { start: vi.fn(), stop: vi.fn(), status: vi.fn(), touch: vi.fn(), touchByAgent: vi.fn(), permit: vi.fn() };
       const f = await build({ redeemCapabilityToken, preview: preview as never, activateExecution: async () => ({ restoreReference: "acp-0" }) }, directWork);
       try {
         await f.session.bootstrap();
@@ -1144,7 +1152,7 @@ describe("relayed session", () => {
       await new Promise<void>(resolve => upstream.listen(0, "127.0.0.1", resolve));
       const origin = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
       const status = (sessionId: string) => ({ sessionId, state: "running" as const, phase: null, url: null, port: null, command: null, install: null, prepare: null, source: null, explanation: null, notes: [], message: "running", startedAt: null, readyAt: null, idleStopMinutes: 30, logTail: [], startedBy: null });
-      const preview = { start: vi.fn(async (sessionId: string) => status(sessionId)), stop: vi.fn(async (sessionId: string) => status(sessionId)), status: vi.fn(status), touch: vi.fn(), permit: vi.fn(),
+      const preview = { start: vi.fn(async (sessionId: string) => status(sessionId)), stop: vi.fn(async (sessionId: string) => status(sessionId)), status: vi.fn(status), touch: vi.fn(), touchByAgent: vi.fn(), permit: vi.fn(),
         origin: vi.fn((_sessionId: string) => origin), browsersPath: "/private/native/browsers" };
       const f = await build({ preview,
         policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true) }, { ...agyWork, kind: "qa", agentRoute: { requiredRole: "qa", agentId: "antigravity" } } as RemoteWorkAssignment);

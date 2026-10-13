@@ -205,6 +205,8 @@ export {
   // asks Core for it.
   REMOTE_CORE_CONTRACT_CAPABILITY,
   coreContractAtLeast,
+  // The first contract whose Core reads a heartbeat's `previews`.
+  REMOTE_PREVIEW_ACTIVITY_MIN_CORE_CONTRACT_VERSION,
   RemoteExecutionRevisionControlIntentSchema,
   computeExecutionRevisionControlIntentDigest,
   RemoteExecutionRevisionControlDeliveryRequestSchema,

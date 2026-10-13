@@ -190,16 +190,55 @@ describe("supervised preview process manager", () => {
     expect(f.children).toHaveLength(1);
   });
 
-  it("records who started a preview: the agent by default, a viewer when one opened it, and keeps it on reuse", async () => {
+  it("records who started a preview: the agent by default, a viewer when one opened it, and the agent once it starts a viewer's", async () => {
     const f = manager();
     expect(f.instance.status("s1").startedBy).toBeNull();
     expect(await f.instance.start("s1", "/work/s1", "viewer")).toMatchObject({ state: "starting", startedBy: "viewer" });
     f.setUp(true);
     await f.instance.waitForSettled("s1", 2_000);
-    // The agent's preview_start reuses the running preview; who started it does not change.
-    expect(await f.instance.start("s1", "/work/s1")).toMatchObject({ state: "running", startedBy: "viewer" });
-    expect(f.instance.list()[0]).toMatchObject({ sessionId: "s1", startedBy: "viewer" });
+    // A viewer opening it again reuses it as it is.
+    expect(await f.instance.start("s1", "/work/s1", "viewer")).toMatchObject({ state: "running", startedBy: "viewer" });
+    // The agent's preview_start reuses the running preview and makes it the agent's, never back.
+    expect(await f.instance.start("s1", "/work/s1")).toMatchObject({ state: "running", startedBy: "agent" });
+    expect(await f.instance.start("s1", "/work/s1", "viewer")).toMatchObject({ state: "running", startedBy: "agent" });
+    expect(f.instance.list()[0]).toMatchObject({ sessionId: "s1", startedBy: "agent" });
+    expect(f.children).toHaveLength(1);
     expect(await f.instance.start("s2", "/work/s2")).toMatchObject({ startedBy: "agent" });
+  });
+
+  it("reports the previews the agent started and used within the window, never moved by viewer traffic", async () => {
+    const f = manager();
+    const window = 3 * 60_000;
+    const iso = (at: number) => new Date(at).toISOString();
+    f.setUp(true);
+    const agentStart = 1_000_000;
+    await f.instance.start("agent", "/work/agent");
+    await f.instance.start("viewer", "/work/viewer", "viewer");
+    await f.instance.waitForSettled("agent", 2_000);
+    await f.instance.waitForSettled("viewer", 2_000);
+    // Only the agent's preview: a viewer's is not the agent at work.
+    expect(f.instance.agentActive(window)).toEqual([{ sessionId: "agent", startedAt: iso(agentStart), agentActiveAt: iso(agentStart) }]);
+    f.advance(2 * 60_000);
+    // Viewer traffic keeps a preview from idling but is not the agent using it.
+    f.instance.touch("agent");
+    f.advance(2 * 60_000);
+    expect(f.instance.agentActive(window)).toEqual([]);
+    expect(f.instance.status("agent").state).toBe("running");
+    // The agent's own preview tool or browser brings it back into the window.
+    f.instance.touchByAgent("agent");
+    expect(f.instance.agentActive(window)).toEqual([{ sessionId: "agent", startedAt: iso(agentStart), agentActiveAt: iso(agentStart + 4 * 60_000) }]);
+    // The agent starting the viewer's preview makes it the agent's from then on.
+    f.instance.touchByAgent("viewer");
+    expect(f.instance.agentActive(window).map(preview => preview.sessionId)).toEqual(["agent"]);
+    await f.instance.start("viewer", "/work/viewer");
+    expect(f.instance.agentActive(window)).toEqual([
+      { sessionId: "agent", startedAt: iso(agentStart), agentActiveAt: iso(agentStart + 4 * 60_000) },
+      { sessionId: "viewer", startedAt: iso(agentStart), agentActiveAt: iso(agentStart + 4 * 60_000) },
+    ]);
+    // A stopped preview is not at work.
+    await f.instance.stop("agent", "agent");
+    expect(f.instance.agentActive(window).map(preview => preview.sessionId)).toEqual(["viewer"]);
+    f.instance.touchByAgent("missing");
   });
 
   it("runs install before the server, and reports a failing step with its log", async () => {
