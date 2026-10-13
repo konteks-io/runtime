@@ -2,9 +2,9 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { mkdir, open, readFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { z } from "zod";
-import { EMBEDDED_RELEASE_ROOTS, findAgentBridge, resolveNativeConnectorExecutable, type EmbeddedReleaseRoot } from "@konteks/remote-release";
+import { EMBEDDED_RELEASE_ROOTS, findAgentBridge, nativeServiceExecutable, verifyNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 import { createNativeService, hostAgentInstallAdapter, loadNativeInstallation, ownedByAnotherConnector, readNativeUpdateLedger, verifyInstalledNativeConnector, NATIVE_SHUTDOWN_RECEIPT_FILE, type HostAgentInstallAdapter, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { ReleaseAcceptedSchema, RemoteInstanceError, SupervisorStatusSchema, runCommand, sanitizeInheritedChildProcessEnv, writeSecretFile } from "@konteks/remote-common";
 import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyList, gitKeyRemove, previewStatus, status, supportBundle, type ControlContext } from "./control-commands.js";
@@ -16,7 +16,7 @@ import { confirm } from "../prompt.js";
 import { spawnEnrollmentStaging } from "./enrollment-staging.js";
 import { onboardCoreUrl, onboardFailureStep, runOnboard } from "./onboard.js";
 import { runnableStep, type OnboardStep } from "./onboard-session.js";
-import { describeServiceFailure, encodeServiceDefinition, nativePlatform, nativeServiceDefinition, NativeServiceCommandError, parseLoadedService, parseServiceExits, serviceRun, startNativeServiceDefinition, type HostOs, type NativeServiceCommand, type NativeServiceDefinition, type NativeServiceExecute, type NativeServiceRun } from "./service.js";
+import { describeServiceFailure, encodeServiceDefinition, nativePlatform, nativeServiceDefinition, NativeServiceCommandError, parseLoadedService, parseServiceExits, parseWindowsUserSid, serviceRun, startNativeServiceDefinition, type HostOs, type NativeServiceCommand, type NativeServiceDefinition, type NativeServiceExecute, type NativeServiceRun, windowsUserSidCommand } from "./service.js";
 import { outputLocale,
   setupDetail,
   setupError, setupFailureText, setupLine, setupLocale, setupText, setupWords,
@@ -31,6 +31,7 @@ import { earlierFailure, earlierFailureNote, keepLauncherCurrent, productionUpda
 import { productionUninstallDeps, uninstallNative } from "./uninstall.js";
 import type { NativeCliActions, NativeCommandContext } from "./cli.js";
 import { captureWindowsServiceOwner, stopWindowsBackgroundHost, waitForWindowsServiceExit, type NativeServiceProcessOwner } from "./windows-service-owner.js";
+import { activateServiceExecutable } from "./service-executable.js";
 
 const environment = () => sanitizeInheritedChildProcessEnv({ env: process.env });
 /** Runs one service or OS command and keeps how it ended; `--verbose` prints it. */
@@ -59,15 +60,44 @@ async function serviceExits(definition: NativeServiceDefinition) {
 }
 async function serviceDefinition(root: string) {
   const platform = nativePlatform();
-  const record = await readNativeRecord(root);
+  // Only an installed root has a service.
+  await readNativeRecord(root);
   let userId: string | undefined;
   if (platform.os === "windows") {
-    const result = await runServiceCommand({ command: "whoami.exe", args: ["/user", "/fo", "csv", "/nh"] }, 10_000);
-    userId = result.code === 0 ? result.stdout?.match(/S-1-\d+(?:-\d+)+/)?.[0] : undefined;
+    const command = windowsUserSidCommand();
+    const result = await runServiceCommand(command, 10_000);
+    userId = result.code === 0 ? parseWindowsUserSid(result.stdout) : undefined;
+    if (!userId) throw new NativeServiceCommandError("register", command, result);
   }
-  // `konteks-connector`, or `connector` in a release from before the rename (a rollback may return to one).
-  const executable = await resolveNativeConnectorExecutable(join(root, "releases", record.releaseId), platform.os);
-  return nativeServiceDefinition({ os: platform.os, home: homedir(), root, executable, uid: process.getuid?.(), ...(userId ? { userId } : {}) });
+  // One path on every release: `start` and `serve` put the record's connector there.
+  return nativeServiceDefinition({ os: platform.os, home: homedir(), root, executable: nativeServiceExecutable(root, platform.os), uid: process.getuid?.(), ...(userId ? { userId } : {}) });
+}
+
+/** `serve` exits with this when its own executable was just replaced, so the service manager starts the replacement. */
+const SERVICE_EXECUTABLE_REPLACED_EXIT = 75;
+
+/**
+ * Before serving, the service's executable is made the record's connector:
+ * an install from before the stable path gets it here, and a crash between
+ * an update's record move and its start is repaired. True when this very
+ * process ran the replaced bytes, so it must exit and be started again. A
+ * failure is logged and serving goes on: the next `start` activates again.
+ */
+async function runsReplacedServiceExecutable(root: string): Promise<boolean> {
+  const platform = nativePlatform();
+  try {
+    const record = await readNativeRecord(root);
+    const release = verifyNativeRelease(JSON.parse(await readFile(join(root, "releases", record.releaseId, "manifest.json"), "utf8")), EMBEDDED_RELEASE_ROOTS);
+    const replaced = await activateServiceExecutable({ root, platform, releaseId: record.releaseId, release });
+    return replaced && samePath(process.execPath, nativeServiceExecutable(root, platform.os), platform.os);
+  } catch (error) {
+    process.stderr.write(`the background service's connector could not be checked: ${error instanceof Error ? error.message : String(error)}\n`);
+    return false;
+  }
+}
+
+function samePath(a: string, b: string, os: HostOs): boolean {
+  return os === "windows" ? resolve(a).toLowerCase() === resolve(b).toLowerCase() : resolve(a) === resolve(b);
 }
 
 /** A reload for the same definition within this window means it did not take; say so instead of restarting again. */
@@ -628,6 +658,7 @@ export async function startNativeConnector(
     return;
   }
   await moveOffOccupiedPort(input, { roots, platform }, serviceState);
+  await activateServiceExecutable({ root: input.root, platform, releaseId: installation.record.releaseId, release: installation.release });
   verbose(`registering and starting ${definition.label} from ${definition.path}`);
   const started = await startNativeServiceDefinition(definition, {
     execute: (command) => command === definition.status ? serviceState().then((state) => (state === "running" ? 0 : stoppedCodes[0]!)) : executeService(command),
@@ -1223,6 +1254,10 @@ export const nativeCliActions: NativeCliActions = {
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)), now: Date.now, platform: nativePlatform(),
   }),
   serve: async input => {
+    if (await runsReplacedServiceExecutable(input.root)) {
+      process.stderr.write("the background service's connector was replaced by the installed release; restarting onto it\n");
+      process.exit(SERVICE_EXECUTABLE_REPLACED_EXIT);
+    }
     const own = await keepServiceOnOwnDefinition(input.root, productionOwnServiceDefinitionDeps(input.root))
       .catch(async error => {
         const detail = error instanceof NativeServiceCommandError ? describeServiceFailure(nativePlatform().os, error) : error instanceof Error ? error.message : String(error);

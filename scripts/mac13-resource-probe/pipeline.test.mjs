@@ -115,10 +115,10 @@ test('a failed package preflight retains its evidence without starting another r
   assert.ok(following.includes("steps.mac13-resource-diagnostic-bounds.outputs.ready == 'true'"));
 });
 
-test('the existing seven CI executions and failed shipping gate stay intact', () => {
+test('the CI jobs, the five native coordinates and the failed shipping gate stay intact', () => {
   assert.match(ciNative, /os: \[macos-26, macos-15-intel, ubuntu-24\.04, ubuntu-24\.04-arm, windows-2022\]/);
   const jobs = ci.slice(ci.indexOf('jobs:\n'));
-  assert.deepEqual(Array.from(jobs.matchAll(/^  ([a-z-]+):$/gm), value => value[1]), ['check', 'windows-bootstrap', 'windows-native']);
+  assert.deepEqual(Array.from(jobs.matchAll(/^  ([a-z-]+):$/gm), value => value[1]), ['check', 'windows-bootstrap', 'stable-path', 'windows-native']);
   assert.ok(ciNative.includes('exit "$failed"'));
   assert.equal(ciNative.includes('continue-on-error'), false);
   assert.match(releaseNative, /needs: check\n/);

@@ -14,14 +14,16 @@ and the agent-on-every-OS proof. Most are called from `.github/workflows/`
   `codex-acp-live-user-patch.mjs`, `konteks-session-prefix.mjs`. Applied only by
   `build-offline-agent.mjs`, which writes `konteks/claude-acp-provenance.json`
   and `konteks/codex-acp-provenance.json` into the package.
-- Build: `build-launcher.mjs`, `sign-launcher.mjs`, `build-offline-agent.mjs`,
+- Build: `build-launcher.mjs`, `sign-launcher.mjs` (+ `sign-connector.mjs`,
+  the opt-in per-OS publisher signing), `build-offline-agent.mjs`,
   `build-offline-tool.mjs` (Graft), `offline-agent-files.mjs`.
 - Release: `release-assets.mjs` (`stage`, `collect`, `commands`, `verify`,
   `notes`), `native-artifact-index.mjs`, `assemble-release-manifest.mjs`,
   `launcher-checksums.mjs`, `sign-checksums.mjs`, `bake-bootstrap.mjs`,
   `publish-release.mjs`.
 - CI: `ci-vendored-contracts.mjs`, `check-agpl.mjs`, `check-secret-canary.mjs`.
-- Proof and probes: `agent-os-proof.mjs` (+ `agent-os-proof/` scripted model),
+- Proof and probes: `stable-path-proof.mjs` (one executed path and publisher
+  identity across a real self-update, per OS in CI), `agent-os-proof.mjs` (+ `agent-os-proof/` scripted model),
   `probe-*.mjs`, `codex-acp-terminal-reconciliation.integration.mjs`.
 - Operator helper: `native-control-call.mjs` sends one control-socket request
   to an installed connector (for example `update.status`) and prints the reply.

@@ -1,11 +1,12 @@
 import { startControlSocketServer, type ControlSocketServer } from "@konteks/remote-common";
+import { lstat } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createDaemon, type CreateDaemonOptions, type Daemon, type DaemonStep } from "../daemon.js";
 import { SupervisorStore, type ShutdownProgress } from "../state/store.js";
 import { Supervisor, type SupervisorOptions } from "../supervisor.js";
 import { loadNativeInstallation, type NativeInstallationOptions } from "./installation.js";
-import { fetchNativeReleaseManifest, resolveNativeConnectorExecutable } from "@konteks/remote-release";
+import { fetchNativeReleaseManifest, nativeServiceExecutable, resolveNativeConnectorExecutable } from "@konteks/remote-release";
 import { launchNativeUpdater } from "./update-launch.js";
 import { readNativeUpdateLedger } from "./update-ledger.js";
 import { startConnectorLogKeeper } from "./connector-log.js";
@@ -90,6 +91,18 @@ function updateOptions(options: NativeServiceOptions, executable: string): NonNu
   };
 }
 
+/**
+ * The connector the updater runs as: the service's stable executable, the
+ * only path an installed connector runs from; the serving release's own
+ * (`konteks-connector`, or `connector` from before the rename) where `serve`
+ * could not make the stable copy.
+ */
+async function updaterExecutable(root: string, releaseId: string, os: NativeServiceOptions["platform"]["os"]): Promise<string> {
+  const stable = nativeServiceExecutable(root, os);
+  if (await lstat(stable).then(info => info.isFile(), () => false)) return stable;
+  return resolveNativeConnectorExecutable(join(root, "releases", releaseId), os);
+}
+
 /** Native service composition: local agents plus authenticated control, no domain services. */
 export function createNativeService(options: NativeServiceOptions): Daemon {
   let supervisor: Supervisor | undefined;
@@ -105,8 +118,7 @@ export function createNativeService(options: NativeServiceOptions): Daemon {
     onStart: async () => {
       stopLogKeeper = startConnectorLogKeeper(options.root);
       const installation = await loadNativeInstallation(options.root, options);
-      // The connector of the release now serving: `konteks-connector`, or `connector` in a release from before the rename.
-      const executable = await resolveNativeConnectorExecutable(join(options.root, "releases", installation.record.releaseId), options.platform.os);
+      const executable = await updaterExecutable(options.root, installation.record.releaseId, options.platform.os);
       supervisor = new Supervisor(installation.config, {
         onLivenessLost: () => { void daemon.shutdown("liveness-lost", 1).catch(() => undefined); },
         // Uninstalled: nothing is left for this process to do, and its

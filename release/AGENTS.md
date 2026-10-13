@@ -54,6 +54,16 @@ release carries. Covers `release/`, `packaging/`, `packages/release/` and
     `BROWSER_MCP_PACKAGE` in `packages/release/src/browser.ts`.
   - The Antigravity pin is bundled into the connector executable, so only a
     runtime release changes it; only `darwin-arm64` is pinned so far.
+- **Publisher signing is opt-in per OS** (`scripts/sign-connector.mjs`,
+  called by `sign-launcher.mjs` on the shipped executable in place, before
+  `release-assets.mjs stage`). macOS: `APPLE_DEVELOPER_ID_P12`,
+  `APPLE_DEVELOPER_ID_P12_PASSWORD` (secrets) + `APPLE_TEAM_ID` (variable);
+  notarization `APPLE_NOTARY_KEY_P8`, `APPLE_NOTARY_KEY_ID`,
+  `APPLE_NOTARY_ISSUER_ID`. Windows: `WINDOWS_CODESIGN_PFX`,
+  `WINDOWS_CODESIGN_PASSWORD`. Linux: `LINUX_SIGNING_KEY` (Ed25519 PKCS#8
+  PEM; `build-launcher.mjs` bakes its public key, the `.sig` ships as
+  `konteks-remote-debian-<arch>.sig`). Absent, the release ships unsigned
+  and the job summary says "unsigned (deferred)"; partly set, the job fails.
 - `connector-commands.json` must match the launcher's command table
   (`packages/launcher/src/__tests__/connector-commands.test.ts`);
   `release-assets.mjs commands` writes it and `verify` requires it.
@@ -65,6 +75,11 @@ release carries. Covers `release/`, `packaging/`, `packages/release/` and
   and installation/update outcomes run in PowerShell 5.1 and 7. Every job that
   installs workspace dependencies runs `scripts/ci-vendored-contracts.mjs`
   before `npm ci`.
+- `ci.yaml` `stable-path` (all five coordinates) runs
+  `scripts/stable-path-proof.mjs`: builds N and N+1, installs N, runs its
+  self-update and checks the executed path, the service definition and the
+  publisher identity (signed with the release's secrets on tag builds:
+  `release.yaml` passes `secrets: inherit` to the check).
 - `agent-os-proof.yaml` (manual, or pushes to `chore/quality-assurance`
   touching runtime paths) runs `scripts/agent-os-proof.mjs` per agent and OS.
   An agent is enabled on an OS only when its job there passes.

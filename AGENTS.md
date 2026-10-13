@@ -65,6 +65,18 @@ Node 22 (`.nvmrc`; CI and releases use 22.23.2). From the repo root:
   (`NATIVE_CONNECTOR_FILE`, `packages/release/src/native.ts`). Never hard-code
   it: resolve with `resolveNativeConnectorExecutable` (`packages/launcher/src/native/commands.ts`),
   which also accepts the pre-rename `connector`.
+- **One executed path.** The service, the updater and the Windows command run
+  `nativeServiceExecutable(root, os)` = `<root>/bin/konteks-connector(.exe)`,
+  never a release folder's copy (macOS privacy grants, Windows firewall and
+  folder-access rules, the systemd unit all name it).
+  `activateServiceExecutable` (`packages/launcher/src/native/service-executable.ts`)
+  replaces it from the record's release on `start` and `serve`; release
+  folders are rollback copies only.
+- **Publisher identity.** Staging an update compares `readCodeIdentity`
+  (`packages/release/src/code-identity.ts`) of the installed and staged
+  connector and refuses a different or missing publisher once the installed
+  one is signed. Signing is opt-in per OS in the release
+  (`scripts/sign-connector.mjs`); never make an unsigned release fail.
 - **Native only.** The supervisor accepts only
   `SUPERVISOR_DEPLOYMENT_KIND=native_connector` and runners only
   `agent_local_subscription`. Do not reintroduce Compose, images,

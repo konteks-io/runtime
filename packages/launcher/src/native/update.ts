@@ -1,8 +1,8 @@
-import { mkdir, readFile, rename, rm } from "node:fs/promises";
+import { lstat, mkdir, readFile, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join, parse, resolve } from "node:path";
 import { NATIVE_UPDATE_TARGET_ENV, NativeUpdateTargetSchema, writeSecretFile } from "@konteks/remote-common";
-import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, installOfflineAgentPackage, isHostAgentId, selectNativeArtifacts, stageNativeRelease, verifyNativeRelease, type EmbeddedReleaseRoot, type VerifiedNativeRelease } from "@konteks/remote-release";
+import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, installOfflineAgentPackage, isHostAgentId, nativeServiceExecutable, readCodeIdentity, resolveNativeConnectorExecutable, selectNativeArtifacts, stageNativeRelease, verifyNativeRelease, type CodeIdentity, type EmbeddedReleaseRoot, type VerifiedNativeRelease } from "@konteks/remote-release";
 import { acquireNativeRootLock, compareSemver, loadNativeInstallation, NativeRuntimeRecordSchema, ownedByAnotherConnector, verifyInstalledNativeConnector, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import type { Output } from "../output.js";
 import { setupDetail, setupError, setupLocale, setupProgress } from "../setup-locale.js";
@@ -14,6 +14,8 @@ export interface NativeUpdateDeps {
   platform?: NativePlatform;
   manifest?: unknown;
   fetchFn?: typeof fetch;
+  /** Reads a connector's publisher identity; the OS's own tools by default. */
+  codeIdentity?: (file: string, os: NativePlatform["os"]) => Promise<CodeIdentity>;
 }
 
 type NativeUpdateCheck =
@@ -81,7 +83,7 @@ export async function stageNativeUpdate(options: { root: string; output: Output;
     const stopProgress = setupProgress(options.output, "phaseDownload");
     try {
       const staged = await stageNativeRelease({ release, target: { ...platform, agentIds: agents }, releasesDir: join(root, "releases"), fetchFn: options.deps?.fetchFn ?? fetch });
-    const { releaseId, directory } = await completeStagedRelease({ root, release, platform, agents, artifacts, staged, lock });
+    const { releaseId, directory } = await completeStagedRelease({ root, release, platform, agents, artifacts, staged, lock, current, output: options.output, deps });
       setupDetail(options.output, "updateStaged", { version: release.manifest.bundleVersion, release: releaseId });
     return { status: "staged", current, release, releaseId, directory };
     } finally {
@@ -124,6 +126,7 @@ function assertOfflineArtifacts(artifacts: readonly SelectedArtifact[]): void {
 async function completeStagedRelease(candidate: {
   root: string; release: VerifiedNativeRelease; platform: NativePlatform; agents: readonly string[]; artifacts: readonly SelectedArtifact[];
   staged: Awaited<ReturnType<typeof stageNativeRelease>>; lock: ReturnType<typeof acquireNativeRootLock>;
+  current: NativeRuntimeRecord; output: Output; deps: NativeUpdateDeps | undefined;
 }): Promise<{ releaseId: string; directory: string }> {
   const { staged } = candidate;
   let directory: string | null = null;
@@ -135,6 +138,7 @@ async function completeStagedRelease(candidate: {
     }
     await writeSecretFile(join(staged.directory, "manifest.json"), JSON.stringify(candidate.release.manifest));
     await verifyInstalledNativeConnector(candidate.release, staged.directory, candidate.platform);
+    await admitConnectorIdentity(candidate, staged.connector);
     const releaseId = `release-${basename(staged.directory).replace(/^\.candidate-/, "")}`;
     directory = join(candidate.root, "releases", releaseId);
     candidate.lock.assertOwned();
@@ -144,6 +148,32 @@ async function completeStagedRelease(candidate: {
     await rm(directory ?? staged.directory, { recursive: true, force: true });
     throw error;
   }
+}
+
+/**
+ * The staged connector must carry the publisher identity of the one the
+ * service runs now (`readCodeIdentity`), so the OS keeps treating every
+ * update as the same program. Enforced once the installed connector is
+ * publisher-signed; an unsigned one (signing not set up yet) accepts the
+ * update and says so. The bytes are trusted either way through the signed
+ * manifest's digest.
+ */
+async function admitConnectorIdentity(candidate: { root: string; platform: NativePlatform; current: NativeRuntimeRecord; output: Output; deps: NativeUpdateDeps | undefined }, connector: string): Promise<void> {
+  const { os } = candidate.platform;
+  const identity = candidate.deps?.codeIdentity ?? readCodeIdentity;
+  const unsigned = (): CodeIdentity => ({ signed: false });
+  const installed = await identity(await installedConnector(candidate.root, os, candidate.current.releaseId), os).catch(unsigned);
+  if (!installed.signed) return setupDetail(candidate.output, "updateIdentityUnsigned");
+  const offered = await identity(connector, os).catch(unsigned);
+  if (!offered.signed || offered.publisher !== installed.publisher) throw setupError("bundle_untrusted", "updateIdentityChanged");
+  setupDetail(candidate.output, "updateIdentitySame");
+}
+
+/** The connector the service runs: its stable copy, or the release's own where none was made yet. */
+async function installedConnector(root: string, os: NativePlatform["os"], releaseId: string): Promise<string> {
+  const stable = nativeServiceExecutable(root, os);
+  if (await lstat(stable).then(info => info.isFile(), () => false)) return stable;
+  return resolveNativeConnectorExecutable(join(root, "releases", releaseId), os);
 }
 
 /**

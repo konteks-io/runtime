@@ -1,4 +1,5 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { canonicalize, withoutMembers, type JsonValue } from "./jcs.js";
 
 export function sha256Base64Url(bytes: Uint8Array | string): string {
@@ -7,6 +8,14 @@ export function sha256Base64Url(bytes: Uint8Array | string): string {
 
 export function sha256Hex(bytes: Uint8Array | string): string {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+/** A file's `sha256:<hex>` digest, read as a stream so a connector executable is never held in memory. */
+export function fileSha256(path: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = createHash("sha256");
+    createReadStream(path).on("data", chunk => hash.update(chunk)).once("error", reject).once("end", () => resolve(`sha256:${hash.digest("hex")}`));
+  });
 }
 
 /** `base64url(SHA-256(JCS(value)))` — the contract's digest for any JSON body. */

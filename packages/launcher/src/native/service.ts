@@ -315,6 +315,20 @@ function systemdUserDefinition({ input, path, label, args }: ServiceDefinitionIn
   };
 }
 
+/**
+ * Asks Windows itself who the current user is. The absolute path matters:
+ * Git for Windows puts its own Unix `whoami` (which knows no `/user`) ahead of
+ * System32 on many PATHs, and then no SID was found and `start` refused.
+ */
+export function windowsUserSidCommand(env: NodeJS.ProcessEnv = process.env): NativeServiceCommand {
+  return { command: win32.join(env.SystemRoot ?? env.SYSTEMROOT ?? "C:\\Windows", "System32", "whoami.exe"), args: ["/user", "/fo", "csv", "/nh"] };
+}
+
+/** The SID in `whoami /user /fo csv /nh` output (`"host\\name","S-1-5-21-…"`), or undefined. */
+export function parseWindowsUserSid(stdout: string | undefined): string | undefined {
+  return stdout?.match(/S-1-\d+(?:-\d+)+/)?.[0];
+}
+
 function windowsLoginDefinition({ input, normalizedRoot, label }: ServiceDefinitionInput): NativeServiceDefinition {
   if (!input.userId || !/^S-1-\d+(?:-\d+)+$/.test(input.userId)) throw new Error("the current Windows user SID is required");
   return windowsBackgroundDefinition({ home: input.home, root: normalizedRoot, executable: input.executable, label, userId: input.userId });

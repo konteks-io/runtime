@@ -1,6 +1,6 @@
 import { createHash, createPublicKey, type KeyObject } from "node:crypto";
 import { chmod, constants as fsConstants, copyFile, lstat, mkdir, mkdtemp, open, rm } from "node:fs/promises";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, win32 } from "node:path";
 import {
   RemoteInstanceError, RemoteSignedBundleManifestSchema, bundleManifestSigningBytes,
   agentModelCapabilityMappingSigningBytes, computeAgentModelCapabilityMappingDigest,
@@ -212,6 +212,18 @@ export function nativeConnectorFileNames(os: NativeArtifactTarget["os"]): [strin
   return [`${NATIVE_CONNECTOR_FILE}${extension}`, `${LEGACY_NATIVE_CONNECTOR_FILE}${extension}`];
 }
 
+/**
+ * The one path the OS service runs on every release: `<root>/bin/konteks-connector`
+ * (`.exe` on Windows). An update or rollback replaces the file there in
+ * place, so launchd, systemd, the Windows login host, firewall and
+ * folder-access rules keep naming the same program; release folders only
+ * keep the copies it is replaced from.
+ */
+export function nativeServiceExecutable(root: string, os: NativeArtifactTarget["os"]): string {
+  // Windows paths are built as Windows paths anywhere; every other OS's in this host's own form.
+  return (os === "windows" ? win32.join : join)(root, "bin", nativeConnectorFileNames(os)[0]);
+}
+
 /** Every connector executable present in a release folder, the Konteks name first. */
 export async function presentNativeConnectorExecutables(directory: string, os: NativeArtifactTarget["os"]): Promise<string[]> {
   const present: string[] = [];
@@ -257,6 +269,7 @@ export async function stageNativeRelease(args: {
       if (artifact.format === "executable") await chmod(file, 0o700);
       if (artifact.kind === "connector") {
         await stageLegacyConnectorCopy(artifact, file, join(directory, nativeConnectorFileNames(args.target.os)[1]));
+        if (args.target.os === "debian") await stageConnectorSignature(fetchFn, artifact, file);
         result.connector = file;
       } else result.bridges[artifact.agentId!] = file;
     }
@@ -299,6 +312,24 @@ async function downloadArtifact(fetchFn: typeof fetch, artifact: RemoteNativeArt
   } finally {
     await handle.close();
   }
+}
+
+/** A Linux connector signature is small; anything larger is not one. */
+const CONNECTOR_SIGNATURE_MAX_BYTES = 4_096;
+
+/**
+ * The Linux connector's detached signature, published next to it as
+ * `<artifact>.sig`, kept beside the staged file. A release built without a
+ * signing key publishes none and nothing is kept: the update's identity
+ * check then reads the candidate as unsigned and decides.
+ */
+async function stageConnectorSignature(fetchFn: typeof fetch, artifact: RemoteNativeArtifact, file: string): Promise<void> {
+  const response = await fetchFn(`${artifact.url}.sig`, { redirect: "follow", credentials: "omit", signal: AbortSignal.timeout(60_000) }).catch(() => null);
+  if (!response || !downloadedOverHttps(response)) return;
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (bytes.length > CONNECTOR_SIGNATURE_MAX_BYTES) throw new Error("native connector signature exceeds its size bound");
+  const handle = await open(`${file}.sig`, "wx", 0o600);
+  try { await handle.writeFile(bytes); } finally { await handle.close(); }
 }
 
 /** A copy, not a link: installed-executable verification refuses both. */

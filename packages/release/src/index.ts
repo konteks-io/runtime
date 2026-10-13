@@ -9,3 +9,4 @@ export * from "./native.js";
 export * from "./reviewed-model-capabilities.js";
 export * from "./offline-profile.js";
 export * from "./offline-agent.js";
+export * from "./code-identity.js";

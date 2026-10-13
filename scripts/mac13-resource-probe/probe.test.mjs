@@ -201,9 +201,9 @@ for (const [label, mutation] of [
   assert.deepEqual(f.writes, []);
 });
 
-test('seven jobs, five coordinates and shipping preflight stay present without acceptance waivers', () => {
+test('the CI jobs, five coordinates and shipping preflight stay present without acceptance waivers', () => {
   const jobs = workflow.slice(workflow.indexOf('jobs:\n'));
-  assert.deepEqual(Array.from(jobs.matchAll(/^  ([a-z-]+):$/gm), value => value[1]), ['check', 'windows-bootstrap', 'windows-native']);
+  assert.deepEqual(Array.from(jobs.matchAll(/^  ([a-z-]+):$/gm), value => value[1]), ['check', 'windows-bootstrap', 'stable-path', 'windows-native']);
   assert.match(workflow, /os: \[macos-26, macos-15-intel, ubuntu-24\.04, ubuntu-24\.04-arm, windows-2022\]/);
   const preflight = step('Preflight the actual offline Mac agent and Graft packages before release');
   assert.ok(preflight.includes('exit "$failed"'));

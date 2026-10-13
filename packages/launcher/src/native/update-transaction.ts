@@ -1,11 +1,10 @@
 import { execFile } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { chmod, copyFile, readFile, rename, rm, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { z } from "zod";
-import { DoctorReportSchema, NATIVE_UPDATE_TARGET_ENV, NativeUpdateTargetSchema, RemoteInstanceError, SupervisorStatusSchema, type ControlRequest } from "@konteks/remote-common";
-import { isHostAgentId, nativeConnectorFileNames, resolveNativeConnectorExecutable } from "@konteks/remote-release";
+import { DoctorReportSchema, fileSha256, NATIVE_UPDATE_TARGET_ENV, NativeUpdateTargetSchema, RemoteInstanceError, SupervisorStatusSchema, type ControlRequest } from "@konteks/remote-common";
+import { isHostAgentId, nativeConnectorFileNames, nativeServiceExecutable, resolveNativeConnectorExecutable } from "@konteks/remote-release";
 import { NATIVE_SHUTDOWN_RECEIPT_FILE, assertLegacyCodexOwnerIdle, ownedByAnotherConnector, recordNativeUpdateAttempt, type NativeRuntimeRecord, type NativeUpdateAttempt } from "@konteks/remote-supervisor";
 import { SupervisorControl } from "../control.js";
 import type { NativeCommandContext } from "./cli.js";
@@ -747,11 +746,7 @@ export async function refreshInstalledLauncher(root: string, record: NativeRunti
 async function sameContents(a: string, b: string): Promise<boolean> {
   const [left, right] = await Promise.all([stat(a), stat(b)]);
   if (left.size !== right.size) return false;
-  const digest = (path: string) => new Promise<string>((done, fail) => {
-    const hash = createHash("sha256");
-    createReadStream(path).on("data", chunk => hash.update(chunk)).once("error", fail).once("end", () => done(hash.digest("hex")));
-  });
-  const [x, y] = await Promise.all([digest(a), digest(b)]);
+  const [x, y] = await Promise.all([fileSha256(a), fileSha256(b)]);
   return x === y;
 }
 
@@ -774,18 +769,25 @@ interface KeepLauncherCurrentDeps {
  * so an older launcher would otherwise keep driving updates with its own old
  * transaction. Waits while an
  * update is still checking this release, and leaves it alone unless this
- * process is the release the record names.
+ * process is the release the record names (run from the service's stable
+ * executable or from its release folder).
  */
 export async function keepLauncherCurrent(root: string, deps: KeepLauncherCurrentDeps,
 ): Promise<"refreshed" | "current" | "skipped"> {
   if (!(nativeConnectorFileNames(hostOs()) as string[]).includes(basename(deps.execPath))) return "skipped";
   for (;;) {
     const record = await deps.readRecord(root);
-    if (resolve(dirname(deps.execPath)) !== resolve(root, "releases", record.releaseId)) return "skipped";
+    if (!runsRecordRelease(deps.execPath, root, record)) return "skipped";
     const ledger = await deps.readLedger(root).catch(() => ({ attempts: [] }));
     if (!stillChecking(ledger.attempts, record, deps)) return (await deps.refresh(root, record)) ? "refreshed" : "current";
     await deps.sleep(deps.pollMs ?? 5_000);
   }
+}
+
+/** The service's stable executable (which `serve` keeps on the record's release) or the release folder's own connector. */
+function runsRecordRelease(execPath: string, root: string, record: NativeRuntimeRecord): boolean {
+  const self = resolve(execPath);
+  return self === resolve(nativeServiceExecutable(root, hostOs())) || resolve(dirname(execPath)) === resolve(root, "releases", record.releaseId);
 }
 
 function hostOs(): "windows" | "macos" | "debian" {

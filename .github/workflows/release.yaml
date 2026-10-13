@@ -14,6 +14,8 @@ permissions:
 jobs:
   check:
     uses: ./.github/workflows/ci.yaml
+    # The stable-path proof signs N and N+1 with the release's own secrets where they are set.
+    secrets: inherit
 
   build:
     needs: check
@@ -48,10 +50,17 @@ jobs:
           KONTEKS_LAUNCHER_VERSION: ${{ github.ref_name }}
           KONTEKS_DEFAULT_CORE_URL: ${{ vars.KONTEKS_DEFAULT_CORE_URL || 'https://api.konteks.io' }}
           KONTEKS_DEFAULT_RELAY_URL: ${{ vars.KONTEKS_DEFAULT_RELAY_URL || 'wss://relay.konteks.io/relay/runtime' }}
-          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
-          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
-          WINDOWS_AUTHENTICODE_PFX: ${{ secrets.WINDOWS_AUTHENTICODE_PFX }}
-          WINDOWS_AUTHENTICODE_PASSWORD: ${{ secrets.WINDOWS_AUTHENTICODE_PASSWORD }}
+          # Publisher signing is opt-in per OS (scripts/sign-connector.mjs):
+          # an OS whose secrets are absent ships unsigned, said in the job summary.
+          APPLE_DEVELOPER_ID_P12: ${{ secrets.APPLE_DEVELOPER_ID_P12 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          WINDOWS_CODESIGN_PFX: ${{ secrets.WINDOWS_CODESIGN_PFX }}
+          WINDOWS_CODESIGN_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
+          LINUX_SIGNING_KEY: ${{ secrets.LINUX_SIGNING_KEY }}
           DEB_SIGNING_KEY: ${{ secrets.DEB_SIGNING_KEY }}
         run: |
           test -n "$KONTEKS_RELEASE_ROOTS_JSON" || { echo "KONTEKS_RELEASE_ROOTS_JSON variable is required: a connector without embedded roots verifies nothing"; exit 1; }
