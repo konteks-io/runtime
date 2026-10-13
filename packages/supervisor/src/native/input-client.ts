@@ -349,10 +349,37 @@ export class NativeInputClient {
     const retry = { logger: this.logger, operation, classification, ...(status === undefined ? {} : { status }) };
     if (attempt === NATIVE_TRANSIENT_MAX_ATTEMPTS) {
       logNativeRetryExhausted(retry);
-      throw error;
+      // Spent quick retries are not a refusal: the failure stays transient,
+      // so the session resumes it with backoff instead of stopping (D132).
+      throw transientlyUnavailable(error as RemoteInstanceError);
     }
     await waitForNativeRetry({ ...retry, attempt, sleep: this.options.retrySleep, baseDelayMs: this.options.retryBaseDelayMs });
   }}
+
+/** A transient network, timeout, rate-limit or upstream failure whose quick retries are spent. */
+export interface TransientInputFailure {
+  classification: NativeTransientClassification;
+  status?: number;
+  diagnostic: string;
+}
+
+/**
+ * What a retryable input failure was, or null for any other failure. Only
+ * these resume with backoff; a definite refusal (4xx, a lost claim, a bad
+ * signature or schema) stays terminal.
+ */
+export function transientInputFailure(error: unknown): TransientInputFailure | null {
+  if (!(error instanceof RemoteInstanceError) || !error.retryable || error.code !== "temporarily_unavailable") return null;
+  const classification = nativeInputTransientClassification(error);
+  if (!classification || error.diagnostic === undefined) return null;
+  const status = transientStatus(error);
+  return { classification, diagnostic: error.diagnostic, ...(status === undefined ? {} : { status }) };
+}
+
+function transientlyUnavailable(error: RemoteInstanceError): RemoteInstanceError {
+  return new RemoteInstanceError("temporarily_unavailable", "Required assignment inputs are temporarily unavailable.",
+    { retryable: true, ...(error.diagnostic === undefined ? {} : { diagnostic: error.diagnostic }) });
+}
 
 function nativeInputTransientClassification(error: unknown): NativeTransientClassification | null {
   if (!(error instanceof RemoteInstanceError)) return null;

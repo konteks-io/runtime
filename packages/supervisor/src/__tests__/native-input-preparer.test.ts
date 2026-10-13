@@ -179,6 +179,27 @@ async function fixture(sourceFiles: Record<string, string> = { "src/app.txt": "o
 }
 
 describe("native authorized input composition", () => {
+  it("keeps a transient 503 at selection retryable, and prepares once Core recovers (D132)", async () => {
+    const f = await fixture();
+    const warn = vi.fn();
+    const options = { ...f.options, logger: { warn } };
+    const unavailable = async () => new Response(null, { status: 503 });
+    for (let attempt = 0; attempt < 4; attempt += 1) f.fetchFn.mockImplementationOnce(unavailable);
+    await expect(createNativeInputPreparer(options)(assignment)).rejects.toMatchObject({
+      code: "temporarily_unavailable", retryable: true, diagnostic: "response_transient_503" });
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({ event: "native.inputs.prepare_failed", stage: "selection",
+      code: "temporarily_unavailable", retryable: true, diagnostic: "response_transient_503" }), "native input preparation failed");
+    expect(await readdir(f.root)).toEqual([]);
+    // Upstream is back: the next preparation of the same claim succeeds.
+    const prepared = await createNativeInputPreparer(options)(assignment);
+    expect(await readFile(join(prepared.cwd, "src", "app.txt"), "utf8")).toBe("original");
+  });
+  it("ends a permanent refusal at selection as terminal", async () => {
+    const f = await fixture();
+    f.fetchFn.mockImplementation(async () => new Response(null, { status: 404 }));
+    await expect(createNativeInputPreparer(f.options)(assignment)).rejects.toMatchObject({ code: "capability_unavailable", retryable: false });
+    expect(f.fetchFn).toHaveBeenCalledTimes(1);
+  });
   it("initializes Git for a repository source and preserves its baseline and edits on restart", async () => {
     const f = await fixture(),
       git = await testGitTool();

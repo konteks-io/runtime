@@ -52,6 +52,8 @@ import {
   type ChunkTrail,
 } from "./activity.js";
 import { NativeExecutionGate, isTransientExecutionRefusal, type NativeExecutionGateOptions } from "../native/execution-gate.js";
+import { transientInputFailure, type TransientInputFailure } from "../native/input-client.js";
+import { nativeDeferralDelayMs } from "../native/transient-retry.js";
 import {
   admittedDirectModelReceipt,
   assertDirectModelAuthority,
@@ -122,6 +124,8 @@ export interface RelayedSessionDeps {
   workspaceRoot: string;
   /** Verified local inputs (workspace, skills, binding) for the claimed assignment. */
   prepareInputs: (assignment: RemoteWorkAssignment) => Promise<PreparedSessionInputs>;
+  /** Jitter for resuming a transient input preparation failure; tests pin it. */
+  inputDeferralRandom?: () => number;
   /**
    * Native-only local ownership commit. Cloud/file preparation and capability
    * redemption finish before this is called; the callback then opens or
@@ -195,6 +199,8 @@ export class RelayedSession {
   get channelId(): string | null { return this.boundChannelId; }
   acpSessionRef: string | null = null;
   private closed = false;
+  /** Ends a transient input preparation's backoff wait at once on close or recovery. */
+  private wakeDeferral: (() => void) | null = null;
   private recoveryStopping = false;
   private recoveryStopTask: Promise<void> | null = null;
   private creationReturned = false;
@@ -377,13 +383,7 @@ export class RelayedSession {
   private async prepareSessionInputs(): Promise<{ prepared: PreparedSessionInputs; binding: RemoteTransferBinding }> {
     this.deps.assertExecutionOwned?.();
     if (this.closed) throw sessionClosed();
-    let prepared: PreparedSessionInputs;
-    try { prepared = await this.bootstrapStage("input_preparation", () => this.deps.prepareInputs(this.assignment)); }
-    catch (error) {
-      // Xcode's license gate keeps its plain finding (git-choice.ts); anything else stays unexplained here.
-      if (isGitXcodeLicenseError(error)) throw error;
-      throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable.");
-    }
+    const prepared = await this.preparedInputsResumingTransient();
     this.deps.assertExecutionOwned?.();
     const binding = this.verifiedBinding(prepared);
     const readOnlyRoots = Object.freeze([...(prepared.readOnlyRoots ?? [])]);
@@ -394,6 +394,47 @@ export class RelayedSession {
     this.boundChannelId = `session:${binding.sessionId}`;
     if (this.closed) throw sessionClosed();
     return { prepared, binding };
+  }
+
+  /**
+   * Input preparation, resumed with backoff while it fails transiently: a
+   * 503, 429, timeout or lost connection on Core's side outlasted the quick
+   * in-request retries (D132). Nothing local is lost: a workspace is
+   * published in one rename and fetched objects stay cached, so the next try
+   * resumes where this one failed. There is no limit on tries; the session's
+   * close or a lost claim ends the wait. A definite refusal stays terminal.
+   */
+  private async preparedInputsResumingTransient(): Promise<PreparedSessionInputs> {
+    for (let deferral = 1; ; deferral += 1) {
+      try {
+        const prepared = await this.bootstrapStage("input_preparation", () => this.deps.prepareInputs(this.assignment));
+        if (deferral > 1) this.logger.info({ event: "native.inputs.prepare_resumed", assignmentId: this.assignment.id,
+          attempt: this.assignment.attempt, preparationAttempt: deferral }, "native input preparation resumed after a transient failure");
+        return prepared;
+      } catch (error) {
+        // Xcode's license gate keeps its plain finding (git-choice.ts); anything else stays unexplained here.
+        if (isGitXcodeLicenseError(error)) throw error;
+        const transient = transientInputFailure(error);
+        if (!transient) throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable.");
+        await this.deferInputPreparation(deferral, transient, error as RemoteInstanceError);
+      }
+    }
+  }
+
+  /** Wait out one transient input failure; the session's close or a lost claim ends the wait early. */
+  private async deferInputPreparation(deferral: number, transient: TransientInputFailure, error: RemoteInstanceError): Promise<void> {
+    const delayMs = nativeDeferralDelayMs(deferral, this.deps.inputDeferralRandom);
+    this.logger.warn({ event: "native.inputs.prepare_deferred", assignmentId: this.assignment.id, attempt: this.assignment.attempt,
+      preparationAttempt: deferral, delayMs, classification: transient.classification, diagnostic: transient.diagnostic,
+      ...(transient.status === undefined ? {} : { status: transient.status }) },
+    "native input preparation failed transiently; resuming with backoff");
+    if (this.closed) throw error;
+    await new Promise<void>(resolve => {
+      const timer = setTimeout(() => { this.wakeDeferral = null; resolve(); }, delayMs);
+      this.wakeDeferral = () => { clearTimeout(timer); this.wakeDeferral = null; resolve(); };
+    });
+    if (this.closed) throw error;
+    this.deps.assertExecutionOwned?.();
   }
 
   private verifiedBinding(prepared: PreparedSessionInputs): RemoteTransferBinding {
@@ -1902,7 +1943,7 @@ export class RelayedSession {
   /** Recovery owns the terminal report, so this never invokes onClosed or
    * synthesizes session_closed(cancelled). Failure keeps the session fenced.
    */
-  fenceForRecovery(): void { this.executionGate?.stop(); this.recoveryStopping = true; this.closed = true; }
+  fenceForRecovery(): void { this.executionGate?.stop(); this.recoveryStopping = true; this.closed = true; this.wakeDeferral?.(); }
 
   stopForRecovery(): Promise<void> {
     if (this.recoveryStopTask) return this.recoveryStopTask;
@@ -1994,6 +2035,7 @@ export class RelayedSession {
   close(reason: SessionClosedReason): Promise<void> {
     this.executionGate?.stop();
     this.folderAccess.stop();
+    this.wakeDeferral?.();
     if (this.closeTask) return this.closeTask;
     if (this.closed) return Promise.resolve();
     this.completedSettlementInProgress = reason === "completed";
