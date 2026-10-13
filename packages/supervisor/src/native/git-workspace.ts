@@ -4,7 +4,7 @@ import { constants, type Stats } from "node:fs";
 import { chmod, lstat, mkdir, open, readdir } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import { z } from "zod";
-import { RemoteFileTreeSchema, RemoteInstanceError, sha256Hex } from "@konteks/remote-common";
+import { RemoteFileTreeSchema, RemoteInstanceError, connectorGitEnv, sha256Hex } from "@konteks/remote-common";
 import { readFully } from "../read-fully.js";
 
 /** Installer-selected local tool, never a field in a cloud assignment. */
@@ -181,6 +181,8 @@ function gitEnvironment(tool: NativeGitTool): NodeJS.ProcessEnv {
     ...(process.platform === "win32" && process.env.SystemRoot
       ? { SystemRoot: process.env.SystemRoot }
       : {}),
+    // The Command Line Tools' git while Xcode's license is pending (git-choice.ts).
+    ...connectorGitEnv(),
   };
 }
 

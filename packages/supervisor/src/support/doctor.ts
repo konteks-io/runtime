@@ -1,6 +1,6 @@
 import type { Stats } from "node:fs";
 import { stat } from "node:fs/promises";
-import { type DoctorCheck, type DoctorReport } from "@konteks/remote-common";
+import { type DoctorCheck, type DoctorReport, type GitChoiceReport } from "@konteks/remote-common";
 
 /**
  * Allowlisted doctor checks: versions, reachability, lease, components,
@@ -69,6 +69,8 @@ interface DoctorInputs {
    * release's code (`windowsInstalledLauncher`); null without one.
    */
   launcher?: "current" | "older" | null;
+  /** Which git the connector and its agents run, and why (git-choice.ts); its path is never shown here. */
+  git?: GitChoiceReport;
 }
 
 type CheckDraft = Omit<DoctorCheck, "recoveryActions"> & { recoveryActions?: DoctorCheck["recoveryActions"] };
@@ -390,6 +392,15 @@ function launcherCheck(inputs: DoctorInputs): CheckDraft[] {
   return [{ id: "launcher", title: "konteks-remote command", status: "warn", detail: "konteks-remote is from an older installer and runs its old code, not this release's. Update it once: run the Windows install line with -Update in place of -ActivationId." }];
 }
 
+function gitCheck({ git }: DoctorInputs): CheckDraft[] {
+  if (!git) return [];
+  const base = { id: "git", title: "Git" };
+  if (git.blocked) return [{ ...base, status: "fail", detail: git.blocked }];
+  // Never its path, like every check here; `konteks-remote status` shows it.
+  if (git.git === "command_line_tools") return [{ ...base, status: "pass", detail: "Command Line Tools git, because the Xcode license is not accepted yet" }];
+  return [git.path ? { ...base, status: "pass", detail: "this computer's git" } : { ...base, status: "warn", detail: "no git found on this computer" }];
+}
+
 function configCheck(inputs: DoctorInputs): CheckDraft[] {
   return [{ id: "config", title: "Desired configuration", status: inputs.configRevision > 0 ? "pass" : "warn", detail: `revision ${inputs.configRevision}` }];
 }
@@ -397,5 +408,5 @@ function configCheck(inputs: DoctorInputs): CheckDraft[] {
 /** Every check, in the order the report lists them. */
 const DOCTOR_CHECKS: readonly DoctorCheckFn[] = [
   dataRootCheck, identityCheck, leaseCheck, relayCheck, reconciliationCheck, componentChecks, coreKeyCheck, agentChecks,
-  diskCheck, queueChecks, previewCheck, browserCheck, agentFamilyChecks, channelCheck, launcherCheck, configCheck,
+  diskCheck, queueChecks, previewCheck, browserCheck, agentFamilyChecks, channelCheck, launcherCheck, gitCheck, configCheck,
 ];

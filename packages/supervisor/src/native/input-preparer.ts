@@ -6,6 +6,9 @@ import { dirname, isAbsolute, join, parse, resolve } from "node:path";
 import { z } from "zod";
 import {
   canonicalize,
+  connectorGitEnv,
+  isGitXcodeLicenseError,
+  requireConnectorGit,
   sha256Hex,
   RemoteInstanceError,
   RemoteTransferManifestSchema,
@@ -248,6 +251,8 @@ async function sourceWorkspace(
   gitTool?: NativeGitTool,
 ): Promise<SourceWorkspace> {
   if (needsGit && !gitTool) throw unavailable();
+  // Xcode's license gate with no Command Line Tools: say so, never an unexplained failure.
+  if (needsGit) await requireConnectorGit(gitTool!.executable);
   const rootStat = await sameDirectory(root);
   const selection = envelope.selection;
   const destination = workspaceDestination(root, selection, needsGit);
@@ -787,7 +792,7 @@ function fetchBundle(git: NativeGitTool, gitDir: string, bundlePath: string, rev
     execFile(git.executable, ["--git-dir", gitDir, "fetch", "--no-tags", "--no-write-fetch-head", bundlePath,
       `+refs/konteks/source:refs/konteks/fetched/${revision}`], {
       env: { PATH: dirname(git.executable), GIT_CONFIG_NOSYSTEM: "1",
-        GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null", GIT_TERMINAL_PROMPT: "0" },
+        GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null", GIT_TERMINAL_PROMPT: "0", ...connectorGitEnv() },
       timeout: 60_000, killSignal: "SIGKILL", maxBuffer: 256 * 1024, windowsHide: true,
     }, error => error ? rejectPromise(unavailable()) : resolvePromise());
   });
@@ -810,7 +815,7 @@ export function createNativeInputPreparer(
         return await preparation.prepare();
       } catch (error) {
         preparation.logFailure(error);
-        throw unavailable();
+        throw isGitXcodeLicenseError(error) ? error : unavailable();
       } finally {
         busy.delete(key);
       }

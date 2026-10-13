@@ -105,6 +105,25 @@ describe("doctor and support bundle", () => {
     expect(channel(await runDoctor(base))).toBeUndefined();
   });
 
+  it("reports which git runs and why, the Xcode license finding in plain words, and never its path (D123)", async () => {
+    const base = {
+      now: () => "2026-10-13T00:00:00Z", dataDir: dir, identity: { instanceId: "inst", administrativeStatus: "active" }, lease: { mode: "active" as const, expiresAt: null },
+      relay: { state: "connected", lastError: null, consecutiveFailures: 0 }, transport: "relay" as const, reconciliationComplete: true, components: [], agents: [],
+      configRevision: 1, diskFreeBytes: 1, minimumDiskBytes: 0, outboxDepth: 0, recoveryRequired: 0, coreSignatureConfigured: true,
+    };
+    const git = (report: Awaited<ReturnType<typeof runDoctor>>) => report.checks.find(check => check.id === "git");
+    const tools = await runDoctor({ ...base, git: { git: "command_line_tools", path: "/Library/Developer/CommandLineTools/usr/bin/git", reason: "xcode_license_pending", blocked: null } });
+    expect(git(tools)).toMatchObject({ status: "pass", detail: "Command Line Tools git, because the Xcode license is not accepted yet" });
+    expectNoPath(tools);
+    const blocked = await runDoctor({ ...base, git: { git: "default", path: "/usr/bin/git", reason: "xcode_license_pending", blocked: "Git on this Mac needs the Xcode license accepted. Run: sudo xcodebuild -license accept" } });
+    expect(git(blocked)).toMatchObject({ status: "fail", detail: "Git on this Mac needs the Xcode license accepted. Run: sudo xcodebuild -license accept" });
+    const standard = await runDoctor({ ...base, git: { git: "default", path: "/usr/local/bin/git", reason: "default", blocked: null } });
+    expect(git(standard)?.status).toBe("pass");
+    expectNoPath(standard);
+    expect(git(await runDoctor({ ...base, git: { git: "default", path: null, reason: "default", blocked: null } }))?.status).toBe("warn");
+    expect(git(await runDoctor(base))).toBeUndefined();
+  });
+
   it("reports the QA browser's version, the agents that carry it, and Chrome or Playwright's Chromium", async () => {
     const base = {
       now: () => "2026-09-06T00:00:00Z", dataDir: dir, identity: { instanceId: "inst", administrativeStatus: "active" }, lease: { mode: "active" as const, expiresAt: null },

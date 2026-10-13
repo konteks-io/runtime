@@ -1,6 +1,6 @@
 import { readdir, readFile, writeFile } from "node:fs/promises";
 import { basename, join, relative, resolve } from "node:path";
-import { runCommand, sanitizeInheritedChildProcessEnv } from "@konteks/remote-common";
+import { connectorGit, runCommand, sanitizeInheritedChildProcessEnv } from "@konteks/remote-common";
 
 /**
  * What the machine can see about the repository the person's agent is in.
@@ -31,7 +31,9 @@ interface RepositoryFacts {
 const env = () => sanitizeInheritedChildProcessEnv({ env: process.env });
 
 async function git(cwd: string, args: string[], timeoutMs = 10_000) {
-  return runCommand({ command: "git", args, cwd, env: env(), timeoutMs });
+  // The Command Line Tools' git while Xcode's license is pending (git-choice.ts).
+  const choice = await connectorGit();
+  return runCommand({ command: "git", args, cwd, env: { ...env(), ...choice.env }, timeoutMs });
 }
 
 /** Git's trimmed output when the command succeeded; null when it failed or could not run. */

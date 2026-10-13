@@ -15,7 +15,10 @@ import {
   REMOTE_DIRECT_MODEL_FALLBACK_MIN_CORE_CONTRACT_VERSION,
   allEqual,
   SystemClock,
+  connectorGit,
   createLogger,
+  gitChoiceReport,
+  type GitChoice,
   parseRfc3339,
   signBody,
   type AgentTurnUsageObservation,
@@ -237,6 +240,8 @@ export class Supervisor {
   private drainDeadline: string | null = null;
   private pendingRevocation = false;
   private lastSnapshot: InventorySnapshot | null = null;
+  /** Which git the connector and its agents run, chosen once at startup (git-choice.ts). */
+  private gitChoice: GitChoice | null = null;
   /** This release's `konteks-remote` commands at its bundle version, built once; null when the table or version does not parse. */
   private connectorCommandsCache: { manifest: ConnectorCommandsManifest | null } | null = null;
   private connectorCommands(): ConnectorCommandsManifest | undefined {
@@ -385,6 +390,7 @@ export class Supervisor {
     await this.openNativeState();
     const identity = await this.loadActivation(native);
     await this.restoreStoredLease(identity.instanceId);
+    await this.chooseGit(native);
     this.composeCoreDeliveries();
     await this.composeLocalAgents(native, identity.instanceId);
     this.composeInventory(native);
@@ -402,6 +408,22 @@ export class Supervisor {
     if (this.stopping) return;
     await this.enterLifecycle();
     this.startChannelTimers();
+  }
+
+  /**
+   * Which git the connector and its agents run: `git` on PATH and the
+   * installer-selected one, probed once before anything runs git, and logged
+   * once. A license finding wins the report, then the Command Line Tools.
+   */
+  private async chooseGit(native: NativeOptions): Promise<void> {
+    const commands = [...new Set(["git", ...(native.git ? [native.git.executable] : [])])];
+    const choices = await Promise.all(commands.map(command => connectorGit(command)));
+    const choice = choices.find(value => value.blocked) ?? choices.find(value => value.git === "command_line_tools") ?? choices.at(-1)!;
+    this.gitChoice = choice;
+    const report = gitChoiceReport(choice);
+    const fields = { event: "git.choice", git: report.git, path: report.path, reason: report.reason };
+    if (report.blocked) this.logger.warn({ ...fields, code: choice.blocked!.code }, report.blocked);
+    else this.logger.info(fields, report.git === "command_line_tools" ? "Xcode's license is not accepted; git runs from the Command Line Tools" : "git chosen");
   }
 
   /** Take the state directory, sweep leftover previews and load the journals. */
@@ -2359,6 +2381,8 @@ export class Supervisor {
         const channel = this.updates ? this.updateChannelReport() : null;
         return channel ? { host: channel.host, override: channel.override, lastCheckedAt: channel.lastCheckedAt, error: channel.lastError } : null;
       },
+      // Its own op for the same reason as `update.channel`.
+      "git.choice": async () => gitChoiceReport(this.gitChoice ?? await connectorGit()),
       "release.accepted": async () => {
         if (!this.instanceId) return { bundleVersion: null };
         const accepted = await this.core.acceptedRelease(this.instanceId);
@@ -2830,6 +2854,7 @@ export class Supervisor {
       ...(openCode ? { openCode } : {}),
       ...(antigravity ? { antigravity } : {}),
       ...(this.updates ? { updateChannel: this.updateChannelReport() } : {}),
+      ...(this.gitChoice ? { git: gitChoiceReport(this.gitChoice) } : {}),
     };
     return runDoctor({ ...inputs, ...(await this.doctorLauncher()) });
   }

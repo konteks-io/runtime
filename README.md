@@ -471,6 +471,11 @@ after `npm run build`).
 - **Old Windows MSI.** An MSI from before 0.10.11 runs its own old code;
   `doctor` says so. Run the Windows install line once with `-Update` in place
   of `-ActivationId` to replace it, update and start the connector.
+- **Xcode license not accepted (macOS).** Xcode's `/usr/bin/git` refuses to
+  run until its license is accepted. The connector and its agents then use the
+  Command Line Tools' git (`DEVELOPER_DIR=/Library/Developer/CommandLineTools`);
+  `status` and `doctor` say so. Without the Command Line Tools, `doctor` and
+  the failed delivery say: run `sudo xcodebuild -license accept`.
 - **Lost machine key.** The connector stops and says so; run
   `konteks-remote onboard` again to connect it as a replacement runtime.
 

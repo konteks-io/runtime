@@ -1,6 +1,6 @@
 import { userInfo } from "node:os";
 import { delimiter, dirname, isAbsolute, join } from "node:path";
-import { findGitForWindows, RemoteInstanceError, sanitizeInheritedChildProcessEnv, type Logger } from "@konteks/remote-common";
+import { connectorGitEnv, findGitForWindows, RemoteInstanceError, sanitizeInheritedChildProcessEnv, type Logger } from "@konteks/remote-common";
 import { findAgentBridge, verifyOfflineAgentPackageOnce, type AgentBridgeFamily, type NativeAgentPackageProfile } from "@konteks/remote-release";
 import type { RunnerConfig } from "../config.js";
 import { hostAdapterForRunner } from "../host/registry.js";
@@ -43,6 +43,9 @@ export function bridgeEnvironment(config: RunnerConfig, family: AgentBridgeFamil
   if (config.RUNNER_NATIVE_CLAUDE_EXECUTABLE !== undefined) usePersonalClaude(config, family, profile, config.RUNNER_NATIVE_CLAUDE_EXECUTABLE, env);
   if (config.RUNNER_NATIVE_CODEX_SOCKET !== undefined) useSharedCodexSocket(config, profile, config.RUNNER_NATIVE_CODEX_SOCKET, env);
   if (profile) useNativePackage(config, profile, base.PATH ?? "", env);
+  // While Xcode's license is pending, the agent's own git runs the Command
+  // Line Tools' git, as the connector's does (git-choice.ts).
+  Object.assign(env, connectorGitEnv());
   return env;
 }
 
