@@ -250,34 +250,47 @@ export async function resolveNativeConnectorExecutable(directory: string, os: Na
  * Package installation, service restart, health gating, and pointer commit are
  * deliberately separate operations; downloading does not execute a package.
  */
-export async function stageNativeRelease(args: {
+interface StageNativeReleaseArgs {
   release: VerifiedNativeRelease;
   target: NativeArtifactTarget;
   releasesDir: string;
   fetchFn?: typeof fetch;
-}): Promise<{ directory: string; connector: string; bridges: Record<string, string> }> {
+  /** First wait before an artifact is downloaded again; doubles each time. */
+  retryDelayMs?: number;
+}
+type StagedNativeRelease = { directory: string; connector: string; bridges: Record<string, string> };
+
+export async function stageNativeRelease(args: StageNativeReleaseArgs): Promise<StagedNativeRelease> {
   if (!isAbsolute(args.releasesDir)) throw new Error("native release directory must be absolute");
   const artifacts = selectNativeArtifacts(args.release, args.target);
   await mkdir(args.releasesDir, { recursive: true, mode: 0o700 });
   const directory = await mkdtemp(join(args.releasesDir, ".candidate-"));
-  const fetchFn = args.fetchFn ?? fetch;
-  const result = { directory, connector: "", bridges: {} as Record<string, string> };
+  const result: StagedNativeRelease = { directory, connector: "", bridges: {} };
+  let current = "";
   try {
     for (const [index, artifact] of artifacts.entries()) {
-      const file = join(directory, stagedArtifactName(index, artifact, args.target.os));
-      await downloadArtifact(fetchFn, artifact, file);
-      if (artifact.format === "executable") await chmod(file, 0o700);
-      if (artifact.kind === "connector") {
-        await stageLegacyConnectorCopy(artifact, file, join(directory, nativeConnectorFileNames(args.target.os)[1]));
-        if (args.target.os === "debian") await stageConnectorSignature(fetchFn, artifact, file);
-        result.connector = file;
-      } else result.bridges[artifact.agentId!] = file;
+      current = artifact.url.split("/").pop() || artifact.kind;
+      await stageArtifact(args, artifact, join(directory, stagedArtifactName(index, artifact, args.target.os)), result);
     }
     return result;
   } catch (error) {
     await rm(directory, { recursive: true, force: true });
-    throw new RemoteInstanceError("bundle_untrusted", "native artifacts were not staged; the existing install was not changed", { cause: error });
+    const why = error instanceof Error ? error.message : String(error);
+    throw new RemoteInstanceError("bundle_untrusted", `native artifacts were not staged (${current}: ${why}); the existing install was not changed`, { cause: error });
   }
+}
+
+async function stageArtifact(args: StageNativeReleaseArgs, artifact: RemoteNativeArtifact, file: string, result: StagedNativeRelease): Promise<void> {
+  const fetchFn = args.fetchFn ?? fetch;
+  await downloadArtifactWithRetry(fetchFn, artifact, file, args.retryDelayMs ?? ARTIFACT_RETRY_FIRST_DELAY_MS);
+  if (artifact.format === "executable") await chmod(file, 0o700);
+  if (artifact.kind !== "connector") {
+    result.bridges[artifact.agentId!] = file;
+    return;
+  }
+  await stageLegacyConnectorCopy(artifact, file, join(result.directory, nativeConnectorFileNames(args.target.os)[1]));
+  if (args.target.os === "debian") await stageConnectorSignature(fetchFn, artifact, file);
+  result.connector = file;
 }
 
 /** File names never come from untrusted URL paths or manifest identifiers. */
@@ -294,14 +307,55 @@ function downloadedOverHttps(response: Response): response is Response & { body:
   return response.ok && response.body !== null && (!response.url || response.url.startsWith("https://"));
 }
 
+/**
+ * A download is abandoned only when no byte arrives for this long; a slow one
+ * that keeps moving is never cut off. A Mac update moves about 460 MB, and the
+ * old fixed 5-minute deadline per artifact failed any link under ~1 MB/s.
+ */
+const ARTIFACT_STALL_MS = 60_000;
+/**
+ * Each artifact is tried again with backoff (2 s, 4 s, 8 s), so a dropped
+ * connection costs a retry rather than the next periodic check hours later.
+ */
+const ARTIFACT_ATTEMPTS = 4;
+const ARTIFACT_RETRY_FIRST_DELAY_MS = 2_000;
+
+async function downloadArtifactWithRetry(fetchFn: typeof fetch, artifact: RemoteNativeArtifact, file: string, firstDelayMs: number): Promise<void> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await downloadArtifact(fetchFn, artifact, file);
+    } catch (error) {
+      await rm(file, { force: true });
+      if (attempt >= ARTIFACT_ATTEMPTS) throw error;
+      await new Promise(resolve => setTimeout(resolve, firstDelayMs * 2 ** (attempt - 1)));
+    }
+  }
+}
+
 async function downloadArtifact(fetchFn: typeof fetch, artifact: RemoteNativeArtifact, file: string): Promise<void> {
-  const response = await fetchFn(artifact.url, { redirect: "follow", credentials: "omit", signal: AbortSignal.timeout(300_000) });
-  if (!downloadedOverHttps(response)) throw new Error("native artifact download failed");
+  const controller = new AbortController();
+  let stall: ReturnType<typeof setTimeout> | undefined;
+  const moving = () => {
+    clearTimeout(stall);
+    stall = setTimeout(() => controller.abort(new Error(`no data for ${ARTIFACT_STALL_MS / 1_000} s`)), ARTIFACT_STALL_MS);
+  };
+  moving();
+  try {
+    const response = await fetchFn(artifact.url, { redirect: "follow", credentials: "omit", signal: controller.signal });
+    if (!downloadedOverHttps(response)) throw new Error(`native artifact download failed (HTTP ${response.status})`);
+    await writeVerifiedArtifact(response.body, artifact, file, moving);
+  } finally {
+    clearTimeout(stall);
+  }
+}
+
+async function writeVerifiedArtifact(body: ReadableStream<Uint8Array>, artifact: RemoteNativeArtifact, file: string, moving: () => void): Promise<void> {
   const handle = await open(file, "wx", 0o600);
   let size = 0;
   const hash = createHash("sha256");
   try {
-    for await (const chunk of response.body) {
+    for await (const chunk of body) {
+      moving();
       size += chunk.byteLength;
       if (size > artifact.sizeBytes) throw new Error("native artifact exceeds its signed size");
       hash.update(chunk);

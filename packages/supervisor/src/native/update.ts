@@ -44,13 +44,27 @@ const DEFAULT_STALE_ATTEMPT_MS = 45 * 60_000;
  * A release waiting only for Core to accept it (or for Core to answer) is
  * checked again this soon, doubling up to the cap, instead of at the next
  * 6-hour tick: Core moves its accepted release minutes to hours after the
- * channel publishes one.
+ * channel publishes one. A channel read that failed and a transaction that
+ * exited without replacing this service are transient too, and retry the same
+ * way (10-13: a failed 0.14.1 update and a timed-out re-check each left the
+ * owner's connector on 0.13.3 until the next 6-hour tick).
  */
 const ACCEPTANCE_RECHECK_FIRST_MS = 15 * 60_000;
 const ACCEPTANCE_RECHECK_MAX_MS = 60 * 60_000;
 
-/** Why the newest signed release waits for Core, for the scheduled re-check. */
-interface AwaitingAcceptance { reason: "accepted_mismatch" | "core_unanswered"; accepted: string | null; available: string }
+/** Why the update is checked again soon, for the scheduled re-check. */
+interface AwaitingAcceptance {
+  reason: "accepted_mismatch" | "core_unanswered" | "check_failed" | "update_failed";
+  accepted: string | null;
+  available: string | null;
+}
+
+const RECHECK_MESSAGES: Record<AwaitingAcceptance["reason"], string> = {
+  accepted_mismatch: "the newest release waits for Konteks to accept it; checking again soon",
+  core_unanswered: "the newest release waits for Konteks to answer; checking again soon",
+  check_failed: "the release channel could not be read; checking again soon",
+  update_failed: "the update did not replace this service; trying again soon",
+};
 
 /**
  * Decides when the running connector asks for its own replacement. The
@@ -191,7 +205,7 @@ export class NativeUpdateCoordinator {
     }, delayMs);
     this.recheckTimer.unref();
     this.options.logger.info({ event: "native.update.recheck_scheduled", ...awaiting, current: this.options.currentBundleVersion, delayMs },
-      "the newest release waits for Konteks to accept it; checking again soon");
+      RECHECK_MESSAGES[awaiting.reason]);
   }
 
   private refuse(reason: string): NativeUpdateApply {
@@ -211,8 +225,10 @@ export class NativeUpdateCoordinator {
     return this.launch(reason, available, assertCurrent);
   }
 
+  /** Also marks an unattended check whose channel read failed for an early re-check. */
   private unavailableReason(target: NativeUpdateTarget | undefined): string {
     if (target) return this.channelError ? "unavailable" : "stale_target";
+    if (this.channelError) this.awaitingAcceptance = { reason: "check_failed", accepted: null, available: null };
     return this.lastError ? `check failed: ${this.lastError}` : "no newer signed release";
   }
 
@@ -275,6 +291,10 @@ export class NativeUpdateCoordinator {
         this.inFlight = null;
         if (code !== 0) this.lastError = `update transaction exited with code ${code ?? "null"} before replacing this service`;
         this.options.logger.warn({ code, bundleVersion: available.bundleVersion }, "native update transaction exited without replacing the service");
+        if (code !== 0 && !this.applying) {
+          this.awaitingAcceptance = { reason: "update_failed", accepted: null, available: available.bundleVersion };
+          this.scheduleAcceptanceRecheck();
+        }
       });
       this.options.logger.info({ bundleVersion: available.bundleVersion, reason, pid: launched.pid }, "native update transaction launched");
       return { started: true, reason: null, pid: launched.pid, status: this.status() };

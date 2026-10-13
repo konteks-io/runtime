@@ -239,6 +239,42 @@ describe("re-check while Konteks has not accepted the newest release (R5-O39)", 
     } finally { f.c.stop(); }
   });
 
+  it("re-checks soon after the release channel could not be read, then installs the accepted release", async () => {
+    vi.useFakeTimers();
+    const logger = createLogger({ name: "test", silent: true });
+    const info = vi.spyOn(logger, "info");
+    const f = coordinator({ logger, acceptedRelease: async () => ({ bundleVersion: "1.1.0", manifestDigest: f.m.newer.digest }) });
+    f.fetchManifest.mockRejectedValueOnce(new Error("The operation was aborted due to timeout"));
+    try {
+      expect(await f.c.apply("periodic")).toMatchObject({ started: false });
+      expect(info.mock.calls.map(([fields]) => fields).find(fields => (fields as { event?: string }).event === "native.update.recheck_scheduled"))
+        .toMatchObject({ reason: "check_failed", available: null, delayMs: 15 * 60_000 });
+      await vi.advanceTimersByTimeAsync(15 * 60_000);
+      expect(f.launch).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ bundleVersion: "1.1.0", reason: "periodic" }));
+    } finally { f.c.stop(); }
+  });
+
+  it("tries again soon after a transaction exits without replacing this service, within the per-release limit", async () => {
+    vi.useFakeTimers();
+    const logger = createLogger({ name: "test", silent: true });
+    const info = vi.spyOn(logger, "info");
+    const f = coordinator({ logger, acceptedRelease: async () => ({ bundleVersion: "1.1.0", manifestDigest: f.m.newer.digest }) });
+    let exit: ((code: number | null) => void) | undefined;
+    f.launch.mockImplementation(async () => ({ pid: 99, onExit: (listener: (code: number | null) => void) => { exit = listener; } }));
+    try {
+      expect(await f.c.apply("periodic")).toMatchObject({ started: true });
+      exit!(1);
+      expect(recheckDelays(info)).toEqual([15 * 60_000]);
+      expect(info.mock.calls.map(([fields]) => fields).find(fields => (fields as { event?: string }).event === "native.update.recheck_scheduled"))
+        .toMatchObject({ reason: "update_failed", available: "1.1.0" });
+      await vi.advanceTimersByTimeAsync(15 * 60_000);
+      expect(f.launch).toHaveBeenCalledTimes(2);
+      exit!(0);
+      await vi.advanceTimersByTimeAsync(2 * 60 * 60_000);
+      expect(f.launch).toHaveBeenCalledTimes(2);
+    } finally { f.c.stop(); }
+  });
+
   it("keeps the 5-minute first check and the 6-hour cadence when nothing newer is published", async () => {
     vi.useFakeTimers();
     const logger = createLogger({ name: "test", silent: true });
