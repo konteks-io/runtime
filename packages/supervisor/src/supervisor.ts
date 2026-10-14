@@ -111,7 +111,7 @@ import { StateMutationGate } from "./state/mutation-gate.js";
 import type { RelayedSessionDeps } from "./session/relayed-session.js";
 import { PermissionBroker } from "./session/permissions.js";
 import { EvaluatorPolicyResponder } from "./session/policy-responder.js";
-import { createWorkspaceToolPolicy } from "./session/workspace-tool-policy.js";
+import { createWorkspaceToolPolicy, DIRECT_SESSION_BASH_BLOCKLIST } from "./session/workspace-tool-policy.js";
 import { ClaudeExecutableIdentity } from "./native/claude-executable-identity.js";
 import { SupervisorJournal, type JournalEntry } from "./state/journal.js";
 import type { RuntimeRecoveryRecord } from "./state/runtime-recovery.js";
@@ -209,6 +209,12 @@ export interface SupervisorOptions {
      */
     updateProbation?: { releaseId: string; readLedger: () => Promise<NativeUpdateLedger>; pollMs?: number; staleAttemptMs?: number };
   };
+}
+
+
+/** A direct session's agent may commit in its own working copy; a delivery's may not. */
+function assignmentToolPolicy(assignment: { kind: string }) {
+  return createWorkspaceToolPolicy(assignment.kind === "direct" ? { bashBlocklist: DIRECT_SESSION_BASH_BLOCKLIST } : {});
 }
 
 export class Supervisor {
@@ -1096,7 +1102,7 @@ export class Supervisor {
           ),
         onTurnActivity: () => this.nudgeHeartbeat(),
         preview: this.sessionPreviewAccess(),
-        policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => this.configuration.humanDeferralAllowed && assignment.policy.humanDeferralAllowed),
+        policy: new EvaluatorPolicyResponder(assignmentToolPolicy(assignment), () => this.configuration.humanDeferralAllowed && assignment.policy.humanDeferralAllowed),
         broker: this.broker,
         registerDeferral: (body) => this.core.deferPermission(this.instanceId ?? "", body),
         instanceId: this.instanceId ?? "",

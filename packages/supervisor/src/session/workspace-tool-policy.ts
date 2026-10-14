@@ -19,6 +19,15 @@ export const DEFAULT_BASH_BLOCKLIST: readonly string[] = [
   "runas", "verb:runas", "gsudo",
 ];
 
+/**
+ * A direct session is the person's own agent working in their own working
+ * copy: it may commit there (owner, 10-14). Pushing, tagging and opening pull
+ * requests stay the person's. A delivery keeps the full list, because Konteks
+ * commits and publishes a delivery's work itself.
+ */
+export const DIRECT_SESSION_BASH_BLOCKLIST: readonly string[] =
+  DEFAULT_BASH_BLOCKLIST.filter(entry => entry !== "git commit");
+
 const FILE_CHANGE_KINDS = new Set(["edit", "delete", "move"]);
 const PATH_KEYS = ["file_path", "filePath", "path", "notebook_path", "target_file", "destination"] as const;
 
