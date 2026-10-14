@@ -26,7 +26,10 @@ export interface SessionPreviewAccess {
   start(sessionId: string, cwd: string): Promise<PreviewStatus>;
   stop(sessionId: string, reason: string): Promise<PreviewStatus>;
   status(sessionId: string): PreviewStatus;
+  /** A prompt or update on the session: keeps its preview from idling. */
   touch(sessionId: string): void;
+  /** The agent used its preview (its preview tool or browser): also marks the agent active on it. */
+  touchByAgent(sessionId: string): void;
   /**
    * The session's worktree may be previewed: a viewer opening the preview in
    * Konteks starts it when nothing runs. Kept while the worktree exists,

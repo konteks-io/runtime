@@ -42,6 +42,11 @@ export interface HeartbeatOptions {
    * when it changes: Core keeps the latest value it received.
    */
   connectorCommands?: () => ConnectorCommandsManifest | undefined;
+  /**
+   * The previews the agent started and is using; undefined to leave the
+   * field out (a Core below 7.8). Never throws the heartbeat away.
+   */
+  previews?: () => HeartbeatMessage["previews"];
   configRevision: () => number;
   bundleVersion: string;
   softMaxConcurrent: () => number | undefined;
@@ -65,6 +70,8 @@ export interface HeartbeatLiveness {
 
 const MIN_SETTLE_DEADLINE_MS = 60_000;
 const MAX_SETTLE_DEADLINE_MS = 10 * 60_000;
+/** HeartbeatMessageSchema's bound on `previews`. */
+const MAX_REPORTED_PREVIEWS = 8;
 
 export class HeartbeatPublisher {
   private timer: NodeJS.Timeout | null = null;
@@ -226,6 +233,7 @@ export class HeartbeatPublisher {
     const utilization = this.utilization(snapshot, pending);
     const supportedAgents = this.supportedAgents(snapshot.agents);
     const commands = this.unsentConnectorCommands(runnerIncarnation);
+    const previews = this.previews();
     this.stage = "sequence";
     const sequence = await this.options.store.allocateHeartbeatSequence();
     assertCurrent();
@@ -242,7 +250,7 @@ export class HeartbeatPublisher {
       activeAssignmentIds: this.options.activeAssignmentIds().slice(0, 256),
       configRevision: this.options.configRevision(),
       bundleVersion: this.options.bundleVersion,
-      ...this.optionalReports(supportedAgents, commands.manifest),
+      ...this.optionalReports(supportedAgents, commands.manifest, previews),
     });
     // The wire carries a top-level `signature` and no `proof` envelope, but the
     // bytes signed are the instance proof's: binding the audience, the
@@ -293,6 +301,15 @@ export class HeartbeatPublisher {
     }
   }
 
+  private previews(): HeartbeatMessage["previews"] {
+    try {
+      return this.options.previews?.()?.slice(0, MAX_REPORTED_PREVIEWS);
+    } catch (error) {
+      this.logger.warn({ err: error }, "previews not reported on this heartbeat");
+      return undefined;
+    }
+  }
+
   /** The connector commands when this incarnation has not sent them yet, with the key that records them as sent. */
   private unsentConnectorCommands(runnerIncarnation: string): { manifest?: ConnectorCommandsManifest; key: string | null } {
     try {
@@ -305,10 +322,12 @@ export class HeartbeatPublisher {
     return { key: null };
   }
 
-  private optionalReports(supportedAgents: readonly SupportedAgentEntry[] | undefined, connectorCommands: ConnectorCommandsManifest | undefined): Record<string, unknown> {
+  private optionalReports(supportedAgents: readonly SupportedAgentEntry[] | undefined, connectorCommands: ConnectorCommandsManifest | undefined,
+    previews: HeartbeatMessage["previews"]): Record<string, unknown> {
     return {
       ...(this.options.modelCapabilitySnapshots ? { modelCapabilitySnapshots: this.options.modelCapabilitySnapshots() } : {}),
       ...(supportedAgents ? { supportedAgents } : {}),
       ...(connectorCommands ? { connectorCommands } : {}),
+      ...(previews ? { previews } : {}),
     };
   }}

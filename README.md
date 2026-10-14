@@ -225,6 +225,13 @@ serve:
 
 Previews are switched on or off per runtime in Konteks (on by default).
 
+The heartbeat names the previews the agent is using, so Konteks shows that
+work as moving: each one the agent started (or started again after a viewer
+opened it) and used in the last 3 minutes through its own preview tool or
+browser, with when it started and when the agent last used it. A viewer
+opening or browsing a preview never counts. Only a Core at contract 7.8 or
+later gets this report.
+
 ### Structured results
 
 Turns that need a typed answer (a plan, a verdict, an estimate) use a local

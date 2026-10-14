@@ -40,6 +40,7 @@ import {
   type RuntimeAgentLoginDeliveryRequest,
   coreContractAtLeast,
   REMOTE_PREVIEW_APP_CREDENTIALS_MIN_CORE_CONTRACT_VERSION,
+  REMOTE_PREVIEW_ACTIVITY_MIN_CORE_CONTRACT_VERSION,
 } from "@konteks/remote-common";
 import { EmbeddedReleaseRootSchema, NATIVE_MANIFEST_URL, isHostAgentId, nativeManifestUrl, connectorCommandsManifest, selectNativeModelCapabilityMappings, verifyNativeRelease, type VerifiedNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 import { chromeInstalled, readAntigravityAdminObservation, type RunnerConfig } from "@konteks/remote-agent-runner";
@@ -74,7 +75,7 @@ import { LeaseLane } from "./lease/lease-lane.js";
 import { channelOfId, coreChannelId, CORE_BOUND_CHANNELS } from "./relay/channel-ids.js";
 import { PreviewWorktreePermits } from "./preview/worktree-permits.js";
 import { PreviewChannel } from "./preview/preview-channel.js";
-import { PreviewProcessManager, PreviewProcessRegistry } from "./preview/process-manager.js";
+import { PreviewProcessManager, PreviewProcessRegistry, type AgentPreviewActivity } from "./preview/process-manager.js";
 import { PreviewViewerStarts } from "./preview/viewer-start.js";
 import type { SessionPreviewAccess } from "./preview/mcp-server.js";
 import { provisioningCredentialIsExpired, refreshProvisioningCredential, submitReadiness } from "./provisioning/activation.js";
@@ -139,6 +140,8 @@ import { evaluateHeartbeatLiveness, isCredentialRefusal, leaseLapseNeedsRestart 
 const PREVIEW_START_WAIT_MS = 45_000;
 /** A viewer's page refreshes every few seconds; a preview that failed is not retried faster than this. */
 const PREVIEW_VIEWER_RETRY_MS = 60_000;
+/** How recently the agent must have used a preview for the heartbeat to report it (Core's "moving" window). */
+const PREVIEW_AGENT_ACTIVE_WINDOW_MS = 3 * 60_000;
 
 /** bb releases sessions idle for 30 minutes, checked every 5 minutes. */
 /**
@@ -1271,6 +1274,7 @@ export class Supervisor {
       // The commands this release carries, only to a Core that takes 7.1 fields.
       connectorCommands: () =>
         this.hostSettings.coreAcceptsRouteBilling ? this.connectorCommands() : undefined,
+      previews: () => this.agentPreviewActivity(),
       configRevision: () => this.control.configRevision,
       bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION,
       softMaxConcurrent: () => this.configuration.softMaxConcurrent ?? this.config.SUPERVISOR_SOFT_MAX_CONCURRENT,
@@ -1278,6 +1282,12 @@ export class Supervisor {
       intervalSeconds: () => this.heartbeatIntervalSeconds ?? this.configuration.heartbeatIntervalSeconds,
       renewalDelayMs: () => (this.lease.current() ? this.lease.nextRenewalDelayMs() : 5000),
     });
+  }
+
+  /** The previews the agent is using, only to a Core that reads them (an older Core refuses the whole heartbeat). */
+  private agentPreviewActivity(): AgentPreviewActivity[] | undefined {
+    if (!coreContractAtLeast(this.coreContractVersion, REMOTE_PREVIEW_ACTIVITY_MIN_CORE_CONTRACT_VERSION)) return undefined;
+    return this.previews.agentActive(PREVIEW_AGENT_ACTIVE_WINDOW_MS);
   }
 
   private async startLocalAgents(native: NativeOptions): Promise<void> {
@@ -2213,6 +2223,7 @@ export class Supervisor {
       stop: (sessionId, reason) => this.previews.stop(sessionId, reason),
       status: sessionId => this.previews.status(sessionId),
       touch: sessionId => this.previews.touch(sessionId),
+      touchByAgent: sessionId => this.previews.touchByAgent(sessionId),
       permit: (sessionId, cwd) => this.previewWorktrees.set(sessionId, cwd),
       origin: sessionId => this.previews.originFor(sessionId),
       // Playwright's own Chromium, when this computer has no Chrome, is installed here once.

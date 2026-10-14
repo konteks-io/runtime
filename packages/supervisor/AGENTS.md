@@ -31,6 +31,14 @@ QA browser, structured results, updates and doctor/support.
   local one, a `preview` work kind or a separate forwarder process. A viewer
   may auto-start a preview only in the worktree the session registered
   (`SessionPreviewAccess.permit`).
+- **Preview activity.** The heartbeat's `previews` lists the previews the
+  agent started (an agent start on a viewer's preview makes it the agent's,
+  never back) and used within 3 minutes (`agentActive`,
+  `PREVIEW_AGENT_ACTIVE_WINDOW_MS`). Only `touchByAgent` (preview tool,
+  agent browser) and an agent start move `agentActiveAt`; viewer traffic,
+  prompts and session updates use `touch`, which only defers the idle stop.
+  Sent only to a Core at `REMOTE_PREVIEW_ACTIVITY_MIN_CORE_CONTRACT_VERSION`
+  (7.8): an older Core's strict schema refuses the whole heartbeat.
 - **QA browser boundary.** `PreviewBrowserGateway` (`preview/browser-gateway.ts`)
   is the security boundary, not Playwright's `--allowed-origins`. It admits
   the session's running preview plus origins Core granted, read only from the
@@ -48,7 +56,8 @@ QA browser, structured results, updates and doctor/support.
   = the session's own folder, no repository selection.
 - **Core contract gating.** `availableCommands`, `supportedAgents`,
   `connectorCommands`, pay-per-use and option billing go only to a 7.1 Core;
-  `integration` work only from 7.3 (`work/accepted-kinds.ts`). The
+  `integration` work only from 7.3 (`work/accepted-kinds.ts`); a heartbeat's
+  `previews` only from 7.8. The
   `agent_runner` component always advertises `core-contract-version-v1`.
   Supported-agent detection (`NotAddedAgentsDetector`) never runs on the
   heartbeat path.

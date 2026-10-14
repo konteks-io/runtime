@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { FixedClock, computeAgentModelOfferedValuesSnapshotDigest, generateInstanceKey, verifyInstanceProof } from "@konteks/remote-common";
+import { FixedClock, HeartbeatMessageSchema, computeAgentModelOfferedValuesSnapshotDigest, generateInstanceKey, verifyInstanceProof, type HeartbeatMessage } from "@konteks/remote-common";
 import { HeartbeatPublisher, type HeartbeatOptions } from "../heartbeat/heartbeat.js";
 import { SupervisorStore } from "../state/store.js";
 import { CORE_AUDIENCE } from "../core/client.js";
@@ -148,6 +148,32 @@ describe("signed HTTPS heartbeat lifecycle", () => {
     const older = new HeartbeatPublisher({ ...f.options, runnerIncarnation: () => "process" } as HeartbeatOptions); publishers.push(older);
     await older.start();
     expect(Object.keys(await older.publish())).not.toContain("supportedAgents");
+  });
+  it("carries the agent's previews inside the signed body as the contract's schema reads them, and a failing provider never costs the heartbeat", async () => {
+    const f = await fixture();
+    const previews = [{ sessionId: "session-1", startedAt: "2026-09-06T00:00:00.000Z", agentActiveAt: "2026-09-06T00:02:00.000Z" }];
+    f.options.previews = () => previews;
+    const publisher = new HeartbeatPublisher({ ...f.options, runnerIncarnation: () => "process" } as HeartbeatOptions); publishers.push(publisher);
+    await publisher.start();
+    expect((await publisher.publish()).previews).toEqual(previews);
+    const { signature, ...sent } = f.heartbeat.mock.calls.at(-1)![0] as HeartbeatMessage & { signature: string };
+    expect(HeartbeatMessageSchema.parse(sent).previews).toEqual(previews);
+    expect(verifyInstanceProof(f.key.publicKey, { method: "heartbeat", audience: CORE_AUDIENCE, subject: "instance", body: sent as never }, { algorithm: "ES256", nonce: `seq:${sent.sequence}`, signature })).toBe(true);
+    // The wire carries at most eight.
+    const many = Array.from({ length: 10 }, (_, index) => ({ ...previews[0]!, sessionId: `session-${index}` }));
+    f.options.previews = () => many;
+    const crowded = new HeartbeatPublisher({ ...f.options, runnerIncarnation: () => "process" } as HeartbeatOptions); publishers.push(crowded);
+    await crowded.start();
+    expect((await crowded.publish()).previews).toEqual(many.slice(0, 8));
+    f.options.previews = () => { throw new Error("preview manager broke"); };
+    const failing = new HeartbeatPublisher({ ...f.options, runnerIncarnation: () => "process" } as HeartbeatOptions); publishers.push(failing);
+    await failing.start();
+    expect(Object.keys(await failing.publish())).not.toContain("previews");
+    // An older Core: the supervisor's provider answers undefined and the field is left out.
+    f.options.previews = () => undefined;
+    const older = new HeartbeatPublisher({ ...f.options, runnerIncarnation: () => "process" } as HeartbeatOptions); publishers.push(older);
+    await older.start();
+    expect(Object.keys(await older.publish())).not.toContain("previews");
   });
   it("sends the release's connector commands on the first accepted heartbeat of an incarnation and again only when they change", async () => {
     const f = await fixture();

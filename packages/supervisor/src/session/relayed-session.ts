@@ -497,7 +497,10 @@ export class RelayedSession {
     const tools = new PreviewMcpServer({
       start: () => preview.start(sessionId, cwd),
       stop: () => preview.stop(sessionId, "agent"),
-      status: () => preview.status(sessionId),
+      status: () => {
+        preview.touchByAgent(sessionId);
+        return preview.status(sessionId);
+      },
     }, { logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt }, browser: browser !== undefined });
     this.previewTools = tools;
     this.previewSessionId = sessionId;
@@ -521,7 +524,7 @@ export class RelayedSession {
     const origin = preview.origin.bind(preview);
     const gateway = new PreviewBrowserGateway({
       target: () => origin(sessionId),
-      onActivity: () => preview.touch(sessionId),
+      onActivity: () => preview.touchByAgent(sessionId),
       logger: this.logger,
       context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt },
     });

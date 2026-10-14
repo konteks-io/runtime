@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { request as httpRequest } from "node:http";
 import { createServer } from "node:net";
-import { createLogger, supportsProcessGroups, type Logger } from "@konteks/remote-common";
+import { createLogger, supportsProcessGroups, type HeartbeatMessage, type Logger } from "@konteks/remote-common";
 import { blockedCommandPattern, DEFAULT_BASH_BLOCKLIST } from "../session/workspace-tool-policy.js";
 import { CONVERSATION_HAS_NO_APP, NOTHING_TO_SERVE_REASON, resolvePreviewPlan, substitutePreviewVariables, type PreviewPlan, type PreviewPlanResult } from "./config.js";
 import { resolvePreviewPath } from "./user-path.js";
@@ -23,8 +23,14 @@ export { PreviewProcessRegistry } from "./process-owner.js";
  * machine responsive.
  */
 export type PreviewState = "not_started" | "starting" | "running" | "failed" | "stopped";
-/** Who started a preview: the session's agent (preview_start) or a viewer opening it in Konteks. */
+/**
+ * Who started a preview: the session's agent (preview_start) or a viewer
+ * opening it in Konteks. The agent starting a viewer's preview makes it the
+ * agent's, never back.
+ */
 export type PreviewStarter = "agent" | "viewer";
+/** A preview the agent started and is using, as the heartbeat reports it. */
+export type AgentPreviewActivity = NonNullable<HeartbeatMessage["previews"]>[number];
 export type PreviewPhase = "install" | "prepare" | "serve";
 
 export interface PreviewStatus {
@@ -175,9 +181,11 @@ interface Entry {
   message: string;
   reason: string | null;
   notes: string[];
-  startedAt: number | null;
+  startedAt: number;
   readyAt: number | null;
   lastActivityAt: number;
+  /** When the agent last started or used it (its preview tool or browser); viewer traffic never moves it. */
+  agentActiveAt: number | null;
   settled: Promise<void>;
   stopping: Promise<void> | null;
 }
@@ -227,10 +235,7 @@ export class PreviewProcessManager {
   async start(sessionId: string, cwd: string, startedBy: PreviewStarter = "agent"): Promise<PreviewStatus> {
     if (this.closed) return this.refusal(sessionId, "The connector is stopping; previews cannot start now.", "The connector on this computer is stopping. Try again once it is back.");
     const current = this.entries.get(sessionId);
-    if (current && reusable(current, cwd)) {
-      current.lastActivityAt = this.now();
-      return this.view(current);
-    }
+    if (current && reusable(current, cwd)) return this.reuse(current, startedBy);
     if (current) await this.stop(sessionId, "restart");
     if (this.entries.has(sessionId)) return this.start(sessionId, cwd, startedBy);
     const active = [...this.entries.values()].filter(entry => activeState(entry.state) || entry.child !== null || entry.stopping !== null);
@@ -238,15 +243,29 @@ export class PreviewProcessManager {
       return this.refusal(sessionId, `${active.length} previews are already running on this computer (the limit is ${this.maxRunning}, to keep it responsive). Stop one with preview_stop, or wait until one stops after ${Math.round(this.idleMs / 60_000)} idle minutes.`,
         `This computer already runs ${active.length} previews, its limit. Stop one, or try again once one stops after ${Math.round(this.idleMs / 60_000)} idle minutes.`);
     }
-    const entry: Entry = {
-      sessionId, cwd, startedBy, generation: ++this.generation, state: "starting", phase: null, plan: null, port: null, host: null, child: null, cleanupFailed: false,
-      logs: [], message: "Starting: reading how to serve this working copy.", reason: null, notes: [], startedAt: this.now(), readyAt: null,
-      lastActivityAt: this.now(), settled: Promise.resolve(), stopping: null,
-    };
+    const entry = this.newEntry(sessionId, cwd, startedBy);
     this.entries.set(sessionId, entry);
     entry.settled = this.launch(entry).catch(error => {
       return this.fail(entry, `The preview could not start: ${error instanceof Error ? error.message.slice(0, 300) : "unexpected error"}.`, UNEXPECTED_REASON);
     });
+    return this.view(entry);
+  }
+
+  private newEntry(sessionId: string, cwd: string, startedBy: PreviewStarter): Entry {
+    return {
+      sessionId, cwd, startedBy, generation: ++this.generation, state: "starting", phase: null, plan: null, port: null, host: null, child: null, cleanupFailed: false,
+      logs: [], message: "Starting: reading how to serve this working copy.", reason: null, notes: [], startedAt: this.now(), readyAt: null,
+      lastActivityAt: this.now(), agentActiveAt: startedBy === "agent" ? this.now() : null, settled: Promise.resolve(), stopping: null,
+    };
+  }
+
+  /** The session's running preview again; the agent starting it makes it the agent's. */
+  private reuse(entry: Entry, startedBy: PreviewStarter): PreviewStatus {
+    entry.lastActivityAt = this.now();
+    if (startedBy === "agent") {
+      entry.startedBy = "agent";
+      entry.agentActiveAt = this.now();
+    }
     return this.view(entry);
   }
 
@@ -293,10 +312,29 @@ export class PreviewProcessManager {
     return `http://${entry.host === "::1" ? "[::1]" : entry.host}:${entry.port}`;
   }
 
-  /** Viewer traffic, an agent's preview call or a prompt on the session. */
+  /** Viewer traffic or a prompt or update on the session: keeps the preview from idling. */
   touch(sessionId: string): void {
     const entry = this.entries.get(sessionId);
     if (entry) entry.lastActivityAt = this.now();
+  }
+
+  /** The session's agent used its preview (its preview tool or browser): keeps it from idling and marks the agent active. */
+  touchByAgent(sessionId: string): void {
+    const entry = this.entries.get(sessionId);
+    if (!entry) return;
+    entry.lastActivityAt = this.now();
+    entry.agentActiveAt = this.now();
+  }
+
+  /** The previews the agent started, starting or running, that it used within the last `windowMs`. */
+  agentActive(windowMs: number): AgentPreviewActivity[] {
+    const since = this.now() - windowMs;
+    const activity: AgentPreviewActivity[] = [];
+    for (const entry of this.entries.values()) {
+      if (entry.startedBy !== "agent" || !activeState(entry.state) || entry.agentActiveAt === null || entry.agentActiveAt < since) continue;
+      activity.push({ sessionId: entry.sessionId, startedAt: new Date(entry.startedAt).toISOString(), agentActiveAt: new Date(entry.agentActiveAt).toISOString() });
+    }
+    return activity;
   }
 
   async stop(sessionId: string, reason: string): Promise<PreviewStatus> {
@@ -471,7 +509,7 @@ export class PreviewProcessManager {
     const openPath = plan.openPath ?? "/";
     entry.message = `Running. Open http://${PREVIEW_HOST}:${port}${openPath === "/" ? "" : openPath} on this computer, or open the preview from the session in Konteks.`;
     this.failures.delete(entry.sessionId);
-    this.logger.info({ event: "preview.ready", source: plan.source, startupMs: entry.readyAt - (entry.startedAt ?? entry.readyAt) }, "preview answered its health probe");
+    this.logger.info({ event: "preview.ready", source: plan.source, startupMs: entry.readyAt - entry.startedAt }, "preview answered its health probe");
   }
 
   private async runPhase(entry: Entry, command: string, env: NodeJS.ProcessEnv): Promise<number | null> {
@@ -637,7 +675,7 @@ export class PreviewProcessManager {
       ...planView(entry.plan),
       notes: [...entry.notes],
       message: entry.message,
-      startedAt: isoOrNull(entry.startedAt),
+      startedAt: new Date(entry.startedAt).toISOString(),
       readyAt: isoOrNull(entry.readyAt),
       idleStopMinutes: Math.round(this.idleMs / 60_000),
       logTail: entry.logs.slice(-LOG_TAIL),
