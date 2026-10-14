@@ -208,6 +208,8 @@ export class ChannelMux {
   private generation = 0;
   /** This connection's relay asks for holder-bound replay (`replay_request`) after reconnects. */
   private holderReplayOnRequest = false;
+  /** The connection generation each channel last logged an acknowledgement beyond its stream on. */
+  private readonly ackBeyondStreamLogged = new Map<string, number>();
   private readonly receiveLanes = new Map<string, Promise<void>>();
   /** Only cursor snapshot/persist/publish holds this shared mutation lane. */
   private pending: Promise<void> = Promise.resolve();
@@ -755,11 +757,7 @@ export class ChannelMux {
     }
     if (ack.dataDirection !== "to_core") return;
     assertRecovery();
-    const origin = holderBound(state.channel) ? "grant_holder" : "core";
-    if (ack.origin !== origin || ack.cumulativeSeq > highestSent) {
-      this.counters.invalidFrames += 1;
-      return;
-    }
+    if (!this.ackWithinStream(ack, state, highestSent)) return;
     if (ack.cumulativeSeq > state.ackedByEndpoint) await this.advanceAck(ack, state, generation, assertRecovery);
   }
 
@@ -941,6 +939,29 @@ export class ChannelMux {
       replayMaxBytes: this.options.replayBufferBytes,
       replayRetention: holderBound(state.channel) ? "endpoint_ack_or_byte_limit" : "age_or_byte_limit",
       ...peer }, "channel replay reset");
+  }
+
+  /** From this channel's endpoint and within what it sent; anything else is counted as invalid. */
+  private ackWithinStream(ack: RelayAck, state: ChannelState, highestSent: number): boolean {
+    const origin = holderBound(state.channel) ? "grant_holder" : "core";
+    if (ack.origin === origin && ack.cumulativeSeq <= highestSent) return true;
+    this.counters.invalidFrames += 1;
+    if (ack.origin === origin) this.logAckBeyondStream(ack, state, highestSent);
+    return false;
+  }
+
+  /**
+   * An endpoint acknowledged frames this channel never sent: it is counting
+   * another stream (a session moved here from another computer kept that
+   * computer's cursor, D141), so this channel's own frames stay unacknowledged
+   * and its holder never acts on them. Once per channel per connection.
+   */
+  private logAckBeyondStream(ack: RelayAck, state: ChannelState, highestSent: number): void {
+    if (this.ackBeyondStreamLogged.get(ack.channelId) === this.generation) return;
+    this.ackBeyondStreamLogged.set(ack.channelId, this.generation);
+    this.logger.warn({ event: "relay.ack.beyond_stream", channelId: ack.channelId, channel: state.channel, connectionEpoch: this.epoch,
+      ackedSeq: ack.cumulativeSeq, highestSent, ackedByEndpoint: state.ackedByEndpoint, unackedCount: state.buffer.unackedCount },
+    "endpoint acknowledged frames this channel never sent; it is counting another stream");
   }
 
   /** One line per handshake for the holder-bound replay kept back until a holder asks; counts and ages only. */

@@ -518,6 +518,23 @@ describe("channel mux", () => {
     expect(mux.handshakeCursors()[channel]?.to_core).toBe(1);
   });
 
+  it("says once per connection when a holder acknowledges frames this session channel never sent (D141)", async () => {
+    const logger = createLogger({ name: "mux-test", silent: true });
+    const warn = vi.spyOn(logger, "warn");
+    const { mux } = buildMux({ logger });
+    await mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: [] });
+    mux.send("session:moved", "session", heartbeat as never);
+    // The holder still counts the stream of the computer the session came from.
+    const ahead = { kind: "ack", channelId: "session:moved", connectionEpoch: 1, cumulativeSeq: 825, issuedAt: "2026-09-06T00:00:00Z", dataDirection: "to_core", origin: "grant_holder", grantId: "grant" } as const;
+    await mux.receive(ahead);
+    await mux.receive(ahead);
+    const lines = warn.mock.calls.filter(([fields]) => (fields as { event?: string }).event === "relay.ack.beyond_stream");
+    expect(lines).toHaveLength(1);
+    expect(lines[0]![0]).toMatchObject({ channelId: "session:moved", ackedSeq: 825, highestSent: 1, ackedByEndpoint: 0, unackedCount: 1 });
+    expect(mux.unackedBytes("session:moved")).toBeGreaterThan(0);
+    expect(mux.counters.invalidFrames).toBe(2);
+  });
+
   it("commits independent control frames and endpoint acknowledgements while assignment acceptance is blocked", async () => {
     const gate = Promise.withResolvers<void>(), entered = vi.fn();
     const { mux, emitted } = buildMux({ ackEveryFrames: 1, onFrame: async frame => { entered(frame.channel); if (frame.channel === "assignment") await gate.promise; } });
