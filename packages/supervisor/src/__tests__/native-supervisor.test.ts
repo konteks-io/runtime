@@ -213,11 +213,13 @@ describe("native Supervisor composition", () => {
       const opening = Promise.withResolvers<boolean>();
       const open = vi.spyOn(internals, "openOnComputerStep").mockImplementation(() => opening.promise);
       const step = delivery({ loginId: "login-opencode", agentId: "opencode", loginOption: "on-computer" });
-      const first = internals.onAgentLogin(step, verifier);
-      const second = internals.onAgentLogin(step, verifier);
-      expect(await second).toBe("duplicate");
+      // Whichever copy claims the step first opens its window; the other is a duplicate.
+      const copies = [internals.onAgentLogin(step, verifier), internals.onAgentLogin(step, verifier)];
+      const duplicate = await Promise.race(copies);
+      expect(duplicate).toBe("duplicate");
+      expect(open).toHaveBeenCalledOnce();
       opening.resolve(true);
-      expect(await first).toBeUndefined();
+      expect((await Promise.all(copies)).sort()).toEqual(["duplicate", undefined]);
       expect(open).toHaveBeenCalledOnce();
       expect(internals.onComputerWatches.has("login-opencode")).toBe(true);
       expect(await internals.onAgentLogin(step, verifier)).toBe("duplicate");
@@ -228,10 +230,11 @@ describe("native Supervisor composition", () => {
     it("starts no watch for an on-computer step stopped while its window opens", async () => {
       const { internals } = await started();
       vi.spyOn(internals, "onComputerFacts").mockReturnValue({ agentId: "opencode", state: "needs_sign_in" });
-      const opening = Promise.withResolvers<boolean>();
-      vi.spyOn(internals, "openOnComputerStep").mockImplementation(() => opening.promise);
+      // Wait on the window starting to open, not on time.
+      const opening = Promise.withResolvers<boolean>(), claimed = Promise.withResolvers<void>();
+      vi.spyOn(internals, "openOnComputerStep").mockImplementation(() => { claimed.resolve(); return opening.promise; });
       const start = internals.onAgentLogin(delivery({ loginId: "login-stop", agentId: "opencode", loginOption: "on-computer" }), verifier);
-      await vi.waitFor(() => expect(internals.openOnComputerStep).toHaveBeenCalledOnce());
+      await claimed.promise;
       await internals.onAgentLogin(delivery({ loginId: "login-stop", agentId: "opencode", loginOption: "on-computer", action: "cancel" }), verifier);
       opening.resolve(true);
       await start;

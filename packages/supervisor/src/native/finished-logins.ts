@@ -26,6 +26,8 @@ const FILE_NAME = "finished-logins.json";
  */
 export class FinishedLogins {
   private entries: FinishedLogin[] | null = null;
+  /** One read of the file, shared by every caller that arrives before it ends. */
+  private loading: Promise<FinishedLogin[]> | null = null;
   private writes: Promise<void> = Promise.resolve();
 
   constructor(private readonly options: { dataDir: string; now: () => number; logger: Logger; mutate: StateMutation }) {}
@@ -51,8 +53,9 @@ export class FinishedLogins {
   }
 
   private async load(): Promise<FinishedLogin[]> {
-    this.entries ??= this.current(await this.read());
-    return this.entries;
+    if (this.entries) return this.entries;
+    this.loading ??= this.read().then(entries => { this.entries ??= this.current(entries); return this.entries; });
+    return this.loading;
   }
 
   /** Every well-formed record on disk; a missing or damaged file is an empty list. */
