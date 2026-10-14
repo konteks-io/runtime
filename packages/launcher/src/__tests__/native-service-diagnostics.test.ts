@@ -270,6 +270,14 @@ describe("the Windows startup manifest is UTF-8 and repairs an outdated definiti
  * Only a real Windows can prove these; CI's windows-native job runs them.
  * Shortcuts are isolated under a disposable home directory.
  */
+/**
+ * Real Windows on a shared CI runner: a cold PowerShell or WScript start took
+ * over 15 s and a child's first file over 10 s (10-14, two runs). These tests
+ * check behaviour, not speed, so they wait like a person's slow machine would.
+ */
+const COLD_START_MS = 60_000;
+const SETTLE_MS = 30_000;
+
 describe.runIf(process.platform === "win32")("on a real Windows", () => {
   const dirs: string[] = [];
   afterEach(async () => { await Promise.all(dirs.splice(0).map(dir => rm(dir, { recursive: true, force: true }))); });
@@ -278,10 +286,10 @@ describe.runIf(process.platform === "win32")("on a real Windows", () => {
   it("Windows PowerShell parses the hidden host script", () => {
     const service = windows();
     const check = "$errors = $null; [System.Management.Automation.Language.Parser]::ParseInput([Console]::In.ReadToEnd(), [ref]$null, [ref]$errors) | Out-Null; if ($errors) { $errors | ForEach-Object { [Console]::Error.WriteLine($_.ToString()) }; exit 1 }";
-    const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", check], { input: hostScript(service), encoding: "utf8", timeout: 15_000 });
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", check], { input: hostScript(service), encoding: "utf8", timeout: COLD_START_MS });
     expect(result.stderr).toBe("");
     expect(result.status).toBe(0);
-  }, 20_000);
+  }, COLD_START_MS + 15_000);
 
   it("Windows PowerShell 5.1 parses every generated lifecycle command without executing it", () => {
     const service = nativeServiceDefinition({ os: "windows", home: "C:\\Users\\Ada & O'Brien", root: "C:\\Users\\Ada & O'Brien\\remote\\", executable: "C:\\Users\\Ada & O'Brien\\remote\\releases\\next\\konteks-connector.exe", userId: "S-1-5-21-1-2-3-1001" });
@@ -289,21 +297,21 @@ describe.runIf(process.platform === "win32")("on a real Windows", () => {
     const encoded = commands.map(command => command.args.at(-1)!);
     encoded.push(Buffer.from(hostScript(service), "utf16le").toString("base64"));
     const check = "$failed=$false; foreach ($encoded in [Console]::In.ReadToEnd().Split([char]10)) { $errors=$null; $text=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encoded.Trim())); [void][System.Management.Automation.Language.Parser]::ParseInput($text,[ref]$null,[ref]$errors); if ($errors) { $failed=$true; foreach ($error in $errors) { [Console]::Error.WriteLine($error.ToString()) } } }; if ($failed) { exit 1 }";
-    const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", check], { input: encoded.join("\n"), encoding: "utf8", windowsHide: true, timeout: 15_000 });
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", check], { input: encoded.join("\n"), encoding: "utf8", windowsHide: true, timeout: COLD_START_MS });
     expect(result.error).toBeUndefined();
     expect(result.stderr).toBe("");
     expect(result.status).toBe(0);
-  }, 20_000);
+  }, COLD_START_MS + 15_000);
 
   it("starts through actual WScript and JScript, then honors login startup and clean connector exit", async () => {
     const base = await mkdtemp(join(tmpdir(), "konteks full chain & O'Brien ")); dirs.push(base);
     const executable = join(base, "connector.cmd");
     const fixture = join(base, "fixture-child.cjs");
     const release = join(base, "fixture-child-release");
-    await writeFile(fixture, `const fs = require('node:fs'); const root = process.argv[2]; fs.writeFileSync(root + '/fixture-child-ready', 'ready');\nconst deadline = setTimeout(() => process.exit(9), 15000); const poll = setInterval(() => { if (fs.existsSync(root + '/fixture-child-release')) { clearTimeout(deadline); clearInterval(poll); process.exit(0); } }, 25);\n`);
+    await writeFile(fixture, `const fs = require('node:fs'); const root = process.argv[2]; fs.writeFileSync(root + '/fixture-child-ready', 'ready');\nconst deadline = setTimeout(() => process.exit(9), 60000); const poll = setInterval(() => { if (fs.existsSync(root + '/fixture-child-release')) { clearTimeout(deadline); clearInterval(poll); process.exit(0); } }, 25);\n`);
     await writeFile(executable, `@echo full-chain: %*\r\n@"${process.execPath}" "${fixture}" "${base}"\r\n@exit /b %errorlevel%\r\n`);
     const service = nativeServiceDefinition({ os: "windows", home: base, root: base, executable, userId: "S-1-5-21-1-2-3-1001" });
-    const run = (command: NativeServiceCommand) => spawnSync(command.command, command.args, { encoding: "utf8", windowsHide: true, timeout: 25_000 });
+    const run = (command: NativeServiceCommand) => spawnSync(command.command, command.args, { encoding: "utf8", windowsHide: true, timeout: COLD_START_MS });
     const state = join(base, "supervisor", "background-host.json");
     const stop = join(base, "supervisor", "background-stop");
     const present = (path: string) => readFile(path).then(() => true, error => { if (error.code === "ENOENT") return false; throw error; });
@@ -312,7 +320,7 @@ describe.runIf(process.platform === "win32")("on a real Windows", () => {
       while (!(await condition()) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
     };
     const waitForExit = async () => {
-      await waitFor(async () => !(await present(state)), 10_000);
+      await waitFor(async () => !(await present(state)), SETTLE_MS);
       expect(await present(state), "Disposable background host must finish its finite connector").toBe(false);
     };
     let parentExited = false;
@@ -332,7 +340,7 @@ describe.runIf(process.platform === "win32")("on a real Windows", () => {
     });
     void started.catch(() => undefined);
     try {
-      await waitFor(() => present(join(base, "fixture-child-ready")), 10_000);
+      await waitFor(() => present(join(base, "fixture-child-ready")), SETTLE_MS);
       expect(await present(join(base, "fixture-child-ready"))).toBe(true);
       await waitFor(async () => parentExited, 5_000);
       expect(parentExited, "Starting PowerShell must exit while the fixture connector is alive").toBe(true);
@@ -347,7 +355,7 @@ describe.runIf(process.platform === "win32")("on a real Windows", () => {
       await waitForExit();
       expect(run(service.status).status).toBe(1);
       await writeFile(stop, "stop");
-      const login = spawnSync(join(process.env.SystemRoot!, "System32", "wscript.exe"), ["//B", "//NoLogo", "//E:JScript", service.supportFiles![0]!.path, "--login"], { encoding: "utf8", windowsHide: true, timeout: 15_000 });
+      const login = spawnSync(join(process.env.SystemRoot!, "System32", "wscript.exe"), ["//B", "//NoLogo", "//E:JScript", service.supportFiles![0]!.path, "--login"], { encoding: "utf8", windowsHide: true, timeout: COLD_START_MS });
       expect(login.error).toBeUndefined();
       expect(login.status, login.stderr).toBe(0);
       await expect(readFile(stop)).rejects.toMatchObject({ code: "ENOENT" });
@@ -363,7 +371,7 @@ describe.runIf(process.platform === "win32")("on a real Windows", () => {
         expect(run(service.remove[0]!).status).toBe(0);
       }
     }
-  }, 45_000);
+  }, 240_000);
 
   it("runs the connector with a path full of cmd and PowerShell metacharacters, appends its output to the log and stops after clean exit", async () => {
     const base = await mkdtemp(join(tmpdir(), "konteks host %PATH% & O'Brien ")); dirs.push(base);
