@@ -59,9 +59,16 @@ type RelayState = "offline" | "connecting" | "handshaking" | "connected" | "reco
 
 /** What the relay may send once its handshake result has arrived, buffered until the handshake is adopted. */
 type InboundEnvelope = ToRuntimeRelayFrame | AssignmentReplyFrame | RelayAck | RelayReplayRequest | RuntimeCancellationDeliveryRequest
-  | RuntimePermissionAnswerDeliveryRequest | RemoteExecutionRevisionControlDeliveryRequest | RuntimeAgentLoginDeliveryRequest | RuntimeUpdateDeliveryRequest;
+  | RuntimePermissionAnswerDeliveryRequest | RemoteExecutionRevisionControlDeliveryRequest | RuntimeAgentLoginDeliveryRequest | RuntimeUpdateDeliveryRequest
+  | DiagnosticCarrierCompanionDeliveryRequest;
 
-type DeliveryReceiver<R> = (request: R, connection: { connectionEpoch: number; assertCurrent(): void }) => Promise<void>;
+/** What a receiver made of a control delivery; a receiver that returns nothing handled it. */
+export type ControlDeliveryOutcome = "handled" | "duplicate";
+
+type DeliveryReceiver<R> = (request: R, connection: { connectionEpoch: number; assertCurrent(): void }) => Promise<ControlDeliveryOutcome | void>;
+
+/** The outcome logged for a control delivery when it arrives. */
+type ControlDeliveryResult = { outcome: ControlDeliveryOutcome } | { outcome: "refused"; code: string };
 
 /** One connection attempt: its socket and handshake progress. */
 interface SocketAttempt {
@@ -78,7 +85,8 @@ interface SocketAttempt {
   handshakeTimer: NodeJS.Timeout | undefined;
   /** This attempt still owns the client's socket. */
   current(): boolean;
-  discardPending(): void;
+  /** Drops the envelopes buffered during the handshake, one warning each. */
+  discardPending(reason: string): void;
 }
 
 /**
@@ -98,7 +106,7 @@ function namesHolderReplayRequest(header: string | string[] | undefined): boolea
 /** Post-handshake envelopes in the order they are recognised; anything else must be a channel frame. */
 const POST_HANDSHAKE_SCHEMAS: ReadonlyArray<{ safeParse(value: unknown): { success: boolean; data?: unknown } }> = [
   RuntimePermissionAnswerDeliveryRequestSchema, RuntimeAgentLoginDeliveryRequestSchema, RuntimeUpdateDeliveryRequestSchema, RuntimeCancellationDeliveryRequestSchema,
-  RemoteExecutionRevisionControlDeliveryRequestSchema, RelayReplayRequestSchema, RelayAckSchema, AssignmentReplyFrameSchema,
+  RemoteExecutionRevisionControlDeliveryRequestSchema, DiagnosticCarrierCompanionDeliveryRequestSchema, RelayReplayRequestSchema, RelayAckSchema, AssignmentReplyFrameSchema,
 ];
 
 function postHandshakeEnvelope(parsed: unknown): InboundEnvelope | null {
@@ -133,6 +141,38 @@ function deliveryType(value: unknown): unknown {
   return typeof value === "object" && value !== null && "type" in value ? value.type : undefined;
 }
 
+function field(value: unknown, name: string): unknown {
+  return typeof value === "object" && value !== null ? (value as Record<string, unknown>)[name] : undefined;
+}
+
+/** A bounded identifier from a received envelope, or null; never a body, signature or nonce. */
+function identifier(value: unknown): string | null {
+  return typeof value === "string" ? value.slice(0, 200) : null;
+}
+
+/** The delivery's own id: the login, update, intent or companion delivery it carries. */
+function controlDeliveryId(value: unknown): string | null {
+  const intent = field(value, "intent");
+  return identifier(field(intent, "loginId") ?? field(intent, "updateId") ?? field(intent, "intentId") ?? field(field(value, "companion"), "deliveryId"));
+}
+
+/** What a received envelope is, for a log line: its type (or ack/replay kind, or channel) and id. */
+function envelopeIdentity(value: unknown): { kind: string; id: string | null; seq?: number } {
+  const kind = identifier(field(value, "type") ?? field(value, "kind") ?? field(value, "channel")) ?? "unknown";
+  const seq = field(value, "seq");
+  return { kind, id: controlDeliveryId(value) ?? identifier(field(value, "channelId")), ...(typeof seq === "number" ? { seq } : {}) };
+}
+
+/** A refusal's code for a log line: the connector's own error code, a schema refusal, or neither. */
+function refusalCode(error: unknown): string {
+  if (error instanceof RemoteInstanceError) return error.code;
+  return error instanceof Error && error.name === "ZodError" ? "schema_invalid" : "unexpected_error";
+}
+
+function refused(error: unknown): ControlDeliveryResult {
+  return { outcome: "refused", code: refusalCode(error) };
+}
+
 export interface RelayClientOptions {
   relayUrl: string;
   instanceId: () => string;
@@ -151,31 +191,16 @@ export interface RelayClientOptions {
   /** Called only after validation and durable mux adoption, with the complete authority result. */
   onConnected?: (result: RelayRuntimeHandshakeResult) => Promise<void> | void;
   /** Separate durable control admission; never a channel cursor or receipt ACK. */
-  onCancellation?: (request: RuntimeCancellationDeliveryRequest, connection: {
-    connectionEpoch: number;
-    assertCurrent(): void;
-  }) => Promise<void>;
-  onPermissionAnswer?: (request: RuntimePermissionAnswerDeliveryRequest, connection: {
-    connectionEpoch: number;
-    assertCurrent(): void;
-  }) => Promise<void>;
+  onCancellation?: DeliveryReceiver<RuntimeCancellationDeliveryRequest>;
+  onPermissionAnswer?: DeliveryReceiver<RuntimePermissionAnswerDeliveryRequest>;
   /** A coding agent login the person started from the site. */
-  onAgentLogin?: (request: RuntimeAgentLoginDeliveryRequest, connection: {
-    connectionEpoch: number;
-    assertCurrent(): void;
-  }) => Promise<void>;
+  onAgentLogin?: DeliveryReceiver<RuntimeAgentLoginDeliveryRequest>;
   /** A fixed signed runtime update, outside the work channel and its cursors. */
   onRuntimeUpdate?: DeliveryReceiver<RuntimeUpdateDeliveryRequest>;
   /** Dedicated safety-control intake; never a mux cursor or receipt ACK. */
-  onExecutionRevisionControl?: (request: RemoteExecutionRevisionControlDeliveryRequest, connection: {
-    connectionEpoch: number;
-    assertCurrent(): void;
-  }) => Promise<void>;
+  onExecutionRevisionControl?: DeliveryReceiver<RemoteExecutionRevisionControlDeliveryRequest>;
   /** Diagnostic-only sidecar; its failure must not interrupt work transport. */
-  onDiagnosticCompanion?: (request: DiagnosticCarrierCompanionDeliveryRequest, connection: {
-    connectionEpoch: number;
-    assertCurrent(): void;
-  }) => Promise<void>;
+  onDiagnosticCompanion?: DeliveryReceiver<DiagnosticCarrierCompanionDeliveryRequest>;
   handshakeTimeoutMs?: number;
   outboundHighWaterBytes?: number;
   outboundLowWaterBytes?: number;
@@ -192,7 +217,7 @@ export class RelayClient {
   private connectionFence = 0;
   /** Only the validated handshake may emit the mux's retained replay before connected publication. */
   private replaySocket: NodeWebSocket | null = null;
-  private discardHandshakeBuffer: (() => void) | null = null;
+  private discardHandshakeBuffer: ((reason: string) => void) | null = null;
   private stopped = false;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private readonly backoff = new ReconnectBackoff();
@@ -233,7 +258,7 @@ export class RelayClient {
     this.clearOutboundQueue();
     this.attemptEpoch += 1;
     this.replaySocket = null;
-    this.discardHandshakeBuffer?.();
+    this.discardHandshakeBuffer?.("stopped");
     this.discardHandshakeBuffer = null;
     this.options.mux.disconnected();
     this.socket?.terminate();
@@ -248,7 +273,7 @@ export class RelayClient {
     this.connectionFence += 1;
     this.clearOutboundQueue();
     this.replaySocket = null;
-    this.discardHandshakeBuffer?.();
+    this.discardHandshakeBuffer?.(`rehandshake:${reason}`);
     this.discardHandshakeBuffer = null;
     if (!this.stopped) this.setState("reconnecting");
     this.options.mux.disconnected();
@@ -408,7 +433,10 @@ export class RelayClient {
     const attempt: SocketAttempt = {
       socket, lease, holderReplayOnRequest: false, handshook: false, handshakeProcessing: false, validatedEpoch: null, pending: [], pendingBytes: 0, receiveFailed: false, handshakeTimer: undefined,
       current: () => ownsAttempt() && !this.stopped && this.socket === socket && !attempt.receiveFailed,
-      discardPending: () => { attempt.pending.length = 0; attempt.pendingBytes = 0; },
+      discardPending: reason => {
+        for (const envelope of attempt.pending) this.logDropped(attempt, envelope, reason);
+        attempt.pending.length = 0; attempt.pendingBytes = 0;
+      },
     };
     this.discardHandshakeBuffer = attempt.discardPending;
     return attempt;
@@ -423,7 +451,7 @@ export class RelayClient {
   private abandon(attempt: SocketAttempt, lastError: string, localReason: string, close: (socket: NodeWebSocket) => void): void {
     attempt.receiveFailed = true;
     this.replaySocket = null;
-    attempt.discardPending();
+    attempt.discardPending(localReason);
     this.lastError = lastError;
     this.options.mux.disconnected();
     this.setState("reconnecting");
@@ -463,7 +491,7 @@ export class RelayClient {
   }
 
   private onMessage(attempt: SocketAttempt, data: NodeWebSocket.RawData): void {
-    if (!attempt.current()) return;
+    if (!attempt.current()) return this.dropSuperseded(attempt, data);
     if (attempt.handshakeProcessing && attempt.validatedEpoch === null) {
       return this.rejectProtocol(attempt, "not_ready", "relay sent data before handshake authority validation completed");
     }
@@ -535,7 +563,8 @@ export class RelayClient {
       if (!this.socketCurrent(attempt)) return;
       void this.receive(attempt, envelope).catch(error => this.failReceive(attempt, error));
     }
-    attempt.discardPending();
+    // Every buffered envelope was admitted above; nothing here is dropped.
+    attempt.pending.length = 0; attempt.pendingBytes = 0;
     this.replaySocket = null;
     attempt.handshook = true;
     attempt.handshakeProcessing = false;
@@ -561,24 +590,50 @@ export class RelayClient {
     return this.dispatch(attempt, value);
   }
 
-  /** A control delivery to its own receiver; anything else is a channel envelope for the mux. */
+  /** Each control delivery kind and its own receiver; anything else is a channel envelope for the mux. */
+  private readonly controlRoutes = new Map<string, (attempt: SocketAttempt, value: unknown) => Promise<ControlDeliveryResult>>([
+    ["runtime_permission_answer_delivery", (attempt, value) => this.deliver(attempt, RuntimePermissionAnswerDeliveryRequestSchema.parse(value), "Answer",
+      this.receiverFor(this.options.onPermissionAnswer), "Permission answer receiver is unavailable")],
+    ["runtime_agent_login_delivery", (attempt, value) => this.deliverLogin(attempt, value)],
+    ["runtime_update_delivery", (attempt, value) => this.deliverRuntimeUpdate(attempt, value)],
+    ["runtime_cancellation_delivery", (attempt, value) => this.deliver(attempt, RuntimeCancellationDeliveryRequestSchema.parse(value), "Cancellation",
+      this.receiverFor(this.options.onCancellation), "Cancellation receiver is unavailable")],
+    ["runtime_diagnostic_carrier_companion_delivery", (attempt, value) => this.deliverDiagnostic(attempt, value)],
+    ["runtime_execution_revision_control_delivery", (attempt, value) => this.deliver(attempt, RemoteExecutionRevisionControlDeliveryRequestSchema.parse(value),
+      "Revision-control", this.receiverFor(this.options.onExecutionRevisionControl), "Revision-control receiver is unavailable")],
+  ]);
+
+  /**
+   * A control delivery to its own receiver, logged once with what became of
+   * it (Core re-sends one until its report arrives, so a repeat is normal);
+   * anything else is a channel envelope for the mux.
+   */
   private async dispatch(attempt: SocketAttempt, value: unknown): Promise<void> {
-    switch (deliveryType(value)) {
-      case "runtime_permission_answer_delivery":
-        return this.deliver(attempt, RuntimePermissionAnswerDeliveryRequestSchema.parse(value), "Answer", this.receiverFor(this.options.onPermissionAnswer), "Permission answer receiver is unavailable");
-      case "runtime_agent_login_delivery":
-        return this.deliverLogin(attempt, value);
-      case "runtime_update_delivery":
-        return this.deliverRuntimeUpdate(attempt, value);
-      case "runtime_cancellation_delivery":
-        return this.deliver(attempt, RuntimeCancellationDeliveryRequestSchema.parse(value), "Cancellation", this.receiverFor(this.options.onCancellation), "Cancellation receiver is unavailable");
-      case "runtime_diagnostic_carrier_companion_delivery":
-        return this.deliverDiagnostic(attempt, value);
-      case "runtime_execution_revision_control_delivery":
-        return this.deliver(attempt, RemoteExecutionRevisionControlDeliveryRequestSchema.parse(value), "Revision-control", this.receiverFor(this.options.onExecutionRevisionControl), "Revision-control receiver is unavailable");
-      default:
-        await this.options.mux.receive(value);
+    const kind = deliveryType(value);
+    const route = typeof kind === "string" ? this.controlRoutes.get(kind) : undefined;
+    if (!route) return this.options.mux.receive(value);
+    const arrival = { event: "control_delivery.received", kind, id: controlDeliveryId(value), connectionEpoch: field(value, "connectionEpoch") };
+    try {
+      this.logger.info({ ...arrival, ...await route(attempt, value) }, "control delivery received");
+    } catch (error) {
+      this.logger.info({ ...arrival, ...refused(error) }, "control delivery received");
+      throw error;
     }
+  }
+
+  /**
+   * A message on a socket this client no longer owns (a re-handshake, a
+   * failed receive or stop) is ignored; it is logged, never processed.
+   */
+  private dropSuperseded(attempt: SocketAttempt, data: NodeWebSocket.RawData): void {
+    const reason = this.stopped ? "stopped" : attempt.receiveFailed ? "receive_failed" : "superseded_socket";
+    this.logDropped(attempt, parsedMessage(data)?.value, reason);
+  }
+
+  /** One warning per envelope this client ignores: its kind and id, never its payload. */
+  private logDropped(attempt: SocketAttempt, value: unknown, reason: string): void {
+    this.logger.warn({ event: "relay.frame.dropped", ...envelopeIdentity(value), reason, connectionEpoch: attempt.validatedEpoch },
+      "relay envelope dropped; its sender re-sends it on the next connection");
   }
 
   /** The options' receiver, called as the options' own method. */
@@ -597,35 +652,39 @@ export class RelayClient {
   }
 
   /** A control delivery outside the channel cursors, checked current before and after its receiver. */
-  private async deliver<R extends { connectionEpoch: number }>(attempt: SocketAttempt, request: R, label: string, receiver: DeliveryReceiver<R> | undefined, unavailable: string, checkAfter = true): Promise<void> {
+  private async deliver<R extends { connectionEpoch: number }>(attempt: SocketAttempt, request: R, label: string, receiver: DeliveryReceiver<R> | undefined,
+    unavailable: string, checkAfter = true): Promise<ControlDeliveryResult> {
     const assertCurrent = this.deliveryGuard(attempt, request, label);
     assertCurrent();
     if (!receiver) throw new RemoteInstanceError("recovery_required", unavailable);
-    await receiver(request, { connectionEpoch: request.connectionEpoch, assertCurrent });
+    const outcome = await receiver(request, { connectionEpoch: request.connectionEpoch, assertCurrent });
     if (checkAfter) assertCurrent();
+    return { outcome: outcome ?? "handled" };
   }
 
   /**
    * A login is the person's convenience, never work transport: whatever goes
    * wrong with it is logged and dropped, and the socket stays up.
    */
-  private async deliverLogin(attempt: SocketAttempt, value: unknown): Promise<void> {
+  private async deliverLogin(attempt: SocketAttempt, value: unknown): Promise<ControlDeliveryResult> {
     try {
-      await this.deliver(attempt, RuntimeAgentLoginDeliveryRequestSchema.parse(value), "Login", this.receiverFor(this.options.onAgentLogin), "Agent login receiver is unavailable", false);
+      return await this.deliver(attempt, RuntimeAgentLoginDeliveryRequestSchema.parse(value), "Login", this.receiverFor(this.options.onAgentLogin), "Agent login receiver is unavailable", false);
     } catch (error) {
       this.logger.warn({ err: error }, "agent login delivery dropped");
+      return refused(error);
     }
   }
 
-  private async deliverRuntimeUpdate(attempt: SocketAttempt, value: unknown): Promise<void> {
+  private async deliverRuntimeUpdate(attempt: SocketAttempt, value: unknown): Promise<ControlDeliveryResult> {
     try {
-      await this.deliver(attempt, RuntimeUpdateDeliveryRequestSchema.parse(value), "Runtime update", this.receiverFor(this.options.onRuntimeUpdate), "Runtime update receiver is unavailable", false);
+      return await this.deliver(attempt, RuntimeUpdateDeliveryRequestSchema.parse(value), "Runtime update", this.receiverFor(this.options.onRuntimeUpdate), "Runtime update receiver is unavailable", false);
     } catch (error) {
       // The operation carries no diagnostics or secrets back to the browser,
       // but the local log says why (10-13: three refusals of the owner's
       // Update now left no reason). A refusal never tears down ordinary work
       // transport.
       this.logger.warn({ event: "runtime.update_delivery_refused", err: error }, "runtime update delivery refused");
+      return refused(error);
     }
   }
 
@@ -633,7 +692,7 @@ export class RelayClient {
    * Diagnostics are deliberately best effort: malformed, stale, or
    * unavailable sidecars become a coverage signal, never a work outage.
    */
-  private async deliverDiagnostic(attempt: SocketAttempt, value: unknown): Promise<void> {
+  private async deliverDiagnostic(attempt: SocketAttempt, value: unknown): Promise<ControlDeliveryResult> {
     try {
       const request = DiagnosticCarrierCompanionDeliveryRequestSchema.parse(value);
       const receiver = this.receiverFor(this.options.onDiagnosticCompanion);
@@ -645,8 +704,10 @@ export class RelayClient {
         reason: "receiver_unavailable",
         deliveryId: request.companion.deliveryId,
       }, "diagnostic companion coverage is incomplete");
+      return { outcome: "refused", code: "receiver_unavailable" };
     } catch (error) {
       this.logger.warn({ err: error }, "diagnostic companion delivery was not retained");
+      return refused(error);
     }
   }
 
@@ -657,7 +718,7 @@ export class RelayClient {
     this.socket = null;
     this.clearOutboundQueue();
     this.replaySocket = null;
-    attempt.discardPending();
+    attempt.discardPending(`socket_closed:${code}`);
     this.discardHandshakeBuffer = null;
     this.options.mux.disconnected();
     if (this.stopped) {

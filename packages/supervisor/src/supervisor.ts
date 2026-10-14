@@ -81,7 +81,7 @@ import type { SessionPreviewAccess } from "./preview/mcp-server.js";
 import { provisioningCredentialIsExpired, refreshProvisioningCredential, submitReadiness } from "./provisioning/activation.js";
 import { Reconciliation } from "./reconnect/reconciliation.js";
 import { ChannelMux } from "./relay/channel-mux.js";
-import { RelayClient, type RelayClientOptions } from "./relay/relay-client.js";
+import { RelayClient, type ControlDeliveryOutcome, type RelayClientOptions } from "./relay/relay-client.js";
 import type { RunnerPort } from "./runner-port.js";
 import { NativeRunner, type NativeRunnerOptions } from "./native/runner.js";
 import { ModelCapabilitySnapshotProducer, antigravityOptionBilling, openCodeOptionBilling } from "./native/model-capability-snapshot.js";
@@ -845,7 +845,7 @@ export class Supervisor {
     );
   }
 
-  private receiveRuntimeUpdate(request: RelayRequestOf<"onRuntimeUpdate">, connection: RelayConnectionOf<"onRuntimeUpdate">, verifier: CoreSignatureVerifier): Promise<void> {
+  private receiveRuntimeUpdate(request: RelayRequestOf<"onRuntimeUpdate">, connection: RelayConnectionOf<"onRuntimeUpdate">, verifier: CoreSignatureVerifier): Promise<ControlDeliveryOutcome> {
     const scope = this.runtimeUpdateScope(connection);
     const receiver = this.ensureRuntimeUpdates(verifier);
     if (!scope || !receiver) throw new RemoteInstanceError("recovery_required", "Runtime update ownership is unavailable.");
