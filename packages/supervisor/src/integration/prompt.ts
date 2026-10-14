@@ -55,7 +55,15 @@ export function buildIntegrationPrompt(spec: IntegrationTaskSpec, resultTool: Re
     ">>>",
     "",
   );
-  const schema = spec.resultSchema as Record<string, unknown>;
-  lines.push(resultTool === "schema" ? resultToolLine() : resultToolLineWithSchema(schema, toolInputSchema(schema).wrapped));
+  lines.push(handInLine(spec, resultTool));
   return lines.join("\n");
+}
+
+/** How the task ends: a locked read when its calls return, any other task with its result. */
+function handInLine(spec: IntegrationTaskSpec, resultTool: ResultToolDefinition): string {
+  if (spec.completesWhenCalled) {
+    return `The task ends by itself as soon as ${spec.completesWhenCalled.join(" and ")} return${spec.completesWhenCalled.length === 1 ? "s" : ""}: make the calls, then stop. Write no summary and call nothing else.`;
+  }
+  const schema = spec.resultSchema as Record<string, unknown>;
+  return resultTool === "schema" ? resultToolLine() : resultToolLineWithSchema(schema, toolInputSchema(schema).wrapped);
 }

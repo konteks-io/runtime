@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { generateEd25519 } from "@konteks/remote-common";
+import { sign } from "node:crypto";
+import { generateEd25519, remoteControlSigningBytes } from "@konteks/remote-common";
 import { CoreSignatureVerifier } from "../control/core-signature.js";
 // Cross-repository interoperability proof: the actual Core producer beside the
 // actual connector consumer. It runs only next to a Core checkout; the public
@@ -78,5 +79,24 @@ describe.skipIf(coreSigning === null)("site-started fixed runtime update deliver
     expect(f.verifier.verifyRuntimeUpdateDelivery({ ...unsigned, command: "arbitrary", signature })).toBe(false);
     expect(f.verifier.verifyRuntimeUpdateDelivery({ ...unsigned, url: "https://other.example", signature })).toBe(false);
     expect(f.verifier.verifyRuntimeUpdateDelivery({ ...unsigned, signature: `${signature}==` })).toBe(false);
+  });
+});
+describe("assignment-available nudge delivery", () => {
+  const unsigned = {
+    type: "runtime_assignment_available_delivery", method: "POST", path: { instanceId: "instance" }, nodeId: "node-1",
+    connectionRef: "conn-1", connectionEpoch: 3, keyId: "control-1", nonce: "A".repeat(22),
+    intent: { tenantId: "tenant", instanceId: "instance", queuedAt: "2026-10-11T02:06:02.400Z" },
+    issuedAt: "2026-10-11T02:06:02.500Z", expiresAt: "2026-10-11T02:06:12.500Z",
+  };
+  // Signed here with the contract's own signing bytes: the Core beside this
+  // checkout may not know the 7.9.0 delivery yet.
+  it("accepts a signed nudge and rejects one moved to another runtime or key", () => {
+    const key = generateEd25519();
+    const verifier = new CoreSignatureVerifier([{ keyId: "release", publicKeyJwk: generateEd25519().publicJwk, coreControlKeys: [{ keyId: "control-1", publicKeyJwk: key.publicJwk }] }]);
+    const signature = sign(null, remoteControlSigningBytes(unsigned), key.privateKey).toString("base64url");
+    expect(verifier.verifyAssignmentAvailableDelivery({ ...unsigned, signature })).toBe(true);
+    expect(verifier.verifyAssignmentAvailableDelivery({ ...unsigned, intent: { ...unsigned.intent, tenantId: "other" }, signature })).toBe(false);
+    expect(verifier.verifyAssignmentAvailableDelivery({ ...unsigned, keyId: "control-2", signature })).toBe(false);
+    expect(verifier.verifyAssignmentAvailableDelivery({ ...unsigned, signature: `${signature}==` })).toBe(false);
   });
 });

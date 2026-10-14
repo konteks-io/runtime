@@ -79,6 +79,8 @@ export function composeIntegrationCarrier(inputs: IntegrationCompositionInputs):
     workspaceRoot: agentId => inputs.configs.find(config => config.RUNNER_AGENT_ID === agentId)?.RUNNER_WORKSPACE_DIR ?? tmpdir(),
     writes: journalWriteLedger(inputs.journal),
     e2eFixtures: integrationFixturesEnabled(inputs.env),
+    // The next read takes a session already started (lazily, after a read).
+    warmSessions: {},
     ...(inputs.onUsage ? { onUsage: inputs.onUsage } : {}),
     logger: inputs.logger,
   });

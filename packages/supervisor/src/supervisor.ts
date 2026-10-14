@@ -12,6 +12,8 @@ import {
   ON_COMPUTER_LOGIN_OPTION,
   REMOTE_AGENT_LOGIN_ON_COMPUTER_CAPABILITY,
   REMOTE_RUNTIME_UPDATE_CAPABILITY,
+  REMOTE_ASSIGNMENT_AVAILABLE_DELIVERY_CAPABILITY,
+  REMOTE_ASSIGNMENT_AVAILABLE_MIN_CORE_CONTRACT_VERSION,
   REMOTE_DIRECT_MODEL_FALLBACK_MIN_CORE_CONTRACT_VERSION,
   allEqual,
   SystemClock,
@@ -38,6 +40,7 @@ import {
   type SupervisorStatus,
   type PreviewStatusReport,
   type RuntimeAgentLoginDeliveryRequest,
+  type RuntimeAssignmentAvailableDeliveryRequest,
   coreContractAtLeast,
   REMOTE_PREVIEW_APP_CREDENTIALS_MIN_CORE_CONTRACT_VERSION,
   REMOTE_PREVIEW_ACTIVITY_MIN_CORE_CONTRACT_VERSION,
@@ -586,7 +589,8 @@ export class Supervisor {
       agentLoginReady: () => this.runners.has("codex") && !this.stopping && this.relay !== null && this.relay !== undefined,
       agentLoginBrowserReady: () => this.runners.has("claude-code") && !this.stopping && this.relay !== null && this.relay !== undefined && machineHasDesktop(),
       additionalCapabilities: () => [...this.openCodeCapabilities(), ...this.antigravityCapabilities(), ...this.onComputerCapabilities(), ...(this.browserToolReady() ? [BROWSER_TOOL_CAPABILITY] : []),
-        ...(this.integrationCarrier ? integrationTaskCapabilities(this.runners.keys()) : []), ...this.runtimeUpdateCapabilities()],
+        ...(this.integrationCarrier ? integrationTaskCapabilities(this.runners.keys(), this.coreContractVersion) : []), ...this.runtimeUpdateCapabilities(),
+        ...this.assignmentNudgeCapabilities()],
       decorateAgents: agents => this.withAntigravityDownload(agents),
       // Previews reach a viewer only over the relay's preview channel.
       previewReady: () => this.previewCapable(),
@@ -702,6 +706,7 @@ export class Supervisor {
       validateHandshake: result => this.validateRelayHandshake(result),
       onConnected: result => this.onRelayConnected(result),
       onAgentLogin: request => this.onAgentLogin(request, verifier),
+      onAssignmentAvailable: request => this.onAssignmentAvailable(request, verifier),
       onRuntimeUpdate: (request, connection) => this.receiveRuntimeUpdate(request, connection, verifier),
       onPermissionAnswer: (request, connection) => this.receivePermissionAnswer(request, connection, verifier),
       onCancellation: (request, connection) => this.receiveCancellation(request, connection, verifier),
@@ -1357,7 +1362,9 @@ export class Supervisor {
       ...(config.RUNNER_AGENT_ID === "codex" && this.nativeCodexOwner ? { afterSuccessfulLogin: () => this.nativeCodexOwner!.refreshAfterLogin() } : {}),
       executionBridgeLimit: () => Math.min(4, this.configuration.softMaxConcurrent ?? this.config.SUPERVISOR_SOFT_MAX_CONCURRENT ?? 4),
       // A full ceiling frees a finished session instead of refusing the new one (D62).
-      reclaimIdleExecution: () => this.work?.reclaimIdleCompletedSession(config.RUNNER_AGENT_ID) ?? Promise.resolve(false),
+      // A warm read session is Konteks's own and goes first.
+      reclaimIdleExecution: async () => (await this.integrationCarrier?.releaseWarmSession(config.RUNNER_AGENT_ID)) === true
+        || (await this.work?.reclaimIdleCompletedSession(config.RUNNER_AGENT_ID)) === true,
       onEvent: event => { void this.onRunnerEvent(config.RUNNER_AGENT_ID, event).catch(error => this.logger.warn({ err: error }, "native runner event failed")); }, ...(this.options.native!.runtimeOptions ? { runtimeOptions: this.options.native!.runtimeOptions } : {}) });
   }
 
@@ -2533,6 +2540,28 @@ export class Supervisor {
   private requireUpdates(): NativeUpdateCoordinator {
     if (!this.updates) throw new RemoteInstanceError("capability_unavailable", "Automatic updates are not configured for this connector.");
     return this.updates;
+  }
+
+  /**
+   * Core queued work for this runtime: pull now instead of on the next 5 s
+   * pull. The pull keeps all of its own gates; a nudge only moves it earlier.
+   */
+  private async onAssignmentAvailable(request: RuntimeAssignmentAvailableDeliveryRequest, verifier: CoreSignatureVerifier): Promise<void> {
+    if (!verifier.verifyAssignmentAvailableDelivery(request)) {
+      throw new RemoteInstanceError("permission_denied", "Core assignment-available signatures are required");
+    }
+    const { intent } = request;
+    if (!this.instanceId || intent.instanceId !== this.instanceId || intent.tenantId !== this.workspaceId) {
+      throw new RemoteInstanceError("recovery_required", "This assignment-available nudge is for another runtime");
+    }
+    this.logger.info({ event: "assignment_available.received", queuedAgoMs: Date.now() - Date.parse(intent.queuedAt) }, "Core says work is queued; pulling now");
+    this.work?.pull();
+  }
+
+  /** Core's assignment-available nudge, for a Core that sends it, over the relay it comes on. */
+  private assignmentNudgeCapabilities(): string[] {
+    if (!this.relay || !this.work || this.stopping) return [];
+    return coreContractAtLeast(this.coreContractVersion, REMOTE_ASSIGNMENT_AVAILABLE_MIN_CORE_CONTRACT_VERSION) ? [REMOTE_ASSIGNMENT_AVAILABLE_DELIVERY_CAPABILITY] : [];
   }
 
   /**

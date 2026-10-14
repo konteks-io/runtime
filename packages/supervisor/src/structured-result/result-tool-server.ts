@@ -44,6 +44,14 @@ const MAX_REPORTED_ERRORS = 20;
 export type ResultToolDefinition = "schema" | "generic";
 
 const ANNOTATIONS = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false } as const;
+/**
+ * Claude Code defers MCP tools behind its tool search when an account has
+ * many; a deferred result tool costs the turn one more model step (a
+ * ToolSearch call) before the agent can hand its result in. This tool is
+ * always in the prompt instead (Claude Code reads `anthropic/alwaysLoad`
+ * from a tool's `_meta`; other agents ignore it).
+ */
+const ALWAYS_LOAD = { "anthropic/alwaysLoad": true } as const;
 
 /** What the tool looks like when no turn asks for a result (and to an agent that never re-reads its tools). */
 export const GENERIC_RESULT_TOOL = {
@@ -52,6 +60,7 @@ export const GENERIC_RESULT_TOOL = {
   description: "Records the final structured result of a Konteks turn. Call it only when the turn's instructions ask you to, once, with the whole result as the arguments; if the result does not match what the turn requires, it answers with exactly what to fix.",
   inputSchema: { type: "object", additionalProperties: true },
   annotations: ANNOTATIONS,
+  _meta: ALWAYS_LOAD,
 } as const;
 
 const BOUND_DESCRIPTION = "Records your final result for this turn. Call it once, when you are finished, with the whole result as the arguments. If it answers with problems, fix exactly those and call it again.";
@@ -149,9 +158,23 @@ export class StructuredResultToolServer {
   /** The agent was told the list changed and did not read it again: do not wait for it next time. */
   private relistIgnored = false;
 
-  constructor(private readonly options: { logger?: Logger; context?: Record<string, unknown>; relistWaitMs?: number } = {}) {
+  private context: Record<string, unknown>;
+  private onAccepted: (() => void) | undefined;
+
+  constructor(options: { logger?: Logger; context?: Record<string, unknown>; relistWaitMs?: number } = {}) {
     this.logger = options.logger ?? createLogger({ name: "structured-result" });
     this.relistWaitMs = options.relistWaitMs ?? DEFAULT_RELIST_WAIT_MS;
+    this.context = options.context ?? {};
+  }
+
+  /**
+   * The turn this server now serves: its log context, and what to call once
+   * when its first valid result is recorded. A server started ahead for a
+   * warm session is attached when a task takes that session.
+   */
+  attach(turn: { context: Record<string, unknown>; onAccepted?: () => void }): void {
+    this.context = turn.context;
+    this.onAccepted = turn.onAccepted;
   }
 
   async start(): Promise<{ name: string; url: string; headers: Array<{ name: string; value: string }> }> {
@@ -194,7 +217,7 @@ export class StructuredResultToolServer {
     const { inputSchema, wrapped } = toolInputSchema(schema);
     this.turn = { validate, inputSchema, wrapped, accepted: null };
     const definition = await this.announce();
-    this.logger.info({ event: "structured_result.bound", toolDefinition: definition, wrapped, ...this.options.context }, "turn result tool bound");
+    this.logger.info({ event: "structured_result.bound", toolDefinition: definition, wrapped, ...this.context }, "turn result tool bound");
     return definition;
   }
 
@@ -236,7 +259,7 @@ export class StructuredResultToolServer {
   private tools(): unknown[] {
     const turn = this.turn;
     if (!turn) return [GENERIC_RESULT_TOOL];
-    return [{ name: STRUCTURED_RESULT_TOOL_NAME, title: "Submit your result", description: BOUND_DESCRIPTION, inputSchema: turn.inputSchema, annotations: ANNOTATIONS }];
+    return [{ name: STRUCTURED_RESULT_TOOL_NAME, title: "Submit your result", description: BOUND_DESCRIPTION, inputSchema: turn.inputSchema, annotations: ANNOTATIONS, _meta: ALWAYS_LOAD }];
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -355,11 +378,12 @@ export class StructuredResultToolServer {
     }
     turn.accepted = { value };
     this.logCall("accepted");
+    this.onAccepted?.();
     return toolAnswer("Recorded. Your result for this turn is accepted; finish your turn now.");
   }
 
   private logCall(outcome: string, extra: Record<string, unknown> = {}): void {
-    this.logger.info({ event: "structured_result.call", outcome, ...extra, ...this.options.context }, "result tool called");
+    this.logger.info({ event: "structured_result.call", outcome, ...extra, ...this.context }, "result tool called");
   }
 
   private fail(response: ServerResponse, status: number, code: string): void {

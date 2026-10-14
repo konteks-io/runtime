@@ -125,6 +125,23 @@ describe("native Supervisor composition", () => {
     expect(roster.agents[0]?.readiness).toBe("ready");
     expect((supervisor as unknown as { lastSnapshot: { agents: Array<{ readiness: string }> } }).lastSnapshot.agents[0]?.readiness).toBe("ready");
   });
+  it("pulls at once on Core's signed assignment-available nudge for this runtime, and refuses one for another", async () => {
+    const f = await fixture(), supervisor = new Supervisor(f.config, f.options);
+    supervisors.push(supervisor);
+    await supervisor.start();
+    const internals = supervisor as unknown as { work: { pull(): void };
+      onAssignmentAvailable(request: unknown, verifier: unknown): Promise<void> };
+    const pull = vi.spyOn(internals.work, "pull").mockImplementation(() => undefined);
+    const intent = { tenantId: "tenant", instanceId: "instance", queuedAt: new Date().toISOString() };
+    await internals.onAssignmentAvailable({ intent }, { verifyAssignmentAvailableDelivery: () => true });
+    expect(pull).toHaveBeenCalledOnce();
+    await expect(internals.onAssignmentAvailable({ intent: { ...intent, instanceId: "other" } }, { verifyAssignmentAvailableDelivery: () => true }))
+      .rejects.toMatchObject({ code: "recovery_required" });
+    await expect(internals.onAssignmentAvailable({ intent }, { verifyAssignmentAvailableDelivery: () => false }))
+      .rejects.toMatchObject({ code: "permission_denied" });
+    expect(pull).toHaveBeenCalledOnce();
+  });
+
   it("starts Google Antigravity's Gemini Enterprise sign-in from the site with its project, and says no_license only to a 7.1.0 Core", async () => {
     const f = await fixture(), supervisor = new Supervisor(f.config, f.options);
     supervisors.push(supervisor);
