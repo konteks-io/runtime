@@ -920,3 +920,82 @@ it.each(['reconnect', 'restart'])('persists an offline terminal frame and replay
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+describe("a to_runtime gap on a preview channel (D100)", () => {
+  const issuedAt = "2026-09-06T00:00:00Z";
+  const preview = (seq: number, epoch = 1): ToRuntimeRelayFrame => ({ channel: "preview", direction: "to_runtime", channelId: "preview:p", connectionEpoch: epoch,
+    seq, issuedAt, body: { streamId: `poll-${seq}`, kind: "request", method: "GET", path: "/api/status", headers: {}, final: true } }) as ToRuntimeRelayFrame;
+  const session = (seq: number, epoch = 1): ToRuntimeRelayFrame => ({ channel: "session", direction: "to_runtime", channelId: "session:s", connectionEpoch: epoch,
+    seq, issuedAt, body: { kind: "acp", method: "session/prompt", id: `p${seq}`, params: { sessionId: "acp", prompt: [{ type: "text", text: "Estimate this." }] } } }) as ToRuntimeRelayFrame;
+  const seqsOf = (frames: ToRuntimeRelayFrame[], channelId: string) => frames.filter(frame => frame.channelId === channelId).map(frame => frame.seq);
+  const acksOf = (emitted: ReturnType<typeof buildMux>["emitted"], channelId: string) =>
+    emitted.filter((envelope): envelope is RelayAck => "kind" in envelope && envelope.kind === "ack" && envelope.channelId === channelId).map(ack => ack.cumulativeSeq);
+
+  function previewMux() {
+    const resyncs: Array<[string, { expected: number; got: number }]> = [];
+    const f = buildMux({ onResync: (channelId, gap) => void resyncs.push([channelId, gap]) });
+    return { ...f, resyncs };
+  }
+
+  it("resets only that channel and takes the frame, leaving a session's in-flight turn and the socket alone", async () => {
+    const f = previewMux();
+    await f.mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: [] });
+    await f.mux.receive(session(1));
+    // The estimate turn is running: its output is out and not yet acknowledged.
+    f.mux.send("session:s", "session", { kind: "session_ready", assignmentId: "estimate" } as never);
+    for (let seq = 1; seq <= 5; seq++) await f.mux.receive(preview(seq));
+    // The relay dropped 6..12 (no_runtime, the stream cap): they never come back.
+    await f.mux.receive(preview(13));
+
+    expect(f.stalls).toEqual([]);
+    expect(f.resyncs).toEqual([["preview:p", { expected: 6, got: 13 }]]);
+    expect(seqsOf(f.frames, "preview:p")).toEqual([1, 2, 3, 4, 5, 13]);
+    f.mux.tick();
+    expect(acksOf(f.emitted, "preview:p").at(-1)).toBe(13);
+
+    await f.mux.receive(session(2));
+    expect(seqsOf(f.frames, "session:s")).toEqual([1, 2]);
+    expect(f.mux.connectionEpoch).toBe(1);
+    expect(f.mux.snapshot().find(channel => channel.channelId === "session:s")).toMatchObject({ unacked: 1, receivedCursor: 2, stalled: false });
+    expect(f.mux.snapshot().find(channel => channel.channelId === "preview:p")).toMatchObject({ receivedCursor: 13, stalled: false });
+    // Its own numbering to Core continues: Core's cursor never moved back.
+    expect(f.mux.send("preview:p", "preview", { streamId: "poll-13", kind: "response", status: 200, headers: {}, final: true })).toBe(1);
+    expect(f.mux.counters).toMatchObject({ stalls: 0, resets: 0, resyncs: 1 });
+  });
+
+  it("never asks for a re-handshake however many gaps follow, one per poll", async () => {
+    const f = previewMux();
+    await f.mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: [] });
+    await f.mux.receive(preview(1));
+    for (const seq of [3, 5, 7, 9, 11, 13]) await f.mux.receive(preview(seq));
+    await f.mux.receive(preview(13));
+
+    expect(f.stalls).toEqual([]);
+    expect(f.resyncs.map(([, gap]) => gap)).toEqual([2, 4, 6, 8, 10, 12].map(expected => ({ expected, got: expected + 1 })));
+    expect(seqsOf(f.frames, "preview:p")).toEqual([1, 3, 5, 7, 9, 11, 13]);
+    expect(f.mux.counters).toMatchObject({ stalls: 0, resyncs: 6, duplicates: 1 });
+  });
+
+  it("still re-handshakes for a session channel's gap and keeps the frame back", async () => {
+    const f = previewMux();
+    await f.mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: [] });
+    await f.mux.receive(session(1));
+    await f.mux.receive(session(4));
+    expect(f.stalls).toEqual(["session:s"]);
+    expect(f.resyncs).toEqual([]);
+    expect(seqsOf(f.frames, "session:s")).toEqual([1]);
+    expect(f.mux.snapshot().find(channel => channel.channelId === "session:s")?.receivedCursor).toBe(1);
+  });
+
+  it("keeps the socket when a preview frame cannot be written, and still stalls a session frame", async () => {
+    const failing = buildMux({ persistRelayState: async () => { throw new Error("disk full"); } });
+    await failing.mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: [] }).catch(() => undefined);
+    failing.mux.send("preview:p", "preview", { streamId: "s", kind: "response", status: 200, headers: {}, final: true });
+    await vi.waitFor(() => expect(failing.mux.snapshot().find(channel => channel.channelId === "preview:p")?.unacked).toBe(1));
+    await new Promise(resolve => setImmediate(resolve));
+    expect(failing.stalls).toEqual([]);
+    failing.mux.send("session:s", "session", { kind: "session_ready", assignmentId: "a" } as never);
+    await vi.waitFor(() => expect(failing.stalls).toEqual(["session:s"]));
+    expect(failing.emitted.filter(envelope => "seq" in envelope)).toEqual([]);
+  });
+});

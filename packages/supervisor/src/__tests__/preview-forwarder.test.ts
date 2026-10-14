@@ -3,7 +3,7 @@ import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WebSocketServer } from "ws";
 import type { PreviewToCoreChunk, RelayChannel } from "@konteks/remote-common";
-import { COULD_NOT_START_PREFIX, PreviewForwarder } from "../preview/forwarder.js";
+import { COULD_NOT_START_PREFIX, INTERRUPTED_MESSAGE, PreviewForwarder } from "../preview/forwarder.js";
 import { PreviewChannel, STARTING_MESSAGE, sessionIdOf } from "../preview/preview-channel.js";
 import type { OutboundMessage } from "../transport/transport.js";
 
@@ -331,7 +331,97 @@ describe("preview channel on the supervisor", () => {
     f.setCanOpen(true);
     f.instance.onToRuntime("preview:s", { streamId: "m", kind: "request", method: "TRACE", path: "/", headers: {}, final: true });
     expect(bodies(f.sent)[1]).toMatchObject({ streamId: "m", status: 400 });
-    expect(f.instance.counters).toEqual({ malformed: 1, refusedDraining: 1, autoStarted: 0, couldNotStart: 0 });
+    expect(f.instance.counters).toEqual({ malformed: 1, refusedDraining: 1, autoStarted: 0, couldNotStart: 0, resyncs: 0, refusedAfterGap: 0 });
+  });
+
+  it("resynchronises only the affected preview's streams and ignores their late request chunks", async () => {
+    const requests: string[] = [];
+    handler = (request, response) => {
+      requests.push(request.url!);
+      if (request.url === "/new") response.end("new request");
+    };
+    const f = channel();
+    try {
+      f.instance.onToRuntime("preview:first", { streamId: "old", kind: "request", method: "GET", path: "/old", headers: {}, final: true });
+      f.instance.onToRuntime("preview:second", { streamId: "other", kind: "request", method: "GET", path: "/other", headers: {}, final: true });
+      await vi.waitFor(() => expect(requests).toHaveLength(2));
+      f.instance.resyncChannel("preview:first");
+      expect(f.sent).toContainEqual({ channel: "preview", channelId: "preview:first", body: { streamId: "old", kind: "close", code: 1012, final: true } });
+      expect(f.sent.filter(message => message.channelId === "preview:second")).toEqual([]);
+      expect(f.closed).toEqual([]);
+      expect(f.instance.activeStreams()).toBe(1);
+
+      f.instance.onToRuntime("preview:first", { streamId: "old", kind: "request", method: "POST", path: "/late", headers: {}, body: b64("tail"), final: true });
+      f.instance.onToRuntime("preview:first", { streamId: "fresh", kind: "request", method: "GET", path: "/new", headers: {}, final: true });
+      await vi.waitFor(() => expect(responseOf(bodies(f.sent), "fresh")).toMatchObject({ status: 200, body: "new request" }));
+      expect(requests).toEqual(expect.arrayContaining(["/old", "/other", "/new"]));
+      expect(requests).toHaveLength(3);
+      expect(bodies(f.sent).filter(chunk => chunk.streamId === "old")).toEqual([{ streamId: "old", kind: "close", code: 1012, final: true }]);
+      expect(f.instance.hasViewer("second")).toBe(true);
+    } finally { f.instance.dispose(); }
+  });
+
+  it("rejects a lost upload tail even when another stream follows the gap first", async () => {
+    const requests: string[] = [];
+    handler = (request, response) => { requests.push(request.url!); response.end("complete"); };
+    const f = channel();
+    try {
+      f.instance.resyncChannel("preview:gap");
+      f.instance.onToRuntime("preview:gap", { streamId: "poll", kind: "request", method: "GET", path: "/poll", headers: {}, final: true });
+      f.instance.onToRuntime("preview:gap", { streamId: "lost-start", kind: "request", method: "POST", path: "/must-not-run", headers: {}, body: b64("tail"), final: true });
+      await vi.waitFor(() => expect(responseOf(bodies(f.sent), "lost-start").status).toBeDefined());
+      expect(requests).not.toContain("/must-not-run");
+      expect(responseOf(bodies(f.sent), "lost-start")).toMatchObject({ status: 503 });
+    } finally { f.instance.dispose(); }
+  });
+
+  it("rejects tails of two uploads whose starts were both lost in one gap", async () => {
+    const requests: string[] = [];
+    handler = (request, response) => { requests.push(request.url!); response.end("complete"); };
+    const f = channel();
+    try {
+      f.instance.resyncChannel("preview:gap");
+      f.instance.onToRuntime("preview:gap", { streamId: "first", kind: "request", method: "POST", path: "/first-tail", headers: {}, body: b64("tail"), final: true });
+      f.instance.onToRuntime("preview:gap", { streamId: "second", kind: "request", method: "POST", path: "/second-tail", headers: {}, body: b64("tail"), final: true });
+      await vi.waitFor(() => expect(responseOf(bodies(f.sent), "second").status).toBeDefined());
+      expect(requests).toEqual([]);
+      expect(responseOf(bodies(f.sent), "second")).toMatchObject({ status: 503 });
+    } finally { f.instance.dispose(); }
+  });
+
+  it("accepts a fresh upload opened after the gap, including its later body chunks", async () => {
+    const requests: Array<{ path: string; body: string }> = [];
+    handler = (request, response, body) => {
+      requests.push({ path: request.url!, body: body.toString() });
+      response.end("complete");
+    };
+    const f = channel();
+    try {
+      f.instance.resyncChannel("preview:gap");
+      f.instance.onToRuntime("preview:gap", { streamId: "fresh-upload", kind: "request", method: "POST", path: "/fresh", headers: {}, final: false });
+      f.instance.onToRuntime("preview:gap", { streamId: "fresh-upload", kind: "request", method: "POST", path: "/fresh", headers: {}, body: b64("body"), final: true });
+      await vi.waitFor(() => expect(responseOf(bodies(f.sent), "fresh-upload")).toMatchObject({ status: 200 }));
+      expect(requests).toEqual([{ path: "/fresh", body: "body" }]);
+      expect(f.instance.counters.refusedAfterGap).toBe(0);
+    } finally { f.instance.dispose(); }
+  });
+
+  it("answers a body whose start may be lost with 503, ignores its tail, and serves the next complete request", async () => {
+    const requests: string[] = [];
+    handler = (request, response) => { requests.push(request.url!); response.end("complete"); };
+    const f = channel();
+    try {
+      f.instance.resyncChannel("preview:gap");
+      f.instance.onToRuntime("preview:gap", { streamId: "partial", kind: "request", method: "POST", path: "/must-not-run", headers: {}, body: b64("middle"), final: false });
+      expect(responseOf(bodies(f.sent), "partial")).toMatchObject({ status: 503, body: INTERRUPTED_MESSAGE, chunks: 1 });
+      f.instance.onToRuntime("preview:gap", { streamId: "partial", kind: "request", method: "POST", path: "/must-not-run", headers: {}, body: b64("end"), final: true });
+      f.instance.onToRuntime("preview:gap", { streamId: "complete", kind: "request", method: "GET", path: "/complete", headers: {}, final: true });
+      await vi.waitFor(() => expect(responseOf(bodies(f.sent), "complete")).toMatchObject({ status: 200, body: "complete" }));
+      expect(requests).toEqual(["/complete"]);
+      expect(responseOf(bodies(f.sent), "complete")).toMatchObject({ status: 200, body: "complete" });
+      expect(bodies(f.sent).filter(chunk => chunk.streamId === "partial")).toHaveLength(1);
+      expect(f.instance.counters).toMatchObject({ resyncs: 1, refusedAfterGap: 1 });
+    } finally { f.instance.dispose(); }
   });
 
   it("starts the preview for a viewer's first request when nothing runs, and says it is starting", async () => {

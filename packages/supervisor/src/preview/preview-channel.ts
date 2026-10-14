@@ -9,8 +9,9 @@ import { COULD_NOT_START_PREFIX, PreviewForwarder, type PreviewForwarderOptions 
  * the loopback port the process manager spawned for that session. A frame
  * for a session with no running preview is answered on its stream with a 503
  * (never silence); a lease that may not open new channels (drain) answers
- * 503 too. Replay and acknowledgements are the mux's, exactly as for a
- * session channel.
+ * 503 too. Replay and acknowledgements are the mux's, as for a session
+ * channel, except that a receive gap resets this channel's streams instead
+ * of the shared relay socket (`resyncChannel`).
  */
 interface PreviewChannelDeps {
   transport: { send(message: OutboundMessage): void; openChannel(channelId: string, channel: RelayChannel): void; closeChannel(channelId: string): void };
@@ -49,12 +50,16 @@ export const STARTING_MESSAGE = "Starting preview. This page refreshes when it i
 const CAPACITY_WAIT_MS = 120_000;
 /** A viewer's start that threw: never "nothing yet", which would refresh forever. */
 const AUTO_START_FAILED_REASON = "This computer could not start the preview. Try again in a moment.";
+/** WebSocket "service restart": the viewer's hot-reload client reconnects. */
+const SERVICE_RESTART = 1012;
 
 export class PreviewChannel {
   private readonly forwarders = new Map<string, PreviewForwarder>();
   private readonly logger: Logger;
   private disposed = false;
-  readonly counters = { malformed: 0, refusedDraining: 0, autoStarted: 0, couldNotStart: 0 };
+  /** Channels that require a known opening frame for body continuations after lost frames. */
+  private readonly resyncing = new Set<string>();
+  readonly counters = { malformed: 0, refusedDraining: 0, autoStarted: 0, couldNotStart: 0, resyncs: 0, refusedAfterGap: 0 };
 
   constructor(private readonly deps: PreviewChannelDeps) {
     this.logger = deps.logger ?? createLogger({ name: "preview-channel" });
@@ -67,11 +72,20 @@ export class PreviewChannel {
     if (sessionId === null || !parsed.success) return this.malformed(channelId, sessionId, body);
     const chunk = parsed.data;
     if (this.disposed || !this.deps.lease.canOpenChannel("preview")) return this.refuseDraining(channelId, chunk);
+    if (this.refuseInterruptedRequest(channelId, sessionId, chunk)) return;
     if (this.startsSession(channelId, sessionId, chunk)) {
       void this.startForViewer(channelId, sessionId, chunk);
       return;
     }
     this.forwarderFor(channelId, sessionId).handle(chunk);
+  }
+
+  private refuseInterruptedRequest(channelId: string, sessionId: string, chunk: PreviewToRuntimeChunk): boolean {
+    if (!this.resyncing.has(channelId) || chunk.kind !== "request" || chunk.body === undefined) return false;
+    // Other streams cannot establish this stream's missing start. Core opens
+    // a fresh upload with a bodyless frame before sending its body chunks.
+    if (this.forwarderFor(channelId, sessionId).refuseAfterGap(chunk)) this.counters.refusedAfterGap += 1;
+    return true;
   }
 
   private malformed(channelId: string, sessionId: string | null, body: unknown): void {
@@ -127,8 +141,22 @@ export class PreviewChannel {
   /** Confirmed stop also withdraws any streams opened during cleanup. */
   previewStopped(sessionId: string): void { this.previewUnavailable(sessionId); }
 
+  /**
+   * The relay lost viewer frames on this channel (the mux already moved its
+   * receive cursor past them). Close the channel's open streams so Core and
+   * the browser retry; the channel, its numbering and every other channel
+   * stay as they are.
+   */
+  resyncChannel(channelId: string): void {
+    this.counters.resyncs += 1;
+    this.resyncing.add(channelId);
+    const streams = this.forwarders.get(channelId)?.closeAll(SERVICE_RESTART, "preview channel resync") ?? 0;
+    this.logger.info({ event: "preview.channel.resync", channelId, streams }, "closed this preview channel's open streams after the relay lost frames");
+  }
+
   /** Relay reset or retirement of the channel: drop its streams and its mux state. */
   closeChannel(channelId: string): void {
+    this.resyncing.delete(channelId);
     const forwarder = this.forwarders.get(channelId);
     if (forwarder) {
       this.forwarders.delete(channelId);
@@ -154,6 +182,7 @@ export class PreviewChannel {
     this.disposed = true;
     for (const forwarder of this.forwarders.values()) forwarder.dispose();
     this.forwarders.clear();
+    this.resyncing.clear();
   }
 
   private forwarderFor(channelId: string, sessionId: string): PreviewForwarder {

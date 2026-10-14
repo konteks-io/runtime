@@ -26,6 +26,38 @@ function fixture(overrides: Partial<RelayClientOptions> = {}) {
 }
 const flush = async () => { for (let n = 0; n < 8; n++) await Promise.resolve(); };
 
+describe("preview gap isolation on the shared relay socket", () => {
+  it("keeps the connected session on a preview gap, but re-handshakes on a session gap", async () => {
+    const key = generateInstanceKey(), onFrame = vi.fn(), onResync = vi.fn();
+    const mux = new ChannelMux({ recoveryAuthority: () => "manifest", clock: new FixedClock(Date.parse(confirmed.runtimeReconciliation.acceptedAt)),
+      key: () => key, ackIntervalSeconds: 5, ackEveryFrames: 1, replayBufferAgeMs: 60000, replayBufferBytes: 4096,
+      emit: value => f.client.emit(value), onFrame, onResync, persistCursors: async () => undefined,
+      onStall: channelId => f.client.rehandshake(`stall:${channelId}`), onReset: vi.fn() });
+    const f = fixture({ mux });
+    const session = (seq: number) => ({ channel: "session", direction: "to_runtime", channelId: "session:s", connectionEpoch: 7, seq,
+      issuedAt: confirmed.runtimeReconciliation.acceptedAt, body: { kind: "acp", method: "session/prompt", id: `p${seq}`, params: { sessionId: "acp", prompt: [{ type: "text", text: "Estimate this." }] } } });
+    const preview = (seq: number) => ({ channel: "preview", direction: "to_runtime", channelId: "preview:p", connectionEpoch: 7, seq,
+      issuedAt: confirmed.runtimeReconciliation.acceptedAt, body: { streamId: `poll-${seq}`, kind: "request", method: "GET", path: "/", headers: {}, final: true } });
+    try {
+      f.socket.message(confirmed); await flush();
+      f.socket.message(session(1)); await flush();
+      f.socket.message(preview(1)); await flush();
+      f.socket.message(preview(3)); await flush();
+      expect(f.client.connected).toBe(true);
+      expect(f.socket.close).not.toHaveBeenCalled();
+      expect(onResync).toHaveBeenCalledWith("preview:p", { expected: 2, got: 3 });
+      expect(onFrame.mock.calls.map(([frame]) => [frame.channelId, frame.seq])).toEqual([["session:s", 1], ["preview:p", 1], ["preview:p", 3]]);
+      expect(mux.handshakeCursors()["session:s"]?.to_runtime).toBe(1);
+      expect(mux.handshakeCursors()["preview:p"]?.to_runtime).toBe(3);
+
+      f.socket.message(session(3)); await flush();
+      expect(f.socket.close).toHaveBeenCalledWith(1012, "stall:session:s");
+      expect(f.client.connected).toBe(false);
+      expect(onFrame).toHaveBeenCalledTimes(3);
+    } finally { f.client.stop(); }
+  });
+});
+
 function delayedAdoption(overrides: Partial<RelayClientOptions> = {}) {
   const adoption = Promise.withResolvers<void>(), key = generateInstanceKey();
   let authority = "manifest";
