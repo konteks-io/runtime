@@ -128,6 +128,8 @@ interface OrchestratorDeps {
   /** Shared-owner status check for an old Codex reference lacking a transport descriptor. */
   inspectLegacyCodexThread?: (reference: string) => Promise<{ unloaded: boolean; ownerGeneration: string }>;
   onUsage: (observation: AgentTurnUsageObservation) => Promise<void>;
+  /** Runs only after proven process exit, before an unfinished execution is released. */
+  preserveStoppedWorkspace?: (admission: LocalAdmission, assertCurrent: () => void) => Promise<void>;
   searchController?: SearchControllerBoundary;
   /** Present on a runtime tagged `onboard`; absent, both kinds are refused. */
   onboardCarrier?: Pick<OnboardWorkCarrier, "execute">;
@@ -1618,8 +1620,9 @@ export class WorkOrchestrator {
    * Stop an unfinished execution's retained process and mark it `stopping` →
    * `process_stopped` → `interrupted_unqualified`, the retained recovery stop's
    * sequence. The runner's restart-only stop refuses a process identity that
-   * is still live under a current local owner. Never touches the workspace:
-   * generated changes stay; only the agent's in-session history is lost.
+   * is still live under a current local owner. Generated changes stay in the
+   * workspace; a configured checkpoint owner may retain an immutable copy.
+   * Process exit alone does not qualify external writers for a handoff.
    * Resolves false when there is nothing this can prove (no record, no
    * process owner, a continued record, no stop support).
    */
@@ -1648,11 +1651,29 @@ export class WorkOrchestrator {
       assertCurrent();
       await this.deps.journal.execution.markProcessStopped(admission, this.deps.clock.nowIso(), assertCurrent);
     }
+    await this.retainStoppedWorkspace(admission, assertCurrent);
+    assertCurrent();
     await this.deps.journal.execution.markInterruptedWithoutQuiescence(admission, this.deps.clock.nowIso(), assertCurrent);
     this.logger.info({ event: "execution.unfinished_retired", assignmentId: admission.assignmentId, attempt: admission.attempt,
       claimId: admission.claimId, stage, outcome: "interrupted_without_quiescence" },
     "the unfinished turn's process is gone; its session's next turn starts fresh");
     return true;
+  }
+
+  /** Checkpoint failure withholds migration; the original checkout and the
+   * ordinary same-runtime continuation remain available. It never certifies
+   * writer quiescence or releases retained execution capacity. */
+  private async retainStoppedWorkspace(admission: LocalAdmission, assertCurrent: () => void): Promise<void> {
+    assertCurrent();
+    try { await this.deps.preserveStoppedWorkspace?.(admission, assertCurrent); }
+    catch (error) {
+      assertCurrent();
+      this.logger.warn({ event: "workspace.checkpoint_retained_locally", assignmentId: admission.assignmentId,
+        attempt: admission.attempt, claimId: admission.claimId,
+        code: error instanceof RemoteInstanceError ? error.code : "unexpected_error" },
+      "Workspace preservation is incomplete; its original checkout stays on this runtime and migration remains withheld");
+    }
+    assertCurrent();
   }
 
   /** An unfinished execution with a retained process, and a runner that can stop it. */
@@ -1722,6 +1743,7 @@ export class WorkOrchestrator {
       // The retained process owner proves the whole process group exited.
       await runner.stopRetainedExecution(processOwner);
       await this.deps.journal.execution.markProcessStopped(prior, this.deps.clock.nowIso(), assertCurrent);
+      await this.retainStoppedWorkspace(prior, assertCurrent);
     }
     await this.deps.journal.execution.markAcpSettled(prior, ref, this.deps.clock.nowIso(), assertCurrent);
   }
@@ -2189,6 +2211,7 @@ export class WorkOrchestrator {
       assertCurrent();
       await this.deps.journal.execution.markProcessStopped(admission, this.deps.clock.nowIso(), assertCurrent);
     }
+    await this.retainStoppedWorkspace(admission, assertCurrent);
     // The bridge may be only a transport adapter to a user-owned Codex
     // app-server. Process-group exit therefore cannot settle the ACP turn,
     // tool calls, or MCP work, and this is deliberately NOT quiescence:
@@ -2295,6 +2318,7 @@ export class WorkOrchestrator {
     }
     assertCurrent();
     await this.deps.journal.execution.markProcessStopped(admission, this.deps.clock.nowIso(), assertCurrent);
+    await this.retainStoppedWorkspace(admission, assertCurrent);
     await this.deps.journal.execution.markInterruptedWithoutQuiescence(admission, this.deps.clock.nowIso(), assertCurrent);
     this.logger.warn({ event: "execution.recovery_interrupted", assignmentId, attempt, claimId: admission.claimId,
       acpSessionRef: settlement.owner?.acpSessionRef ?? stopped.acpSessionRef, phase: "interrupted_unqualified", quiescenceQualified: false,

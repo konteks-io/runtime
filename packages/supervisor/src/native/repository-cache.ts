@@ -3,8 +3,11 @@ import { execFile } from "node:child_process";
 import { constants, type Stats } from "node:fs";
 import { chmod, lstat, mkdir, open, readFile, realpath, rename, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, parse, resolve } from "node:path";
-import { RemoteInstanceError, canonicalize, sha256Hex } from "@konteks/remote-common";
+import { RemoteInstanceError, canonicalize, createLogger, sha256Hex } from "@konteks/remote-common";
 import { verifyNativeGitTool, type NativeGitTool } from "./git-workspace.js";
+import { staleCheckoutVerdict } from "./output-capture.js";
+
+const logger = createLogger({ name: "native-repository-cache" });
 
 const COMMIT = /^[a-f0-9]{40}$/;
 const LOCK_RETRY_MS = 20;
@@ -268,6 +271,17 @@ interface WorktreeRequest {
   agentWorkspaceRoot: string;
   worktreeId: string;
   mode?: "preserve" | "reset_to_revision";
+  /**
+   * A delivery session coming back to this computer (D105): a checkout left
+   * from an earlier stint, started at another commit, may be replaced when
+   * nothing in it is unsaved relative to what Core published; otherwise it is
+   * moved aside, kept, and a fresh checkout continues.
+   */
+  staleCheckout?: {
+    accepted: () => Promise<{ treeDigest: string; deletions: readonly string[] } | null>;
+    /** Told after a checkout holding unsaved edits was moved aside, so the delivery can say so. Never fails the turn. */
+    keptAside?: (kept: { keptBaselineCommit: string; publishedRevision: string }) => Promise<void>;
+  } | undefined;
 }
 
 const REPOSITORY_CONFIG =
@@ -347,7 +361,7 @@ class WorktreePreparation {
       await this.verify();
       return { cwd: this.cwd, baselineCommit: this.setup.input.revision, verify };
     }
-    if (current) {
+    if (current && !this.staleSessionCheckout(current)) {
       this.assertResettable(current);
       await this.verify(current);
     }
@@ -412,13 +426,65 @@ class WorktreePreparation {
   private async prepareLocked(): Promise<void> {
     const current = await this.currentReceipt();
     if (current && sameReceipt(current, this.expected)) return;
-    if (current) this.assertResettable(current);
+    const stale = this.staleOrResettable(current);
     await this.ensureRepository();
     await this.verifyRepository();
     if (await exists(this.legacyReceiptPath)) return this.migrateLegacyReceipt();
     await this.ensureRevision();
+    if (stale) await this.retireStaleCheckout(stale);
     if ((await exists(this.receiptPath)) && (await exists(this.cwd)) && !(await exists(this.legacyReceiptPath))) return this.resetWorktree();
     await this.addWorktree();
+  }
+
+  /** The receipt when it is this session's old checkout; any other differing receipt must be resettable. */
+  private staleOrResettable(current: WorktreeReceipt | null): WorktreeReceipt | null {
+    if (!current) return null;
+    if (this.staleSessionCheckout(current)) return current;
+    this.assertResettable(current);
+    return null;
+  }
+
+  /** The same session's own checkout, from an earlier stint that started at another commit. */
+  private staleSessionCheckout(current: WorktreeReceipt): boolean {
+    const expected = this.expected;
+    return Boolean(this.setup.input.staleCheckout) && (this.setup.input.mode ?? "preserve") === "preserve" &&
+      current.repositoryDigest === expected.repositoryDigest && current.worktreePathDigest === expected.worktreePathDigest &&
+      current.commonDirectoryDigest === expected.commonDirectoryDigest && current.baselineCommit !== expected.baselineCommit;
+  }
+
+  /**
+   * Replace an old checkout of this session whose edits all exist elsewhere
+   * (none, its last accepted output, or the published commit). One holding
+   * unsaved changes is moved aside intact, never deleted, and said so.
+   */
+  private async retireStaleCheckout(stale: WorktreeReceipt): Promise<void> {
+    await this.verify(stale);
+    const verdict = await staleCheckoutVerdict({ cwd: this.cwd, gitExecutable: this.setup.tool.executable,
+      baselineCommit: stale.baselineCommit, publishedCommit: this.setup.input.revision,
+      accepted: await this.setup.input.staleCheckout!.accepted() });
+    const fields = { event: "native.repository.stale_checkout", outcome: verdict === "unsaved" ? "kept" : "replaced", verdict,
+      staleBaseline: stale.baselineCommit.slice(0, 12), publishedRevision: this.setup.input.revision.slice(0, 12) };
+    if (verdict === "unsaved") {
+      const kept = `${this.cwd}.kept-${stale.baselineCommit.slice(0, 12)}-${Date.now()}`;
+      await this.git(["--git-dir", this.gitDir, "worktree", "move", this.cwd, kept]);
+      logger.warn({ ...fields, keptAt: kept }, "this computer kept unsaved changes from an earlier turn of this delivery beside its new checkout");
+      await this.reportKept(stale);
+    } else {
+      await this.git(["--git-dir", this.gitDir, "worktree", "remove", "--force", this.cwd]);
+      await rm(this.cwd, { recursive: true, force: true });
+      logger.info(fields, "an old checkout of this delivery held nothing unsaved and was replaced by the published commit");
+    }
+    await rm(this.receiptPath, { force: true });
+  }
+
+  /** Tell Core the checkout was kept aside; the line is history, so a failure only logs. */
+  private async reportKept(stale: WorktreeReceipt): Promise<void> {
+    try {
+      await this.setup.input.staleCheckout?.keptAside?.({ keptBaselineCommit: stale.baselineCommit, publishedRevision: this.setup.input.revision });
+    } catch (error) {
+      logger.warn({ event: "native.repository.stale_checkout_report_failed", errorClass: error instanceof Error ? error.name : "UnknownError" },
+        "the kept checkout could not be reported to Core; it stays kept");
+    }
   }
 
   private async ensureRepository(): Promise<void> {

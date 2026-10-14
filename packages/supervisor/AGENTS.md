@@ -54,10 +54,27 @@ QA browser, structured results, updates and doctor/support.
 - **Direct work** (`work/continued-session.ts`, `isDirectAssignment`): no
   preamble, no Konteks MCP servers, no preview/browser/result tool, policy root
   = the session's own folder, no repository selection.
+- **Workspace checkpoints** use the signed Core checkpoint contract gate.
+  Dirty ownership is retained before agent writes. A stopped execution can
+  retain an immutable snapshot for retry; this grants no new execution or
+  accepted-output authority. Restore into a fresh private folder, verify before
+  acknowledging, and retain every superseded checkout. An active recovered
+  folder keeps later uncommitted edits across preparation and supervisor restarts.
+- **A delivery session coming back** (D105): a harness turn that finds its own
+  old checkout started at another commit (`staleCheckout`) replaces it only when
+  `staleCheckoutVerdict` says nothing is unsaved (no edits, exactly its last
+  accepted output, or every edit already in the published commit). Otherwise the
+  checkout is moved aside intact (`<worktree>.kept-<baseline>-<ms>`, warn
+  `native.repository.stale_checkout` `outcome: kept`) and a fresh checkout
+  continues. With a Core at contract 7.10 it reports the `kept` workspace
+  operation, so the delivery's session and Updates say so; a failed report
+  only logs. A restored folder is retired, never deleted. Other preserved
+  checkouts at another commit still refuse.
 - **Core contract gating.** `availableCommands`, `supportedAgents`,
   `connectorCommands`, pay-per-use and option billing go only to a 7.1 Core;
   `integration` work only from 7.3 (`work/accepted-kinds.ts`); a heartbeat's
-  `previews` only from 7.8. The
+  `previews` only from 7.8; workspace checkpoints and their chunk transfer
+  only from 7.9. The
   `agent_runner` component always advertises `core-contract-version-v1`.
   Supported-agent detection (`NotAddedAgentsDetector`) never runs on the
   heartbeat path.

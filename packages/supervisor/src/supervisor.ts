@@ -1,3 +1,5 @@
+import { NativeWorkspaceCheckpointStore } from "./native/workspace-preservation.js";
+import { logicalSessionId } from "./work/continued-session.js";
 import { ObservationDelivery } from "./control/observation-delivery.js";
 import { readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
@@ -15,6 +17,8 @@ import {
   REMOTE_ASSIGNMENT_AVAILABLE_DELIVERY_CAPABILITY,
   REMOTE_ASSIGNMENT_AVAILABLE_MIN_CORE_CONTRACT_VERSION,
   REMOTE_DIRECT_MODEL_FALLBACK_MIN_CORE_CONTRACT_VERSION,
+  REMOTE_WORKSPACE_CHECKPOINT_MIN_CORE_CONTRACT_VERSION, REMOTE_WORKSPACE_CHUNK_MIN_CORE_CONTRACT_VERSION,
+  REMOTE_WORKSPACE_KEPT_ASIDE_MIN_CORE_CONTRACT_VERSION,
   allEqual,
   SystemClock,
   connectorGit,
@@ -584,6 +588,7 @@ export class Supervisor {
     const claudeIdentity = claudeExecutable ? new ClaudeExecutableIdentity(claudeExecutable, { logger: this.logger }) : null;
     this.inventory = new NativeInventoryCollector({ runners: this.runners, sampler: new SignalSampler(this.config.SUPERVISOR_DATA_DIR), bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION,
       gitVersion: () => this.git.version(),
+      workspaceRecoveryReady: () => Boolean(native.git) && Boolean(this.work) && !this.stopping,
       ...(claudeIdentity ? { claudeExecutable: () => claudeIdentity.capability() } : {}),
       executionPermitsReady: () => {
         // Native sessionDeps below always composes NativeExecutionGate.
@@ -1035,6 +1040,20 @@ export class Supervisor {
     this.broker = new PermissionBroker({ clock: this.clock, deadlineSeconds: () => this.configuration.permissionResponderDeadlineSeconds, onTimeout: async (request) => this.work.onPermissionTimeout(request) });
     this.work = new WorkOrchestrator({
       verifyCancellation: directive => verifier.verify(directive, directive.signature),
+      preserveStoppedWorkspace: async (admission, assertCurrent) => {
+        if (!coreContractAtLeast(this.coreContractVersion, REMOTE_WORKSPACE_CHECKPOINT_MIN_CORE_CONTRACT_VERSION)) return;
+        assertCurrent();
+        const runner = native.runners.find(config => config.RUNNER_AGENT_ID === admission.agentId);
+        if (!runner) throw new RemoteInstanceError("recovery_required", "The workspace's original runner is unavailable.");
+        const assignment = this.journal.execution.start(admission.assignmentId, admission.attempt)?.assignment;
+        const sessionId = assignment && logicalSessionId(assignment.source);
+        if (sessionId) await this.previews.stop(sessionId, "workspace_checkpoint");
+        assertCurrent();
+        await new NativeWorkspaceCheckpointStore({ root: runner.RUNNER_WORKSPACE_DIR, repositoryCacheRoot: native.repositoryCacheRoot,
+          chunksSupported: () => coreContractAtLeast(this.coreContractVersion, REMOTE_WORKSPACE_CHUNK_MIN_CORE_CONTRACT_VERSION),
+          client: () => new NativeInputClient({ baseUrl: this.config.SUPERVISOR_CORE_URL, roots: this.roots, clock: this.clock,
+            credential: () => this.lease.mode() === "active" ? (this.lease.current()?.lease ?? null) : null }) }).seal(admission, assertCurrent);
+      },
       onSessionReleased: async sessionId => {
         // The dev server stops with the session; its worktree stays openable
         // by a viewer while it exists (a delivery's preview after the delivery).
@@ -1139,6 +1158,9 @@ export class Supervisor {
           },
         }),
         prepareInputs: native.prepareInputs ?? createNativeInputPreparer({
+          workspaceRecovery: () => coreContractAtLeast(this.coreContractVersion, REMOTE_WORKSPACE_CHECKPOINT_MIN_CORE_CONTRACT_VERSION),
+          workspaceChunks: () => coreContractAtLeast(this.coreContractVersion, REMOTE_WORKSPACE_CHUNK_MIN_CORE_CONTRACT_VERSION),
+          workspaceKeptAside: () => coreContractAtLeast(this.coreContractVersion, REMOTE_WORKSPACE_KEPT_ASIDE_MIN_CORE_CONTRACT_VERSION),
           logger: this.logger,
           root: native.runners.find(config => config.RUNNER_AGENT_ID === runner.agentId)!.RUNNER_WORKSPACE_DIR,
           clock: this.clock,

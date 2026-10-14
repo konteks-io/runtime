@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { createServer, type IncomingHttpHeaders, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { createLogger, plainRecord, RemoteInstanceError, type Logger } from "@konteks/remote-common";
 import type { CapabilityTokenIssue } from "../core/client.js";
 import { bearerMatches, readBounded, sendJson } from "../loopback-http.js";
@@ -68,7 +69,8 @@ export class McpCapabilityFacade {
   private readonly logger: Logger;
   private readonly now: () => number;
   private readonly localCredential: string;
-  private readonly activeRequests = new Set<AbortController>();
+  private readonly activeRequests = new Map<AbortController, { settled: Promise<void>; resolve: () => void }>();
+  private closeTask: Promise<void> | null = null;
   private issue: CapabilityTokenIssue;
   private server: Server | null = null;
   private refreshTask: Promise<CapabilityTokenIssue> | null = null;
@@ -122,22 +124,41 @@ export class McpCapabilityFacade {
     this.active = true;
   }
 
-  async close(): Promise<void> {
-    if (this.closed) return;
+  close(): Promise<void> {
+    this.closeTask ??= this.closeOwned();
+    return this.closeTask;
+  }
+
+  private async closeOwned(): Promise<void> {
     this.closed = true;
     this.active = false;
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
     this.refreshTimer = null;
-    for (const controller of this.activeRequests) controller.abort();
-    this.activeRequests.clear();
+    // Abort is only a request. Retain each local upstream operation until its
+    // actual handler settles; Core separately owns remote tool disposition.
+    const pending = [...this.activeRequests.values()].map(request => request.settled);
+    for (const controller of this.activeRequests.keys()) controller.abort();
     const server = this.server;
     this.server = null;
     if (server) {
       const closed = new Promise<void>(resolve => server.close(() => resolve()));
       server.closeAllConnections();
-      await closed;
+      pending.push(closed);
     }
+    await Promise.all(pending);
     this.logger.info({ event: "mcp_capability.facade_closed", ...this.options.context }, "local MCP capability facade closed");
+  }
+
+  private retainRequest(controller: AbortController): void {
+    let resolve!: () => void;
+    const settled = new Promise<void>(done => { resolve = done; });
+    this.activeRequests.set(controller, { settled, resolve });
+  }
+
+  private settleRequest(controller: AbortController): void {
+    const request = this.activeRequests.get(controller);
+    this.activeRequests.delete(controller);
+    request?.resolve();
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -170,18 +191,20 @@ export class McpCapabilityFacade {
 
   private async proxy(request: IncomingMessage, body: Buffer, response: ServerResponse): Promise<void> {
     let upstream = await this.forward(request, body, false);
-    // Core's native MCP ingress authenticates before parsing or dispatching
-    // the body. Its 401 therefore proves that replay has no tool side effect.
-    if (upstream.response.status === 401) {
-      upstream.controller.abort();
-      this.activeRequests.delete(upstream.controller);
-      this.logger.warn({ event: "mcp_capability.auth_rejected", ...this.options.context, action: "refresh_and_replay" }, "upstream MCP capability was rejected before dispatch");
-      await this.refresh(true, "auth_rejection");
-      upstream = await this.forward(request, body, true);
-    }
-    const observed = this.options.onBrowserAccess ? environmentOpenRequestId(body) : undefined;
-    if (observed !== undefined) await this.writeObserved(upstream.response, upstream.controller, response, observed);
-    else await this.writeUpstream(upstream.response, upstream.controller, response);
+    try {
+      // Core authenticates before dispatch, so only its 401 permits replay.
+      if (upstream.response.status === 401) {
+        upstream.controller.abort();
+        this.settleRequest(upstream.controller);
+        this.logger.warn({ event: "mcp_capability.auth_rejected", ...this.options.context, action: "refresh_and_replay" }, "upstream MCP capability was rejected before dispatch");
+        await this.refresh(true, "auth_rejection");
+        upstream = await this.forward(request, body, true);
+      }
+      if (this.closed) throw new RemoteInstanceError("execution_fenced", "The local MCP facade lost its assignment.");
+      const observed = this.options.onBrowserAccess ? environmentOpenRequestId(body) : undefined;
+      if (observed !== undefined) await this.writeObserved(upstream.response, upstream.controller, response, observed);
+      else await this.writeUpstream(upstream.response, response);
+    } finally { this.settleRequest(upstream.controller); }
   }
 
   private proxyFailed(response: ServerResponse, error: unknown): void {
@@ -213,7 +236,7 @@ export class McpCapabilityFacade {
     const headers = forwardedHeaders(request.headers);
     headers.set("authorization", authorization(issue));
     const controller = new AbortController();
-    this.activeRequests.add(controller);
+    this.retainRequest(controller);
     try {
       const response = await fetch(upstream, { method: "POST", headers, body: body.toString("utf8"), signal: controller.signal });
       this.logger.info({
@@ -224,26 +247,16 @@ export class McpCapabilityFacade {
       }, "upstream MCP request returned");
       return { response, controller };
     } catch (error) {
-      this.activeRequests.delete(controller);
+      this.settleRequest(controller);
       throw error;
     }
   }
 
-  private async writeUpstream(upstream: Response, controller: AbortController, response: ServerResponse): Promise<void> {
+  private async writeUpstream(upstream: Response, response: ServerResponse): Promise<void> {
     response.statusCode = upstream.status;
     copyResponseHeaders(upstream, response);
-    try {
-      if (!upstream.body) return void response.end();
-      await new Promise<void>((resolve, reject) => {
-        const stream = Readable.fromWeb(upstream.body as never);
-        stream.once("error", reject);
-        response.once("error", reject);
-        response.once("finish", resolve);
-        stream.pipe(response);
-      });
-    } finally {
-      this.activeRequests.delete(controller);
-    }
+    if (!upstream.body) return void response.end();
+    await pipeline(Readable.fromWeb(upstream.body as never), response);
   }
 
   /**
@@ -254,13 +267,8 @@ export class McpCapabilityFacade {
    * nothing.
    */
   private async writeObserved(upstream: Response, controller: AbortController, response: ServerResponse, requestId: string | number): Promise<void> {
-    if (!observableAnswer(upstream)) return this.writeUpstream(upstream, controller, response);
-    let text: string;
-    try {
-      text = await boundedText(upstream.body!, controller);
-    } finally {
-      this.activeRequests.delete(controller);
-    }
+    if (!observableAnswer(upstream)) return this.writeUpstream(upstream, response);
+    const text = await boundedText(upstream.body!, controller);
     this.readGrant(text, requestId);
     response.statusCode = upstream.status;
     copyResponseHeaders(upstream, response);
@@ -268,6 +276,7 @@ export class McpCapabilityFacade {
   }
 
   private readGrant(text: string, requestId: string | number): void {
+    if (this.closed) return;
     try {
       const grant = browserAccessFrom(text, requestId, this.options.context.sessionId, this.now());
       if (grant) this.options.onBrowserAccess?.(grant);

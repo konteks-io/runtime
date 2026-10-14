@@ -80,7 +80,12 @@ async function acknowledge(journal: SupervisorJournal, identity: LocalAdmission)
 
 function orchestrator(journal: SupervisorJournal, outbox: DurableOutbox, runnerIncarnation: string) {
   const runner = { stopRetainedExecution: vi.fn(async (_owner: unknown) => undefined), releaseSealedSession: vi.fn(async () => undefined) };
+  const preserveStoppedWorkspace = vi.fn(async (owner: LocalAdmission, assertCurrent: () => void) => {
+    assertCurrent();
+    expect(journal.execution.execution(owner)?.phase).toBe("process_stopped");
+  });
   const work = new WorkOrchestrator({ journal, outbox, transport: {}, clock, runners: new Map([["claude-code", runner]]),
+    preserveStoppedWorkspace,
     sessionDeps: () => ({}), onUsage: async () => undefined, instanceId: () => "instance", workspaceId: () => "workspace",
     runnerIncarnation: () => runnerIncarnation, assertOwned: () => undefined, recoveryAuthority: () => "accepted", reportDeliveryAllowed: () => false } as never);
   const internal = work as unknown as {
@@ -88,7 +93,7 @@ function orchestrator(journal: SupervisorJournal, outbox: DurableOutbox, runnerI
     onSessionClosed(session: unknown, reason: "cancelled" | "completed", assertAuthority: () => void): Promise<void>;
     takeOverCompletedChannel(assignment: RemoteWorkAssignment, admission: LocalAdmission, assertCurrent: () => void): Promise<{ reference: string; mode: "live" | "restore" } | undefined>;
   };
-  return { work, internal, runner };
+  return { work, internal, runner, preserveStoppedWorkspace };
 }
 
 /** Review 1 completed; review 2 continued its live ACP session and is running. */
@@ -114,7 +119,7 @@ async function continuedReviews(nextIncarnation = "process") {
 it("stops a cancelled review continuation's process at close so the next review starts fresh", async () => {
   const f = await continuedReviews();
   await runningClaim(f.journal, f.cancelled);
-  const { internal, runner } = orchestrator(f.journal, f.outbox, "process");
+  const { internal, runner, preserveStoppedWorkspace } = orchestrator(f.journal, f.outbox, "process");
   // The cancelled turn's live owner: its own close has already cancelled and
   // closed the ACP session; the orchestrator now reports and retires it. As
   // in RelayedSession, close() is the in-flight close that calls onClosed.
@@ -127,10 +132,12 @@ it("stops a cancelled review continuation's process at close so the next review 
   await internal.onSessionClosed(session, "cancelled", current);
   // Nothing is stopped while the session's own close is still running.
   expect(runner.stopRetainedExecution).not.toHaveBeenCalled();
+  expect(preserveStoppedWorkspace).not.toHaveBeenCalled();
   finishClose();
 
   await vi.waitFor(() => expect(f.journal.execution.execution(f.cancelled)?.phase).toBe("interrupted_unqualified"));
   expect(runner.stopRetainedExecution).toHaveBeenCalledExactlyOnceWith(processOwner);
+  expect(preserveStoppedWorkspace).toHaveBeenCalledExactlyOnceWith(f.cancelled, expect.any(Function));
   expect(f.journal.execution.execution(f.cancelled)).toMatchObject({ acpSessionRef: "qa-ref", processOwner });
   expect(f.journal.assignments.get("cancelled:1")?.reports.terminalSequence).toBe(1);
   expect(internal.sessions.has("cancelled:1")).toBe(false);
@@ -143,6 +150,17 @@ it("stops a cancelled review continuation's process at close so the next review 
   // Fresh: nothing was transferred or restored from the cancelled reference.
   expect(f.journal.execution.execution(f.next)).toBeUndefined();
   expect(runner.stopRetainedExecution).toHaveBeenCalledOnce();
+});
+
+it("keeps the source workspace on its runtime when checkpoint retention fails without wedging its next turn", async () => {
+  const f = await continuedReviews();
+  await terminalClaim(f.journal, f.cancelled, { class: "cancelled", reason: "user_cancelled" }, true);
+  const { internal, preserveStoppedWorkspace } = orchestrator(f.journal, f.outbox, "process");
+  preserveStoppedWorkspace.mockRejectedValueOnce(new RemoteInstanceError("capability_unavailable", "Checkpoint upload unavailable; original workspace kept."));
+  await expect(internal.takeOverCompletedChannel(review(f.next, "qa-3", "qa-1"), f.next, current)).resolves.toBeUndefined();
+  expect(f.journal.execution.execution(f.cancelled)?.phase).toBe("interrupted_unqualified");
+  expect(f.journal.execution.execution(f.next)).toBeUndefined();
+  expect(preserveStoppedWorkspace).toHaveBeenCalledOnce();
 });
 
 it("a next review placed while the cancelled turn is still closing waits for its stop, then starts fresh", async () => {

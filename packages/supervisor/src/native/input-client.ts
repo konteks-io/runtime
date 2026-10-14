@@ -5,6 +5,7 @@ import {
   RemoteRepositoryFetchRequestSchema,
   RemoteWorkAssignmentSchema,
   RemoteFileTreeSchema,
+  RemoteWorkspaceBeginRequestSchema, RemoteWorkspaceAnySealRequestSchema, RemoteWorkspaceAcknowledgeRequestSchema, RemoteWorkspaceKeptAsideRequestSchema, RemoteWorkspaceAnyCheckpointSchema, RemoteWorkspaceChunkSchema, RemoteWorkspaceChunkWriteRequestSchema, RemoteWorkspaceChunkReadRequestSchema,
   RemoteInstanceError,
   allEqual,
   createLogger,
@@ -49,6 +50,17 @@ const CORE_HTTP_DATE_UNCERTAINTY_MS = 1_000;
 
 /** Artifact transport has tighter body/redirect/error rules than ordinary control JSON. */
 export class NativeInputClient {
+  /** Unfinished workspace retention is independent of successful output. */
+  async workspace(assignment: RemoteWorkAssignment, operation: "begin" | "seal" | "read" | "acknowledge" | "write-chunk" | "read-chunk" | "kept", raw: unknown): Promise<unknown> {
+    const schemas = { "write-chunk": RemoteWorkspaceChunkWriteRequestSchema, "read-chunk": RemoteWorkspaceChunkReadRequestSchema, begin: RemoteWorkspaceBeginRequestSchema, seal: RemoteWorkspaceAnySealRequestSchema,
+      read: RemoteWorkspaceBeginRequestSchema, acknowledge: RemoteWorkspaceAcknowledgeRequestSchema, kept: RemoteWorkspaceKeptAsideRequestSchema };
+    const body = schemas[operation].parse(raw);
+    const result = await this.withTransientRetry(`workspace.${operation}`, () => this.requestAttempt(assignment,
+      operation, body, workspaceResponseLimit(operation), "workspaces"));
+    if (operation === "read") return RemoteWorkspaceAnyCheckpointSchema.parse(result);
+    return operation === "read-chunk" ? RemoteWorkspaceChunkSchema.parse(result) : result;
+  }
+
   private readonly verifier: CoreSignatureVerifier;
   private readonly origin: string;
   private readonly fetchFn: FetchFn;
@@ -209,9 +221,10 @@ export class NativeInputClient {
 
   private requestAttempt(
     assignment: RemoteWorkAssignment,
-    operation: "prepare" | "read",
+    operation: string,
     body: unknown,
     maxBytes: number,
+    area: "inputs" | "workspaces" = "inputs",
   ): Promise<unknown> {
     return this.postOnce(assignment, operation, body, "application/json", async (response, signal, held) => {
       if (!response.ok || response.redirected || mediaType(response) !== "application/json" || !response.body) {
@@ -225,7 +238,7 @@ export class NativeInputClient {
       } catch {
         throw unavailable("response_decode_invalid");
       }
-    });
+    }, area);
   }
 
   /**
@@ -240,11 +253,12 @@ export class NativeInputClient {
     body: unknown,
     accept: string,
     take: (response: Response, signal: AbortSignal, held: { reader?: ReadableStreamDefaultReader<Uint8Array> }) => Promise<T>,
+    area: "inputs" | "workspaces" = "inputs",
   ): Promise<T> {
     let credential = this.options.credential();
     if (!credential) throw unavailable("credential_missing");
     if (!this.verifier.configured) throw unavailable("trust_roots_missing");
-    const url = `${this.origin}/api/remote-instances/internal/remote-instances/${encodeURIComponent(assignment.instanceId)}/assignments/${encodeURIComponent(assignment.id)}/inputs/${endpoint}`;
+    const url = `${this.origin}/api/remote-instances/internal/remote-instances/${encodeURIComponent(assignment.instanceId)}/assignments/${encodeURIComponent(assignment.id)}/${area}/${endpoint}`;
     const abort = new AbortController();
     // Core's own preparation budget is 90 s (NATIVE_INPUT_REQUEST_TIMEOUT_MS):
     // the delivery Session is materialized and a repository snapshot pinned
@@ -505,4 +519,9 @@ function bindingMatchesAssignment(binding: RemoteAssignmentInputsEnvelope["selec
     [binding.assignmentId, assignment.id],
     [binding.attempt, assignment.attempt],
   ]) && (continued === null || binding.sessionId === continued.sessionId);
+}
+
+function workspaceResponseLimit(operation: string): number {
+  if (operation === "read") return 90 * 1024 * 1024;
+  return operation === "read-chunk" ? 2 * 1024 * 1024 : 128 * 1024;
 }

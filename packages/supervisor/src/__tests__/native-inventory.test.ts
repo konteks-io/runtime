@@ -14,6 +14,13 @@ function fixture(executionPermitsReady?: () => boolean, cancellationDeliveryRead
 }
 
 describe("native host inventory", () => {
+  it("advertises workspace restoration only when the live composition supports it", async () => {
+    let ready = false;
+    const inventory = new NativeInventoryCollector({ runners: new Map(), sampler: { sample: async () => signals }, bundleVersion: "1.0.0", workspaceRecoveryReady: () => ready });
+    expect((await inventory.collect()).components[0]?.capabilities).not.toContain("workspace-checkpoint-v1");
+    ready = true;
+    expect((await inventory.collect()).components[0]?.capabilities).toContain("workspace-checkpoint-v1");
+  });
   it("discovers every signed installed runner without an agent-add registration step", async () => {
     const claude = { ...agent, agentId: "claude-code", displayName: "Claude Code", readiness: "not_configured" as const };
     const runners = new Map([

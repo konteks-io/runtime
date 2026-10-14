@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { DELIVERY_TURN_RENEWAL_CAPABILITY } from "./delivery-turn-renewal.js";
 import { DIRECT_TURN_RENEWAL_CAPABILITY } from "./direct-turn-renewal.js";
-import { ConnectedAgentViewSchema, REMOTE_CORE_CONTRACT_CAPABILITY,
+import { ConnectedAgentViewSchema, REMOTE_CORE_CONTRACT_CAPABILITY, REMOTE_WORKSPACE_CHECKPOINT_CAPABILITY, REMOTE_WORKSPACE_CHUNK_CAPABILITY,
   REMOTE_DIRECT_MODEL_FALLBACK_CAPABILITY,
   REMOTE_AGENT_LOGIN_BROWSER_CAPABILITY, REMOTE_AGENT_LOGIN_CAPABILITY, REMOTE_CANCELLATION_DELIVERY_CAPABILITY, REMOTE_EXECUTION_PERMITS_CAPABILITY, REMOTE_DELIVERY_PERMITS_CAPABILITY, REMOTE_PREVIEW_APP_CREDENTIALS_CAPABILITY, REMOTE_PREVIEW_CAPABILITY, REMOTE_SESSION_LABEL_CAPABILITY, type ConnectedAgentView,
 } from "@konteks/remote-common";
@@ -16,6 +16,7 @@ const readinessSchema = z.object({
 }).strict();
 
 interface NativeInventoryOptions {
+  workspaceRecoveryReady?: () => boolean;
   runners: ReadonlyMap<string, Pick<RunnerPort, "readiness">>;
   sampler: Pick<SignalSampler, "sample">;
   bundleVersion: string;
@@ -165,6 +166,7 @@ export class NativeInventoryCollector {
     // fields (pay-per-use turns, the download state, a credential's reason)
     // from it.
     capabilities.push(REMOTE_CORE_CONTRACT_CAPABILITY);
+    if (this.options.workspaceRecoveryReady?.()) capabilities.push(REMOTE_WORKSPACE_CHECKPOINT_CAPABILITY, REMOTE_WORKSPACE_CHUNK_CAPABILITY);
     // This build's preview takes the app's own cookies and Authorization (D46).
     if (this.options.previewReady?.()) capabilities.push(REMOTE_PREVIEW_CAPABILITY, REMOTE_PREVIEW_APP_CREDENTIALS_CAPABILITY);
     return capabilities;
