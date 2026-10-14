@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { NativeWorkspaceCheckpointStore } from "./workspace-preservation.js";
 import { NativeRecoveredWorkspaceStore } from "./workspace-recovery.js";
 import { constants, type Stats } from "node:fs";
@@ -47,6 +48,8 @@ interface NativeInputPreparerOptions {
   /** Signed Core contract gate; older Core never receives checkpoint requests. */
   workspaceRecovery?: () => boolean;
   workspaceChunks?: () => boolean;
+  /** Core takes the `kept` workspace report (contract 7.10). */
+  workspaceKeptAside?: () => boolean;
   /** Private, runner-specific connector workspace root, never a user checkout. */
   root: string;
   clock: Clock;
@@ -555,12 +558,6 @@ class DeliveryOutput {
   }
 }
 
-/** A delivery session coming back to this computer may find its own old checkout (D105). */
-function staleCheckoutPolicy(inputs: AuthorizedInputs, root: string) {
-  if (!harnessTurnOf(inputs.current)) return undefined;
-  return { accepted: () => new NativeOutputSessionHeadStore(root, inputs.selection.binding.sessionId).latestAccepted() };
-}
-
 function harnessTurnOf(assignment: RemoteWorkAssignment) {
   return assignment.kind === "delivery" && assignment.source.kind === "harness_delivery" ? assignment.source.turn : undefined;
 }
@@ -703,6 +700,19 @@ class InputPreparation {
     } };
   }
 
+  /** A delivery session coming back to this computer may find its own old checkout (D105). */
+  private staleCheckoutPolicy(inputs: AuthorizedInputs, root: string) {
+    if (!harnessTurnOf(inputs.current)) return undefined;
+    return {
+      accepted: () => new NativeOutputSessionHeadStore(root, inputs.selection.binding.sessionId).latestAccepted(),
+      keptAside: async (kept: { keptBaselineCommit: string; publishedRevision: string }) => {
+        if (!this.options.workspaceKeptAside?.()) return;
+        await this.options.client().workspace(inputs.current, "kept", { attempt: inputs.current.attempt, claimId: inputs.claimId,
+          selectionDigest: inputs.digest, checkpointId: randomUUID(), ...kept });
+      },
+    };
+  }
+
   private async repositoryWorktree(
     inputs: AuthorizedInputs,
     root: string,
@@ -710,7 +720,7 @@ class InputPreparation {
     wiringOf: { task?: Promise<void> },
   ): Promise<SourceWorkspace> {
     const fetched: { record?: { bytes: number; durationMs: number } } = {};
-    const staleCheckout = staleCheckoutPolicy(inputs, root);
+    const staleCheckout = this.staleCheckoutPolicy(inputs, root);
     const recovered = await new NativeRecoveredWorkspaceStore({ root, tool: repository.git, client: this.options.client }).prepare({
       assignment: inputs.current, claimId: inputs.claimId, selectionDigest: inputs.digest, selection: inputs.selection },
     { retireStale: Boolean(staleCheckout) });

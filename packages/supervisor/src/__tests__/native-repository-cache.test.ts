@@ -332,7 +332,11 @@ describe("a delivery session returning to a computer with its old checkout", () 
     const old = await f.cache.prepare({ ...session, revision: f.first, agentWorkspaceRoot: f.claudeRoot, staleCheckout: none });
     await writeFile(join(old.cwd, "unsaved.txt"), "only here\n");
     const second = await published(f, "two\n");
-    const fresh = await f.cache.prepare({ ...session, revision: second, agentWorkspaceRoot: f.claudeRoot, staleCheckout: none });
+    const reported: Array<{ keptBaselineCommit: string; publishedRevision: string }> = [];
+    const fresh = await f.cache.prepare({ ...session, revision: second, agentWorkspaceRoot: f.claudeRoot,
+      staleCheckout: { ...none, keptAside: async kept => { reported.push(kept); throw new Error("Core unreachable"); } } });
+    // The delivery is told once, and a failed report never fails the turn.
+    expect(reported).toEqual([{ keptBaselineCommit: f.first, publishedRevision: second }]);
     expect(fresh.baselineCommit).toBe(second);
     await expect(readFile(join(fresh.cwd, "unsaved.txt"), "utf8")).rejects.toThrow();
     const kept = (await readdir(f.claudeRoot)).filter(name => name.includes(".kept-"));

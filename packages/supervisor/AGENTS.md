@@ -66,7 +66,9 @@ QA browser, structured results, updates and doctor/support.
   accepted output, or every edit already in the published commit). Otherwise the
   checkout is moved aside intact (`<worktree>.kept-<baseline>-<ms>`, warn
   `native.repository.stale_checkout` `outcome: kept`) and a fresh checkout
-  continues. A restored folder is retired, never deleted. Other preserved
+  continues. With a Core at contract 7.10 it reports the `kept` workspace
+  operation, so the delivery's session and Updates say so; a failed report
+  only logs. A restored folder is retired, never deleted. Other preserved
   checkouts at another commit still refuse.
 - **Core contract gating.** `availableCommands`, `supportedAgents`,
   `connectorCommands`, pay-per-use and option billing go only to a 7.1 Core;

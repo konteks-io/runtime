@@ -5,7 +5,7 @@ import {
   RemoteRepositoryFetchRequestSchema,
   RemoteWorkAssignmentSchema,
   RemoteFileTreeSchema,
-  RemoteWorkspaceBeginRequestSchema, RemoteWorkspaceAnySealRequestSchema, RemoteWorkspaceAcknowledgeRequestSchema, RemoteWorkspaceAnyCheckpointSchema, RemoteWorkspaceChunkSchema, RemoteWorkspaceChunkWriteRequestSchema, RemoteWorkspaceChunkReadRequestSchema,
+  RemoteWorkspaceBeginRequestSchema, RemoteWorkspaceAnySealRequestSchema, RemoteWorkspaceAcknowledgeRequestSchema, RemoteWorkspaceKeptAsideRequestSchema, RemoteWorkspaceAnyCheckpointSchema, RemoteWorkspaceChunkSchema, RemoteWorkspaceChunkWriteRequestSchema, RemoteWorkspaceChunkReadRequestSchema,
   RemoteInstanceError,
   allEqual,
   createLogger,
@@ -51,9 +51,9 @@ const CORE_HTTP_DATE_UNCERTAINTY_MS = 1_000;
 /** Artifact transport has tighter body/redirect/error rules than ordinary control JSON. */
 export class NativeInputClient {
   /** Unfinished workspace retention is independent of successful output. */
-  async workspace(assignment: RemoteWorkAssignment, operation: "begin" | "seal" | "read" | "acknowledge" | "write-chunk" | "read-chunk", raw: unknown): Promise<unknown> {
+  async workspace(assignment: RemoteWorkAssignment, operation: "begin" | "seal" | "read" | "acknowledge" | "write-chunk" | "read-chunk" | "kept", raw: unknown): Promise<unknown> {
     const schemas = { "write-chunk": RemoteWorkspaceChunkWriteRequestSchema, "read-chunk": RemoteWorkspaceChunkReadRequestSchema, begin: RemoteWorkspaceBeginRequestSchema, seal: RemoteWorkspaceAnySealRequestSchema,
-      read: RemoteWorkspaceBeginRequestSchema, acknowledge: RemoteWorkspaceAcknowledgeRequestSchema };
+      read: RemoteWorkspaceBeginRequestSchema, acknowledge: RemoteWorkspaceAcknowledgeRequestSchema, kept: RemoteWorkspaceKeptAsideRequestSchema };
     const body = schemas[operation].parse(raw);
     const result = await this.withTransientRetry(`workspace.${operation}`, () => this.requestAttempt(assignment,
       operation, body, workspaceResponseLimit(operation), "workspaces"));

@@ -18,6 +18,7 @@ import {
   REMOTE_ASSIGNMENT_AVAILABLE_MIN_CORE_CONTRACT_VERSION,
   REMOTE_DIRECT_MODEL_FALLBACK_MIN_CORE_CONTRACT_VERSION,
   REMOTE_WORKSPACE_CHECKPOINT_MIN_CORE_CONTRACT_VERSION, REMOTE_WORKSPACE_CHUNK_MIN_CORE_CONTRACT_VERSION,
+  REMOTE_WORKSPACE_KEPT_ASIDE_MIN_CORE_CONTRACT_VERSION,
   allEqual,
   SystemClock,
   connectorGit,
@@ -1153,6 +1154,7 @@ export class Supervisor {
         prepareInputs: native.prepareInputs ?? createNativeInputPreparer({
           workspaceRecovery: () => coreContractAtLeast(this.coreContractVersion, REMOTE_WORKSPACE_CHECKPOINT_MIN_CORE_CONTRACT_VERSION),
           workspaceChunks: () => coreContractAtLeast(this.coreContractVersion, REMOTE_WORKSPACE_CHUNK_MIN_CORE_CONTRACT_VERSION),
+          workspaceKeptAside: () => coreContractAtLeast(this.coreContractVersion, REMOTE_WORKSPACE_KEPT_ASIDE_MIN_CORE_CONTRACT_VERSION),
           logger: this.logger,
           root: native.runners.find(config => config.RUNNER_AGENT_ID === runner.agentId)!.RUNNER_WORKSPACE_DIR,
           clock: this.clock,

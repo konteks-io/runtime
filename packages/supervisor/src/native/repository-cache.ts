@@ -277,7 +277,11 @@ interface WorktreeRequest {
    * nothing in it is unsaved relative to what Core published; otherwise it is
    * moved aside, kept, and a fresh checkout continues.
    */
-  staleCheckout?: { accepted: () => Promise<{ treeDigest: string; deletions: readonly string[] } | null> } | undefined;
+  staleCheckout?: {
+    accepted: () => Promise<{ treeDigest: string; deletions: readonly string[] } | null>;
+    /** Told after a checkout holding unsaved edits was moved aside, so the delivery can say so. Never fails the turn. */
+    keptAside?: (kept: { keptBaselineCommit: string; publishedRevision: string }) => Promise<void>;
+  } | undefined;
 }
 
 const REPOSITORY_CONFIG =
@@ -464,12 +468,23 @@ class WorktreePreparation {
       const kept = `${this.cwd}.kept-${stale.baselineCommit.slice(0, 12)}-${Date.now()}`;
       await this.git(["--git-dir", this.gitDir, "worktree", "move", this.cwd, kept]);
       logger.warn({ ...fields, keptAt: kept }, "this computer kept unsaved changes from an earlier turn of this delivery beside its new checkout");
+      await this.reportKept(stale);
     } else {
       await this.git(["--git-dir", this.gitDir, "worktree", "remove", "--force", this.cwd]);
       await rm(this.cwd, { recursive: true, force: true });
       logger.info(fields, "an old checkout of this delivery held nothing unsaved and was replaced by the published commit");
     }
     await rm(this.receiptPath, { force: true });
+  }
+
+  /** Tell Core the checkout was kept aside; the line is history, so a failure only logs. */
+  private async reportKept(stale: WorktreeReceipt): Promise<void> {
+    try {
+      await this.setup.input.staleCheckout?.keptAside?.({ keptBaselineCommit: stale.baselineCommit, publishedRevision: this.setup.input.revision });
+    } catch (error) {
+      logger.warn({ event: "native.repository.stale_checkout_report_failed", errorClass: error instanceof Error ? error.name : "UnknownError" },
+        "the kept checkout could not be reported to Core; it stays kept");
+    }
   }
 
   private async ensureRepository(): Promise<void> {
