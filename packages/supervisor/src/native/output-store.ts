@@ -189,6 +189,15 @@ export class NativeOutputSessionHeadStore {
     await this.write({ version: 1, latest, recovered, ...(pending ? { pending } : {}) });
   }
 
+  /** The output this session's last accepted turn produced here, when this computer still records one. Read-only. */
+  async latestAccepted(): Promise<{ treeDigest: string; deletions: string[] } | null> {
+    const head = await this.read();
+    if (!head?.latest) return null;
+    const record = await this.record({ invocationId: head.latest.invocationId, claimId: head.latest.claimId }).read();
+    if (record?.state !== "accepted") return null;
+    return { treeDigest: record.candidate.files.treeDigest, deletions: [...record.candidate.deletions] };
+  }
+
   async verifyExpected(expected: ExpectedAcceptance, current: Omit<TurnIdentity, "sessionId">): Promise<void> {
     let head = await this.required();
     await this.cleanup(head);

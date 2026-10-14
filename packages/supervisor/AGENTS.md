@@ -60,6 +60,14 @@ QA browser, structured results, updates and doctor/support.
   accepted-output authority. Restore into a fresh private folder, verify before
   acknowledging, and retain every superseded checkout. An active recovered
   folder keeps later uncommitted edits across preparation and supervisor restarts.
+- **A delivery session coming back** (D105): a harness turn that finds its own
+  old checkout started at another commit (`staleCheckout`) replaces it only when
+  `staleCheckoutVerdict` says nothing is unsaved (no edits, exactly its last
+  accepted output, or every edit already in the published commit). Otherwise the
+  checkout is moved aside intact (`<worktree>.kept-<baseline>-<ms>`, warn
+  `native.repository.stale_checkout` `outcome: kept`) and a fresh checkout
+  continues. A restored folder is retired, never deleted. Other preserved
+  checkouts at another commit still refuse.
 - **Core contract gating.** `availableCommands`, `supportedAgents`,
   `connectorCommands`, pay-per-use and option billing go only to a 7.1 Core;
   `integration` work only from 7.3 (`work/accepted-kinds.ts`); a heartbeat's

@@ -201,3 +201,68 @@ function deliveryCandidate(options: CaptureOptions, entries: CapturedEntry[], de
   const body = { ...identity, resultId: `result-${createHash("sha256").update("konteks-native-output-id-v1\0").update(canonicalize(identity as never)).digest("hex")}` };
   return RemoteDeliveryResultCandidateSchema.parse({ ...body, resultDigest: computeRemoteDeliveryOutputDigest(body) });
 }
+/** What an old checkout of a delivery session holds, relative to what Core published (D105). */
+export type StaleCheckoutVerdict = "clean" | "accepted" | "published" | "unsaved";
+
+/**
+ * Whether a checkout this computer kept from an earlier stint of the session
+ * holds anything nobody else has. `clean`: no edits since its own start.
+ * `accepted`: exactly the output this computer's last accepted turn produced.
+ * `published`: every edit is already in the commit Core published now. Only
+ * `unsaved` holds changes that exist nowhere else. Read-only: a private index
+ * and object store, never the checkout's own index or refs.
+ */
+export async function staleCheckoutVerdict(options: StaleCheckoutInput): Promise<StaleCheckoutVerdict> {
+  let temporary: string | undefined;
+  try {
+    const root = await checkedDirectory(options.cwd);
+    assertStaleInput(options);
+    await connectorGit(options.gitExecutable);
+    const objectDirectory = await commonObjectDirectory(options.gitExecutable, root);
+    temporary = await mkdtemp(join(dirname(root), ".stale-checkout-")); await chmod(temporary, 0o700);
+    const temporaryObjects = join(temporary, "objects"); await mkdir(temporaryObjects, { mode: 0o700 });
+    const env = { GIT_INDEX_FILE: join(temporary, "index"), GIT_OBJECT_DIRECTORY: temporaryObjects, GIT_ALTERNATE_OBJECT_DIRECTORIES: objectDirectory };
+    return await verdictOf(options, root, env);
+  } finally {
+    if (temporary) await rm(temporary, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+type StaleCheckoutInput = { cwd: string; gitExecutable: string; baselineCommit: string;
+  publishedCommit: string; accepted?: { treeDigest: string; deletions: readonly string[] } | null };
+
+function assertStaleInput(options: StaleCheckoutInput): void {
+  if (!isAbsolute(options.gitExecutable) || !oidPattern.test(options.baselineCommit) || !oidPattern.test(options.publishedCommit)) throw unavailable();
+}
+
+async function verdictOf(options: StaleCheckoutInput, root: string, env: NodeJS.ProcessEnv): Promise<StaleCheckoutVerdict> {
+  const { entries, deletions } = await capturedChanges(options.gitExecutable, root, options.baselineCommit, env);
+  if (!entries.length && !deletions.length) return "clean";
+  if (sameOutput(options.accepted, entries, deletions)) return "accepted";
+  // The private index now holds the checkout exactly as captured.
+  const tree = (await runGit(options.gitExecutable, root, ["write-tree"], env)).toString("ascii").trim();
+  if (!oidPattern.test(tree)) throw unavailable();
+  const changed = [...entries.map(entry => entry.path), ...deletions];
+  const local = await treeEntries(options.gitExecutable, root, env, tree, changed);
+  const published = await treeEntries(options.gitExecutable, root, env, options.publishedCommit, changed);
+  return changed.every(path => local.get(path) === published.get(path)) ? "published" : "unsaved";
+}
+
+function sameOutput(accepted: StaleCheckoutInput["accepted"], entries: CapturedEntry[], deletions: string[]): boolean {
+  return Boolean(accepted) && accepted!.treeDigest === computeRemoteFileTreeDigest(entries) &&
+    canonicalize([...accepted!.deletions].sort()) === canonicalize(deletions);
+}
+
+/** Mode and object of each named path in a tree; absent paths are absent. */
+async function treeEntries(executable: string, cwd: string, env: NodeJS.ProcessEnv, treeish: string, paths: string[]): Promise<Map<string, string>> {
+  const result = new Map<string, string>();
+  if (!paths.length) return result;
+  const rows = new TextDecoder("utf-8", { fatal: true }).decode(await runGit(executable, cwd,
+    ["ls-tree", "-z", "--full-tree", treeish, "--", ...paths], env)).split("\0").filter(Boolean);
+  for (const row of rows) {
+    const match = /^(\d{6}) (blob|commit|tree) ([a-f0-9]{40}(?:[a-f0-9]{24})?)\t(.+)$/u.exec(row);
+    if (!match) throw unavailable();
+    result.set(match[4]!, `${match[1]} ${match[3]}`);
+  }
+  return result;
+}

@@ -281,3 +281,70 @@ describe("native shared repository cache", () => {
     await chmod(repository, 0o700);
   });
 });
+
+// D105: a delivery session comes back to this computer after running
+// elsewhere. Its old checkout started at another commit; Core now publishes a
+// newer one. The computer continues instead of waiting forever, and never
+// throws away anything that exists nowhere else.
+describe("a delivery session returning to a computer with its old checkout", () => {
+  const session = { repositoryId: "repository:online-store", worktreeId: "generator-session", mode: "preserve" as const };
+  async function published(f: Awaited<ReturnType<typeof fixture>>, content: string, file = "app.txt") {
+    await writeFile(join(f.seed, file), content);
+    await testGitCommand(f.tool, f.seed, ["add", file]);
+    await testGitCommand(f.tool, f.seed, ["-c", "user.name=Test", "-c", "user.email=test@invalid", "commit", "-m", content.trim()]);
+    const revision = (await testGitCommand(f.tool, f.seed, ["rev-parse", "HEAD"])).trim();
+    await testGitCommand(f.tool, f.seed, ["push", f.origin, "HEAD:refs/heads/main"]);
+    return revision;
+  }
+  const none = { accepted: async () => null };
+
+  it("replaces a checkout with no edits, one whose edits are all published, or one holding its accepted output", async () => {
+    const f = await fixture();
+    const old = await f.cache.prepare({ ...session, revision: f.first, agentWorkspaceRoot: f.claudeRoot, staleCheckout: none });
+    // No edits: an older checkout simply moves to the published commit.
+    const second = await published(f, "two\n");
+    const clean = await f.cache.prepare({ ...session, revision: second, agentWorkspaceRoot: f.claudeRoot, staleCheckout: none });
+    expect(clean.cwd).toBe(old.cwd);
+    expect(clean.baselineCommit).toBe(second);
+    expect(await readFile(join(clean.cwd, "app.txt"), "utf8")).toBe("two\n");
+    // Its edit is exactly what the delivery branch now holds.
+    await writeFile(join(clean.cwd, "app.txt"), "three\n");
+    const third = await published(f, "three\n");
+    const onBranch = await f.cache.prepare({ ...session, revision: third, agentWorkspaceRoot: f.claudeRoot, staleCheckout: none });
+    expect(await readFile(join(onBranch.cwd, "app.txt"), "utf8")).toBe("three\n");
+    expect((await testGitCommand(f.tool, onBranch.cwd, ["status", "--porcelain"])).trim()).toBe("");
+    // Its edit is the output this computer's last accepted turn produced.
+    await writeFile(join(onBranch.cwd, "accepted.txt"), "accepted\n");
+    const content = Buffer.from("accepted\n");
+    const { computeRemoteFileTreeDigest } = await import("@konteks/remote-common");
+    const { createHash } = await import("node:crypto");
+    const treeDigest = computeRemoteFileTreeDigest([{ path: "accepted.txt", mode: 384, sizeBytes: content.byteLength,
+      digest: `sha256:${createHash("sha256").update(content).digest("hex")}`, contentBase64: content.toString("base64") }]);
+    const fourth = await published(f, "four\n", "other.txt");
+    const accepted = await f.cache.prepare({ ...session, revision: fourth, agentWorkspaceRoot: f.claudeRoot,
+      staleCheckout: { accepted: async () => ({ treeDigest, deletions: [] }) } });
+    expect(await readFile(join(accepted.cwd, "other.txt"), "utf8")).toBe("four\n");
+    expect((await readdir(f.claudeRoot)).filter(name => name.includes(".kept-"))).toEqual([]);
+  });
+
+  it("moves a checkout holding unsaved changes aside, intact, and continues on a fresh one", async () => {
+    const f = await fixture();
+    const old = await f.cache.prepare({ ...session, revision: f.first, agentWorkspaceRoot: f.claudeRoot, staleCheckout: none });
+    await writeFile(join(old.cwd, "unsaved.txt"), "only here\n");
+    const second = await published(f, "two\n");
+    const fresh = await f.cache.prepare({ ...session, revision: second, agentWorkspaceRoot: f.claudeRoot, staleCheckout: none });
+    expect(fresh.baselineCommit).toBe(second);
+    await expect(readFile(join(fresh.cwd, "unsaved.txt"), "utf8")).rejects.toThrow();
+    const kept = (await readdir(f.claudeRoot)).filter(name => name.includes(".kept-"));
+    expect(kept).toHaveLength(1);
+    expect(await readFile(join(f.claudeRoot, kept[0]!, "unsaved.txt"), "utf8")).toBe("only here\n");
+    await fresh.verify();
+  });
+
+  it("still refuses to move any other preserved checkout", async () => {
+    const f = await fixture();
+    await f.cache.prepare({ ...session, revision: f.first, agentWorkspaceRoot: f.claudeRoot });
+    const second = await published(f, "two\n");
+    await expect(f.cache.prepare({ ...session, revision: second, agentWorkspaceRoot: f.claudeRoot })).rejects.toThrow();
+  });
+});

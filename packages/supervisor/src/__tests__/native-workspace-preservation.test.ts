@@ -103,6 +103,15 @@ it('restores before acknowledging the handoff and reuses later uncommitted chang
 
   const changedTool = { ...tool, digest: `sha256:${'0'.repeat(64)}` };
   await expect(new NativeRecoveredWorkspaceStore({ root: targetRoot, client: () => api, tool: changedTool }).prepare(input)).rejects.toMatchObject({ code: 'capability_unavailable' });
+  // D105: the session comes back here at a newer published commit. Without
+  // leave to continue it still waits; with it, the restored folder is kept
+  // exactly as it is and the turn continues from the published commit.
+  const moved = { ...selection, workspaceRecovery: undefined, repository: { ...selection.repository!, revision: 'c'.repeat(40) } };
+  await expect(new NativeRecoveredWorkspaceStore({ root: targetRoot, client: () => api, tool }).prepare({ ...input, selection: moved }))
+    .rejects.toMatchObject({ code: 'recovery_required' });
+  await expect(new NativeRecoveredWorkspaceStore({ root: targetRoot, client: () => api, tool }).prepare({ ...input, selection: moved },
+    { retireStale: true })).resolves.toBeNull();
+  expect(await readFile(join(next!.cwd, 'file.txt'), 'utf8')).toBe('next unfinished edit');
 });
 
 function fileContent(entries: ReturnType<typeof RemoteWorkspaceSealRequestSchema.parse>['checkpoint']['entries']): string {

@@ -555,6 +555,12 @@ class DeliveryOutput {
   }
 }
 
+/** A delivery session coming back to this computer may find its own old checkout (D105). */
+function staleCheckoutPolicy(inputs: AuthorizedInputs, root: string) {
+  if (!harnessTurnOf(inputs.current)) return undefined;
+  return { accepted: () => new NativeOutputSessionHeadStore(root, inputs.selection.binding.sessionId).latestAccepted() };
+}
+
 function harnessTurnOf(assignment: RemoteWorkAssignment) {
   return assignment.kind === "delivery" && assignment.source.kind === "harness_delivery" ? assignment.source.turn : undefined;
 }
@@ -704,8 +710,10 @@ class InputPreparation {
     wiringOf: { task?: Promise<void> },
   ): Promise<SourceWorkspace> {
     const fetched: { record?: { bytes: number; durationMs: number } } = {};
+    const staleCheckout = staleCheckoutPolicy(inputs, root);
     const recovered = await new NativeRecoveredWorkspaceStore({ root, tool: repository.git, client: this.options.client }).prepare({
-      assignment: inputs.current, claimId: inputs.claimId, selectionDigest: inputs.digest, selection: inputs.selection });
+      assignment: inputs.current, claimId: inputs.claimId, selectionDigest: inputs.digest, selection: inputs.selection },
+    { retireStale: Boolean(staleCheckout) });
     if (recovered) return recovered;
     const repositoryWorkspace = inputs.selection.repositoryWorkspace;
     const worktree = await new NativeRepositoryCache({
@@ -722,6 +730,7 @@ class InputPreparation {
       // only fetch missing objects into the shared bare repository cache.
       worktreeId: inputs.selection.binding.sessionId,
       ...(repositoryWorkspace ? { mode: repositoryWorkspace.mode } : {}),
+      staleCheckout,
     });
     const fetchMs = fetched.record?.durationMs ?? 0;
     this.logStage("repository_fetch", fetchMs, { cacheHit: fetched.record === undefined, bytes: fetched.record?.bytes ?? 0 });

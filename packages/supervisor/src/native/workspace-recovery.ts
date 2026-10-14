@@ -1,13 +1,14 @@
 import { lstat, mkdir, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod/v4";
-import { canonicalize, RemoteWorkspaceChunkSchema, RemoteInstanceError, RemoteWorkspaceAnyCheckpointSchema, RemoteWorkspaceRecoveryReferenceSchema, sha256Hex,
+import { canonicalize, createLogger, RemoteWorkspaceChunkSchema, RemoteInstanceError, RemoteWorkspaceAnyCheckpointSchema, RemoteWorkspaceRecoveryReferenceSchema, sha256Hex,
   type RemoteAssignmentInputsEnvelope, type RemoteWorkAssignment } from "@konteks/remote-common";
 import { restoreWorkspaceCheckpoint, verifyRestoredWorkspaceCheckpoint } from "./workspace-checkpoint.js";
 import { privateWorkspaceDirectory, readPrivateWorkspaceFile, readWorkspaceControlFile, writePrivateWorkspaceJson } from "./workspace-storage.js";
 import { verifyNativeGitTool, type NativeGitTool } from "./git-workspace.js";
 import type { NativeInputClient } from "./input-client.js";
 
+const logger = createLogger({ name: "native-recovered-workspace" });
 const unavailable = () => new RemoteInstanceError("recovery_required", "The preserved workspace could not be restored and verified. Existing work was kept.");
 const ReceiptSchema = z.object({ version: z.literal(1), workspaceId: z.string(), sessionId: z.string(),
   reference: RemoteWorkspaceRecoveryReferenceSchema, configDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/), writing: z.boolean(), retired: z.boolean() }).strict();
@@ -20,7 +21,7 @@ type Workspace = { recoveredCheckpointDigest: string; cwd: string; container: st
 export class NativeRecoveredWorkspaceStore {
   constructor(private readonly options: { root: string; client: () => Pick<NativeInputClient, "workspace">; tool: NativeGitTool }) {}
 
-  async prepare(input: Input): Promise<Workspace | null> {
+  async prepare(input: Input, options: { retireStale?: boolean } = {}): Promise<Workspace | null> {
     const repository = input.selection.repository;
     if (!repository) return null;
     await privateWorkspaceDirectory(this.options.root);
@@ -36,13 +37,25 @@ export class NativeRecoveredWorkspaceStore {
     if (!active || active.retired) return null;
     assertSameReference(reference, active.reference);
     assertRepositoryOwner(active, workspaceId, sessionId, repository.repositoryId);
-    if (active.reference.baselineCommit !== repository.revision) return this.changedRevision(input, pointer, folder, active);
+    if (active.reference.baselineCommit !== repository.revision) return this.changedRevision(input, pointer, folder, active, options);
     return this.workspace(input, folder, key, pointer, active);
   }
 
-  private async changedRevision(input: Input, pointer: string, folder: string, active: Receipt): Promise<null> {
-    if (input.selection.repositoryWorkspace?.mode !== "reset_to_revision") throw unavailable();
+  /**
+   * A reset starts over; a delivery session coming back to this computer
+   * (D105) continues from what Core published now. Either way the restored
+   * folder stays exactly as it is: retiring it only stops using it.
+   */
+  private async changedRevision(input: Input, pointer: string, folder: string, active: Receipt, options: { retireStale?: boolean }): Promise<null> {
+    const reset = input.selection.repositoryWorkspace?.mode === "reset_to_revision";
+    if (!reset && !options.retireStale) throw unavailable();
     await writePrivateWorkspaceJson(folder, pointer, { ...active, retired: true });
+    if (!reset) {
+      logger.warn({ event: "native.repository.stale_checkout", outcome: "kept", verdict: "recovered",
+        checkpointId: active.reference.checkpointId, staleBaseline: active.reference.baselineCommit.slice(0, 12),
+        publishedRevision: input.selection.repository!.revision.slice(0, 12) },
+      "this computer kept a restored checkout from an earlier turn of this delivery and continues from the published commit");
+    }
     return null;
   }
 
