@@ -107,6 +107,11 @@ QA browser, structured results, updates and doctor/support.
 ## Gotchas
 
 - `status` must stay parseable by older launchers: add control ops, not fields.
+- Core re-sends a person's control delivery until its report arrives, so a
+  repeat is normal: a sign-in that ended is answered with its terminal report
+  (`native/finished-logins.ts`, the last 200 within 24 h, kept on disk), and
+  an on-computer start is claimed before its first await so two copies open
+  one window. Every arrival logs `control_delivery.received`.
 - A repository role session whose turn ended unfinished is retired after its
   process is proven gone (`retireAfterClose` in `work/orchestrator.ts`);
   generated changes in the working copy are kept.

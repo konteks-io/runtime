@@ -165,6 +165,83 @@ describe("native Supervisor composition", () => {
     internals.runners.delete("antigravity");
   });
 
+  describe("a person's sign-in re-sent by Core (D134)", () => {
+    type Report = Record<string, unknown>;
+    type Internals = { runners: Map<string, unknown>; core: { reportAgentLogin: (instanceId: string, report: Report) => Promise<unknown> };
+      activeLogins: Map<string, { emit(event: unknown): void }>; onComputerWatches: Map<string, unknown>;
+      onAgentLogin(request: unknown, verifier: unknown): Promise<string | void>;
+      onComputerFacts(agentId: string): unknown; openOnComputerStep(loginId: string, agentId: string, plan: unknown): Promise<boolean> };
+    const verifier = { verifyAgentLoginDelivery: () => true };
+    const delivery = (intent: Record<string, unknown>) => ({ intent: { tenantId: "tenant", instanceId: "instance", action: "start", ...intent } });
+
+    async function started() {
+      const f = await fixture(), supervisor = new Supervisor(f.config, f.options);
+      supervisors.push(supervisor);
+      await supervisor.start();
+      const internals = supervisor as unknown as Internals;
+      const reports: Report[] = [];
+      vi.spyOn(internals.core, "reportAgentLogin").mockImplementation(async (_instanceId, report) => { reports.push(report); return {}; });
+      return { internals, reports };
+    }
+
+    it("answers a late copy of a sign-in that already ended with its report, never starting it again", async () => {
+      const { internals, reports } = await started();
+      const codex = internals.runners.get("codex");
+      const login = vi.fn(async (_organization: boolean, loginId: string) => ({ loginId }));
+      internals.runners.set("codex", { agentId: "codex", login, loginCancel: vi.fn(async () => ({})), siteLoginOptions: () => [], startEvents: vi.fn(), stopEvents: vi.fn() });
+      try {
+        expect(await internals.onAgentLogin(delivery({ loginId: "login-codex", agentId: "codex" }), verifier)).toBeUndefined();
+        // A copy that arrives while it runs changes nothing.
+        expect(await internals.onAgentLogin(delivery({ loginId: "login-codex", agentId: "codex" }), verifier)).toBe("duplicate");
+        internals.activeLogins.get("login-codex")!.emit({ kind: "completed", loginId: "login-codex", readiness: "ready" });
+        expect(internals.activeLogins.has("login-codex")).toBe(false);
+        expect(reports.at(-1)).toEqual({ loginId: "login-codex", agentId: "codex", state: "succeeded" });
+
+        expect(await internals.onAgentLogin(delivery({ loginId: "login-codex", agentId: "codex" }), verifier)).toBe("duplicate");
+        expect(login).toHaveBeenCalledOnce();
+        expect(internals.activeLogins.has("login-codex")).toBe(false);
+        expect(reports.slice(-2)).toEqual([
+          { loginId: "login-codex", agentId: "codex", state: "succeeded" },
+          { loginId: "login-codex", agentId: "codex", state: "succeeded" },
+        ]);
+      } finally { internals.runners.set("codex", codex); }
+    });
+
+    it("opens one window for two copies of an on-computer step that arrive together", async () => {
+      const { internals, reports } = await started();
+      vi.spyOn(internals, "onComputerFacts").mockReturnValue({ agentId: "opencode", state: "needs_sign_in" });
+      const opening = Promise.withResolvers<boolean>();
+      const open = vi.spyOn(internals, "openOnComputerStep").mockImplementation(() => opening.promise);
+      const step = delivery({ loginId: "login-opencode", agentId: "opencode", loginOption: "on-computer" });
+      // Whichever copy claims the step first opens its window; the other is a duplicate.
+      const copies = [internals.onAgentLogin(step, verifier), internals.onAgentLogin(step, verifier)];
+      const duplicate = await Promise.race(copies);
+      expect(duplicate).toBe("duplicate");
+      expect(open).toHaveBeenCalledOnce();
+      opening.resolve(true);
+      expect((await Promise.all(copies)).sort()).toEqual(["duplicate", undefined]);
+      expect(open).toHaveBeenCalledOnce();
+      expect(internals.onComputerWatches.has("login-opencode")).toBe(true);
+      expect(await internals.onAgentLogin(step, verifier)).toBe("duplicate");
+      expect(open).toHaveBeenCalledOnce();
+      expect(reports).toEqual([{ loginId: "login-opencode", agentId: "opencode", loginOption: "on-computer", state: "awaiting_person", step: "sign_in" }]);
+    });
+
+    it("starts no watch for an on-computer step stopped while its window opens", async () => {
+      const { internals } = await started();
+      vi.spyOn(internals, "onComputerFacts").mockReturnValue({ agentId: "opencode", state: "needs_sign_in" });
+      // Wait on the window starting to open, not on time.
+      const opening = Promise.withResolvers<boolean>(), claimed = Promise.withResolvers<void>();
+      vi.spyOn(internals, "openOnComputerStep").mockImplementation(() => { claimed.resolve(); return opening.promise; });
+      const start = internals.onAgentLogin(delivery({ loginId: "login-stop", agentId: "opencode", loginOption: "on-computer" }), verifier);
+      await claimed.promise;
+      await internals.onAgentLogin(delivery({ loginId: "login-stop", agentId: "opencode", loginOption: "on-computer", action: "cancel" }), verifier);
+      opening.resolve(true);
+      await start;
+      expect(internals.onComputerWatches.has("login-stop")).toBe(false);
+    });
+  });
+
   it("takes Core's 7.1 fields from the signed contract version alone, never from OpenCode's free-models switch", async () => {
     const f = await fixture(), supervisor = new Supervisor(f.config, f.options);
     supervisors.push(supervisor);

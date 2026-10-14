@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
-import { FixedClock, computeExecutionRevisionControlIntentDigest, generateInstanceKey, logicalAssignmentRequestDigest, verifyInstanceProof, type RelayRuntimeHandshakeResult } from "@konteks/remote-common";
+import { FixedClock, RemoteInstanceError, computeExecutionRevisionControlIntentDigest, generateInstanceKey, logicalAssignmentRequestDigest, verifyInstanceProof, type RelayRuntimeHandshakeResult } from "@konteks/remote-common";
 import { RelayClient, type RelayClientOptions } from "../relay/relay-client.js";
 import { ChannelMux } from "../relay/channel-mux.js";
 import { CORE_AUDIENCE } from "../core/client.js";
@@ -605,5 +605,113 @@ describe("native runtime relay handshake validation boundary", () => {
       expect(verifyInstanceProof(f.key.publicKey, { method: "relay_handshake", audience: CORE_AUDIENCE, subject: "instance", body }, proof)).toBe(true);
       if (candidate) expect(verifyInstanceProof(f.key.publicKey, { method: "relay_handshake", audience: CORE_AUDIENCE, subject: "instance", body: { ...body, appliedManifestId: "other" } }, proof)).toBe(false);
     } finally { f.client.stop(); }
+  });
+
+  describe("control delivery observability (D134)", () => {
+    const login = () => ({ type: "runtime_agent_login_delivery", method: "POST", path: { instanceId: "instance" },
+      nodeId: "node", connectionRef: "connection", connectionEpoch: 7,
+      intent: { loginId: "login", tenantId: "tenant", instanceId: "instance", agentId: "codex", action: "start" },
+      keyId: "control", nonce: "N".repeat(22), issuedAt: confirmed.runtimeReconciliation.acceptedAt,
+      expiresAt: "2026-09-06T00:00:30.000Z", signature: "A".repeat(86) });
+    const revisionControl = () => {
+      const intent = { schemaVersion: "remote-execution-revision-control-v1" as const, negotiatedCapability: "execution-revision-control-v1" as const,
+        intentId: "revision-intent", tenantId: "tenant", instanceId: "instance", executionId: "execution", executionRevision: 1, checkId: "check",
+        policyRevision: null, connectionRef: "connection", connectionEpoch: 7, reason: "authority_revoked" as const,
+        issuedAt: confirmed.runtimeReconciliation.acceptedAt, deadlineAt: "2026-09-06T00:00:02.000Z" };
+      return { type: "runtime_execution_revision_control_delivery", method: "POST", path: { instanceId: "instance" }, nodeId: "node",
+        connectionRef: "connection", connectionEpoch: 7, intent, intentDigest: computeExecutionRevisionControlIntentDigest(intent),
+        keyId: "control", nonce: "N".repeat(22), issuedAt: intent.issuedAt, expiresAt: intent.deadlineAt, signature: "A".repeat(86) };
+    };
+    const sessionFrame = { channel: "session", direction: "to_runtime", channelId: "session:s", connectionEpoch: 7, seq: 3,
+      issuedAt: confirmed.runtimeReconciliation.acceptedAt, body: { kind: "acp", message: { jsonrpc: "2.0", method: "session/prompt", params: { prompt: "secret prompt" } } } };
+    const logger = () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn() });
+    const events = (mock: ReturnType<typeof vi.fn>, event: string) =>
+      mock.mock.calls.map(call => call[0] as Record<string, unknown>).filter(fields => fields.event === event);
+    const handled = async () => undefined;
+    const kinds = [
+      ["runtime_agent_login_delivery", "login", login, { onAgentLogin: handled }],
+      ["runtime_update_delivery", "update", runtimeUpdate, { onRuntimeUpdate: handled }],
+      ["runtime_permission_answer_delivery", "intent", answer, { onPermissionAnswer: handled }],
+      ["runtime_cancellation_delivery", "intent", cancellation, { onCancellation: handled }],
+      ["runtime_execution_revision_control_delivery", "revision-intent", revisionControl, { onExecutionRevisionControl: handled }],
+      ["runtime_diagnostic_carrier_companion_delivery", "diagnostic-delivery", diagnosticCompanion, { onDiagnosticCompanion: handled }],
+    ] as const;
+
+    it.each(kinds)("logs %s on arrival with its id, epoch and outcome", async (kind, id, delivery, receivers) => {
+      const log = logger();
+      const f = fixture({ logger: log as never, ...receivers } as never);
+      try {
+        f.socket.message(confirmed); await flush();
+        f.socket.message(delivery()); await flush();
+        expect(events(log.info, "control_delivery.received")).toEqual([{ event: "control_delivery.received", kind, id, connectionEpoch: 7, outcome: "handled" }]);
+        expect(JSON.stringify(log.info.mock.calls)).not.toContain("A".repeat(86));
+      } finally { f.client.stop(); }
+    });
+
+    it("logs a repeat as a duplicate and a refusal with its code", async () => {
+      const log = logger();
+      const f = fixture({ logger: log as never, onAgentLogin: async () => "duplicate",
+        onRuntimeUpdate: async () => { throw new RemoteInstanceError("temporarily_unavailable", "Runtime update admission is busy."); } });
+      try {
+        f.socket.message(confirmed); await flush();
+        f.socket.message(login()); await flush();
+        f.socket.message(runtimeUpdate()); await flush();
+        // A copy signed for another socket is refused before its receiver; cancellation still closes the socket.
+        f.socket.message({ ...cancellation(), connectionEpoch: 8 }); await flush();
+        expect(events(log.info, "control_delivery.received")).toEqual([
+          { event: "control_delivery.received", kind: "runtime_agent_login_delivery", id: "login", connectionEpoch: 7, outcome: "duplicate" },
+          { event: "control_delivery.received", kind: "runtime_update_delivery", id: "update", connectionEpoch: 7, outcome: "refused", code: "temporarily_unavailable" },
+          { event: "control_delivery.received", kind: "runtime_cancellation_delivery", id: "intent", connectionEpoch: 8, outcome: "refused", code: "recovery_required" },
+        ]);
+        expect(f.socket.close).toHaveBeenCalledWith(1011, "durable_receive_failed");
+      } finally { f.client.stop(); }
+    });
+
+    it("logs one drop per frame that reaches the socket a re-handshake is leaving, never its payload", async () => {
+      const log = logger();
+      const onAgentLogin = vi.fn(handled);
+      const f = fixture({ logger: log as never, onAgentLogin });
+      try {
+        f.socket.message(confirmed); await flush();
+        f.client.rehandshake("lease_rotation");
+        f.socket.message(login()); f.socket.message(sessionFrame); await flush();
+        expect(onAgentLogin).not.toHaveBeenCalled();
+        expect(f.mux.receive).not.toHaveBeenCalled();
+        expect(events(log.warn, "relay.frame.dropped")).toEqual([
+          { event: "relay.frame.dropped", kind: "runtime_agent_login_delivery", id: "login", reason: "superseded_socket", connectionEpoch: 7 },
+          { event: "relay.frame.dropped", kind: "session", id: "session:s", seq: 3, reason: "superseded_socket", connectionEpoch: 7 },
+        ]);
+        expect(JSON.stringify(log.warn.mock.calls)).not.toContain("secret prompt");
+      } finally { f.client.stop(); }
+    });
+
+    it("logs one drop per frame buffered during handshake adoption that a close discards", async () => {
+      const log = logger();
+      const onAgentLogin = vi.fn(handled);
+      const f = delayedAdoption({ logger: log as never, onAgentLogin });
+      try {
+        await flush(); f.socket.message(login()); await flush();
+        f.socket.emit("close", 1006, Buffer.from(""));
+        f.adoption.resolve(); await flush();
+        expect(onAgentLogin).not.toHaveBeenCalled();
+        expect(events(log.warn, "relay.frame.dropped")).toEqual([
+          { event: "relay.frame.dropped", kind: "runtime_agent_login_delivery", id: "login", reason: "socket_closed:1006", connectionEpoch: 7 },
+        ]);
+      } finally { f.client.stop(); }
+    });
+
+    it("buffers a diagnostic companion that arrives during handshake adoption instead of closing with 1002", async () => {
+      const onDiagnosticCompanion = vi.fn(handled);
+      const f = delayedAdoption({ onDiagnosticCompanion });
+      try {
+        await flush(); f.socket.message(diagnosticCompanion()); await flush();
+        expect(f.socket.close).not.toHaveBeenCalled();
+        expect(onDiagnosticCompanion).not.toHaveBeenCalled();
+        f.adoption.resolve(); await flush();
+        expect(onDiagnosticCompanion).toHaveBeenCalledOnce();
+        expect(f.socket.close).not.toHaveBeenCalled();
+        expect(f.client.connected).toBe(true);
+      } finally { f.client.stop(); }
+    });
   });
 });

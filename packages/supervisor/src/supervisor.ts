@@ -81,13 +81,14 @@ import type { SessionPreviewAccess } from "./preview/mcp-server.js";
 import { provisioningCredentialIsExpired, refreshProvisioningCredential, submitReadiness } from "./provisioning/activation.js";
 import { Reconciliation } from "./reconnect/reconciliation.js";
 import { ChannelMux } from "./relay/channel-mux.js";
-import { RelayClient, type RelayClientOptions } from "./relay/relay-client.js";
+import { RelayClient, type ControlDeliveryOutcome, type RelayClientOptions } from "./relay/relay-client.js";
 import type { RunnerPort } from "./runner-port.js";
 import { NativeRunner, type NativeRunnerOptions } from "./native/runner.js";
 import { ModelCapabilitySnapshotProducer, antigravityOptionBilling, openCodeOptionBilling } from "./native/model-capability-snapshot.js";
 import { NativeInventoryCollector, machineHasDesktop } from "./native/inventory.js";
 import { windowsInstalledLauncher } from "./native/windows-launcher.js";
 import { antigravityRunnerCapabilities, openCodeRunnerCapabilities, siteLoginRelay } from "./native/site-login.js";
+import { FinishedLogins } from "./native/finished-logins.js";
 import { ON_COMPUTER_AGENTS, canOpenOnComputer, onComputerDone, onComputerScript, openOnComputer, planOnComputer, readOnComputerWatches, releaseLauncher, removeOnComputerWatch, standInTerminalEnv, writeOnComputerWatch, type OnComputerAgent, type OnComputerPlan, type OnComputerWatch } from "./native/on-computer.js";
 import { antigravityDownloadState, withAntigravityDownload } from "./native/antigravity-download.js";
 import { antigravityDiskBytes, antigravityPin } from "./native/antigravity-installation.js";
@@ -341,6 +342,9 @@ export class Supervisor {
   private readonly activeLogins = new Map<string, { agentId: string; emit: (event: ControlLoginEvent) => void }>();
   /** Site-started steps waiting on the person at a window on this computer, by login id. */
   private readonly onComputerWatches = new Map<string, NodeJS.Timeout>();
+  /** On-computer starts still opening their window, claimed before their first await; a cancel drops the claim. */
+  private readonly onComputerStarts = new Set<string>();
+  private readonly finishedLogins: FinishedLogins;
   private turnActivityTimer: NodeJS.Timeout | null = null;
 
   constructor(config: SupervisorConfig = loadSupervisorConfig(), private readonly options: SupervisorOptions = {}) {
@@ -358,6 +362,7 @@ export class Supervisor {
     // Keep diagnostics outside the mutation queue that shutdown itself waits to close.
     this.shutdownProgressStore = new SupervisorStore(config.SUPERVISOR_DATA_DIR);
     this.journal = new SupervisorJournal(this.store.path("journal"), this.stateMutations.run);
+    this.finishedLogins = new FinishedLogins({ dataDir: config.SUPERVISOR_DATA_DIR, now: () => this.clock.now(), logger: this.logger, mutate: this.stateMutations.run });
     this.outbox = new DurableOutbox(this.store.path("outbox"), this.stateMutations.run);
     this.lease = new LeaseState(this.clock);
     this.previewRegistry = new PreviewProcessRegistry(join(config.SUPERVISOR_DATA_DIR, "preview-processes.json"));
@@ -845,7 +850,7 @@ export class Supervisor {
     );
   }
 
-  private receiveRuntimeUpdate(request: RelayRequestOf<"onRuntimeUpdate">, connection: RelayConnectionOf<"onRuntimeUpdate">, verifier: CoreSignatureVerifier): Promise<void> {
+  private receiveRuntimeUpdate(request: RelayRequestOf<"onRuntimeUpdate">, connection: RelayConnectionOf<"onRuntimeUpdate">, verifier: CoreSignatureVerifier): Promise<ControlDeliveryOutcome> {
     const scope = this.runtimeUpdateScope(connection);
     const receiver = this.ensureRuntimeUpdates(verifier);
     if (!scope || !receiver) throw new RemoteInstanceError("recovery_required", "Runtime update ownership is unavailable.");
@@ -2535,20 +2540,35 @@ export class Supervisor {
    * link and code go back to Core. A login that asks for typed input is
    * stopped: nothing the person types may cross Konteks.
    */
-  private async onAgentLogin(request: RuntimeAgentLoginDeliveryRequest, verifier: CoreSignatureVerifier): Promise<void> {
+  private async onAgentLogin(request: RuntimeAgentLoginDeliveryRequest, verifier: CoreSignatureVerifier): Promise<ControlDeliveryOutcome | void> {
     if (!verifier.verifyAgentLoginDelivery(request)) {
       throw new RemoteInstanceError("permission_denied", "Core agent login signatures are required");
     }
     const { intent } = request;
     const instanceId = this.loginRuntime(intent);
+    if (intent.action === "start" && await this.answerFinishedLogin(instanceId, intent.loginId)) return "duplicate";
     if (isOnComputerLogin(intent)) return this.startOnComputer(instanceId, intent.loginId, intent.agentId as OnComputerAgent, intent.action);
-    const agentId = intent.agentId;
-    if (!isSiteLoginAgent(agentId)) return this.refuseLoginAgent(instanceId, intent);
+    if (!isSiteLoginAgent(intent.agentId)) return this.refuseLoginAgent(instanceId, intent);
+    return this.siteLogin(instanceId, intent, intent.agentId);
+  }
+
+  /**
+   * A late copy of a sign-in that already ended here (Core re-sends one until
+   * its report arrives) is answered with the report that ended it, never run again.
+   */
+  private async answerFinishedLogin(instanceId: string, loginId: string): Promise<boolean> {
+    const finished = await this.finishedLogins.get(loginId);
+    if (!finished) return false;
+    await this.sendLoginReport(instanceId, finished);
+    return true;
+  }
+
+  private async siteLogin(instanceId: string, intent: AgentLoginIntent, agentId: SiteLoginAgent): Promise<ControlDeliveryOutcome | void> {
     const site = siteLoginSelection(intent);
     const report = this.siteLoginReporter(instanceId, intent.loginId, site.loginOption);
     if (intent.action === "cancel") return this.cancelSiteLogin(intent.loginId);
     // A repeated delivery of a login already under way changes nothing.
-    if (this.activeLogins.has(intent.loginId)) return;
+    if (this.activeLogins.has(intent.loginId)) return "duplicate";
     const runner = this.runners.get(agentId);
     if (!runner || siteLoginRefused(agentId, site, runner)) {
       await report({ loginId: intent.loginId, agentId, state: "failed", failure: "unavailable" });
@@ -2569,15 +2589,23 @@ export class Supervisor {
   /** An agent this connector cannot sign in from the site: its start is reported unavailable. */
   private async refuseLoginAgent(instanceId: string, intent: AgentLoginIntent): Promise<void> {
     if (intent.action === "cancel") return;
-    await this.core.reportAgentLogin(instanceId, { loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "unavailable" } as AgentLoginReport)
-      .catch(error => this.logger.warn({ err: error, loginId: intent.loginId }, "agent login report not delivered"));
+    await this.reportLogin(instanceId, { loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "unavailable" } as AgentLoginReport);
   }
 
   /** Every report of a site sign-in echoes the sign-in option it named. */
   private siteLoginReporter(instanceId: string, loginId: string, loginOption: SiteLoginSelection["loginOption"]) {
-    return (value: AgentLoginReport) =>
-      this.core.reportAgentLogin(instanceId, { ...value, ...(loginOption === undefined ? {} : { loginOption }) } as AgentLoginReport)
-        .catch(error => this.logger.warn({ err: error, loginId }, "agent login report not delivered"));
+    return (value: AgentLoginReport) => this.reportLogin(instanceId, { ...value, ...(loginOption === undefined ? {} : { loginOption }) } as AgentLoginReport);
+  }
+
+  /** Tells Core how a site-started sign-in stands; a report that ends it is remembered for late copies. */
+  private reportLogin(instanceId: string, report: AgentLoginReport): Promise<unknown> {
+    this.finishedLogins.record(report);
+    return this.sendLoginReport(instanceId, report);
+  }
+
+  private sendLoginReport(instanceId: string, report: AgentLoginReport): Promise<unknown> {
+    return this.core.reportAgentLogin(instanceId, report)
+      .catch(error => this.logger.warn({ err: error, loginId: report.loginId }, "agent login report not delivered"));
   }
 
   private async cancelSiteLogin(loginId: string): Promise<void> {
@@ -2618,10 +2646,21 @@ export class Supervisor {
    * the window is the person's to close.
    */
   private async startOnComputer(instanceId: string, loginId: string, agentId: OnComputerAgent, action: "start" | "cancel",
-  ): Promise<void> {
+  ): Promise<ControlDeliveryOutcome | void> {
+    if (action === "cancel") {
+      this.onComputerStarts.delete(loginId);
+      await this.stopOnComputerWatch(loginId);
+      return;
+    }
+    // Claimed before the first await: two copies of one start open one window.
+    if (this.onComputerWatches.has(loginId) || this.onComputerStarts.has(loginId)) return "duplicate";
+    this.onComputerStarts.add(loginId);
+    try { await this.openAndWatchOnComputer(instanceId, loginId, agentId); }
+    finally { this.onComputerStarts.delete(loginId); }
+  }
+
+  private async openAndWatchOnComputer(instanceId: string, loginId: string, agentId: OnComputerAgent): Promise<void> {
     const report = this.onComputerReporter(instanceId, loginId, agentId);
-    if (action === "cancel") { await this.stopOnComputerWatch(loginId); return; }
-    if (this.onComputerWatches.has(loginId)) return;
     const facts = this.onComputerFacts(agentId);
     if (!facts) { await report({ state: "failed", failure: "unavailable" }); return; }
     if (onComputerDone(facts.state)) { await report({ state: "succeeded" }); return; }
@@ -2632,6 +2671,8 @@ export class Supervisor {
       return;
     }
     await report({ state: "awaiting_person", step: plan.step });
+    // Stopped while its window was opening: nothing is left to watch.
+    if (!this.onComputerStarts.has(loginId)) return;
     const watch: OnComputerWatch = { instanceId, loginId, agentId, until: plan.until, deadline: Date.now() + ON_COMPUTER_WATCH_MS };
     // Kept on disk: adding an agent restarts this connector, and the step must
     // still end (and say so on the site) in the connector that comes back.
@@ -2660,8 +2701,7 @@ export class Supervisor {
   private onComputerReporter(instanceId: string, loginId: string, agentId: OnComputerAgent) {
     type Report = Parameters<CoreClient["reportAgentLogin"]>[1];
     return (value: Omit<Report, "loginId" | "agentId" | "loginOption">) =>
-      this.core.reportAgentLogin(instanceId, { loginId, agentId, loginOption: ON_COMPUTER_LOGIN_OPTION, ...value } as Report)
-        .catch(error => this.logger.warn({ err: error, loginId }, "agent login report not delivered"));
+      this.reportLogin(instanceId, { loginId, agentId, loginOption: ON_COMPUTER_LOGIN_OPTION, ...value } as Report);
   }
 
   private onComputerFacts(agentId: OnComputerAgent) {

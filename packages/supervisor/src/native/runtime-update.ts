@@ -7,6 +7,7 @@ import { deliveryNotCurrent } from "../control/delivery-scope.js";
 import type { NativeUpdateCoordinator } from "./update.js";
 import type { NativeUpdateLedger } from "./update-ledger.js";
 import { RuntimeUpdateStore, type RuntimeUpdateJournal, type RuntimeUpdateRecord } from "./runtime-update-store.js";
+import type { ControlDeliveryOutcome } from "../relay/relay-client.js";
 
 export interface RuntimeUpdateScope {
   instanceId: string;
@@ -61,7 +62,8 @@ export class RuntimeUpdateReceiver {
     this.timer = null;
   }
 
-  async receive(candidate: unknown, scope: RuntimeUpdateScope): Promise<void> {
+  /** Admits a signed update once; a repeat of one already admitted is a duplicate. */
+  async receive(candidate: unknown, scope: RuntimeUpdateScope): Promise<ControlDeliveryOutcome> {
     const parsed = RuntimeUpdateDeliveryRequestSchema.safeParse(candidate);
     if (!parsed.success || !this.deps.verifier.verifyRuntimeUpdateDelivery(parsed.data)) {
       throw new RemoteInstanceError("permission_denied", "Core runtime update signatures are required.");
@@ -91,14 +93,17 @@ export class RuntimeUpdateReceiver {
     return task;
   }
 
-  private async receiveCurrent(request: RuntimeUpdateDeliveryRequest, assertCurrent: () => void): Promise<void> {
+  private async receiveCurrent(request: RuntimeUpdateDeliveryRequest, assertCurrent: () => void): Promise<ControlDeliveryOutcome> {
     assertCurrent();
     const assertReportOwner = this.deps.captureReportOwner();
     assertReportOwner();
     const journal = await this.deps.store.read();
     assertCurrent();
     const existing = rememberDelivery(journal, request, this.deps.now());
-    if (existing) return this.deps.store.write(journal, assertCurrent);
+    if (existing) {
+      await this.deps.store.write(journal, assertCurrent);
+      return "duplicate";
+    }
     const ledger = await this.deps.readLedger().catch(() => null);
     const record = this.newRecord(request, ledger);
     retainRecord(journal, record, this.deps.now());
@@ -106,6 +111,7 @@ export class RuntimeUpdateReceiver {
     if (ledger) await this.launch(journal, record, assertCurrent, assertReportOwner);
     else await this.fail(journal, record, "unavailable", assertCurrent);
     await this.flush(journal, record, assertReportOwner);
+    return "handled";
   }
 
   private newRecord(request: RuntimeUpdateDeliveryRequest, ledger: NativeUpdateLedger | null): RuntimeUpdateRecord {
