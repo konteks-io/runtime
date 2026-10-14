@@ -63,7 +63,8 @@ QA browser, structured results, updates and doctor/support.
 - **Core contract gating.** `availableCommands`, `supportedAgents`,
   `connectorCommands`, pay-per-use and option billing go only to a 7.1 Core;
   `integration` work only from 7.3 (`work/accepted-kinds.ts`); a heartbeat's
-  `previews` only from 7.8. The
+  `previews` only from 7.8; workspace checkpoints and their chunk transfer
+  only from 7.9. The
   `agent_runner` component always advertises `core-contract-version-v1`.
   Supported-agent detection (`NotAddedAgentsDetector`) never runs on the
   heartbeat path.
