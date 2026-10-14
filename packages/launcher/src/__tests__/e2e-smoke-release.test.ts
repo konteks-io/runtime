@@ -9,6 +9,26 @@ import { installOfflineAgentPackage, NativeAgentPackageProfileSchema, verifyNati
 import { RunnerConfigSchema, resolveBridgeSpawnSpec, spawnBridge } from "@konteks/remote-agent-runner";
 import { extendE2ERealRelease, extendE2ESmokeRelease, prepareE2ERealRelease, prepareE2ESmokeRelease, reissueE2ERelease } from "../e2e/smoke-release.js";
 
+/**
+ * The fake bridge starts with `#!/usr/bin/env node`, so it exec()s twice: once
+ * into env before spawn returns, then into node. When the runner reads the
+ * new process's identity during that second exec, /proc/<pid>/cmdline can be
+ * empty, and the runner stops the candidate and refuses with its retryable
+ * `bridge_process_identity_capture_failed` (10-14: three CI failures, one of
+ * them the v0.16.0 release run). Real bridges exec once. Retry exactly that
+ * refusal, as the runner's contract says, and nothing else.
+ */
+async function spawnSettledBridge<T>(spawn: () => Promise<T>): Promise<T> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await spawn();
+    } catch (error) {
+      const refusal = error as { retryable?: boolean; diagnostic?: string };
+      if (attempt >= 3 || refusal.retryable !== true || refusal.diagnostic !== "bridge_process_identity_capture_failed") throw error;
+    }
+  }
+}
+
 describe("signed E2E ACP releases", () => {
   it("adds a second machine platform without losing the original signed artifacts", async () => {
     const root = await mkdtemp(join(tmpdir(), "konteks-e2e-two-platforms-"));
@@ -173,7 +193,7 @@ describe("signed E2E ACP releases", () => {
       await mkdir(credentials, { mode: 0o700 }); await mkdir(workspace, { mode: 0o700 });
       const config = RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "codex", RUNNER_AUTH_MODE: "agent_local_subscription", RUNNER_CREDENTIAL_DIR: credentials, RUNNER_WORKSPACE_DIR: workspace, RUNNER_BRIDGE_PREFIX: prefix, RUNNER_BRIDGE_VERSION: profile.bridge.version, RUNNER_NATIVE_PACKAGE_PROFILE: profile, RUNNER_NATIVE_PACKAGE_ARTIFACT: artifact });
       const updates: unknown[] = [];
-      const bridge = await spawnBridge({ spec: resolveBridgeSpawnSpec(config), initializeTimeoutMs: 2_000, clientVersion: "e2e", handlers: { onSessionUpdate: update => updates.push(update), onRequestPermission: async () => ({ outcome: { outcome: "cancelled" } }), onCreateElicitation: async () => ({ action: "cancel" }), onExit: () => undefined } });
+      const bridge = await spawnSettledBridge(() => spawnBridge({ spec: resolveBridgeSpawnSpec(config), initializeTimeoutMs: 2_000, clientVersion: "e2e", handlers: { onSessionUpdate: update => updates.push(update), onRequestPermission: async () => ({ outcome: { outcome: "cancelled" } }), onCreateElicitation: async () => ({ action: "cancel" }), onExit: () => undefined } }));
       try {
         const session = await bridge.connection.newSession({ cwd: workspace, mcpServers: [] });
         expect(session.sessionId).toMatch(/^e2e-session-/);
