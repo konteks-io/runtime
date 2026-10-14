@@ -5,7 +5,7 @@ import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import { afterAll, describe, expect, it } from "vitest";
 import { McpToolCallLedger } from "../session/permission-tool-identity.js";
 import { EvaluatorPolicyResponder } from "../session/policy-responder.js";
-import { DEFAULT_BASH_BLOCKLIST, POLICY_REFUSAL_PREFIX, blockedCommandPattern, createWorkspaceToolPolicy, describeRefusedPath, isWithinWorkspace, type WorkspaceToolPolicyEvaluation, type WorkspaceToolPolicyContext } from "../session/workspace-tool-policy.js";
+import { DEFAULT_BASH_BLOCKLIST, DIRECT_SESSION_BASH_BLOCKLIST, POLICY_REFUSAL_PREFIX, blockedCommandPattern, createWorkspaceToolPolicy, describeRefusedPath, isWithinWorkspace, type WorkspaceToolPolicyEvaluation, type WorkspaceToolPolicyContext } from "../session/workspace-tool-policy.js";
 
 const options = [
   { optionId: "allow", name: "Allow", kind: "allow_once" },
@@ -164,6 +164,23 @@ describe("the connector's command blocklist", () => {
     expect(blockedCommandPattern("sudo -n true", DEFAULT_BASH_BLOCKLIST)).toBe("sudo ");
     expect(blockedCommandPattern("type runas.txt", DEFAULT_BASH_BLOCKLIST)).toBeNull();
     expect(blockedCommandPattern("npm run assemble", DEFAULT_BASH_BLOCKLIST)).toBeNull();
+  });
+});
+
+describe("a direct session's commits (owner, 10-14)", () => {
+  const execute = (command: string, bashBlocklist?: readonly string[]) => createWorkspaceToolPolicy(bashBlocklist ? { bashBlocklist } : {})
+    .evaluateToolUse({ toolName: "execute", input: { command }, workspaceRoot: "/w" } as WorkspaceToolPolicyContext) as WorkspaceToolPolicyEvaluation;
+
+  it("lets the person's own agent commit in a direct session, and still keeps push, tag and pull requests the person's", () => {
+    expect(execute("git add -A && git commit -m 'Add the parser'", DIRECT_SESSION_BASH_BLOCKLIST)).toEqual({ allowed: true });
+    for (const command of ["git push origin main", "git tag v1", "gh pr create --fill"]) {
+      expect(execute(command, DIRECT_SESSION_BASH_BLOCKLIST)).toMatchObject({ allowed: false, refusal: { reason: "bash_blocklist" } });
+    }
+  });
+
+  it("keeps commits refused in a delivery, where Konteks commits and publishes the work itself", () => {
+    expect(execute("git commit -m 'x'")).toMatchObject({ allowed: false, refusal: { reason: "bash_blocklist", pattern: "git commit" } });
+    expect(DIRECT_SESSION_BASH_BLOCKLIST).toEqual(DEFAULT_BASH_BLOCKLIST.filter(entry => entry !== "git commit"));
   });
 });
 
