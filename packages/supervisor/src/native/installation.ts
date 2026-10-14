@@ -5,7 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, parse, resolve } from "node:path";
 import { z } from "zod";
 import { isRetiredAgentId } from "@konteks/backstage-plugin-common";
-import { RemoteInstanceError } from "@konteks/remote-common";
+import { CORE_PERMISSION_ANSWER_PRODUCER, RemoteInstanceError } from "@konteks/remote-common";
 import { RunnerConfigSchema, type RunnerConfig } from "@konteks/remote-agent-runner";
 import { EmbeddedReleaseRootSchema, findAgentBridge, selectNativeArtifacts, verifyNativeRelease, type EmbeddedReleaseRoot, type VerifiedNativeRelease } from "@konteks/remote-release";
 import { SupervisorConfigSchema } from "../config.js";
@@ -294,6 +294,10 @@ function supervisorConfig(record: NativeRuntimeRecord, dataDir: string, releaseD
     SUPERVISOR_DEPLOYMENT_KIND: "native_connector", SUPERVISOR_DATA_DIR: dataDir,
     SUPERVISOR_CORE_URL: record.coreUrl, SUPERVISOR_RELAY_URL: record.relayUrl,
     SUPERVISOR_CONTROL_PORT: record.controlPort, SUPERVISOR_BUNDLE_VERSION: record.bundleVersion,
+    // A person answers a direct session's question from Konteks (R5-O22): the
+    // connector accepts answers from Core's one named producer. A name, not a
+    // secret; Core's signatures carry the authority.
+    SUPERVISOR_CORE_PERMISSION_ANSWER_PRODUCER: CORE_PERMISSION_ANSWER_PRODUCER,
     SUPERVISOR_PLATFORM_OS: options.platform.os, SUPERVISOR_PLATFORM_ARCH: options.platform.architecture,
     SUPERVISOR_RELEASE_MANIFEST_FILE: join(releaseDir, "manifest.json"),
     // The managed-git key lives in this runtime's private data, not at the
