@@ -49,6 +49,7 @@ const inputSchema = z.object({
   integration: z.object({
     admittedMcpServerNames: z.array(z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/)).max(8),
     accountConnectors: z.boolean(),
+    utility: z.object({ model: z.string().min(1).max(256).optional() }).strict().optional(),
   }).strict().optional(),
 }).strict().refine(value => value.acpSessionRef === undefined || value.restoreAcpSessionRef === undefined)
   .refine(
@@ -307,6 +308,11 @@ export class NativeRunner implements RunnerPort {
     const request = this.request(ref, id, "session/set_config_option", params);
     if (request.method !== "session/set_config_option") throw invalid();
     this.runtime.sessions.setConfigOption(ref, id, request.params);
+  }
+
+  adoptSession(ref: string, context: RunnerSessionInput["context"]) {
+    this.requireStarted();
+    this.runtime.sessions.adoptIntegrationSession(ref, context);
   }
 
   async cancel(ref: string) {

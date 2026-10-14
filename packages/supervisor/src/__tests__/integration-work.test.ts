@@ -123,9 +123,11 @@ describe("integration work kind", () => {
 describe("integration-task-v1 advertisement", () => {
   it("is advertised when a Claude Code or Codex runner can hold a binding, and not for host agents alone", async () => {
     const { integrationTaskCapabilities } = await import("../integration/carrier.js");
-    expect(integrationTaskCapabilities(["codex"])).toEqual([REMOTE_INTEGRATION_TASK_CAPABILITY]);
-    expect(integrationTaskCapabilities(["claude-code", "dsh"])).toEqual([REMOTE_INTEGRATION_TASK_CAPABILITY]);
-    expect(integrationTaskCapabilities(["dsh", "opencode", "antigravity"])).toEqual([]);
-    expect(integrationTaskCapabilities([])).toEqual([]);
+    expect(integrationTaskCapabilities(["codex"], "7.5")).toEqual([REMOTE_INTEGRATION_TASK_CAPABILITY]);
+    expect(integrationTaskCapabilities(["claude-code", "dsh"], undefined)).toEqual([REMOTE_INTEGRATION_TASK_CAPABILITY]);
+    // A locked read's completesWhenCalled is announced only to a Core of contract 7.6.
+    expect(integrationTaskCapabilities(["claude-code"], "7.6")).toEqual([REMOTE_INTEGRATION_TASK_CAPABILITY, "integration-task-calls-complete-v1"]);
+    expect(integrationTaskCapabilities(["dsh", "opencode", "antigravity"], "7.6")).toEqual([]);
+    expect(integrationTaskCapabilities([], "7.6")).toEqual([]);
   });
 });

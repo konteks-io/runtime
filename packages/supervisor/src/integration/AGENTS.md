@@ -46,6 +46,33 @@ is installed.
   with the approved canonical arguments, once per nonce, recorded in the
   journal's `integration-writes` table BEFORE the `allow_once`; everything
   else denied without deferral.
+- **The turn ends when the result is in.** Once `submit_result` is accepted
+  and no allowed call is still running, the session cancels the agent's turn
+  instead of waiting for its closing message (nothing reads it). The result
+  tool is always loaded (`anthropic/alwaysLoad`), so Claude never spends a
+  step finding it. `integration.task.timing` logs each allowed call's ask
+  and end and the result, in ms after the prompt.
+- **A routed read is a utility turn.** When Core routes the assignment to a
+  model (`agentRoute.sessionConfig.model`, Core's per-workspace choice of the
+  agent's fastest offered model), the session takes that model if offered,
+  the lowest effort it offers (`thought_level`) and no extended thinking
+  (Claude `_meta.claudeCode.options.thinking`), each best effort
+  (`agent-runner/src/sessions/utility-turn.ts`). An unrouted read runs on the
+  agent's own settings.
+- **A locked read ends on its calls.** A spec's `completesWhenCalled`
+  (sent only to a connector advertising `integration-task-calls-complete-v1`,
+  which it does only to a Core of contract 7.6) ends the turn once each named
+  tool's own result was observed; the prompt asks for no summary and no
+  agent report is kept.
+- **Warm read sessions** (`warm.ts`, `opened-session.ts`): after a read, the
+  carrier opens one new session of the same shape (agent, admitted sources,
+  utility model) per agent, closed after 3 min idle. The next read of that
+  shape takes it (`adoptSession` moves it to the task's assignment; only a
+  never-prompted integration session can be adopted), so one gated session
+  per task still holds. A session that finds every execution slot held
+  closes it first (`reclaimIdleExecution`), and a read of another shape
+  replaces it. `integration.warm_session` logs ready, reused, missed (with
+  why) and closed (with why); `integration.task.timing` says `warmSession`.
 - The connector's own observation of each allowed call is the evidence
   (`connector_observed`, bounded, hashed); the agent's `submit_result` is only
   `agentReport`. An MCP call that completes without reaching the gate cancels

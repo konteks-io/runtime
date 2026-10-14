@@ -10,6 +10,7 @@ import {
   RuntimePermissionAnswerDeliveryRequestSchema,
   RuntimeAgentLoginDeliveryRequestSchema,
   RuntimeUpdateDeliveryRequestSchema,
+  RuntimeAssignmentAvailableDeliveryRequestSchema,
 } from "@konteks/remote-common";
 
 /**
@@ -54,6 +55,17 @@ export class CoreSignatureVerifier {
   /** A login the person started from the site, signed by Core for this socket. */
   verifyAgentLoginDelivery(candidate: unknown): boolean {
     const parsed = RuntimeAgentLoginDeliveryRequestSchema.safeParse(candidate);
+    if (!parsed.success) return false;
+    const request = parsed.data, key = this.keys.get(request.keyId);
+    if (!key || !/^[A-Za-z0-9_-]{86}$/.test(request.signature) ||
+      Buffer.from(request.signature, "base64url").toString("base64url") !== request.signature) return false;
+    try { return ed25519Verify(key, remoteControlSigningBytes(request), request.signature); }
+    catch { return false; }
+  }
+
+  /** Core's nudge that work is queued for this socket. */
+  verifyAssignmentAvailableDelivery(candidate: unknown): boolean {
+    const parsed = RuntimeAssignmentAvailableDeliveryRequestSchema.safeParse(candidate);
     if (!parsed.success) return false;
     const request = parsed.data, key = this.keys.get(request.keyId);
     if (!key || !/^[A-Za-z0-9_-]{86}$/.test(request.signature) ||

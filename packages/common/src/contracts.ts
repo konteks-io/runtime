@@ -147,6 +147,11 @@ export {
   type RuntimeAgentLoginDeliveryRequest,
   RuntimeAgentLoginReportSchema,
   REMOTE_RUNTIME_UPDATE_CAPABILITY,
+  // Core's nudge that work is queued: pull now, not on the next 5 s pull.
+  REMOTE_ASSIGNMENT_AVAILABLE_DELIVERY_CAPABILITY,
+  REMOTE_ASSIGNMENT_AVAILABLE_MIN_CORE_CONTRACT_VERSION,
+  RuntimeAssignmentAvailableDeliveryRequestSchema,
+  type RuntimeAssignmentAvailableDeliveryRequest,
   RuntimeUpdateIntentSchema,
   RuntimeUpdateDeliveryRequestSchema,
   RuntimeUpdateReportSchema,
