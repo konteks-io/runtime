@@ -1,7 +1,7 @@
 import { RemoteInstanceError, RuntimePermissionAnswerDeliveryRequestSchema, runtimePermissionAnswerMatches,
   verifyRemoteExecutionOperationSignature, type RemoteAuthorizedOperation, type RemoteExecutionOperationPermitClaims,
   type RuntimePermissionAnswerDeliveryRequest } from "@konteks/remote-common";
-import { CORE_DELIVERY_CLOCK_SKEW_MS, deliveryNotCurrent } from "./delivery-scope.js";
+import { CORE_DELIVERY_CLOCK_SKEW_MS, deliveryStaleReason } from "./delivery-scope.js";
 import type { CoreSignatureVerifier } from "./core-signature.js";
 import type { CapturedCancellationConnection } from "./cancellation-receiver.js";
 import type { CoreClient } from "../core/client.js";
@@ -31,7 +31,8 @@ export class PermissionAnswerReceiver {
     const assertConnection = () => {
       scope.assertCurrent();
       const now = this.deps.now();
-      if (!Number.isSafeInteger(now) || deliveryNotCurrent(request, scope, now, CORE_DELIVERY_CLOCK_SKEW_MS)) throw denied("connection_window");
+      const stale = Number.isSafeInteger(now) ? deliveryStaleReason(request, scope, now, CORE_DELIVERY_CLOCK_SKEW_MS) : "clock";
+      if (stale) throw denied(`connection_window: ${stale}`);
     };
     assertConnection();
     const keys = await this.deps.core.executionSigningKeys();
