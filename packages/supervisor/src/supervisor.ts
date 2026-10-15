@@ -559,6 +559,8 @@ export class Supervisor {
       onRestartFailure: error => this.logger.warn({ err: error }, "shared Codex app-server restart failed; retrying"),
       onOrphanedTurnsInterrupted: turns => this.logger.warn({ event: "codex.orphaned_turns_interrupted", turns },
         "interrupted Codex turns still waiting on a person after their Konteks session ended"),
+      onMaintenancePreflight: report => this.logger.info({ event: "codex.maintenance.preflight", ...report },
+        report.outcome === "idle" ? "Codex is idle for the update" : "Codex is not ready for the update"),
     });
     // The QA browser is the connector's, not an agent package's: every
     // agent's sessions get it when an installed Claude Code or Codex package

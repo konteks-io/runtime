@@ -103,6 +103,55 @@ it.skipIf(process.platform === "win32")("rejects a disconnect between loaded-lis
   await expect(codexLoadedThreadStatuses(f.socket)).rejects.toThrow(/inventory unavailable/);
 });
 
+/** 10-15, taufan-mac: a 15 s budget for every loaded thread together ended a healthy owner's update preflight. */
+function slowServer(f: Awaited<ReturnType<typeof fixture>>, loaded: string[], answerThreadRead: boolean) {
+  const held: Array<() => void> = [];
+  f.ws.on("connection", socket => socket.on("message", data => {
+    const message = JSON.parse(data.toString());
+    if (message.id === undefined) return;
+    const reply = (result: unknown) => socket.send(JSON.stringify({ id: message.id, result }));
+    if (message.method === "thread/read") {
+      if (answerThreadRead) held.push(() => reply({ thread: { id: message.params.threadId, status: { type: "idle" } } }));
+      return;
+    }
+    reply(message.method === "thread/loaded/list" ? { data: loaded, nextCursor: null } : {});
+  }));
+  return held;
+}
+async function until(check: () => boolean) {
+  for (let i = 0; i < 200 && !check(); i++) await new Promise(resolve => setImmediate(resolve));
+  expect(check()).toBe(true);
+}
+it.skipIf(process.platform === "win32")("reads many loaded threads past the old 15 s budget while each answer comes in time", async () => {
+  const f = await fixture();
+  const loaded = ["00000000-0000-7000-8000-000000000101", "00000000-0000-7000-8000-000000000102", "00000000-0000-7000-8000-000000000103"];
+  const held = slowServer(f, loaded, true);
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    const read = codexLoadedThreadStatuses(f.socket);
+    for (let answered = 0; answered < loaded.length; answered++) {
+      await until(() => held.length > 0);
+      vi.advanceTimersByTime(6_000);
+      held.shift()!();
+    }
+    expect([...(await read).values()]).toEqual(["idle", "idle", "idle"]);
+  } finally { vi.useRealTimers(); }
+});
+it.skipIf(process.platform === "win32")("fails closed when the owner stops answering one request", async () => {
+  const f = await fixture();
+  let asked = false;
+  slowServer(f, ["00000000-0000-7000-8000-000000000201"], false);
+  f.ws.on("connection", socket => socket.on("message", data => { if (JSON.parse(data.toString()).method === "thread/read") asked = true; }));
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    const read = codexLoadedThreadStatuses(f.socket);
+    const refused = expect(read).rejects.toThrow(/inventory unavailable/);
+    await until(() => asked);
+    vi.advanceTimersByTime(10_000);
+    await refused;
+  } finally { vi.useRealTimers(); }
+});
+
 /** 10-15, taufan-mac: a turn left waiting on an approval after its session ended blocked every update. */
 function orphanServer(f: Awaited<ReturnType<typeof fixture>>, threads: Record<string, { status: { type: string; activeFlags?: string[] }; updatedAt: number; turn?: string }>) {
   const calls: Array<{ method: string; params: unknown }> = [];
