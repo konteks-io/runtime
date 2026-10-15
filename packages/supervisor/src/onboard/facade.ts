@@ -9,6 +9,8 @@ import {
   REPOSITORY_RELOCATE_REPORT_TOOL,
   REPOSITORY_RELOCATE_STATUS_TOOL,
   RemoteInstanceError,
+  RemoteFileTreeSchema,
+  type RemoteFileTree,
   type DiscoveryEvidenceSubmission,
   type DiscoveryRunBounds,
   type EnrichmentProgressInput,
@@ -128,6 +130,7 @@ export function requireBounds(run: z.infer<typeof OnboardRunViewSchema>): Onboar
 }
 
 export interface OnboardFacade {
+  sourceFiles?(runRef: string, canonicalKey: string): Promise<{ revision: string; tree: RemoteFileTree }>;
   runGet(runRef: string): Promise<OnboardRunView>;
   inventoryList(runRef: string, cursor?: string): Promise<OnboardInventoryPage>;
   evidenceSubmit(runRef: string, evidence: readonly OnboardEvidenceSubmission[]): Promise<void>;
@@ -140,12 +143,25 @@ export interface OnboardFacade {
 interface McpOnboardFacadeOptions {
   /** The redeemed platform MCP entry for this claim. Never journaled. */
   endpoint: { url: string; headers: ReadonlyArray<{ name: string; value: string }> };
+  sourceOwner?: { assignmentId: string; attempt: number; instanceId: string };
   fetchFn?: FetchFn;
   timeoutMs?: number;
 }
 
+const sourceEnvelope = z.object({
+  error: z.unknown().optional(),
+  result: z.object({
+    revision: z.string().regex(/^[a-f0-9]{40}$/), tree: RemoteFileTreeSchema,
+    binding: z.object({ runRef: z.string(), canonicalKey: z.string(), assignmentId: z.string(),
+      attempt: z.number().int().positive(), sessionId: z.string().min(1), instanceId: z.string().min(1) }),
+  }).optional(),
+});
+const sourceUnavailable = () => new RemoteInstanceError("capability_unavailable", "Core did not authorize this discovery file read.", { diagnostic: "onboard_source_refused" });
+const MAX_SOURCE_RESPONSE_BYTES = 12 * 512 * 1024 * 4 / 3 + 65_536;
+
+
 /**
- * A minimal MCP `tools/call` client. It exists because the runtime's only
+ * The onboard tool client and private bounded source transport. The runtime's only
  * credential for the onboard surface is the capability token in this entry, and
  * the entry is an MCP endpoint. Nothing here interprets a tool's meaning: each
  * caller parses its own result with its own schema.
@@ -157,6 +173,20 @@ export class McpOnboardFacade implements OnboardFacade {
   constructor(private readonly options: McpOnboardFacadeOptions) {
     this.fetchFn = options.fetchFn ?? fetch;
     this.timeoutMs = options.timeoutMs ?? 60_000;
+  }
+
+  /** Private runtime transport, deliberately absent from the model tool list. */
+  async sourceFiles(runRef: string, canonicalKey: string): Promise<{ revision: string; tree: RemoteFileTree }> {
+    const owner = this.options.sourceOwner;
+    if (!owner) throw sourceUnavailable();
+    const response = await this.post("onboarding/read-files", { runRef, canonicalKey }, "onboarding/read-files");
+    const parsed = sourceEnvelope.safeParse(await boundedSourceJson(response));
+    if (!parsed.success) throw sourceUnavailable();
+    const envelope = parsed.data;
+    const result = envelope.result;
+    if (envelope.error || !result) throw sourceUnavailable();
+    assertSourceBinding(result.binding, owner, runRef, canonicalKey);
+    return { revision: result.revision, tree: result.tree };
   }
 
   async runGet(runRef: string): Promise<OnboardRunView> {
@@ -210,19 +240,20 @@ export class McpOnboardFacade implements OnboardFacade {
     return toolContent(tool, envelope.data.result);
   }
 
-  private async post(tool: string, args: Record<string, unknown>): Promise<Response> {
+  private async post(tool: string, args: Record<string, unknown>, method = "tools/call"): Promise<Response> {
     const headers: Record<string, string> = { "content-type": "application/json", accept: "application/json" };
     for (const header of this.options.endpoint.headers) headers[header.name] = header.value;
     let response: Response;
     try {
       response = await this.fetchFn(this.options.endpoint.url, {
         method: "POST",
+        redirect: "error",
         headers,
-        body: JSON.stringify({ jsonrpc: "2.0", id: randomUUID(), method: "tools/call", params: { name: tool, arguments: args } }),
+        body: JSON.stringify({ jsonrpc: "2.0", id: randomUUID(), method, params: method === "tools/call" ? { name: tool, arguments: args } : args }),
         signal: AbortSignal.timeout(this.timeoutMs),
       });
     } catch (error) {
-      throw new RemoteInstanceError("temporarily_unavailable", "The onboard facade is not reachable from this runtime.", { retryable: true, cause: error, diagnostic: "onboard_facade_unreachable" });
+      throw unreachableFacade(method, error);
     }
     if (response.status === 401 || response.status === 403) {
       throw new RemoteInstanceError("permission_denied", "This runtime's capability token does not carry the onboard facade.", { diagnostic: "onboard_facade_forbidden" });
@@ -231,7 +262,8 @@ export class McpOnboardFacade implements OnboardFacade {
       throw new RemoteInstanceError("temporarily_unavailable", `The onboard facade refused ${tool}.`, { retryable: true, diagnostic: "onboard_facade_http" });
     }
     return response;
-  }}
+  }
+}
 
 /** A tool result's structured content, or its first text part parsed as JSON; `{}` when it has neither. */
 function toolContent(tool: string, result: z.infer<typeof McpResponseSchema>["result"]): unknown {
@@ -259,3 +291,34 @@ const McpResponseSchema = z
       .optional(),
   })
   .passthrough();
+
+
+
+async function boundedSourceJson(response: Response): Promise<unknown> {
+  if (!response.body || Number(response.headers.get("content-length") ?? 0) > MAX_SOURCE_RESPONSE_BYTES) throw sourceUnavailable();
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      size += chunk.value.byteLength;
+      if (size > MAX_SOURCE_RESPONSE_BYTES) throw sourceUnavailable();
+      chunks.push(chunk.value);
+    }
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    throw sourceUnavailable();
+  } finally { await reader.cancel().catch(() => undefined); reader.releaseLock(); }
+}
+
+function assertSourceBinding(binding: NonNullable<z.infer<typeof sourceEnvelope>["result"]>["binding"],
+  owner: NonNullable<McpOnboardFacadeOptions["sourceOwner"]>, runRef: string, canonicalKey: string): void {
+  if (binding.runRef !== runRef || binding.canonicalKey !== canonicalKey) throw sourceUnavailable();
+  if (binding.assignmentId !== owner.assignmentId || binding.attempt !== owner.attempt || binding.instanceId !== owner.instanceId) throw sourceUnavailable();
+}
+function unreachableFacade(method: string, error: unknown): RemoteInstanceError {
+  if (method === "onboarding/read-files") return sourceUnavailable();
+  return new RemoteInstanceError("temporarily_unavailable", "The onboard facade is not reachable from this runtime.", { retryable: true, cause: error, diagnostic: "onboard_facade_unreachable" });
+}

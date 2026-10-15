@@ -16,6 +16,14 @@ const conversation = RemoteWorkAssignmentSchema.parse({ ...base, kind: "assistan
   source: { kind: "conversation", portability: "portable_before_claim", sessionId: "conv-1", turnRef: "t1" } });
 
 describe("direct work on the connector", () => {
+  it("keeps onboarding placement while admitting its conversation through signed native operations", () => {
+    const onboarding = RemoteWorkAssignmentSchema.parse({ ...conversation, kind: "onboarding",
+      agentRoute: { ...conversation.agentRoute, requiredRole: "onboard" } });
+    expect(isNativeTurn(onboarding)).toBe(true);
+    expect(isDirectAssignment(onboarding)).toBe(false);
+    expect(isNativeTurn({ kind: "onboarding", source: { kind: "onboard_inventory" } } as unknown as RemoteWorkAssignment)).toBe(false);
+  });
+
   it("continues its session like a conversation, but is told apart from one", () => {
     expect(continuedSession(direct.source)).toMatchObject({ sessionId: "direct-1", turnRef: "t2", acpSessionRef: "acp-1" });
     expect(continuedSession(conversation.source)).toMatchObject({ sessionId: "conv-1" });

@@ -507,6 +507,8 @@ async function sessionFixture(work: RemoteWorkAssignment = assignment, acceptDel
 
 const directTurn: RemoteWorkAssignment = { ...assignment, kind: "direct", agentRoute: { agentId: "codex", requiredRole: "assistant" },
   source: { kind: "direct_session", portability: "instance_bound", ownerInstanceId: "instance", sessionId: "session", turnRef: "turn" } };
+const onboardingTurn: RemoteWorkAssignment = { ...assignment, kind: "onboarding",
+  agentRoute: { ...assignment.agentRoute, requiredRole: "onboard" } };
 const deliveryTurn: RemoteWorkAssignment = { ...assignment, kind: "delivery", taskId: "task", correlationId: "invocation",
   agentRoute: { agentId: "codex", requiredRole: "generator", sessionConfig: { model: "model-a" } },
   source: { kind: "harness_delivery", portability: "instance_bound", ownerInstanceId: "instance", executionSessionId: "session",
@@ -637,8 +639,8 @@ describe("native session dispatch uses genuine execution admission", () => {
     expect(f.send).not.toHaveBeenCalled();
     expect(f.journal.pendingRequests.get("acp:received:request")?.authorization?.state).toBe("denied");
   });
-  it("rejects bare ACP and dispatches a verified operation only once, preserving local skill injection", async () => {
-    const f = await sessionFixture();
+  it.each([assignment, onboardingTurn])("$kind rejects bare ACP and dispatches a verified operation only once, preserving local skill injection", async work => {
+    const f = await sessionFixture(work);
     await expect(f.session.onToRuntime(message)).rejects.toMatchObject({ code: "operation_permit_required" });
     await f.session.onToRuntime(f.envelope);
     expect(f.runner.prompt).toHaveBeenCalledWith("acp", "request", { sessionId: "acp", prompt: [{ type: "text", text: "trusted local skill" }, { type: "text", text: "hello" }] });
@@ -653,6 +655,31 @@ describe("native session dispatch uses genuine execution admission", () => {
     f.advance(31_000); await f.session.onToRuntime(f.envelope);
     expect(f.runner.prompt).toHaveBeenCalledTimes(1);
     expect(f.send.mock.calls.map(call => call[0].body)).toContainEqual({ kind: "session_closed", assignmentId: "assignment", reason: "completed" });
+  });
+
+  it.each(["workspaceId", "instanceId", "sessionId", "turnRef", "assignmentId", "claimId", "runnerIncarnation"])("onboarding conversation refuses a foreign %s before consumption", async field => {
+    const f = await sessionFixture(onboardingTurn);
+    await expect(f.session.onToRuntime({ ...f.envelope, permit: signed({ ...f.claims, [field]: "foreign" }) })).rejects.toThrow();
+    expect(f.client.consumeExecution).not.toHaveBeenCalled();
+    expect(f.runner.prompt).not.toHaveBeenCalled();
+  });
+
+  it("onboarding conversation rejects a tampered prompt and invalid signature before consumption", async () => {
+    const f = await sessionFixture(onboardingTurn);
+    await expect(f.session.onToRuntime({ ...f.envelope, message: { ...message, id: "tampered" } })).rejects.toThrow();
+    await expect(f.session.onToRuntime({ ...f.envelope, permit: signed(f.claims, generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey) })).rejects.toThrow();
+    expect(f.client.consumeExecution).not.toHaveBeenCalled();
+    expect(f.runner.prompt).not.toHaveBeenCalled();
+  });
+
+  it("onboarding conversation honors signed Stop before dispatch without starting a prompt", async () => {
+    const f = await sessionFixture(onboardingTurn);
+    await f.session.onToRuntime(stopOperation(f, false));
+    expect(f.runner.cancel).toHaveBeenCalledExactlyOnceWith("acp");
+    expect(f.runner.prompt).not.toHaveBeenCalled();
+    expect(f.journal.pendingRequests.all()).toContainEqual(expect.objectContaining({
+      authorization: expect.objectContaining({ state: "completed", claims: expect.objectContaining({ method: "session/cancel" }) }),
+    }));
   });
 
   it("admits a direct session prompt only with Core's permit, with nothing put in front of the person's text, and ends the assignment at end_turn", async () => {
@@ -749,7 +776,7 @@ describe("native session dispatch uses genuine execution admission", () => {
     expect(f.client.checkExecution).toHaveBeenCalledTimes(asked);
   });
 
-  it.each([["delivery", deliveryTurn], ["direct", directTurn]] as const)("ends a %s turn as stopped at once when the person stops it while its first check retries", async (_turn, work) => {
+  it.each([["delivery", deliveryTurn], ["direct", directTurn], ["onboarding conversation", onboardingTurn]] as const)("ends a %s turn as stopped at once when the person stops it while its first check retries", async (_turn, work) => {
     const f = await sessionFixture(work); vi.useFakeTimers();
     const check = checkOf(f);
     check.mockRejectedValue(new RemoteInstanceError("temporarily_unavailable", "Core request failed", { retryable: true }));

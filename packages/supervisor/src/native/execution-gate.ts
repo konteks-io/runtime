@@ -12,6 +12,7 @@ import {
 import type { CoreClient } from "../core/client.js";
 import type { SupervisorJournal } from "../state/journal.js";
 import { OperationAdmissionJournal, admittedOperationKey } from "../state/operation-admission.js";
+import { conversationTurnSource } from "../work/continued-session.js";
 
 export interface NativeExecutionGateOptions {
   assignment: RemoteWorkAssignment;
@@ -738,7 +739,8 @@ function conversationSourceMatches(claims: RemoteExecutionAuthorityView, assignm
 
 /** An Assistant turn's conversation, or a person's direct session prompt. */
 function conversationSource(assignment: RemoteWorkAssignment) {
-  if (assignment.kind === "assistant_execution" && assignment.source.kind === "conversation") return assignment.source;
+  const conversation = conversationTurnSource(assignment);
+  if (conversation) return conversation;
   if (assignment.kind === "direct" && assignment.source.kind === "direct_session") return assignment.source;
   return null;
 }
