@@ -30,11 +30,17 @@ export function isDirectAssignment(assignment: Pick<RemoteWorkAssignment, "kind"
   return isDirectWorkKind(assignment.kind);
 }
 
+/** A conversation retains its authorized placement kind while using signed turn admission. */
+export function conversationTurnSource(assignment: Pick<RemoteWorkAssignment, "kind" | "source">) {
+  if (assignment.kind !== "assistant_execution" && assignment.kind !== "onboarding") return null;
+  return assignment.source.kind === "conversation" ? assignment.source : null;
+}
+
 /**
  * One assignment per turn on a native session, closed when its turn ends and
  * admitted per operation through Core's signed permits: an Assistant turn, a
  * direct session prompt, or a native delivery turn.
  */
 export function isNativeTurn(assignment: Pick<RemoteWorkAssignment, "kind" | "source">): boolean {
-  return assignment.kind === "assistant_execution" || isDirectWorkKind(assignment.kind) || assignment.source.kind === "harness_delivery";
+  return conversationTurnSource(assignment) !== null || isDirectWorkKind(assignment.kind) || assignment.source.kind === "harness_delivery";
 }

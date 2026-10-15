@@ -12,7 +12,7 @@ import { gitGap, gitOk, type GitAccess, type GitResult } from "./git.js";
  * portfolio that was read entirely through one path and one that fell back for
  * half its repositories are different facts about the run.
  */
-export const EVIDENCE_READ_PATHS = ["git_archive", "raw_file_api"] as const;
+export const EVIDENCE_READ_PATHS = ["git_archive", "raw_file_api", "core_vcs_file"] as const;
 export type EvidenceReadPath = (typeof EVIDENCE_READ_PATHS)[number];
 
 interface RawFileRequest {

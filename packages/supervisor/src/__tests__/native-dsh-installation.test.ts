@@ -190,6 +190,7 @@ describe("the Node that runs the person's DeepSeek Harness", () => {
     await mkdir(join(base, "bin"), { recursive: true });
     await writeFile(node, "#!/bin/sh\necho v22.21.0\n");
     await chmod(node, 0o755);
-    await expect(resolveNativeDshNode(install(join(base, "x")), { PATH: join(base, "bin") }, "linux")).resolves.toBe(node);
+    const installed = install(join(base, "lib", "node_modules", "@deepseek-ai", "dsh"));
+    await expect(resolveNativeDshNode(installed, { PATH: join(base, "bin") }, "linux")).resolves.toBe(node);
   });
 });
