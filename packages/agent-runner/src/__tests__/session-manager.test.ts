@@ -916,6 +916,16 @@ describe("integration sessions", () => {
     expect(plain.calls.newSession?.[0]).not.toHaveProperty("_meta.konteksIntegration");
   });
 
+  it("gives an integration session's Claude no built-in tool but the deferred-tool loader (D165)", async () => {
+    const { bridge, calls } = fakeBridge();
+    const manager = new SessionManager({ bridge: () => bridge, events: new RunnerEventBus(), refStore: new InMemorySessionRefStore() });
+    await manager.create({ context, cwd: "/w", mcpServers: [], integration: { admittedMcpServerNames: [], accountConnectors: true } });
+    expect(calls.newSession?.[0]).toMatchObject({ _meta: { claudeCode: { options: { tools: ["ToolSearch"] } } } });
+    const plain = fakeBridge();
+    await new SessionManager({ bridge: () => plain.bridge, events: new RunnerEventBus(), refStore: new InMemorySessionRefStore() }).create({ context, cwd: "/w", mcpServers: [] });
+    expect(plain.calls.newSession?.[0]).not.toHaveProperty("_meta.claudeCode.options.tools");
+  });
+
   it("never carries an admission into a continued or restored session", async () => {
     const { bridge } = fakeBridge();
     const store = new InMemorySessionRefStore();

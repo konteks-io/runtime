@@ -327,6 +327,39 @@ describe("integration task carrier: a read through a Claude account connector", 
   });
 });
 
+describe("integration task carrier: a locked read stays a read (D165)", () => {
+  it("stops when a Claude built-in tool runs without asking the gate, and drops the agent's report", async () => {
+    const agent = new FakeAgent(async a => {
+      await a.update({ sessionUpdate: "tool_call", toolCallId: "t-search", status: "pending", _meta: { claudeCode: { toolName: "ToolSearch" } } });
+      await a.update(claudeDone("t-search", "ToolSearch", { matches: [] }));
+      await a.update({ sessionUpdate: "tool_call", toolCallId: "t-bash", status: "pending", rawInput: { command: "echo hi" }, _meta: { claudeCode: { toolName: "Bash" } } });
+      await a.update(claudeDone("t-bash", "Bash", "hi"));
+      await a.submit({ summary: "I read it" });
+      await a.end();
+    });
+    const result = await run(spec(), agent);
+    expect(result.error).toMatchObject({ code: "operation_unsupported", params: { reason: "ungated_call" } });
+    expect(result.agentReport).toBeUndefined();
+    expect(agent.cancelled).toHaveBeenCalled();
+  });
+
+  it("keeps the deferred-tool loader: a ToolSearch that ran alone does not stop the read", async () => {
+    const agent = new FakeAgent(async a => {
+      await a.update({ sessionUpdate: "tool_call", toolCallId: "t-search", status: "pending", _meta: { claudeCode: { toolName: "ToolSearch" } } });
+      await a.update(claudeDone("t-search", "ToolSearch", { matches: [] }));
+      await a.end();
+    });
+    const result = await run(spec(), agent);
+    expect(result.error).not.toMatchObject({ params: { reason: "ungated_call" } });
+  });
+
+  it("asks again when a read ends having reached nothing: no call judged and nothing handed in", async () => {
+    const result = await run(spec(), new FakeAgent(async a => { await a.end(); }));
+    expect(result.toolCalls).toEqual([]);
+    expect(result.error).toMatchObject({ code: "capacity_wait", params: { reason: "source_unreached" } });
+  });
+});
+
 describe("integration task carrier: Codex", () => {
   const codexSpec = () => spec({ agentId: "codex", binding: { ...claudeBinding, source: { kind: "agent_mcp", serverName: "atlassian" } },
     admittedTools: [{ server: "atlassian", tool: "getJiraIssue", mode: "read" }] });

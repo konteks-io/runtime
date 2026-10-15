@@ -10,7 +10,7 @@ import {
   type IntegrationTaskSpec,
 } from "@konteks/backstage-plugin-common";
 import { RemoteInstanceError, createLogger, plainRecord, type AgentTurnUsageObservation, type Logger, type RemoteWorkAssignment } from "@konteks/remote-common";
-import type { RunnerEvent } from "@konteks/remote-agent-runner";
+import { INTEGRATION_CLAUDE_TOOLS, type RunnerEvent } from "@konteks/remote-agent-runner";
 import type { RunnerPort, RunnerSessionInput } from "../runner-port.js";
 import { McpToolCallLedger } from "../session/permission-tool-identity.js";
 import { STRUCTURED_RESULT_MCP_SERVER_NAME, compileResultSchema } from "../structured-result/result-tool-server.js";
@@ -145,6 +145,11 @@ function isMcpCall(meta: Record<string, unknown> | undefined, claudeTool: unknow
   return meta?.is_mcp_tool_call === true || (typeof claudeTool === "string" && claudeTool.startsWith("mcp__"));
 }
 
+/** A Claude built-in tool other than the deferred-tool loader the session keeps (`INTEGRATION_CLAUDE_TOOLS`). */
+function isClaudeNativeCall(claudeTool: unknown): claudeTool is string {
+  return typeof claudeTool === "string" && claudeTool.length > 0 && !claudeTool.startsWith("mcp__") && !INTEGRATION_CLAUDE_TOOLS.includes(claudeTool);
+}
+
 /** The session's own `konteks-result` tool, which is not a provider call. */
 function isOwnResultCall(codexServer: unknown, claudeTool: unknown): boolean {
   return codexServer === STRUCTURED_RESULT_MCP_SERVER_NAME || (typeof claudeTool === "string" && claudeTool.startsWith(`mcp__${STRUCTURED_RESULT_MCP_SERVER_NAME}__`));
@@ -181,6 +186,8 @@ export class IntegrationSession {
   private readonly logger: Logger;
   private readonly ledger = new McpToolCallLedger();
   private readonly mcpCalls = new Set<string>();
+  /** Claude built-in tool calls by id, with the tool's name, for the ungated stop. */
+  private readonly nativeCalls = new Map<string, string>();
   private readonly settled = new Set<string>();
   private readonly observations: IntegrationTaskObservation[] = [];
   private observedBytes = 0;
@@ -374,16 +381,21 @@ export class IntegrationSession {
     const claudeTool = plainRecord(meta?.claudeCode)?.toolName;
     const codexServer = plainRecord(update.rawInput)?.server;
     if (isMcpCall(meta, claudeTool) && !isOwnResultCall(codexServer, claudeTool)) this.mcpCalls.add(id);
+    else if (isClaudeNativeCall(claudeTool)) this.nativeCalls.set(id, claudeTool);
   }
 
   /**
    * An MCP call that ran to completion without ever asking the gate went
-   * around it: the route is not governed. Stop instead of reporting.
+   * around it: the route is not governed. So did a Claude built-in tool the
+   * session should not have (D165: Bash and a subagent ran without asking).
+   * Stop instead of reporting.
    */
   private stopIfUngated(id: string, status: string): void {
-    if (!this.mcpCalls.has(id) || status !== "completed" || this.gate!.wasJudged(id)) return;
+    if ((!this.mcpCalls.has(id) && !this.nativeCalls.has(id)) || status !== "completed" || this.gate!.wasJudged(id)) return;
     this.settled.add(id);
-    this.logger.error({ assignmentId: this.assignment.id, toolCallId: id }, "an MCP call ran without reaching the integration gate; stopping the task");
+    const tool = this.nativeCalls.get(id);
+    this.logger.error({ assignmentId: this.assignment.id, toolCallId: id, ...(tool ? { tool } : {}) },
+      tool ? "a built-in tool ran without reaching the integration gate; stopping the task" : "an MCP call ran without reaching the integration gate; stopping the task");
     this.endTurn?.({ kind: "ungated" });
     this.ungated = true;
   }
@@ -422,5 +434,15 @@ export class IntegrationSession {
   private taskError(end: TurnEnd, toolCalls: ReturnType<IntegrationToolGate["records"]>): IntegrationTaskError | undefined {
     if (this.ungated || end.kind === "ungated") return new IntegrationTaskError("operation_unsupported", { reason: "ungated_call" });
     if (this.spec.phase === "write" && toolCalls.some(call => call.status === "allowed" && call.outcome === "unknown")) return new IntegrationTaskError("outcome_unknown");
-    return turnEndError(end);
+    return turnEndError(end) ?? this.unreachedRead(end, toolCalls);
+  }
+
+  /**
+   * A read whose turn ended with no call judged and nothing handed in never
+   * reached its source (D165: a connector that timed out while connecting
+   * left the agent with no tool). That is worth another try, not a success.
+   */
+  private unreachedRead(end: TurnEnd, toolCalls: ReturnType<IntegrationToolGate["records"]>): IntegrationTaskError | undefined {
+    if (this.spec.phase !== "read" || end.kind !== "result" || toolCalls.length > 0 || this.submitted) return undefined;
+    return new IntegrationTaskError("capacity_wait", { reason: "source_unreached" });
   }}
