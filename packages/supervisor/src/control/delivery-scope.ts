@@ -17,6 +17,14 @@ interface DeliveryRequest {
 }
 
 /**
+ * How far a Core delivery's `issuedAt` may run ahead of this computer's clock.
+ * Core and a person's computer are rarely in step (10-15: taufan-mac ran about
+ * 450 ms behind Core), and each delivery still expires on its own clock and is
+ * used once.
+ */
+export const CORE_DELIVERY_CLOCK_SKEW_MS = 300_000;
+
+/**
  * Whether a delivery is not for this connection: it names another runtime,
  * workspace or connection epoch, was issued later than `now + skewMs`, has
  * expired, or outlives the connection's lease. An unreadable clock or lease

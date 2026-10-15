@@ -176,6 +176,14 @@ function refused(error: unknown): ControlDeliveryResult {
   return { outcome: "refused", code: refusalCode(error) };
 }
 
+/**
+ * A delivery refused for what it is (bad authority or an unreadable shape)
+ * would be refused again on any socket. Closing the socket for it only made
+ * Core re-send it on the next one, in a loop that cut every session on the
+ * computer off until the permit lapsed (10-15).
+ */
+const DEFINITIVE_REFUSALS = new Set(["permission_denied", "schema_invalid"]);
+
 export interface RelayClientOptions {
   relayUrl: string;
   instanceId: () => string;
@@ -622,8 +630,11 @@ export class RelayClient {
     try {
       this.logger.info({ ...arrival, ...await route(attempt, value) }, "control delivery received");
     } catch (error) {
-      this.logger.info({ ...arrival, ...refused(error) }, "control delivery received");
-      throw error;
+      if (!DEFINITIVE_REFUSALS.has(refusalCode(error))) {
+        this.logger.info({ ...arrival, ...refused(error) }, "control delivery received");
+        throw error;
+      }
+      this.logger.info({ ...arrival, ...refused(error), reason: error instanceof Error ? error.message : String(error) }, "control delivery received");
     }
   }
 
