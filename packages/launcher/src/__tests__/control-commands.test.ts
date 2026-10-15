@@ -170,6 +170,27 @@ describe("native control commands", () => {
     expect(f.calls.slice(1)).toEqual([{ op: "auth.input", loginId: "l1", text: "deepseek" }, { op: "auth.input", loginId: "l1", text: "sk-typed-key-never-shown" }]);
     expect(f.text()).not.toContain("sk-typed-key-never-shown");
   });
+  it("keeps Claude's code hidden and forwards an empty Enter continuation", async () => {
+    const f = fake();
+    const hidden: string[] = [], visible: string[] = [];
+    f.context.promptSecret = async label => { hidden.push(label); return "disposable-code-answer"; };
+    f.context.promptLine = async label => { visible.push(label); return ""; };
+    f.context.control.call = scriptedLogin([
+      { kind: "prompt", loginId: "l1", label: "Paste code here if prompted >", secret: false },
+      TICK,
+      { kind: "prompt", loginId: "l1", label: "Press Enter to continue", secret: false, visible: true },
+      TICK,
+      { kind: "completed", loginId: "l1", readiness: "ready" },
+    ], f.calls) as typeof f.context.control.call;
+    await authLogin(f.context, "claude-code", false);
+    expect(hidden).toEqual(["Paste code here if prompted >"]);
+    expect(visible).toEqual(["Press Enter to continue"]);
+    expect(f.calls.slice(1)).toEqual([
+      { op: "auth.input", loginId: "l1", text: "disposable-code-answer" },
+      { op: "auth.input", loginId: "l1", text: "" },
+    ]);
+    expect(f.text()).not.toContain("disposable-code-answer");
+  });
   it("passes Google Antigravity's Gemini Enterprise project and location on, and its key only through the hidden prompt", async () => {
     const f = fake();
     const hidden: string[] = [];

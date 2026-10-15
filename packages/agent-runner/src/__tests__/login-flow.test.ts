@@ -84,3 +84,48 @@ it("keeps arbitrary partial output buffered across pauses", async () => {
   f.child.emit("close", 0);
   await f.flow.done;
 });
+
+it("relays Claude Code's post-login Enter prompt and forwards an empty answer", async () => {
+  vi.useFakeTimers();
+  const f = fixture();
+  const write = vi.spyOn(f.child.stdin, "write");
+  f.child.stdout.write("Login successful\nPress Enter to continue");
+  await vi.advanceTimersByTimeAsync(200);
+  expect(f.seen).toContainEqual(
+    expect.objectContaining({
+      event: { type: "prompt", label: "Press Enter to continue", secret: false, visible: true },
+    }),
+  );
+  f.flow.input("");
+  expect(write).toHaveBeenCalledWith("\n");
+  f.child.emit("close", 0);
+  await f.flow.done;
+});
+
+it("keeps code entry hidden when its instructions also mention pressing Enter", async () => {
+  vi.useFakeTimers();
+  const f = fixture();
+  const label = "Paste the authorization code, then press Enter to continue:";
+  f.child.stderr.write(label);
+  await vi.advanceTimersByTimeAsync(200);
+  expect(f.seen).toContainEqual(expect.objectContaining({
+    event: { type: "prompt", label, secret: false },
+  }));
+  f.child.emit("close", 0);
+  await f.flow.done;
+});
+
+it("recognizes Claude's code prompt after paused chunks on stderr", async () => {
+  vi.useFakeTimers();
+  const f = fixture();
+  f.child.stderr.write("Paste code here ");
+  await vi.advanceTimersByTimeAsync(200);
+  expect(f.seen).toEqual([]);
+  f.child.stderr.write("if prompted > ");
+  await vi.advanceTimersByTimeAsync(200);
+  expect(f.seen).toContainEqual(expect.objectContaining({
+    event: { type: "prompt", label: "Paste code here if prompted >", secret: false },
+  }));
+  f.child.emit("close", 0);
+  await f.flow.done;
+});
