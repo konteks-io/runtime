@@ -47,6 +47,7 @@ export type LoginFailureReason = "no_license";
 
 const URL_PATTERN = /https?:\/\/[^\s<>"')\]]+/g;
 const USER_CODE_PATTERN = /\b([A-Z0-9]{4,5}-[A-Z0-9]{4,5})\b/;
+const ENTER_CONTINUE_PATTERN = /^\s*press\s+(?:the\s+)?enter(?:\s+key)?\s+to\s+continue[.:]?\s*$/i;
 const PROMPT_PATTERN = /(?:paste|enter|input|type)[^\n]*(?:code|token|key|url)[^\n]*[:?>]\s*$/i;
 // Codex colours its device link and one-time code. Left in, the escape after
 // the link became part of the URL Konteks showed, and the one before the code
@@ -57,14 +58,24 @@ export function withoutTerminalEscapes(line: string): string {
   return line.replace(TERMINAL_ESCAPE, "");
 }
 
-export function extractLoginSignals(line: string): { url?: string; userCode?: string; prompt?: { label: string; secret: boolean } } {
-  const out: { url?: string; userCode?: string; prompt?: { label: string; secret: boolean } } = {};
+export function extractLoginSignals(line: string): {
+  url?: string;
+  userCode?: string;
+  prompt?: { label: string; secret: boolean; visible?: true };
+} {
+  const out: {
+    url?: string;
+    userCode?: string;
+    prompt?: { label: string; secret: boolean; visible?: true };
+  } = {};
   const url = URL_PATTERN.exec(line)?.[0];
   URL_PATTERN.lastIndex = 0;
   if (url) out.url = url;
   const userCode = USER_CODE_PATTERN.exec(line)?.[1];
   if (userCode) out.userCode = userCode;
-  if (PROMPT_PATTERN.test(line)) {
+  if (ENTER_CONTINUE_PATTERN.test(line)) {
+    out.prompt = { label: line.trim().slice(0, 256), secret: false, visible: true };
+  } else if (PROMPT_PATTERN.test(line)) {
     out.prompt = { label: line.trim().slice(0, 256), secret: /token|key|secret/i.test(line) };
   }
   return out;
