@@ -193,6 +193,22 @@ export type SessionClosedReason = Extract<SessionToCoreMessage, { kind: "session
 
 const HOLDER_REQUEST_METHODS = new Set(["session/prompt", "session/set_mode", "session/set_config_option"]);
 
+/** How long a prompt's local recheck runs before its relay frame is released. */
+const PROMPT_RECHECK_RELEASE_MS = 5_000;
+
+/**
+ * A prompt whose inputs recheck is slow releases its relay frame, as one
+ * waiting for Core's first check does (D89). A recheck that never settled held
+ * the conversation's receive lane, so the person's Stop and every later
+ * turn's permit queued behind it unacknowledged (10-15, D172). A quick
+ * recheck keeps its refusal inside the frame.
+ */
+async function releasedWhenSlow<T>(release: () => void, run: () => Promise<T>): Promise<T> {
+  const timer = setTimeout(release, PROMPT_RECHECK_RELEASE_MS);
+  timer.unref?.();
+  try { return await run(); } finally { clearTimeout(timer); }
+}
+
 export class RelayedSession {
   private boundChannelId: string | null;
   /** Native channels are unavailable until Core-authorized input binding is verified. */
@@ -1257,7 +1273,7 @@ export class RelayedSession {
     const message = operation.envelope.message;
     let params: unknown = message.kind === "acp" ? message.params : null;
     try {
-      if (isPromptMessage(message)) params = await this.authorizedPromptParams(message.params);
+      if (isPromptMessage(message)) params = await releasedWhenSlow(onWait, () => this.authorizedPromptParams(message.params));
       if (this.closed) throw new RemoteInstanceError("execution_fenced", "The execution session is closed.");
       if (!(await gate.begin(operation, onWait))) return { started: false, params };
       assertDeliveryCurrent();
