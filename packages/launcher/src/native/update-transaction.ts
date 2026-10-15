@@ -93,6 +93,12 @@ type NativeUpdateOutcome =
 const DrainStatusSchema = z.object({ draining: z.boolean(), reason: z.string().nullable(), activeAssignments: z.number().int().min(0), openSessions: z.number().int().min(0) }).strict();
 const AgentsSchema = z.object({ agents: z.array(z.object({ agentId: z.string(), readiness: z.string() }).passthrough()) }).passthrough();
 const CodexMaintenanceSchema = z.object({ idle: z.literal(true) }).strict();
+/**
+ * The connector bounds its own Codex preflight (owner start 75 s, then two
+ * inventory reads of at most 90 s each). The default 30 s control wait ended
+ * healthy preflights early and cancelled the update (10-15, taufan-mac).
+ */
+const CODEX_PREFLIGHT_TIMEOUT_MS = 300_000;
 
 export function productionUpdateDeps(input: { serviceDefinition: NativeUpdateTransactionDeps["serviceDefinition"]; execute: NativeUpdateTransactionDeps["execute"]; start: NativeUpdateTransactionDeps["start"]; serviceExits: NonNullable<NativeUpdateTransactionDeps["serviceExits"]>; forceStop?: NativeUpdateTransactionDeps["forceStop"] | undefined; servicePid?: NativeUpdateTransactionDeps["servicePid"] | undefined }): NativeUpdateTransactionDeps {
   const { forceStop, servicePid, ...rest } = input;
@@ -329,7 +335,7 @@ class UpdateTransaction {
 
   /** The running connector's Codex owner must be idle; an older one without the control op is checked directly. */
   private async codexPreflight(): Promise<void> {
-    try { await this.control.call({ op: "codex.maintenance.preflight" }, CodexMaintenanceSchema); }
+    try { await this.control.call({ op: "codex.maintenance.preflight" }, CodexMaintenanceSchema, { timeoutMs: CODEX_PREFLIGHT_TIMEOUT_MS }); }
     catch (error) {
       try {
         if (!closedProtocolRefusal(error) || !this.deps.legacyCodexPreflight) throw error;

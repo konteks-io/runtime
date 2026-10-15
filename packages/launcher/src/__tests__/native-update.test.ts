@@ -510,6 +510,20 @@ describe("native update transaction", () => {
     expect(h.ledger.map(attempt => (attempt as { outcome: string }).outcome)).toEqual(["in_progress", "applied"]);
     expect(h.currentRecord().releaseId).toBe("release-next");
   });
+  it("waits for the connector's own bounded Codex preflight, not the default 30 s control wait (10-15)", async () => {
+    const h = harness({ previous: { ...previous, agents: ["codex"] } });
+    const originalControl = h.deps.control;
+    const waits: Array<number | undefined> = [];
+    h.deps.control = (root, record) => {
+      const inner = originalControl(root, record);
+      return { call: async (request: { op: string }, schema: unknown, options?: { timeoutMs?: number }) => {
+        if (request.op === "codex.maintenance.preflight") waits.push(options?.timeoutMs);
+        return (inner.call as (...args: unknown[]) => Promise<unknown>)(request, schema, options);
+      } } as never;
+    };
+    await runNativeUpdate({ root: "/root", output: h.output }, h.deps);
+    expect(waits).toEqual([300_000]);
+  });
   it("cancels an update drain before service stop when Codex idle preflight cannot prove safety", async () => {
     const h = harness({ previous: { ...previous, agents: ["codex"] } });
     const originalControl = h.deps.control;

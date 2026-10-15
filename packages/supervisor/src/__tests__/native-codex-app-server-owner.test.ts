@@ -109,6 +109,44 @@ describe("native shared Codex app-server owner", () => {
     await owner.stop();
   });
 
+  it("reports each preflight step, and names the step that refused (10-15: a silent minute ended an update)", async () => {
+    const f = fixture();
+    const assertIdleThreads = vi.fn(async () => undefined);
+    const onMaintenancePreflight = vi.fn();
+    const owner = new NativeCodexAppServerOwner({
+      config, spawn: f.spawn, stop: f.stop, prepareSocket: f.prepareSocket,
+      waitUntilReady: f.waitUntilReady, cleanupSocket: f.cleanupSocket,
+      verifyPackage: f.verifyPackage, assertIdleThreads, interruptOrphanedTurns: vi.fn(async () => []), onMaintenancePreflight,
+    });
+    await owner.start();
+    await owner.preflightMaintenance();
+    expect(onMaintenancePreflight).toHaveBeenLastCalledWith(expect.objectContaining({ outcome: "idle", failedStep: null,
+      steps: [expect.objectContaining({ step: "owner_start" }), expect.objectContaining({ step: "orphaned_turns" }), expect.objectContaining({ step: "idle_threads" })] }));
+    assertIdleThreads.mockRejectedValueOnce(new Error("Codex has an active or unverified loaded thread"));
+    await expect(owner.preflightMaintenance()).rejects.toThrow(/active or unverified/);
+    expect(onMaintenancePreflight).toHaveBeenLastCalledWith(expect.objectContaining({ outcome: "refused", failedStep: "idle_threads",
+      error: "Codex has an active or unverified loaded thread" }));
+    await owner.stop();
+  });
+
+  it("refuses by name when the owner never finishes starting, instead of holding the update's call", async () => {
+    const f = fixture();
+    const onMaintenancePreflight = vi.fn();
+    const owner = new NativeCodexAppServerOwner({
+      config, spawn: f.spawn, stop: f.stop, prepareSocket: f.prepareSocket,
+      waitUntilReady: () => new Promise<void>(() => undefined), cleanupSocket: f.cleanupSocket,
+      verifyPackage: f.verifyPackage, assertIdleThreads: vi.fn(async () => undefined), onMaintenancePreflight,
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      void owner.start().catch(() => undefined);
+      const preflight = expect(owner.preflightMaintenance()).rejects.toThrow(/did not finish starting/);
+      await vi.advanceTimersByTimeAsync(75_000);
+      await preflight;
+      expect(onMaintenancePreflight).toHaveBeenLastCalledWith(expect.objectContaining({ outcome: "refused", failedStep: "owner_start" }));
+    } finally { vi.useRealTimers(); }
+  });
+
   it("refuses to attest shutdown while the exact owned process group remains alive", async () => {
     const f = fixture();
     let groupAlive = true;
