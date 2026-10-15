@@ -447,7 +447,7 @@ it("retains delivery completion for replay without a second consumption", async 
   expect(f.client.consumeDeliveryExecution).toHaveBeenCalledOnce();
 });
 
-it.each(["valid", "lost-during-keys", "lost-during-admission", "wrong-producer", "wrong-incarnation"])("independently verifies native answer delivery: %s", async mode => {
+it.each(["valid", "core-clock-ahead", "lost-during-keys", "lost-during-admission", "wrong-producer", "wrong-incarnation"])("independently verifies native answer delivery: %s", async mode => {
   const f = await fixture(), control = generateEd25519();
   const verifier = new CoreSignatureVerifier([{ keyId: "release", publicKeyJwk: generateEd25519().publicJwk,
     coreControlKeys: [{ keyId: "control", publicKeyJwk: control.publicJwk }] }]);
@@ -458,7 +458,9 @@ it.each(["valid", "lost-during-keys", "lost-during-admission", "wrong-producer",
   const operation = { kind: "authorized_operation", operationId: claims.operationId, permit: signed(claims), message: answer };
   const body = { type: "runtime_permission_answer_delivery", method: "POST", path: { instanceId: "instance" }, nodeId: "node",
     connectionRef: "connection", connectionEpoch: 1, intent: { intentId: "intent", tenantId: "tenant", instanceId: "instance", executionId: "execution", operation },
-    keyId: "control", nonce: "N".repeat(22), issuedAt: f.clock.nowIso(), expiresAt: new Date(f.clock.coreNow() + 30000).toISOString(), signature: "AA" };
+    // 10-15: Core's clock ran about 450 ms ahead of taufan-mac's, so every answer arrived "issued in the future".
+    keyId: "control", nonce: "N".repeat(22), issuedAt: mode === "core-clock-ahead" ? new Date(f.clock.coreNow() + 450).toISOString() : f.clock.nowIso(),
+    expiresAt: new Date(f.clock.coreNow() + 30000).toISOString(), signature: "AA" };
   body.signature = ed25519Sign(control.privateKey, remoteControlSigningBytes(body));
   let current = true;
   const dispatched = vi.fn();
@@ -471,7 +473,7 @@ it.each(["valid", "lost-during-keys", "lost-during-admission", "wrong-producer",
     now: () => f.clock.coreNow(), deliver,
     captureConnection: () => ({ instanceId: "instance", workspaceId: "tenant", runnerIncarnation: mode === "wrong-incarnation" ? "other" : "runner",
       connectionEpoch: 1, leaseExpiresAt: expiresAt, assertCurrent: () => { if (!current) throw new Error("delivery ownership lost"); } }) });
-  if (mode === "valid") {
+  if (mode === "valid" || mode === "core-clock-ahead") {
     await receiver.receive(body); expect(dispatched).toHaveBeenCalledOnce();
     expect(deliver).toHaveBeenCalledWith(operation, expect.objectContaining({ sender: claims.sender }), expect.any(Function));
   } else { await expect(receiver.receive(body)).rejects.toThrow(); expect(dispatched).not.toHaveBeenCalled(); }
@@ -507,6 +509,8 @@ async function sessionFixture(work: RemoteWorkAssignment = assignment, acceptDel
 
 const directTurn: RemoteWorkAssignment = { ...assignment, kind: "direct", agentRoute: { agentId: "codex", requiredRole: "assistant" },
   source: { kind: "direct_session", portability: "instance_bound", ownerInstanceId: "instance", sessionId: "session", turnRef: "turn" } };
+const onboardingTurn: RemoteWorkAssignment = { ...assignment, kind: "onboarding",
+  agentRoute: { ...assignment.agentRoute, requiredRole: "onboard" } };
 const deliveryTurn: RemoteWorkAssignment = { ...assignment, kind: "delivery", taskId: "task", correlationId: "invocation",
   agentRoute: { agentId: "codex", requiredRole: "generator", sessionConfig: { model: "model-a" } },
   source: { kind: "harness_delivery", portability: "instance_bound", ownerInstanceId: "instance", executionSessionId: "session",
@@ -656,8 +660,8 @@ describe("native session dispatch uses genuine execution admission", () => {
     expect(f.send).not.toHaveBeenCalled();
     expect(f.journal.pendingRequests.get("acp:received:request")?.authorization?.state).toBe("denied");
   });
-  it("rejects bare ACP and dispatches a verified operation only once, preserving local skill injection", async () => {
-    const f = await sessionFixture();
+  it.each([assignment, onboardingTurn])("$kind rejects bare ACP and dispatches a verified operation only once, preserving local skill injection", async work => {
+    const f = await sessionFixture(work);
     await expect(f.session.onToRuntime(message)).rejects.toMatchObject({ code: "operation_permit_required" });
     await f.session.onToRuntime(f.envelope);
     expect(f.runner.prompt).toHaveBeenCalledWith("acp", "request", { sessionId: "acp", prompt: [{ type: "text", text: "trusted local skill" }, { type: "text", text: "hello" }] });
@@ -672,6 +676,31 @@ describe("native session dispatch uses genuine execution admission", () => {
     f.advance(31_000); await f.session.onToRuntime(f.envelope);
     expect(f.runner.prompt).toHaveBeenCalledTimes(1);
     expect(f.send.mock.calls.map(call => call[0].body)).toContainEqual({ kind: "session_closed", assignmentId: "assignment", reason: "completed" });
+  });
+
+  it.each(["workspaceId", "instanceId", "sessionId", "turnRef", "assignmentId", "claimId", "runnerIncarnation"])("onboarding conversation refuses a foreign %s before consumption", async field => {
+    const f = await sessionFixture(onboardingTurn);
+    await expect(f.session.onToRuntime({ ...f.envelope, permit: signed({ ...f.claims, [field]: "foreign" }) })).rejects.toThrow();
+    expect(f.client.consumeExecution).not.toHaveBeenCalled();
+    expect(f.runner.prompt).not.toHaveBeenCalled();
+  });
+
+  it("onboarding conversation rejects a tampered prompt and invalid signature before consumption", async () => {
+    const f = await sessionFixture(onboardingTurn);
+    await expect(f.session.onToRuntime({ ...f.envelope, message: { ...message, id: "tampered" } })).rejects.toThrow();
+    await expect(f.session.onToRuntime({ ...f.envelope, permit: signed(f.claims, generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey) })).rejects.toThrow();
+    expect(f.client.consumeExecution).not.toHaveBeenCalled();
+    expect(f.runner.prompt).not.toHaveBeenCalled();
+  });
+
+  it("onboarding conversation honors signed Stop before dispatch without starting a prompt", async () => {
+    const f = await sessionFixture(onboardingTurn);
+    await f.session.onToRuntime(stopOperation(f, false));
+    expect(f.runner.cancel).toHaveBeenCalledExactlyOnceWith("acp");
+    expect(f.runner.prompt).not.toHaveBeenCalled();
+    expect(f.journal.pendingRequests.all()).toContainEqual(expect.objectContaining({
+      authorization: expect.objectContaining({ state: "completed", claims: expect.objectContaining({ method: "session/cancel" }) }),
+    }));
   });
 
   it("admits a direct session prompt only with Core's permit, with nothing put in front of the person's text, and ends the assignment at end_turn", async () => {
@@ -753,6 +782,30 @@ describe("native session dispatch uses genuine execution admission", () => {
     expect(f.session.isClosed).toBe(false);
   });
 
+  it("releases the prompt's relay frame once its inputs recheck is slow, so a stuck recheck holds nothing behind it (D172)", async () => {
+    const f = await sessionFixture(directTurn); vi.useFakeTimers();
+    let finishRecheck!: () => void;
+    f.beforePrompt.mockImplementation(() => new Promise<void>(resolve => { finishRecheck = resolve; }));
+    // After 5 s the frame settles while the recheck is still pending: later frames on the conversation are heard.
+    let settled = false;
+    const frame = f.session.onToRuntime(f.envelope).then(() => { settled = true; });
+    await vi.waitFor(() => expect(f.beforePrompt).toHaveBeenCalledOnce());
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await frame;
+    expect(f.runner.prompt).not.toHaveBeenCalled();
+    // The person's Stop is heard at once: the turn ends as stopped while the recheck still hangs.
+    await f.session.onToRuntime(stopOperation(f, false));
+    expect(f.session.isClosed).toBe(true);
+    expect(f.send.mock.calls.map(call => call[0].body)).toEqual([{ kind: "session_closed", assignmentId: "assignment", reason: "cancelled" }]);
+    // When the recheck finally returns, the closed session refuses the prompt: nothing reaches the agent.
+    finishRecheck();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.waitFor(() => expect(f.journal.pendingRequests.get("acp:received:request")?.authorization?.state).toBe("denied"));
+    expect(f.runner.prompt).not.toHaveBeenCalled();
+  });
+
   it.each(["cancelled", "drain", "lease_lost"] as const)("ends a pre-dispatch wait on close(%s) and reports that reason, never agent_exited", async reason => {
     const f = await sessionFixture(); vi.useFakeTimers();
     f.client.checkExecution.mockRejectedValue(new RemoteInstanceError("temporarily_unavailable", "Core request failed", { retryable: true }));
@@ -768,7 +821,7 @@ describe("native session dispatch uses genuine execution admission", () => {
     expect(f.client.checkExecution).toHaveBeenCalledTimes(asked);
   });
 
-  it.each([["delivery", deliveryTurn], ["direct", directTurn]] as const)("ends a %s turn as stopped at once when the person stops it while its first check retries", async (_turn, work) => {
+  it.each([["delivery", deliveryTurn], ["direct", directTurn], ["onboarding conversation", onboardingTurn]] as const)("ends a %s turn as stopped at once when the person stops it while its first check retries", async (_turn, work) => {
     const f = await sessionFixture(work); vi.useFakeTimers();
     const check = checkOf(f);
     check.mockRejectedValue(new RemoteInstanceError("temporarily_unavailable", "Core request failed", { retryable: true }));

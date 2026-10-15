@@ -7,7 +7,7 @@ import type { GitAccess, GitGap, GitRemote, OnboardScratch } from "./git.js";
 
 /**
  * The evidence collector. It reads a bounded, named set of files per
- * repository with the machine's own git, extracts facts locally, and submits
+ * repository through the admitted Core source transport or local Git, extracts facts locally, and submits
  * `DiscoveryEvidence` — refs, hashes, facts. It never submits a body, never
  * reads a file it cannot name in `refs`, and refuses a run whose bounds are
  * absent.
@@ -22,6 +22,8 @@ import type { GitAccess, GitGap, GitRemote, OnboardScratch } from "./git.js";
  */
 
 export interface OnboardEvidenceCollectorDeps {
+  /** Enabled only by the signed Core contract version. No fallback after a refusal. */
+  coreSourceFiles?: boolean;
   git: GitAccess;
   rawFiles: Pick<RawFileApi, "read">;
   scratch: OnboardScratch;
@@ -98,7 +100,7 @@ export class OnboardEvidenceCollector {
       const outstanding = page.items.filter(item => !item.collected);
       for (const batch of chunk(outstanding, this.batchSize)) {
         assertCurrent();
-        await this.submitGroupingBatch(run, batch, outcome);
+        await this.submitGroupingBatch(run, batch, outcome, assertCurrent);
       }
       cursor = page.nextCursor ?? undefined;
     } while (cursor);
@@ -108,8 +110,9 @@ export class OnboardEvidenceCollector {
     return outcome;
   }
 
-  private async submitGroupingBatch(run: OnboardRunView, batch: DiscoveryInventoryItem[], outcome: GroupingOutcome): Promise<void> {
-    const results = await mapWithConcurrency(batch, this.concurrency, item => this.readRepository(item, run.bounds));
+  private async submitGroupingBatch(run: OnboardRunView, batch: DiscoveryInventoryItem[], outcome: GroupingOutcome, assertCurrent: () => void): Promise<void> {
+    const results = await mapWithConcurrency(batch, this.concurrency, item => this.readRepository(item, run.bounds, run.runRef));
+    assertCurrent();
     const submissions: OnboardEvidenceSubmission[] = results.map(result => {
       if (result.submission.refs.length > 0 || result.gaps.length === 0) return result.submission;
       // Nothing readable: the gap IS the evidence for this repository, and
@@ -212,7 +215,34 @@ export class OnboardEvidenceCollector {
    * single-file reads, `git archive --remote` first and the provider's raw-file
    * API when the host refuses it — recording which path produced each ref.
    */
-  private async readRepository(item: DiscoveryInventoryItem, bounds: DiscoveryRunBounds): Promise<RepositoryEvidence> {
+  private async readRepository(item: DiscoveryInventoryItem, bounds: DiscoveryRunBounds, runRef: string): Promise<RepositoryEvidence> {
+    const remote = this.deps.resolveRemote(item);
+    if (this.deps.coreSourceFiles && item.provider === "gitea" && !remote.identityFile) return this.readCoreRepository(item, bounds, runRef);
+    return this.readLocalRepository(item, bounds);
+  }
+
+  private async readCoreRepository(item: DiscoveryInventoryItem, bounds: DiscoveryRunBounds, runRef: string): Promise<RepositoryEvidence> {
+    if (!this.deps.facade.sourceFiles) throw new Error("Core discovery source transport is absent");
+    const source = await this.deps.facade.sourceFiles(runRef, item.canonicalKey);
+    if (source.tree.entries.length > bounds.maxFilesPerRepository) throw new Error("Core discovery source exceeds the file bound");
+    const candidates = evidenceCandidates(item.repoName, bounds.maxFilesPerRepository);
+    const files: ReadFile[] = [];
+    const refs: CatalogLearningEvidence[] = [];
+    const readPaths: Record<string, EvidenceReadPath> = {};
+    for (const entry of source.tree.entries) {
+      const candidate = candidates.find(value => value.path === entry.path);
+      if (!candidate || entry.sizeBytes > MAX_EVIDENCE_FILE_BYTES) throw new Error("Core discovery source is outside the selected evidence paths");
+      const body = Buffer.from(entry.contentBase64, "base64");
+      if (body.length !== entry.sizeBytes || entry.digest !== `sha256:${sha256Hex(body)}`) throw new Error("Core discovery source digest is invalid");
+      files.push({ candidate, body });
+      const ref = evidenceRef({ ...item, defaultBranch: source.revision }, candidate, body);
+      refs.push(ref);
+      readPaths[ref.ref] = "core_vcs_file";
+    }
+    return { submission: { canonicalKey: item.canonicalKey, refs, facts: extractFacts(files) }, readPaths, gaps: [] };
+  }
+
+  private async readLocalRepository(item: DiscoveryInventoryItem, bounds: DiscoveryRunBounds): Promise<RepositoryEvidence> {
     const remote = this.deps.resolveRemote(item);
     const files: ReadFile[] = [];
     const refs: CatalogLearningEvidence[] = [];

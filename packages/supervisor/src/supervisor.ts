@@ -2243,6 +2243,7 @@ export class Supervisor {
         managedBinding: () => this.managedGitBinding,
         now: () => this.clock.nowIso(),
       },
+      coreSourceSupported: () => coreContractAtLeast(this.coreContractVersion, "7.11"),
       redeemFacade: assignment => this.redeemPlatformMcp(assignment),
       fetchWorkload: (assignment: OnboardWorkAssignment) => this.core.fetchWorkload(this.instanceId ?? "", assignment.id),
     });

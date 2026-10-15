@@ -56,6 +56,8 @@ interface OnboardCarrierDeps {
   fetchWorkload: (assignment: OnboardWorkAssignment) => Promise<WorkloadDefinition>;
   /** Injected in tests; production composes an MCP client over the entry. */
   createFacade?: (entry: PlatformMcpEntry) => OnboardFacade;
+  /** Comes only from the verified desired configuration. */
+  coreSourceSupported?: () => boolean;
   logger?: Logger;
 }
 
@@ -76,7 +78,7 @@ export class OnboardWorkCarrier {
     if (!entry) {
       throw new RemoteInstanceError("capability_unavailable", "An onboard assignment arrived without its capability token.", { diagnostic: "onboard_facade_absent" });
     }
-    const facade = (this.deps.createFacade ?? ((value: PlatformMcpEntry) => new McpOnboardFacade({ endpoint: value })))(entry);
+    const facade = (this.deps.createFacade ?? ((value: PlatformMcpEntry) => new McpOnboardFacade({ endpoint: value, sourceOwner: { assignmentId: assignment.id, attempt: assignment.attempt, instanceId: assignment.instanceId } })))(entry);
     assertCurrent();
     if (assignment.kind === "repository_relocation") return this.relocate(assignment, facade, assertCurrent);
     return this.collectEvidence(assignment, facade, assertCurrent);
@@ -98,7 +100,7 @@ export class OnboardWorkCarrier {
     if (source.kind !== "discovery_run") {
       throw new RemoteInstanceError("schema_invalid", "An onboard evidence assignment carries the discovery-run source.", { diagnostic: "onboard_source_mismatch" });
     }
-    const collector = new OnboardEvidenceCollector({ ...this.deps.collector, facade });
+    const collector = new OnboardEvidenceCollector({ ...this.deps.collector, facade, coreSourceFiles: this.deps.coreSourceSupported?.() ?? false });
     const run = await facade.runGet(source.runRef);
     const scope = await this.enrichmentScope(assignment);
     assertCurrent();

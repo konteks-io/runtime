@@ -1,7 +1,7 @@
 import { RemoteInstanceError, RuntimePermissionAnswerDeliveryRequestSchema, runtimePermissionAnswerMatches,
   verifyRemoteExecutionOperationSignature, type RemoteAuthorizedOperation, type RemoteExecutionOperationPermitClaims,
   type RuntimePermissionAnswerDeliveryRequest } from "@konteks/remote-common";
-import { deliveryNotCurrent } from "./delivery-scope.js";
+import { CORE_DELIVERY_CLOCK_SKEW_MS, deliveryNotCurrent } from "./delivery-scope.js";
 import type { CoreSignatureVerifier } from "./core-signature.js";
 import type { CapturedCancellationConnection } from "./cancellation-receiver.js";
 import type { CoreClient } from "../core/client.js";
@@ -21,20 +21,23 @@ export class PermissionAnswerReceiver {
 
   async receive(raw: unknown): Promise<void> {
     const parsed = RuntimePermissionAnswerDeliveryRequestSchema.safeParse(raw);
-    const denied = () => new RemoteInstanceError("permission_denied", "Current Core permission answer authority is required");
-    if (!parsed.success || !this.deps.coreProducer || !this.deps.verifier.verifyPermissionAnswerDelivery(parsed.data)) throw denied();
+    // Which check refused is said, so a refusal can be told apart from the log alone (10-15).
+    const denied = (reason: string) => new RemoteInstanceError("permission_denied", `Current Core permission answer authority is required (${reason})`);
+    if (!parsed.success) throw denied("request");
+    if (!this.deps.coreProducer) throw denied("producer");
+    if (!this.deps.verifier.verifyPermissionAnswerDelivery(parsed.data)) throw denied("signature");
     const request = parsed.data, scope = this.deps.captureConnection();
-    if (!scope) throw denied();
+    if (!scope) throw denied("connection");
     const assertConnection = () => {
       scope.assertCurrent();
       const now = this.deps.now();
-      if (!Number.isSafeInteger(now) || deliveryNotCurrent(request, scope, now, 0)) throw denied();
+      if (!Number.isSafeInteger(now) || deliveryNotCurrent(request, scope, now, CORE_DELIVERY_CLOCK_SKEW_MS)) throw denied("connection_window");
     };
     assertConnection();
     const keys = await this.deps.core.executionSigningKeys();
     assertConnection();
-    const claims = this.verifiedClaims(request, keys, scope, denied);
-    const assertCurrent = () => { assertConnection(); if (claims.exp * 1000 <= this.deps.now()) throw denied(); };
+    const claims = this.verifiedClaims(request, keys, scope, () => denied("permit"));
+    const assertCurrent = () => { assertConnection(); if (claims.exp * 1000 <= this.deps.now()) throw denied("permit_expired"); };
     assertCurrent();
     await this.deps.deliver(request.intent.operation, claims, assertCurrent);
     assertCurrent();

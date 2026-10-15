@@ -1,5 +1,5 @@
 import { allEqual, RemoteInstanceError, RuntimeCancellationDeliveryRequestSchema } from "@konteks/remote-common";
-import { deliveryNotCurrent } from "./delivery-scope.js";
+import { CORE_DELIVERY_CLOCK_SKEW_MS, deliveryNotCurrent } from "./delivery-scope.js";
 import type { CoreSignatureVerifier } from "./core-signature.js";
 import type { CancellationInbox, CancellationInboxRecord } from "../state/cancellation-inbox.js";
 import type { LocalExecutionJournal } from "../state/local-execution.js";
@@ -81,7 +81,7 @@ export class CancellationReceiver {
     if (!scope) throw unavailable();
     const assertCurrent = () => {
       scope.assertCurrent();
-      if (deliveryNotCurrent(request, scope, this.deps.now(), 300_000)) throw unavailable();
+      if (deliveryNotCurrent(request, scope, this.deps.now(), CORE_DELIVERY_CLOCK_SKEW_MS)) throw unavailable();
       const { assignmentId, attempt } = request.intent.directive;
       const start = this.deps.claims.start(assignmentId, attempt);
       if (!start || !claimedOnConnection(start, request.intent, scope)) throw unavailable();

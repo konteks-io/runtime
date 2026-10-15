@@ -5,12 +5,11 @@ import { RemoteInstanceError, connectorGitEnv, createLogger, runCommand, sanitiz
 /**
  * The onboard role's git access.
  *
- * The runtime uses **the machine's own git access** for a customer's VCS —
- * whatever `git` on this machine already authenticates with, exactly as native
- * delivery does — and its own registered key for managed git. Core's connector
- * credential never reaches a runtime and the broker is never called from here,
- * so there is no credential lane to build: the only thing this module does is
- * run `git` and read what the local credential helper already holds.
+ * Local Git serves legacy shallow reads, deep enrichment and relocation.
+ * Connector-backed shallow evidence uses Core's bounded source transport when
+ * the signed Core contract admits it. Managed Git uses the runtime's own
+ * registered key. This adapter reads machine authentication through Git;
+ * it never receives or resolves a Core connector credential.
  *
  * A side this machine cannot read is NOT an exception. It is reported back as
  * an ordinary evidence gap (`credential_unavailable`) carrying the remedy a
