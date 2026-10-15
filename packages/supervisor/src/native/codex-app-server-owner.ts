@@ -29,6 +29,16 @@ import { resolveNativeCodexHome } from "./codex-home.js";
 const DEFAULT_RESTART_DELAYS_MS = [250, 500, 1_000, 2_000, 5_000, 10_000] as const;
 /** Drained for maintenance, a question waiting this long has nobody left to answer it. */
 const MAINTENANCE_ORPHAN_AFTER_MS = 60_000;
+/** The owner's own start is bounded by its socket wait; a start this long is not coming. */
+const MAINTENANCE_START_DEADLINE_MS = 75_000;
+
+/** One update preflight, step by step, for the supervisor's log (10-15: a silent minute ended an update). */
+export interface CodexMaintenancePreflightReport {
+  outcome: "idle" | "refused";
+  steps: Array<{ step: "owner_start" | "orphaned_turns" | "idle_threads"; ms: number }>;
+  failedStep: "owner_start" | "orphaned_turns" | "idle_threads" | null;
+  error: string | null;
+}
 
 export interface NativeCodexAppServerOwnerOptions {
   config: RunnerConfig;
@@ -52,6 +62,8 @@ export interface NativeCodexAppServerOwnerOptions {
   interruptOrphanedTurns?: typeof interruptOrphanedCodexTurns;
   /** Each orphaned turn this owner interrupted, for the supervisor's log. */
   onOrphanedTurnsInterrupted?: (turns: OrphanedCodexTurn[]) => void;
+  /** Each update preflight's steps and timing, for the supervisor's log. */
+  onMaintenancePreflight?: (report: CodexMaintenancePreflightReport) => void;
   /** Stop a stale server's process group; tests replace the signals. */
   stopHolder?: (pid: number) => Promise<void>;
   onStaleReplaced?: (event: { pid: number; staleRelease: string; currentRelease: string }) => void;
@@ -140,12 +152,38 @@ export class NativeCodexAppServerOwner {
    * has no owner left to finish it: it is interrupted, then all must be idle.
    */
   async preflightMaintenance(unowned: () => boolean = () => true): Promise<void> {
-    await this.startPromise;
-    if (this.stopping) throw unavailable("The shared Codex owner is stopping.");
-    if (this.child || this.adoptedHolder) {
-      await this.releaseOrphanedTurns({ unowned, staleAfterMs: MAINTENANCE_ORPHAN_AFTER_MS });
-      await this.ops.assertIdleThreads(this.options.config.RUNNER_NATIVE_CODEX_SOCKET!);
+    const report: CodexMaintenancePreflightReport = { outcome: "idle", steps: [], failedStep: null, error: null };
+    const step = async (name: CodexMaintenancePreflightReport["steps"][number]["step"], work: () => Promise<unknown>) => {
+      const started = Date.now();
+      try { await work(); } catch (error) {
+        report.failedStep = name;
+        throw error;
+      } finally { report.steps.push({ step: name, ms: Date.now() - started }); }
+    };
+    try {
+      await step("owner_start", () => this.startedWithin(MAINTENANCE_START_DEADLINE_MS));
+      if (this.stopping) throw unavailable("The shared Codex owner is stopping.");
+      if (this.child || this.adoptedHolder) {
+        await step("orphaned_turns", () => this.releaseOrphanedTurns({ unowned, staleAfterMs: MAINTENANCE_ORPHAN_AFTER_MS }));
+        await step("idle_threads", () => this.ops.assertIdleThreads(this.options.config.RUNNER_NATIVE_CODEX_SOCKET!));
+      }
+    } catch (error) {
+      report.outcome = "refused";
+      report.error = error instanceof Error ? error.message : String(error);
+      throw error;
+    } finally {
+      this.options.onMaintenancePreflight?.(report);
     }
+  }
+
+  /** The owner's start, or a named refusal once it has taken longer than any healthy start. */
+  private startedWithin(ms: number): Promise<void> {
+    let timer: NodeJS.Timeout | undefined;
+    const late = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(unavailable("The shared Codex owner did not finish starting.")), ms);
+      timer.unref();
+    });
+    return Promise.race([this.startPromise ?? Promise.resolve(), late]).finally(() => clearTimeout(timer));
   }
 
   /** Interrupts in-progress turns while `unowned` holds; see `interruptOrphanedCodexTurns`. */

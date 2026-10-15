@@ -8,7 +8,14 @@ const threadStatus = z.object({ type: z.enum(["notLoaded", "idle", "systemError"
 const threadRead = z.object({ thread: z.object({ id: z.string().uuid(), status: threadStatus, updatedAt: z.number().optional() }).passthrough() }).passthrough();
 const threadTurns = z.object({ thread: z.object({ id: z.string().uuid(), turns: z.array(z.object({ id: z.string().min(1), status: z.string() }).passthrough()).optional() }).passthrough() }).passthrough();
 const MAX_LOADED_THREADS = 4096;
-const DEADLINE_MS = 15_000;
+/** One answer from a healthy owner; a slower one is not answering. */
+const REQUEST_DEADLINE_MS = 10_000;
+/**
+ * The whole read. Sequential `thread/read`s grow with the threads the shared
+ * owner keeps loaded, so a single 15 s budget refused healthy owners (10-15:
+ * taufan-mac's update preflight ran past the launcher's wait).
+ */
+const INVENTORY_DEADLINE_MS = 90_000;
 
 /** A loaded thread as the shared owner reports it; `updatedAt` is its last activity, in epoch seconds. */
 export interface CodexLoadedThread { id: string; status: string; flags: string[]; updatedAt: number | null }
@@ -46,11 +53,14 @@ async function withCodexInventory<T>(socketPath: string, use: (request: Inventor
   stream.once("error", fail);
   stream.once("close", fail);
   lines.once("close", fail);
-  const timeout = setTimeout(() => { fail(); stream.destroy(); }, DEADLINE_MS);
+  const expire = () => { fail(); stream.destroy(); };
+  const timeout = setTimeout(expire, INVENTORY_DEADLINE_MS);
   const request = (method: string, params: unknown): Promise<unknown> => new Promise((resolve, reject) => {
     if (closed || stream.destroyed) { reject(new Error("Codex loaded-thread inventory unavailable")); return; }
     if (pending) { reject(new Error("Concurrent Codex inventory request")); return; }
-    pending = { id: ++id, resolve, reject };
+    const answer = setTimeout(expire, REQUEST_DEADLINE_MS);
+    const settle = <V>(fn: (value: V) => void) => (value: V) => { clearTimeout(answer); fn(value); };
+    pending = { id: ++id, resolve: settle(resolve), reject: settle(reject) };
     stream.write(`${JSON.stringify({ id, method, params })}\n`, error => { if (error) fail(); });
   });
   try {
