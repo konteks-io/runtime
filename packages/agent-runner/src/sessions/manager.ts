@@ -109,6 +109,19 @@ function konteksIntegrationMeta(admission: IntegrationSessionAdmission) {
   return { konteksIntegration: { version: 1 as const, admittedMcpServerNames: [...admission.admittedMcpServerNames], accountConnectors: admission.accountConnectors } };
 }
 
+/**
+ * Claude's built-in tools an integration session keeps: only the loader for
+ * deferred MCP tools. The tool gate refuses every native call that asks, but
+ * Claude runs Bash it judges read-only, Read, Grep and its Agent tool without
+ * asking; a locked read ran Bash and a subagent that way (10-15, D165).
+ */
+export const INTEGRATION_CLAUDE_TOOLS: readonly string[] = ["ToolSearch"];
+
+function withIntegrationToolLock(meta: Record<string, unknown>): Record<string, unknown> {
+  const claudeCode = (meta.claudeCode ?? {}) as { options?: Record<string, unknown> };
+  return { ...meta, claudeCode: { ...claudeCode, options: { ...claudeCode.options, tools: [...INTEGRATION_CLAUDE_TOOLS] } } };
+}
+
 export interface CreatedSession {
   acpSessionRef: string;
   resumed: boolean;
@@ -431,7 +444,8 @@ export class SessionManager {
     const naming = args.agentTitled ? konteksAgentTitledMetadata(args.context.agentId)
       : konteksSessionMetadata(konteksCodingSessionTitle(args.sessionLabel, acpSessionRef.slice(-8)), args.context.agentId);
     const meta = { ...naming, ...this.options.sessionMeta, ...(args.integration ? konteksIntegrationMeta(args.integration) : {}) };
-    return args.integration?.utility ? withUtilityTurnOptions(meta) : meta;
+    const locked = args.integration ? withIntegrationToolLock(meta) : meta;
+    return args.integration?.utility ? withUtilityTurnOptions(locked) : locked;
   }
 
   async create(args: CreateSessionArgs): Promise<CreatedSession> {
