@@ -160,6 +160,8 @@ const PREVIEW_AGENT_ACTIVE_WINDOW_MS = 3 * 60_000;
 const LEASE_LANE_HOLD_MS = 3 * 60_000;
 const IDLE_SESSION_RELEASE_MS = 30 * 60_000;
 const IDLE_SESSION_SWEEP_MS = 5 * 60_000;
+/** How often, and after how long a wait, an orphaned Codex question is interrupted. */
+const CODEX_ORPHAN_SWEEP_MS = 15 * 60_000;
 const LIVENESS_CHECK_MS = 30_000;
 /** How long a site-started step waits on the person at the window on this computer (Core keeps it 30 minutes). */
 const ON_COMPUTER_WATCH_MS = 30 * 60_000;
@@ -331,6 +333,7 @@ export class Supervisor {
   private drainEpoch = 0;
   private pullTimer: NodeJS.Timeout | null = null;
   private reaperTimer: NodeJS.Timeout | null = null;
+  private codexOrphanTimer: NodeJS.Timeout | null = null;
   private updates: NativeUpdateCoordinator | null = null;
   private runtimeUpdates: RuntimeUpdateReceiver | null = null;
   private muxTimer: NodeJS.Timeout | null = null;
@@ -554,6 +557,8 @@ export class Supervisor {
       ...native.codexAppServerOptions,
       config: sharedCodex,
       onRestartFailure: error => this.logger.warn({ err: error }, "shared Codex app-server restart failed; retrying"),
+      onOrphanedTurnsInterrupted: turns => this.logger.warn({ event: "codex.orphaned_turns_interrupted", turns },
+        "interrupted Codex turns still waiting on a person after their Konteks session ended"),
     });
     // The QA browser is the connector's, not an agent package's: every
     // agent's sessions get it when an installed Claude Code or Codex package
@@ -1811,6 +1816,8 @@ export class Supervisor {
     // Every 5 minutes, release sessions idle for 30 minutes.
     this.reaperTimer = setInterval(() => void this.work.reapIdleCompletedSessions(IDLE_SESSION_RELEASE_MS).catch(() => undefined), IDLE_SESSION_SWEEP_MS);
     this.reaperTimer.unref();
+    this.codexOrphanTimer = setInterval(() => void this.releaseOrphanedCodexTurns(), CODEX_ORPHAN_SWEEP_MS);
+    this.codexOrphanTimer.unref();
     this.previews.startIdleSweep();
     this.ensureUpdates()?.start();
     this.ensureRuntimeUpdates()?.start();
@@ -2430,7 +2437,7 @@ export class Supervisor {
         if (!this.draining || this.drainReason !== "update" || this.work.activeCount() !== 0 || this.stopping) {
           throw new RemoteInstanceError("active_work", "The update drain has not settled for Codex maintenance.");
         }
-        await this.nativeCodexOwner?.preflightMaintenance();
+        await this.nativeCodexOwner?.preflightMaintenance(() => this.draining && this.work.activeCount() === 0 && !this.stopping);
         return { idle: true };
       },
       "drain.cancel": () => this.cancelLocalDrain(),
@@ -2528,6 +2535,19 @@ export class Supervisor {
 
   private drainStatus() {
     return { draining: this.draining, reason: this.drainReason, activeAssignments: this.work.activeCount(), openSessions: this.work.openSessions() };
+  }
+
+  /**
+   * A Codex turn left waiting on a person after its Konteks session ended
+   * would block every update and stop (10-15, taufan-mac). Swept only while no
+   * Konteks work runs here, and only once it has waited 15 minutes.
+   */
+  private async releaseOrphanedCodexTurns(): Promise<void> {
+    const unowned = () => !this.stopping && this.work.activeCount() === 0;
+    if (!this.nativeCodexOwner || !unowned()) return;
+    await this.nativeCodexOwner.releaseOrphanedTurns({ unowned, staleAfterMs: CODEX_ORPHAN_SWEEP_MS }).catch((error: unknown) => {
+      this.logger.debug({ err: error }, "orphaned Codex turn sweep skipped");
+    });
   }
 
   /** Only a locally requested drain is reversible; a Core directive with a deadline stays in force until Core lifts it. */
@@ -3196,6 +3216,7 @@ export class Supervisor {
     stopTimeout(this.turnActivityTimer);
     this.turnActivityTimer = null;
     stopInterval(this.reaperTimer);
+    stopInterval(this.codexOrphanTimer);
     stopInterval(this.livenessTimer);
     this.livenessTimer = null;
     this.updates?.stop();

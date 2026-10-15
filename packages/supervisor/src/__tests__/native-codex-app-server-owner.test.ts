@@ -86,6 +86,29 @@ describe("native shared Codex app-server owner", () => {
     expect(assertIdleThreads.mock.invocationCallOrder[0]).toBeLessThan(f.stop.mock.invocationCallOrder[0]!);
   });
 
+  it("interrupts orphaned questions before the maintenance idle check, and reports them (10-15)", async () => {
+    const f = fixture();
+    const turn = { threadId: "00000000-0000-7000-8000-00000000000b", turnId: "turn-orphan", flags: ["waitingOnApproval"], updatedAt: 1_792_000_000 };
+    const interruptOrphanedTurns = vi.fn(async () => [turn]);
+    const assertIdleThreads = vi.fn(async () => undefined);
+    const onOrphanedTurnsInterrupted = vi.fn();
+    const owner = new NativeCodexAppServerOwner({
+      config, spawn: f.spawn, stop: f.stop, prepareSocket: f.prepareSocket,
+      waitUntilReady: f.waitUntilReady, cleanupSocket: f.cleanupSocket,
+      verifyPackage: f.verifyPackage, assertIdleThreads, interruptOrphanedTurns, onOrphanedTurnsInterrupted,
+    });
+    await owner.start();
+    let unownedNow = true;
+    await owner.preflightMaintenance(() => unownedNow);
+    expect(interruptOrphanedTurns).toHaveBeenCalledWith(config.RUNNER_NATIVE_CODEX_SOCKET, { unowned: expect.any(Function), staleAfterMs: 60_000 });
+    const [, options] = interruptOrphanedTurns.mock.calls[0] as unknown as [string, { unowned: () => boolean }];
+    unownedNow = false;
+    expect(options.unowned()).toBe(false);
+    expect(interruptOrphanedTurns.mock.invocationCallOrder[0]).toBeLessThan(assertIdleThreads.mock.invocationCallOrder[0]!);
+    expect(onOrphanedTurnsInterrupted).toHaveBeenCalledWith([turn]);
+    await owner.stop();
+  });
+
   it("refuses to attest shutdown while the exact owned process group remains alive", async () => {
     const f = fixture();
     let groupAlive = true;
