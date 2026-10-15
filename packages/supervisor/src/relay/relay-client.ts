@@ -630,12 +630,11 @@ export class RelayClient {
     try {
       this.logger.info({ ...arrival, ...await route(attempt, value) }, "control delivery received");
     } catch (error) {
-      const result = refused(error);
-      if (!DEFINITIVE_REFUSALS.has(result.code)) {
-        this.logger.info({ ...arrival, ...result }, "control delivery received");
+      if (!DEFINITIVE_REFUSALS.has(refusalCode(error))) {
+        this.logger.info({ ...arrival, ...refused(error) }, "control delivery received");
         throw error;
       }
-      this.logger.info({ ...arrival, ...result, reason: error instanceof Error ? error.message : String(error) }, "control delivery received");
+      this.logger.info({ ...arrival, ...refused(error), reason: error instanceof Error ? error.message : String(error) }, "control delivery received");
     }
   }
 
