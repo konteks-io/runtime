@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { canOpenOnComputer, onComputerDone, onComputerScript, openOnComputer, planOnComputer, readOnComputerWatches, releaseLauncher, removeOnComputerWatch, standInTerminalEnv, writeOnComputerWatch } from "../native/on-computer.js";
+import { canOpenOnComputer, onComputerDone, onComputerScript, onComputerSettled, openCodeKeyPlan, openOnComputer, planOnComputer, readOnComputerWatches, releaseLauncher, removeOnComputerWatch, standInTerminalEnv, writeOnComputerWatch } from "../native/on-computer.js";
 
 describe("a step the site brings to the front on this computer (on-computer)", () => {
   const dirs: string[] = [];
@@ -100,6 +100,29 @@ describe("a step the site brings to the front on this computer (on-computer)", (
     expect(onComputerDone("not_added", "added")).toBe(false);
     expect(onComputerDone("needs_sign_in", "ready")).toBe(false);
     expect(onComputerDone("ready")).toBe(true);
+  });
+
+  it("signs an OpenCode Go plan in at the connector's key prompt, and ends once that provider's key is ready (owner, 10-15)", () => {
+    const plan = openCodeKeyPlan("opencode-go");
+    expect(plan).toEqual({ step: "sign_in", commands: ["konteks-remote auth login opencode --provider opencode-go --method key"], until: "credential:opencode-go" });
+    const script = onComputerScript(plan, { agentId: "opencode", root: "/r", platform: "darwin" });
+    expect(script).toContain("auth login opencode --provider opencode-go --method key");
+    // Already ready on the Console account: only a ready Go credential ends the step.
+    const console = { state: "ready", credentials: [{ providerId: "opencode", state: "ready" }] };
+    expect(onComputerSettled(console, plan.until)).toBe(false);
+    expect(onComputerSettled({ ...console, credentials: [...console.credentials, { providerId: "opencode-go", state: "needs_sign_in" }] }, plan.until)).toBe(false);
+    expect(onComputerSettled({ ...console, credentials: [...console.credentials, { providerId: "opencode-go", state: "ready" }] }, plan.until)).toBe(true);
+    expect(onComputerSettled(undefined, plan.until)).toBe(false);
+    expect(onComputerSettled({ state: "ready" }, "ready")).toBe(true);
+    expect(onComputerDone("ready", plan.until)).toBe(false);
+  });
+
+  it("keeps a Go key step across a restart with its option, and drops a malformed provider", async () => {
+    const data = await mkdtemp(join(tmpdir(), "on-computer-")); dirs.push(data);
+    const watch = { instanceId: "i-1", loginId: "login-go", agentId: "opencode" as const, loginOption: "opencode-go", until: "credential:opencode-go" as const, deadline: 123 };
+    await writeOnComputerWatch(data, watch);
+    await writeOnComputerWatch(data, { ...watch, loginId: "login-bad", until: "credential:Bad Provider" as `credential:${string}` });
+    expect(await readOnComputerWatches(data)).toEqual([watch]);
   });
 
   it("keeps a waiting step across a restart (adding an agent restarts the connector), and drops a damaged one", async () => {

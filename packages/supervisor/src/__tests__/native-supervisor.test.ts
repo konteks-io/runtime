@@ -244,6 +244,21 @@ describe("native Supervisor composition", () => {
       expect(reports).toEqual([{ loginId: "login-opencode", agentId: "opencode", loginOption: "on-computer", state: "awaiting_person", step: "sign_in" }]);
     });
 
+    it("opens the Go key prompt on the computer for OpenCode already ready on the Console account, and reports under the Go option (owner, 10-15)", async () => {
+      const { internals, reports } = await started();
+      const facts = vi.spyOn(internals, "onComputerFacts").mockReturnValue({ agentId: "opencode", state: "ready", credentials: [{ providerId: "opencode", state: "ready" }] });
+      const open = vi.spyOn(internals, "openOnComputerStep").mockResolvedValue(true);
+      expect(await internals.onAgentLogin(delivery({ loginId: "login-go", agentId: "opencode", loginOption: "opencode-go" }), verifier)).toBeUndefined();
+      expect(open).toHaveBeenCalledWith("login-go", "opencode", { step: "sign_in", commands: ["konteks-remote auth login opencode --provider opencode-go --method key"], until: "credential:opencode-go" });
+      expect(reports).toEqual([{ loginId: "login-go", agentId: "opencode", loginOption: "opencode-go", state: "awaiting_person", step: "sign_in" }]);
+      expect(internals.onComputerWatches.has("login-go")).toBe(true);
+      // Once its key is in, a fresh copy of the start is answered as done, without another window.
+      facts.mockReturnValue({ agentId: "opencode", state: "ready", credentials: [{ providerId: "opencode", state: "ready" }, { providerId: "opencode-go", state: "ready" }] });
+      await internals.onAgentLogin(delivery({ loginId: "login-go-2", agentId: "opencode", loginOption: "opencode-go" }), verifier);
+      expect(open).toHaveBeenCalledOnce();
+      expect(reports.at(-1)).toEqual({ loginId: "login-go-2", agentId: "opencode", loginOption: "opencode-go", state: "succeeded" });
+    });
+
     it("starts no watch for an on-computer step stopped while its window opens", async () => {
       const { internals } = await started();
       vi.spyOn(internals, "onComputerFacts").mockReturnValue({ agentId: "opencode", state: "needs_sign_in" });

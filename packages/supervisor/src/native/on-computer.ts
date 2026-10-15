@@ -23,8 +23,12 @@ export interface OnComputerPlan {
   step: OnComputerStep;
   /** The commands the window runs, in order, each only after the one before succeeded. */
   commands: string[];
-  /** What ends the step: the agent ready, or (when its sign-in is done on the site) only added. */
-  until: "ready" | "added";
+  /**
+   * What ends the step: the agent ready, or (when its sign-in is done on the
+   * site) only added, or a ready credential for one provider (a key added to
+   * an agent that was already ready, such as an OpenCode Go plan).
+   */
+  until: "ready" | "added" | `credential:${string}`;
 }
 
 /**
@@ -48,6 +52,15 @@ export function planOnComputer(agent: OnComputerAgentFacts, platform: NodeJS.Pla
   if (ADD_STATES.has(agent.state)) return { step: "add", ...after([add]) };
   if (SIGN_IN_STATES.has(agent.state)) return siteSignIn ? null : { step: "sign_in", commands: [signIn], until: "ready" };
   return null;
+}
+
+/**
+ * An OpenCode provider that signs in with an API key only (an OpenCode Go
+ * plan): the window runs the connector's own key prompt for that provider,
+ * and the step ends once its credential is ready. The key is typed there.
+ */
+export function openCodeKeyPlan(provider: string): OnComputerPlan {
+  return { step: "sign_in", commands: [`konteks-remote auth login opencode --provider ${provider} --method key`], until: `credential:${provider}` };
 }
 
 const INSTALL_STATES: ReadonlySet<string> = new Set(["not_installed", "unsupported_version"]);
@@ -205,7 +218,18 @@ const NOT_YET_ADDED = new Set(["not_installed", "unsupported_version", "installe
 /** Whether the agent's state ends the step: ready, or for an add-only step, added at all. */
 export function onComputerDone(state: string | undefined, until: OnComputerPlan["until"] = "ready"): boolean {
   if (state === undefined) return false;
+  if (until.startsWith("credential:")) return false;
   return until === "added" ? !NOT_YET_ADDED.has(state) : state === "ready";
+}
+
+/** Whether the agent as the connector sees it ends the step, a provider's credential included. */
+export function onComputerSettled(agent: { state?: string; credentials?: ReadonlyArray<{ providerId: string; state: string }> } | undefined, until: OnComputerPlan["until"]): boolean {
+  if (!agent) return false;
+  if (until.startsWith("credential:")) {
+    const provider = until.slice("credential:".length);
+    return (agent.credentials ?? []).some(credential => credential.providerId === provider && credential.state === "ready");
+  }
+  return onComputerDone(agent.state, until);
 }
 
 /** A site-started step still waiting on the person, kept across a restart of the connector. */
@@ -213,6 +237,8 @@ export interface OnComputerWatch {
   instanceId: string;
   loginId: string;
   agentId: OnComputerAgent;
+  /** The reviewed sign-in option the site started, when it was not the generic on-computer action. */
+  loginOption?: string;
   until: OnComputerPlan["until"];
   /** Epoch milliseconds after which the step has run out of time. */
   deadline: number;
@@ -251,5 +277,9 @@ export async function readOnComputerWatches(dataDir: string): Promise<OnComputer
 
 function wellFormedWatch(value: Partial<OnComputerWatch>): value is OnComputerWatch {
   return typeof value.instanceId === "string" && typeof value.loginId === "string" && (ON_COMPUTER_AGENTS as readonly string[]).includes(value.agentId as string)
-    && (value.until === "ready" || value.until === "added") && typeof value.deadline === "number";
+    && wellFormedUntil(value.until) && (value.loginOption === undefined || typeof value.loginOption === "string") && typeof value.deadline === "number";
+}
+
+function wellFormedUntil(until: unknown): until is OnComputerPlan["until"] {
+  return until === "ready" || until === "added" || (typeof until === "string" && /^credential:[a-z0-9][a-z0-9._-]{0,63}$/.test(until));
 }

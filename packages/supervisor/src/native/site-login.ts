@@ -136,7 +136,9 @@ export function openCodeRunnerCapabilities(input: { installed: boolean; relayRea
   if (!input.installed) return [];
   const capabilities: string[] = [REMOTE_OPENCODE_FREE_MODELS_CAPABILITY];
   if (!input.relayReady) return capabilities;
-  const options = input.options.filter((id): id is OpenCodeLoginOptionId => id in OPENCODE_LOGIN_OPTIONS && (OPENCODE_LOGIN_OPTIONS[id as OpenCodeLoginOptionId].method !== "machine_browser" || input.desktop));
+  // A browser sign-in, and one finished in a window on the computer (an OpenCode Go key), need a desktop here.
+  const needsDesktop = (id: OpenCodeLoginOptionId) => (OPENCODE_LOGIN_OPTIONS[id].method as string) !== "device_code";
+  const options = input.options.filter((id): id is OpenCodeLoginOptionId => id in OPENCODE_LOGIN_OPTIONS && (!needsDesktop(id as OpenCodeLoginOptionId) || input.desktop));
   if (options.length > 0) capabilities.push(REMOTE_AGENT_LOGIN_OPENCODE_CAPABILITY, ...options.map(openCodeLoginOptionCapability));
   return capabilities;
 }
