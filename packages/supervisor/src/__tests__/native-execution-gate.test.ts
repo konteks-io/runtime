@@ -763,6 +763,30 @@ describe("native session dispatch uses genuine execution admission", () => {
     expect(f.session.isClosed).toBe(false);
   });
 
+  it("releases the prompt's relay frame once its inputs recheck is slow, so a stuck recheck holds nothing behind it (D172)", async () => {
+    const f = await sessionFixture(directTurn); vi.useFakeTimers();
+    let finishRecheck!: () => void;
+    f.beforePrompt.mockImplementation(() => new Promise<void>(resolve => { finishRecheck = resolve; }));
+    // After 5 s the frame settles while the recheck is still pending: later frames on the conversation are heard.
+    let settled = false;
+    const frame = f.session.onToRuntime(f.envelope).then(() => { settled = true; });
+    await vi.waitFor(() => expect(f.beforePrompt).toHaveBeenCalledOnce());
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await frame;
+    expect(f.runner.prompt).not.toHaveBeenCalled();
+    // The person's Stop is heard at once: the turn ends as stopped while the recheck still hangs.
+    await f.session.onToRuntime(stopOperation(f, false));
+    expect(f.session.isClosed).toBe(true);
+    expect(f.send.mock.calls.map(call => call[0].body)).toEqual([{ kind: "session_closed", assignmentId: "assignment", reason: "cancelled" }]);
+    // When the recheck finally returns, the closed session refuses the prompt: nothing reaches the agent.
+    finishRecheck();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.waitFor(() => expect(f.journal.pendingRequests.get("acp:received:request")?.authorization?.state).toBe("denied"));
+    expect(f.runner.prompt).not.toHaveBeenCalled();
+  });
+
   it.each(["cancelled", "drain", "lease_lost"] as const)("ends a pre-dispatch wait on close(%s) and reports that reason, never agent_exited", async reason => {
     const f = await sessionFixture(); vi.useFakeTimers();
     f.client.checkExecution.mockRejectedValue(new RemoteInstanceError("temporarily_unavailable", "Core request failed", { retryable: true }));
