@@ -5,7 +5,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { z } from "zod";
 import { DoctorReportSchema, fileSha256, NATIVE_UPDATE_TARGET_ENV, NativeUpdateTargetSchema, RemoteInstanceError, SupervisorStatusSchema, type ControlRequest } from "@konteks/remote-common";
 import { isHostAgentId, nativeConnectorFileNames, nativeServiceExecutable, resolveNativeConnectorExecutable } from "@konteks/remote-release";
-import { NATIVE_SHUTDOWN_RECEIPT_FILE, assertLegacyCodexOwnerIdle, ownedByAnotherConnector, recordNativeUpdateAttempt, type NativeRuntimeRecord, type NativeUpdateAttempt } from "@konteks/remote-supervisor";
+import { DEFERRED_UPDATE_DETAIL_PREFIX, NATIVE_SHUTDOWN_RECEIPT_FILE, assertLegacyCodexOwnerIdle, isDeferredUpdateAttempt, ownedByAnotherConnector, recordNativeUpdateAttempt, type NativeRuntimeRecord, type NativeUpdateAttempt } from "@konteks/remote-supervisor";
 import { SupervisorControl } from "../control.js";
 import type { NativeCommandContext } from "./cli.js";
 import {
@@ -368,7 +368,9 @@ class UpdateTransaction {
     // would leave the computer offline).
     if (this.stopped && this.update.wasRunning) await this.restartUnchanged();
     else if (this.drained) await this.cancelDrain();
-    await this.finish("failed", detail);
+    // Never stopped: the running release kept serving and nothing changed, so
+    // this attempt waited (on active work, or a busy Codex) rather than failed.
+    await this.finish("failed", this.stopped ? detail : `${DEFERRED_UPDATE_DETAIL_PREFIX}${detail}`);
   }
 
   private async restartUnchanged(): Promise<void> {
@@ -943,7 +945,7 @@ function describeChecks(ids: readonly string[], failing: ReadonlyMap<string, str
  * so the person hears that before being offered it again.
  */
 export function earlierFailure(attempts: readonly NativeUpdateAttempt[], manifestDigest: string): NativeUpdateAttempt | null {
-  const last = [...attempts].reverse().find(attempt => attempt.manifestDigest === manifestDigest && attempt.outcome !== "in_progress");
+  const last = [...attempts].reverse().find(attempt => attempt.manifestDigest === manifestDigest && attempt.outcome !== "in_progress" && !isDeferredUpdateAttempt(attempt));
   return last && (last.outcome === "rolled_back" || last.outcome === "failed") ? last : null;
 }
 
