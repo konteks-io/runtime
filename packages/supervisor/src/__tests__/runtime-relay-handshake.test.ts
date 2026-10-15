@@ -197,6 +197,23 @@ describe("native runtime relay handshake validation boundary", () => {
     keyId: "control", nonce: "N".repeat(22), issuedAt: confirmed.runtimeReconciliation.acceptedAt,
     expiresAt: "2026-09-06T00:00:30.000Z", signature: "A".repeat(86) });
 
+  it("refuses an answer it has no authority for without closing the socket (10-15)", async () => {
+    const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    const receive = vi.fn<NonNullable<RelayClientOptions["onPermissionAnswer"]>>(async () => {
+      throw new RemoteInstanceError("permission_denied", "Current Core permission answer authority is required (connection_window)");
+    });
+    const f = fixture({ logger: log as never, onPermissionAnswer: receive });
+    try {
+      f.socket.message(confirmed); await flush(); f.socket.send.mockClear();
+      f.socket.message(answer()); await flush();
+      expect(receive).toHaveBeenCalledOnce();
+      expect(f.socket.close).not.toHaveBeenCalled();
+      expect(f.client.connected).toBe(true);
+      expect(log.info).toHaveBeenCalledWith(expect.objectContaining({ event: "control_delivery.received", kind: "runtime_permission_answer_delivery",
+        outcome: "refused", code: "permission_denied", reason: expect.stringContaining("connection_window") }), "control delivery received");
+    } finally { f.client.stop(); }
+  });
+
   it.each(["direct", "buffered", "unavailable", "epoch"])("routes answer-only control with captured socket ownership: %s", async mode => {
     const receive = vi.fn<NonNullable<RelayClientOptions["onPermissionAnswer"]>>(async (_request, connection) => connection.assertCurrent());
     const options = mode === "unavailable" ? {} : { onPermissionAnswer: receive };

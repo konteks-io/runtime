@@ -447,7 +447,7 @@ it("retains delivery completion for replay without a second consumption", async 
   expect(f.client.consumeDeliveryExecution).toHaveBeenCalledOnce();
 });
 
-it.each(["valid", "lost-during-keys", "lost-during-admission", "wrong-producer", "wrong-incarnation"])("independently verifies native answer delivery: %s", async mode => {
+it.each(["valid", "core-clock-ahead", "lost-during-keys", "lost-during-admission", "wrong-producer", "wrong-incarnation"])("independently verifies native answer delivery: %s", async mode => {
   const f = await fixture(), control = generateEd25519();
   const verifier = new CoreSignatureVerifier([{ keyId: "release", publicKeyJwk: generateEd25519().publicJwk,
     coreControlKeys: [{ keyId: "control", publicKeyJwk: control.publicJwk }] }]);
@@ -458,7 +458,9 @@ it.each(["valid", "lost-during-keys", "lost-during-admission", "wrong-producer",
   const operation = { kind: "authorized_operation", operationId: claims.operationId, permit: signed(claims), message: answer };
   const body = { type: "runtime_permission_answer_delivery", method: "POST", path: { instanceId: "instance" }, nodeId: "node",
     connectionRef: "connection", connectionEpoch: 1, intent: { intentId: "intent", tenantId: "tenant", instanceId: "instance", executionId: "execution", operation },
-    keyId: "control", nonce: "N".repeat(22), issuedAt: f.clock.nowIso(), expiresAt: new Date(f.clock.coreNow() + 30000).toISOString(), signature: "AA" };
+    // 10-15: Core's clock ran about 450 ms ahead of taufan-mac's, so every answer arrived "issued in the future".
+    keyId: "control", nonce: "N".repeat(22), issuedAt: mode === "core-clock-ahead" ? new Date(f.clock.coreNow() + 450).toISOString() : f.clock.nowIso(),
+    expiresAt: new Date(f.clock.coreNow() + 30000).toISOString(), signature: "AA" };
   body.signature = ed25519Sign(control.privateKey, remoteControlSigningBytes(body));
   let current = true;
   const dispatched = vi.fn();
@@ -471,7 +473,7 @@ it.each(["valid", "lost-during-keys", "lost-during-admission", "wrong-producer",
     now: () => f.clock.coreNow(), deliver,
     captureConnection: () => ({ instanceId: "instance", workspaceId: "tenant", runnerIncarnation: mode === "wrong-incarnation" ? "other" : "runner",
       connectionEpoch: 1, leaseExpiresAt: expiresAt, assertCurrent: () => { if (!current) throw new Error("delivery ownership lost"); } }) });
-  if (mode === "valid") {
+  if (mode === "valid" || mode === "core-clock-ahead") {
     await receiver.receive(body); expect(dispatched).toHaveBeenCalledOnce();
     expect(deliver).toHaveBeenCalledWith(operation, expect.objectContaining({ sender: claims.sender }), expect.any(Function));
   } else { await expect(receiver.receive(body)).rejects.toThrow(); expect(dispatched).not.toHaveBeenCalled(); }
