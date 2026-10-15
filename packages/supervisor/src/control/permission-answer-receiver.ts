@@ -31,7 +31,9 @@ export class PermissionAnswerReceiver {
     const assertConnection = () => {
       scope.assertCurrent();
       const now = this.deps.now();
-      const stale = Number.isSafeInteger(now) ? deliveryStaleReason(request, scope, now, CORE_DELIVERY_CLOCK_SKEW_MS) : "clock";
+      // Core's clock as this computer estimates it carries a fractional skew; any finite reading is a time (10-15: an
+      // integer-only check refused every answer as "connection_window").
+      const stale = deliveryStaleReason(request, scope, now, CORE_DELIVERY_CLOCK_SKEW_MS);
       if (stale) throw denied(`connection_window: ${stale}`);
     };
     assertConnection();
