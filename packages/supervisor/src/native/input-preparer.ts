@@ -234,14 +234,14 @@ async function pathExists(path: string): Promise<boolean> {
 /**
  * A conversation's workspace is the SESSION's, so its path is stable across
  * turns: the local agent's own per-directory memory survives, and a
- * continued ACP session keeps the cwd it was created with. A delivery keeps
- * a per-assignment checkout, because the agent commits into it.
+ * continued ACP session keeps the cwd it was created with. An isolated answering
+ * turn uses a per-assignment directory; a delivery uses a per-assignment checkout.
  */
 function workspaceDestination(root: string, selection: RemoteAssignmentInputsEnvelope["selection"], needsGit: boolean): string {
   const { binding } = selection;
   return join(
     root,
-    needsGit
+    needsGit || selection.contextIsolation === "assignment"
       ? "assignment-" + sha256Hex(canonicalize({ binding, claimId: selection.claimId }))
       : "session-" +
           sha256Hex(
