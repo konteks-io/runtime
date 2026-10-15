@@ -221,6 +221,13 @@ function assignmentToolPolicy(assignment: { kind: string }) {
   return createWorkspaceToolPolicy(assignment.kind === "direct" ? { bashBlocklist: DIRECT_SESSION_BASH_BLOCKLIST } : {});
 }
 
+/** Why a local drain ended, in the words of whoever requested it. */
+const DRAIN_CANCELLED: Record<string, string> = {
+  user: "drain cancelled by the local operator",
+  update: "the update did not replace this service; taking new work again",
+  remove: "removal stopped; taking new work again",
+};
+
 export class Supervisor {
   readonly config: SupervisorConfig;
   readonly logger: Logger;
@@ -2526,10 +2533,11 @@ export class Supervisor {
   /** Only a locally requested drain is reversible; a Core directive with a deadline stays in force until Core lifts it. */
   private cancelLocalDrain() {
     if (this.draining && this.drainDeadline === null) {
+      const reason = this.drainReason;
       this.draining = false;
       this.drainReason = null;
       if (this.administrativeStatus === "draining") this.administrativeStatus = "active";
-      this.logger.info("drain cancelled by the local operator");
+      this.logger.info({ reason }, DRAIN_CANCELLED[reason ?? "user"] ?? DRAIN_CANCELLED.user);
     }
     return this.drainStatus();
   }
