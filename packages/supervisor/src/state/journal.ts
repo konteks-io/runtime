@@ -7,6 +7,7 @@ import { AssignmentReportSchema, allEqual, canonicalize, isFsErrorWithCode, Remo
   RemoteExecutionAdmissionClaimsSchema, RemoteDeliveryAdmissionClaimsSchema, SessionToCoreMessageSchema, RemoteWorkKindSchema, RemoteRecoveryEvidenceSchema,
   remoteRecoveryEvidenceIdentityKey, type RemoteRecoveryEvidence } from "@konteks/remote-common";
 import { unrestrictedStateMutation, type StateMutation } from "./mutation-gate.js";
+import { timedJournalWork, timedJournalWorkAsync } from "./slow-work.js";
 import { RuntimeRecoveryJournal, RuntimeRecoveryRecordSchema, recoveryRecordKey, type RuntimeRecoveryRecord } from "./runtime-recovery.js";
 import { LocalExecutionJournal, LocalExecutionRecordSchema, localExecutionKey, type LocalExecutionRecord } from "./local-execution.js";
 import { AssignmentStreamJournal } from "./assignment-stream.js";
@@ -394,7 +395,7 @@ class AppendLog<T extends { [key: string]: unknown }> {
 
   all(): T[] {
     if (this.writeUncertain) throw new Error("Journal write outcome requires recovery");
-    return structuredClone([...this.entries.values()]);
+    return timedJournalWork(this.table.name, "all", this.entries.size, () => structuredClone([...this.entries.values()]));
   }
 
   get(key: string): T | undefined {
@@ -467,13 +468,7 @@ class AppendLog<T extends { [key: string]: unknown }> {
       await this.loadInternal();
       const candidates = derive();
       if (!candidates) return;
-      const next = new Map<string, T>();
-      for (const candidate of candidates) {
-        const parsed = this.table.schema.parse(structuredClone(candidate));
-        const key = this.table.key(parsed);
-        if (next.has(key)) throw new Error("Journal rewrite contains duplicate keys");
-        next.set(key, parsed);
-      }
+      const next = timedJournalWork(this.table.name, "rewrite", candidates.length, () => this.validatedRows(candidates));
       await this.compactInternal(next);
       this.entries.clear();
       for (const [key, entry] of next) this.entries.set(key, entry);
@@ -511,7 +506,22 @@ class AppendLog<T extends { [key: string]: unknown }> {
     if (this.appends >= COMPACT_EVERY_APPENDS || this.entries.size > this.bound) await this.compactInternal().catch(() => undefined);
   }
 
-  private async compactInternal(entries = this.entries): Promise<void> {
+  private validatedRows(candidates: T[]): Map<string, T> {
+    const next = new Map<string, T>();
+    for (const candidate of candidates) {
+      const parsed = this.table.schema.parse(structuredClone(candidate));
+      const key = this.table.key(parsed);
+      if (next.has(key)) throw new Error("Journal rewrite contains duplicate keys");
+      next.set(key, parsed);
+    }
+    return next;
+  }
+
+  private compactInternal(entries = this.entries): Promise<void> {
+    return timedJournalWorkAsync(this.table.name, "compact", entries.size, () => this.compactRows(entries));
+  }
+
+  private async compactRows(entries: Map<string, T>): Promise<void> {
     const tmp = `${this.path}.${randomUUID()}.tmp`;
     const file = await open(tmp, "wx", 0o600);
     let renamed = false;

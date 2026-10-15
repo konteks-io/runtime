@@ -12,6 +12,7 @@ import {
   AgentLoginGcpSchema,
   AgentLoginOptionIdSchema,
   ON_COMPUTER_LOGIN_OPTION,
+  OPENCODE_LOGIN_OPTIONS,
   REMOTE_AGENT_LOGIN_ON_COMPUTER_CAPABILITY,
   REMOTE_RUNTIME_UPDATE_CAPABILITY,
   REMOTE_ASSIGNMENT_AVAILABLE_DELIVERY_CAPABILITY,
@@ -96,7 +97,7 @@ import { NativeInventoryCollector, machineHasDesktop } from "./native/inventory.
 import { windowsInstalledLauncher } from "./native/windows-launcher.js";
 import { antigravityRunnerCapabilities, openCodeRunnerCapabilities, siteLoginRelay } from "./native/site-login.js";
 import { FinishedLogins } from "./native/finished-logins.js";
-import { ON_COMPUTER_AGENTS, canOpenOnComputer, onComputerDone, onComputerScript, openOnComputer, planOnComputer, readOnComputerWatches, releaseLauncher, removeOnComputerWatch, standInTerminalEnv, writeOnComputerWatch, type OnComputerAgent, type OnComputerPlan, type OnComputerWatch } from "./native/on-computer.js";
+import { ON_COMPUTER_AGENTS, canOpenOnComputer, onComputerDone, onComputerScript, onComputerSettled, openCodeKeyPlan, openOnComputer, planOnComputer, readOnComputerWatches, releaseLauncher, removeOnComputerWatch, standInTerminalEnv, writeOnComputerWatch, type OnComputerAgent, type OnComputerPlan, type OnComputerWatch } from "./native/on-computer.js";
 import { antigravityDownloadState, withAntigravityDownload } from "./native/antigravity-download.js";
 import { antigravityDiskBytes, antigravityPin } from "./native/antigravity-installation.js";
 import { BROWSER_TOOL_CAPABILITY, resolveConnectorBrowser, withConnectorBrowser, type ConnectorBrowserStatus } from "./native/browser-capability.js";
@@ -118,6 +119,8 @@ import { EvaluatorPolicyResponder } from "./session/policy-responder.js";
 import { createWorkspaceToolPolicy, DIRECT_SESSION_BASH_BLOCKLIST } from "./session/workspace-tool-policy.js";
 import { ClaudeExecutableIdentity } from "./native/claude-executable-identity.js";
 import { SupervisorJournal, type JournalEntry } from "./state/journal.js";
+import { observeSlowJournalWork } from "./state/slow-work.js";
+import { EventLoopWatch } from "./event-loop-watch.js";
 import type { RuntimeRecoveryRecord } from "./state/runtime-recovery.js";
 import { DurableOutbox } from "./state/outbox.js";
 import { DEFAULT_CONFIG, MACHINE_KEY_LOST, SupervisorStore, type ConfigRecord, type ShutdownProgress } from "./state/store.js";
@@ -334,6 +337,7 @@ export class Supervisor {
   private pullTimer: NodeJS.Timeout | null = null;
   private reaperTimer: NodeJS.Timeout | null = null;
   private codexOrphanTimer: NodeJS.Timeout | null = null;
+  private eventLoopWatch: EventLoopWatch | null = null;
   private updates: NativeUpdateCoordinator | null = null;
   private runtimeUpdates: RuntimeUpdateReceiver | null = null;
   private muxTimer: NodeJS.Timeout | null = null;
@@ -1822,6 +1826,7 @@ export class Supervisor {
     this.reaperTimer.unref();
     this.codexOrphanTimer = setInterval(() => void this.releaseOrphanedCodexTurns(), CODEX_ORPHAN_SWEEP_MS);
     this.codexOrphanTimer.unref();
+    this.watchEventLoop();
     this.previews.startIdleSweep();
     this.ensureUpdates()?.start();
     this.ensureRuntimeUpdates()?.start();
@@ -2544,6 +2549,13 @@ export class Supervisor {
     return { draining: this.draining, reason: this.drainReason, activeAssignments: this.work.activeCount(), openSessions: this.work.openSessions() };
   }
 
+  /** Diagnostic only (D175): a held event loop, and the slow journal work before it, are logged. */
+  private watchEventLoop(): void {
+    observeSlowJournalWork(work => this.logger.info({ event: "journal.slow_work", ...work }, "slow journal work"));
+    this.eventLoopWatch ??= new EventLoopWatch(this.logger);
+    this.eventLoopWatch.start();
+  }
+
   /**
    * A Codex turn left waiting on a person after its Konteks session ended
    * would block every update and stop (10-15, taufan-mac). Swept only while no
@@ -2643,7 +2655,7 @@ export class Supervisor {
     const { intent } = request;
     const instanceId = this.loginRuntime(intent);
     if (intent.action === "start" && await this.answerFinishedLogin(instanceId, intent.loginId)) return "duplicate";
-    if (isOnComputerLogin(intent)) return this.startOnComputer(instanceId, intent.loginId, intent.agentId as OnComputerAgent, intent.action);
+    if (isOnComputerLogin(intent)) return this.startOnComputer(instanceId, intent.loginId, intent.agentId as OnComputerAgent, intent.action, keyedLoginOption(intent));
     if (!isSiteLoginAgent(intent.agentId)) return this.refuseLoginAgent(instanceId, intent);
     return this.siteLogin(instanceId, intent, intent.agentId);
   }
@@ -2742,6 +2754,7 @@ export class Supervisor {
    * the window is the person's to close.
    */
   private async startOnComputer(instanceId: string, loginId: string, agentId: OnComputerAgent, action: "start" | "cancel",
+    loginOption?: string,
   ): Promise<ControlDeliveryOutcome | void> {
     if (action === "cancel") {
       this.onComputerStarts.delete(loginId);
@@ -2751,16 +2764,17 @@ export class Supervisor {
     // Claimed before the first await: two copies of one start open one window.
     if (this.onComputerWatches.has(loginId) || this.onComputerStarts.has(loginId)) return "duplicate";
     this.onComputerStarts.add(loginId);
-    try { await this.openAndWatchOnComputer(instanceId, loginId, agentId); }
+    try { await this.openAndWatchOnComputer(instanceId, loginId, agentId, loginOption); }
     finally { this.onComputerStarts.delete(loginId); }
   }
 
-  private async openAndWatchOnComputer(instanceId: string, loginId: string, agentId: OnComputerAgent): Promise<void> {
-    const report = this.onComputerReporter(instanceId, loginId, agentId);
+  private async openAndWatchOnComputer(instanceId: string, loginId: string, agentId: OnComputerAgent, loginOption?: string): Promise<void> {
+    const report = this.onComputerReporter(instanceId, loginId, agentId, loginOption);
     const facts = this.onComputerFacts(agentId);
     if (!facts) { await report({ state: "failed", failure: "unavailable" }); return; }
-    if (onComputerDone(facts.state)) { await report({ state: "succeeded" }); return; }
-    const plan = onComputerPlan(agentId, facts);
+    const start = onComputerStart(agentId, facts, loginOption);
+    if (start.done) { await report({ state: "succeeded" }); return; }
+    const plan = start.plan;
     if (!plan) { await report({ state: "failed", failure: "unavailable" }); return; }
     if (!(await this.openOnComputerStep(loginId, agentId, plan))) {
       await report({ state: "failed", failure: "unavailable" });
@@ -2769,7 +2783,7 @@ export class Supervisor {
     await report({ state: "awaiting_person", step: plan.step });
     // Stopped while its window was opening: nothing is left to watch.
     if (!this.onComputerStarts.has(loginId)) return;
-    const watch: OnComputerWatch = { instanceId, loginId, agentId, until: plan.until, deadline: Date.now() + ON_COMPUTER_WATCH_MS };
+    const watch: OnComputerWatch = { instanceId, loginId, agentId, ...(loginOption ? { loginOption } : {}), until: plan.until, deadline: Date.now() + ON_COMPUTER_WATCH_MS };
     // Kept on disk: adding an agent restarts this connector, and the step must
     // still end (and say so on the site) in the connector that comes back.
     await writeOnComputerWatch(this.config.SUPERVISOR_DATA_DIR, watch).catch(error => this.logger.warn({ err: error, loginId }, "on-computer step not kept across a restart"));
@@ -2794,10 +2808,10 @@ export class Supervisor {
     }
   }
 
-  private onComputerReporter(instanceId: string, loginId: string, agentId: OnComputerAgent) {
+  private onComputerReporter(instanceId: string, loginId: string, agentId: OnComputerAgent, loginOption?: string) {
     type Report = Parameters<CoreClient["reportAgentLogin"]>[1];
     return (value: Omit<Report, "loginId" | "agentId" | "loginOption">) =>
-      this.reportLogin(instanceId, { loginId, agentId, loginOption: ON_COMPUTER_LOGIN_OPTION, ...value } as Report);
+      this.reportLogin(instanceId, { loginId, agentId, loginOption: loginOption ?? ON_COMPUTER_LOGIN_OPTION, ...value } as Report);
   }
 
   private onComputerFacts(agentId: OnComputerAgent) {
@@ -2821,10 +2835,10 @@ export class Supervisor {
 
   /** Looks every few seconds whether the step's agent reads ready (or, for an add, added); says so once, or that it ran out of time. */
   private watchOnComputer(watch: OnComputerWatch): void {
-    const report = this.onComputerReporter(watch.instanceId, watch.loginId, watch.agentId);
+    const report = this.onComputerReporter(watch.instanceId, watch.loginId, watch.agentId, watch.loginOption);
     const tick = () => {
       const now = this.onComputerFacts(watch.agentId);
-      if (now && onComputerDone(now.state, watch.until)) {
+      if (onComputerSettled(now, watch.until)) {
         void this.stopOnComputerWatch(watch.loginId);
         void report({ state: "succeeded" });
         if (this.activeLoopStarted) void this.heartbeat.publish().catch(error => this.logger.warn({ err: error }, "heartbeat after an on-computer step failed"));
@@ -3224,6 +3238,8 @@ export class Supervisor {
     this.turnActivityTimer = null;
     stopInterval(this.reaperTimer);
     stopInterval(this.codexOrphanTimer);
+    this.eventLoopWatch?.stop();
+    observeSlowJournalWork(undefined);
     stopInterval(this.livenessTimer);
     this.livenessTimer = null;
     this.updates?.stop();
@@ -3363,8 +3379,33 @@ function isSiteLoginAgent(agentId: string): agentId is SiteLoginAgent {
 
 function isOnComputerLogin(intent: AgentLoginIntent): boolean {
   return (
-    intent.loginOption === ON_COMPUTER_LOGIN_OPTION && (ON_COMPUTER_AGENTS as readonly string[]).includes(intent.agentId)
+    (intent.loginOption === ON_COMPUTER_LOGIN_OPTION && (ON_COMPUTER_AGENTS as readonly string[]).includes(intent.agentId)) ||
+    keyedLoginOption(intent) !== undefined
   );
+}
+
+/** A reviewed OpenCode sign-in that is a key typed on the computer (an OpenCode Go plan), when the intent is one. */
+function keyedLoginOption(intent: AgentLoginIntent): string | undefined {
+  if (intent.agentId !== "opencode" || intent.loginOption === undefined) return undefined;
+  return keyedLoginPlan(intent.loginOption) ? intent.loginOption : undefined;
+}
+
+/**
+ * Whether a site-started step on this computer is already done, else the
+ * window it opens. A key for one provider (an OpenCode Go plan) is added to
+ * an agent that may already be ready on another account.
+ */
+function onComputerStart(agentId: OnComputerAgent, facts: Parameters<typeof onComputerPlan>[1] & Parameters<typeof onComputerSettled>[0],
+  loginOption: string | undefined): { done: true } | { done: false; plan: OnComputerPlan | null } {
+  const keyed = loginOption === undefined ? null : keyedLoginPlan(loginOption);
+  if (keyed ? onComputerSettled(facts, keyed.until) : onComputerDone(facts.state)) return { done: true };
+  return { done: false, plan: keyed ?? onComputerPlan(agentId, facts) };
+}
+
+/** The window plan for such a sign-in: the connector's key prompt for its provider. */
+function keyedLoginPlan(loginOption: string): OnComputerPlan | null {
+  const option = (OPENCODE_LOGIN_OPTIONS as Readonly<Record<string, { integration: string; method: string }>>)[loginOption];
+  return option?.method === "on_computer" ? openCodeKeyPlan(option.integration) : null;
 }
 
 type SiteLoginSelection = ReturnType<typeof siteLoginSelection>;

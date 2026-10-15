@@ -72,6 +72,14 @@ describe("what a connector with OpenCode advertises", () => {
     ]);
     expect(openCodeRunnerCapabilities({ installed: true, relayReady: true, options: ["gitlab"], desktop: false })).toEqual(["opencode-free-models-v1"]);
   });
+  it("offers an OpenCode Go plan's key sign-in only where a window can open on the computer", () => {
+    expect(openCodeRunnerCapabilities({ installed: true, relayReady: true, options: ["opencode-console", "opencode-go"], desktop: true })).toEqual([
+      "opencode-free-models-v1", "agent-login-opencode-v1", "agent-login-opencode:opencode-console", "agent-login-opencode:opencode-go",
+    ]);
+    expect(openCodeRunnerCapabilities({ installed: true, relayReady: true, options: ["opencode-console", "opencode-go"], desktop: false })).toEqual([
+      "opencode-free-models-v1", "agent-login-opencode-v1", "agent-login-opencode:opencode-console",
+    ]);
+  });
 });
 
 describe("Google Antigravity's Gemini Enterprise sign-in from the site", () => {
