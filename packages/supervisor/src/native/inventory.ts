@@ -2,7 +2,7 @@ import { z } from "zod";
 import { DELIVERY_TURN_RENEWAL_CAPABILITY } from "./delivery-turn-renewal.js";
 import { DIRECT_TURN_RENEWAL_CAPABILITY } from "./direct-turn-renewal.js";
 import { ConnectedAgentViewSchema, REMOTE_CORE_CONTRACT_CAPABILITY, REMOTE_WORKSPACE_CHECKPOINT_CAPABILITY, REMOTE_WORKSPACE_CHUNK_CAPABILITY,
-  REMOTE_DIRECT_MODEL_FALLBACK_CAPABILITY,
+  REMOTE_DIRECT_MODEL_FALLBACK_CAPABILITY, REMOTE_PERMISSION_ANSWER_CAPABILITY,
   REMOTE_AGENT_LOGIN_BROWSER_CAPABILITY, REMOTE_AGENT_LOGIN_CAPABILITY, REMOTE_CANCELLATION_DELIVERY_CAPABILITY, REMOTE_EXECUTION_PERMITS_CAPABILITY, REMOTE_DELIVERY_PERMITS_CAPABILITY, REMOTE_PREVIEW_APP_CREDENTIALS_CAPABILITY, REMOTE_PREVIEW_CAPABILITY, REMOTE_SESSION_LABEL_CAPABILITY, type ConnectedAgentView,
 } from "@konteks/remote-common";
 import { hostPressureRatio, UtilizationSignalsSchema, type SignalSampler } from "@konteks/remote-sysmon";
@@ -24,6 +24,9 @@ interface NativeInventoryOptions {
   executionPermitsReady?: () => boolean;
   /** Dedicated delivery protocol composition; Assistant support is not enough. */
   deliveryExecutionPermitsReady?: () => boolean;
+  /** A person's answer to a pending question can reach this connector: it
+   * trusts Core's answer producer and is relay-connected (R5-O22). */
+  permissionAnswersReady?: () => boolean;
   /** Cancellation remains available independently of agent sign-in/readiness. */
   cancellationDeliveryReady?: () => boolean;
   /** A person may start this machine's Codex login from the site. */
@@ -175,9 +178,14 @@ export class NativeInventoryCollector {
   /** Signed execution and delivery permits, only while some agent is ready to use them. */
   private permitCapabilities(anyReady: boolean): string[] {
     const permits: string[] = [];
-    if (anyReady && this.options.executionPermitsReady?.()) permits.push(REMOTE_EXECUTION_PERMITS_CAPABILITY, REMOTE_DIRECT_MODEL_FALLBACK_CAPABILITY, DIRECT_TURN_RENEWAL_CAPABILITY);
+    if (anyReady && this.options.executionPermitsReady?.()) permits.push(REMOTE_EXECUTION_PERMITS_CAPABILITY, REMOTE_DIRECT_MODEL_FALLBACK_CAPABILITY, DIRECT_TURN_RENEWAL_CAPABILITY, ...this.answerCapabilities());
     if (anyReady && this.options.deliveryExecutionPermitsReady?.()) permits.push(REMOTE_DELIVERY_PERMITS_CAPABILITY, DELIVERY_TURN_RENEWAL_CAPABILITY);
     return permits;
+  }
+
+  /** A turn may ask the person only where their answer can come back. */
+  private answerCapabilities(): string[] {
+    return this.options.permissionAnswersReady?.() ? [REMOTE_PERMISSION_ANSWER_CAPABILITY] : [];
   }
 
   /** Cancellation delivery and site-started logins, whatever the agents' readiness. */

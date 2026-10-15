@@ -98,6 +98,18 @@ describe("native host inventory", () => {
     f.readiness.mockRejectedValue(new Error("runner unavailable"));
     expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(["core-contract-version-v1"]);
   });
+  it("says a person's answer can reach it only while permits are live and Core's answer producer is trusted (R5-O22)", async () => {
+    let answers = true;
+    const readiness = vi.fn(async () => ({ agent, utilization: { activeSessions: 0, activeTurns: 0 } }));
+    const sample = vi.fn(async () => signals);
+    const collect = async (permits: boolean) => (await new NativeInventoryCollector({ runners: new Map([["codex", { readiness }]]), sampler: { sample }, bundleVersion: "1.0.0",
+      now: () => new Date(signals.observedAt), executionPermitsReady: () => permits, permissionAnswersReady: () => answers }).collect()).components[0]?.capabilities;
+    expect(await collect(true)).toContain("permission-answer-delivery.v1");
+    expect(await collect(false)).not.toContain("permission-answer-delivery.v1");
+    answers = false;
+    expect(await collect(true)).not.toContain("permission-answer-delivery.v1");
+  });
+
   it("reports only the actual in-process runner and host pressure, never appliance components", async () => {
     const f = fixture();
     const snapshot = await f.inventory.collect();

@@ -596,6 +596,8 @@ export class Supervisor {
         if (!this.work || !this.nativeOwnership || this.stopping) return false;
         try { this.nativeOwnership.assertOwned(); return true; } catch { return false; }
       },
+      // A person's answer needs Core's named producer and the relay (R5-O22).
+      permissionAnswersReady: () => Boolean(this.config.SUPERVISOR_CORE_PERMISSION_ANSWER_PRODUCER) && Boolean(this.relay) && !this.stopping,
       // A site-started login needs a native install with a Codex runner.
       agentLoginReady: () => this.runners.has("codex") && !this.stopping && this.relay !== null && this.relay !== undefined,
       agentLoginBrowserReady: () => this.runners.has("claude-code") && !this.stopping && this.relay !== null && this.relay !== undefined && machineHasDesktop(),
