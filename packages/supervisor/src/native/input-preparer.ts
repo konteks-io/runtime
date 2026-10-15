@@ -68,6 +68,8 @@ interface NativeInputPreparerOptions {
   prepareRepositoryWorktree?: (cwd: string, agentId: string) => Promise<void | "unavailable" | "skipped" | "wired">;
   outputClient?: () => NativeOutputClient;
   logger?: Pick<Logger, "warn"> & Partial<Pick<Logger, "info">>;
+  /** How often a prompt recheck still waiting on one step logs it; tests shorten it. */
+  recheckWatchMs?: number;
 }
 const ReceiptSchema = z
   .object({
@@ -845,21 +847,24 @@ class InputPreparation {
       this.mutate(async () => {
         if (prompting) throw unavailable();
         prompting = true;
+        const progress = new RecheckProgress(this.options.logger, this.assignment, this.options.recheckWatchMs ?? RECHECK_WATCH_MS);
         try {
-          await source.verify();
-          await prepared.beforePrompt();
+          await progress.step("source_verify", () => source.verify());
+          await progress.step("session_inputs", () => prepared.beforePrompt());
           // The one Core recheck between the envelope and the prompt.
           // After local verification, so a local failure costs no call.
-          await inputs.authorize();
-          await source.verify();
-          await this.beginWorkspacePreservation(inputs, source);
+          await progress.step("core_recheck", () => inputs.authorize());
+          await progress.step("source_reverify", () => source.verify());
+          await progress.step("workspace_preservation", () => this.beginWorkspacePreservation(inputs, source));
+          progress.finished();
         } catch (error) {
           // The turn fails as unavailable either way; keep why.
           this.options.logger?.warn({ event: "native.inputs.recheck_failed", assignmentId: this.assignment.id,
-            attempt: this.assignment.attempt, ...failureFields(error, "local_verification_failed") },
+            attempt: this.assignment.attempt, ...failureFields(error, "local_verification_failed"), ...progress.fields() },
           "Inputs could not be rechecked before the prompt");
           throw unavailable();
         } finally {
+          progress.stop();
           prompting = false;
         }
       });
@@ -905,4 +910,49 @@ export function createNativeInputPreparer(
 
 function checkpointFormat(supported: (() => boolean) | undefined): { format?: "konteks-workspace-checkpoint-v2" } {
   return supported?.() ? { format: "konteks-workspace-checkpoint-v2" } : {};
+}
+
+/** How often a recheck still waiting on one step says so. */
+const RECHECK_WATCH_MS = 30_000;
+
+/**
+ * The recheck between an admitted prompt and the agent, step by step. A turn
+ * waited 58 minutes here with nothing logged (10-15, D172); now each wait
+ * past the watch interval names its step, and a finished recheck its timings.
+ */
+class RecheckProgress {
+  private readonly started = Date.now();
+  private readonly durations: Record<string, number> = {};
+  private current: { step: string; since: number } | null = null;
+  private readonly timer: ReturnType<typeof setInterval>;
+
+  constructor(private readonly logger: NativeInputPreparerOptions["logger"], private readonly assignment: RemoteWorkAssignment, watchMs: number) {
+    this.timer = setInterval(() => this.reportWaiting(), watchMs);
+    this.timer.unref?.();
+  }
+
+  async step<T>(step: string, run: () => Promise<T>): Promise<T> {
+    this.current = { step, since: Date.now() };
+    try { return await run(); }
+    finally { this.durations[step] = Date.now() - this.current.since; this.current = null; }
+  }
+
+  finished(): void {
+    this.logger?.info?.({ event: "native.inputs.recheck_finished", assignmentId: this.assignment.id, attempt: this.assignment.attempt,
+      elapsedMs: Date.now() - this.started, stepsMs: this.durations }, "inputs rechecked before the prompt");
+  }
+
+  fields(): { step?: string; elapsedMs: number } {
+    return { ...(this.current ? { step: this.current.step } : {}), elapsedMs: Date.now() - this.started };
+  }
+
+  stop(): void { clearInterval(this.timer); }
+
+  private reportWaiting(): void {
+    if (!this.current) return;
+    const now = Date.now();
+    this.logger?.warn({ event: "native.inputs.recheck_waiting", assignmentId: this.assignment.id, attempt: this.assignment.attempt,
+      step: this.current.step, stepElapsedMs: now - this.current.since, elapsedMs: now - this.started },
+    "the prompt still waits for its inputs to be rechecked");
+  }
 }

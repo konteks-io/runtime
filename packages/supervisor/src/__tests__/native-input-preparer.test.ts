@@ -296,6 +296,27 @@ describe("repository session continuity inputs", () => {
     await expect(prepared.beforePrompt()).rejects.toThrow();
     expect(f.fetchFn).not.toHaveBeenCalled();
   });
+  it("says which recheck step a prompt still waits on, and how long each took (D172)", async () => {
+    const f = await repositoryFixture({});
+    const logger = { warn: vi.fn(), info: vi.fn() };
+    const prepared = await createNativeInputPreparer({ ...f.options, git: f.git, logger, recheckWatchMs: 10,
+      repositoryCacheRoot: join(f.root, "cache") })(nativeRepositoryAssignment());
+    const serve = f.fetchFn.getMockImplementation()!;
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    f.fetchFn.mockImplementation(async (...args: Parameters<typeof serve>) => {
+      if (String(args[0]).endsWith("/inputs/prepare")) await held;
+      return serve(...args);
+    });
+    const recheck = prepared.beforePrompt();
+    await vi.waitFor(() => expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "native.inputs.recheck_waiting", step: "core_recheck" }), expect.any(String)));
+    release();
+    await recheck;
+    const finished = logger.info.mock.calls.map(([fields]) => fields as { event?: string; stepsMs?: Record<string, number> })
+      .find(fields => fields.event === "native.inputs.recheck_finished");
+    expect(Object.keys(finished!.stepsMs!)).toEqual(["source_verify", "session_inputs", "core_recheck", "source_reverify", "workspace_preservation"]);
+  });
   it("retains empty source-tree compatibility for repository sessions", async () => {
     const f = await repositoryFixture({});
     const prepared = await createNativeInputPreparer({ ...f.options, git: f.git,
