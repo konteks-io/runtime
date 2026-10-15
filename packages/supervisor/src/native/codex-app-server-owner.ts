@@ -18,6 +18,8 @@ import {
   verifyNativeRunnerPackage,
   assertCodexThreadsIdle,
   codexLoadedThreadStatuses,
+  interruptOrphanedCodexTurns,
+  type OrphanedCodexTurn,
   resolveCodexSocket,
   type RunnerConfig,
 } from "@konteks/remote-agent-runner";
@@ -25,6 +27,8 @@ import { resolveNativeCodexSocket } from "./installation.js";
 import { resolveNativeCodexHome } from "./codex-home.js";
 
 const DEFAULT_RESTART_DELAYS_MS = [250, 500, 1_000, 2_000, 5_000, 10_000] as const;
+/** Drained for maintenance, a question waiting this long has nobody left to answer it. */
+const MAINTENANCE_ORPHAN_AFTER_MS = 60_000;
 
 export interface NativeCodexAppServerOwnerOptions {
   config: RunnerConfig;
@@ -44,6 +48,10 @@ export interface NativeCodexAppServerOwnerOptions {
   socketHolder?: (socketPath: string) => Promise<CodexSocketHolder | null>;
   /** Fail closed unless every loaded thread in the shared owner is idle. */
   assertIdleThreads?: (socketPath: string) => Promise<void>;
+  /** Interrupt turns no Konteks session can own; tests replace the socket calls. */
+  interruptOrphanedTurns?: typeof interruptOrphanedCodexTurns;
+  /** Each orphaned turn this owner interrupted, for the supervisor's log. */
+  onOrphanedTurnsInterrupted?: (turns: OrphanedCodexTurn[]) => void;
   /** Stop a stale server's process group; tests replace the signals. */
   stopHolder?: (pid: number) => Promise<void>;
   onStaleReplaced?: (event: { pid: number; staleRelease: string; currentRelease: string }) => void;
@@ -91,7 +99,7 @@ export class NativeCodexAppServerOwner {
     this.ops = { ...DEFAULT_OPERATIONS, ...withoutUndefined({
       spawn: options.spawn, stop: options.stop, groupAlive: options.groupAlive, prepareSocket: options.prepareSocket,
       socketAvailable: options.socketAvailable, waitUntilReady: options.waitUntilReady, cleanupSocket: options.cleanupSocket,
-      verifyPackage: options.verifyPackage, socketHolder: options.socketHolder, assertIdleThreads: options.assertIdleThreads,
+      verifyPackage: options.verifyPackage, socketHolder: options.socketHolder, assertIdleThreads: options.assertIdleThreads, interruptOrphanedTurns: options.interruptOrphanedTurns,
       stopHolder: options.stopHolder, listProcesses: options.listProcesses, strayReachable: options.strayReachable,
     }) };
   }
@@ -126,13 +134,26 @@ export class NativeCodexAppServerOwner {
     process.once("exit", this.exitReaper);
   }
 
-  /** Called while the launcher drain is still cancellable, before service stop. */
-  async preflightMaintenance(): Promise<void> {
+  /**
+   * Called while the launcher drain is still cancellable, before service stop.
+   * The supervisor has drained every Konteks turn, so a turn still in progress
+   * has no owner left to finish it: it is interrupted, then all must be idle.
+   */
+  async preflightMaintenance(unowned: () => boolean = () => true): Promise<void> {
     await this.startPromise;
     if (this.stopping) throw unavailable("The shared Codex owner is stopping.");
     if (this.child || this.adoptedHolder) {
+      await this.releaseOrphanedTurns({ unowned, staleAfterMs: MAINTENANCE_ORPHAN_AFTER_MS });
       await this.ops.assertIdleThreads(this.options.config.RUNNER_NATIVE_CODEX_SOCKET!);
     }
+  }
+
+  /** Interrupts in-progress turns while `unowned` holds; see `interruptOrphanedCodexTurns`. */
+  async releaseOrphanedTurns(options: { unowned: () => boolean; staleAfterMs?: number }): Promise<OrphanedCodexTurn[]> {
+    if (this.stopping || (!this.child && !this.adoptedHolder)) return [];
+    const turns = await this.ops.interruptOrphanedTurns(this.options.config.RUNNER_NATIVE_CODEX_SOCKET!, options);
+    if (turns.length > 0) this.options.onOrphanedTurnsInterrupted?.(turns);
+    return turns;
   }
 
   async inspectLegacyThread(reference: string): Promise<{ unloaded: boolean; ownerGeneration: string }> {
@@ -593,6 +614,7 @@ interface OwnerOperations {
   verifyPackage: typeof verifyNativeRunnerPackage;
   socketHolder: (socketPath: string) => Promise<CodexSocketHolder | null>;
   assertIdleThreads: (socketPath: string) => Promise<void>;
+  interruptOrphanedTurns: typeof interruptOrphanedCodexTurns;
   stopHolder: (pid: number) => Promise<void>;
   listProcesses: () => Promise<Array<{ pid: number; command: string }>>;
   strayReachable: (socketPath: string) => Promise<boolean>;
@@ -609,6 +631,7 @@ const DEFAULT_OPERATIONS: OwnerOperations = {
   verifyPackage: verifyNativeRunnerPackage,
   socketHolder: findCodexSocketHolder,
   assertIdleThreads: assertCodexThreadsIdle,
+  interruptOrphanedTurns: interruptOrphanedCodexTurns,
   stopHolder: stopProcessGroup,
   listProcesses,
   strayReachable: canConnect,

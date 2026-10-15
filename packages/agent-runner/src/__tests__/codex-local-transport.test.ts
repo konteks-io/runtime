@@ -6,7 +6,7 @@ import { once } from "node:events";
 import { WebSocketServer } from "ws";
 import { afterEach, expect, it, vi } from "vitest";
 import { connectCodexLocalTransport } from "../bridge/codex-local-transport.js";
-import { codexLoadedThreadStatuses } from "../bridge/codex-thread-inventory.js";
+import { assertCodexThreadsIdle, codexLoadedThreadStatuses, interruptOrphanedCodexTurns } from "../bridge/codex-thread-inventory.js";
 import { readCodexAccount } from "../auth/codex-account.js";
 import { RunnerConfigSchema } from "../config.js";
 import { findAgentBridge } from "@konteks/remote-release";
@@ -101,6 +101,52 @@ it.skipIf(process.platform === "win32")("rejects a disconnect between loaded-lis
     }
   }));
   await expect(codexLoadedThreadStatuses(f.socket)).rejects.toThrow(/inventory unavailable/);
+});
+
+/** 10-15, taufan-mac: a turn left waiting on an approval after its session ended blocked every update. */
+function orphanServer(f: Awaited<ReturnType<typeof fixture>>, threads: Record<string, { status: { type: string; activeFlags?: string[] }; updatedAt: number; turn?: string }>) {
+  const calls: Array<{ method: string; params: unknown }> = [];
+  f.ws.on("connection", socket => socket.on("message", data => {
+    const message = JSON.parse(data.toString());
+    if (message.id === undefined) return;
+    calls.push({ method: message.method, params: message.params });
+    const thread = threads[message.params?.threadId];
+    const result = message.method === "thread/loaded/list" ? { data: Object.keys(threads), nextCursor: null }
+      : message.method === "thread/read" ? { thread: { id: message.params.threadId, status: thread!.status, updatedAt: thread!.updatedAt,
+        ...(message.params.includeTurns ? { turns: [{ id: "turn-old", status: "completed" }, ...(thread!.turn ? [{ id: thread!.turn, status: "inProgress" }] : [])] } : {}) } }
+      : {};
+    socket.send(JSON.stringify({ id: message.id, result }));
+  }));
+  return calls;
+}
+const ids = { idle: "00000000-0000-7000-8000-00000000000a", orphan: "00000000-0000-7000-8000-00000000000b", running: "00000000-0000-7000-8000-00000000000c", fresh: "00000000-0000-7000-8000-00000000000d" };
+const NOW = Date.parse("2026-10-15T08:40:00Z");
+const threads = {
+  [ids.idle]: { status: { type: "idle" }, updatedAt: NOW / 1000 - 3600 },
+  [ids.orphan]: { status: { type: "active", activeFlags: ["waitingOnApproval"] }, updatedAt: Date.parse("2026-10-14T17:02:14Z") / 1000, turn: "turn-orphan" },
+  [ids.running]: { status: { type: "active", activeFlags: [] }, updatedAt: NOW / 1000 - 3600, turn: "turn-running" },
+  [ids.fresh]: { status: { type: "active", activeFlags: ["waitingOnUserInput"] }, updatedAt: NOW / 1000 - 30, turn: "turn-fresh" },
+};
+it.skipIf(process.platform === "win32")("refuses maintenance as active work, naming what still waits and since when", async () => {
+  const f = await fixture();
+  orphanServer(f, { [ids.idle]: threads[ids.idle]!, [ids.orphan]: threads[ids.orphan]! });
+  await expect(assertCodexThreadsIdle(f.socket)).rejects.toMatchObject({
+    code: "active_work", message: `Codex has an active or unverified loaded thread: ${ids.orphan} active (waitingOnApproval) since 2026-10-14T17:02:14.000Z`,
+  });
+});
+it.skipIf(process.platform === "win32")("interrupts only stale turns waiting on a person, while nothing owns them", async () => {
+  const f = await fixture();
+  const calls = orphanServer(f, threads);
+  const interrupted = await interruptOrphanedCodexTurns(f.socket, { unowned: () => true, staleAfterMs: 15 * 60_000, now: () => NOW });
+  expect(interrupted).toEqual([{ threadId: ids.orphan, turnId: "turn-orphan", flags: ["waitingOnApproval"], updatedAt: threads[ids.orphan]!.updatedAt }]);
+  // A running turn ends by itself; a question asked 30 s ago may still be answered.
+  expect(calls.filter(call => call.method === "turn/interrupt").map(call => call.params)).toEqual([{ threadId: ids.orphan, turnId: "turn-orphan" }]);
+});
+it.skipIf(process.platform === "win32")("interrupts nothing once Konteks work owns the computer again", async () => {
+  const f = await fixture();
+  const calls = orphanServer(f, threads);
+  expect(await interruptOrphanedCodexTurns(f.socket, { unowned: () => false, now: () => NOW })).toEqual([]);
+  expect(calls.some(call => call.method === "turn/interrupt")).toBe(false);
 });
 
 /** Codex 0.159+ binds in its own private directory and links the path it was given. */
