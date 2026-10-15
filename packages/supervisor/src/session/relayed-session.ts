@@ -36,6 +36,7 @@ import type { CapabilityTokenIssue, DeferredPermissionBody } from "../core/clien
 import { deferredPermissionRequest, type AdmittedMcpTool, type PolicyDecision, type PolicyResponder } from "./policy-responder.js";
 import type { PreparedSessionInputs } from "../skills/session-inputs.js";
 import { McpCapabilityFacade, type McpLocalTransportIdentity } from "../mcp/capability-facade.js";
+import { NativeCoordinationInvocations } from "../mcp/native-invocations.js";
 import { PREVIEW_WORK_KINDS, PreviewMcpServer, type SessionPreviewAccess } from "../preview/mcp-server.js";
 import { PreviewBrowserGateway } from "../preview/browser-gateway.js";
 import {
@@ -232,8 +233,11 @@ export class RelayedSession {
   private readonly toolGovernance: HostToolGovernance | null;
   /** The MCP servers this session gave its agent (the only Code Mode namespaces an OpenCode block may call, the only servers Antigravity may reach). */
   private sessionServers: ReadonlySet<string> = new Set();
+  private platformServers: ReadonlySet<string> = new Set();
   /** Codex's announced MCP calls: its approvals name only the tool call id. */
   private readonly mcpCalls: McpToolCallLedger | null;
+  private readonly coordinationCalls: NativeCoordinationInvocations;
+  private readonly pendingToolPermissions = new Map<string, RequestPermissionRequest>();
   /** The path the agent's streamed reply ends inside, sent whole with the next chunk. */
   private readonly pathHold = new StreamedPathHold();
   /** Says on a waiting step when macOS is asking the person to let Konteks open a folder (E11). */
@@ -267,6 +271,7 @@ export class RelayedSession {
   constructor(readonly assignment: RemoteWorkAssignment, private readonly deps: RelayedSessionDeps) {
     this.toolGovernance = hostToolGovernance(assignment.agentRoute.agentId);
     this.mcpCalls = assignment.agentRoute.agentId === "codex" ? new McpToolCallLedger() : null;
+    this.coordinationCalls = new NativeCoordinationInvocations(deps.journal, () => this.coordinationContext(), () => new Date(deps.clock.now()));
     // Bound only after input preparation proves Core's claim-bound session.
     this.boundChannelId = null;
     this.logger = deps.logger ?? createLogger({ name: "relayed-session" });
@@ -463,6 +468,7 @@ export class RelayedSession {
     if (!this.assignment.agentRoute.mcpCapabilityTokenRef || direct) return;
     const issue = await this.bootstrapStage("capability_redemption", () => this.deps.redeemCapabilityToken(this.assignment));
     this.deps.assertExecutionOwned?.();
+    this.platformServers = new Set([issue.mcpServer.name]);
     const facade = new McpCapabilityFacade({
       initial: issue,
       ...(this.deps.mcpLocalTransport ? { localTransport: this.deps.mcpLocalTransport } : {}),
@@ -473,6 +479,7 @@ export class RelayedSession {
         return this.deps.redeemCapabilityToken(this.assignment);
       },
       onUnavailable: () => this.close("agent_exited"),
+      coordinationInvocation: (tool, args) => this.coordinationCalls.resolve(tool, args),
       // Core's answer to environment_open is the only thing that widens
       // this session's browser, and only to what Core named.
       onBrowserAccess: grant => { this.browserGateway?.grant(grant.origins, grant.kind); },
@@ -487,6 +494,23 @@ export class RelayedSession {
     this.mcpFacade = facade;
     mcpServers.push({ type: "http", ...(await this.bootstrapStage("facade", () => facade.start())),
     });
+  }
+
+  /** Only this process's currently dispatched, Core-admitted prompt can originate a tool effect. */
+  private coordinationContext() {
+    this.deps.assertExecutionOwned?.();
+    const authorization = this.dispatchingPromptAuthorization();
+    if (this.closed || !authorization) return null;
+    const claims = authorization.claims;
+    return { workspaceId: claims.workspaceId, assignmentId: claims.assignmentId, attempt: claims.attempt, acpSessionRef: claims.acpSessionRef, operationId: claims.operationId };
+  }
+
+  private dispatchingPromptAuthorization() {
+    const key = this.promptReservation;
+    if (key === null || this.executionGate === null) return null;
+    if (!this.executionGate.isDispatching(key)) return null;
+    const authorization = this.deps.journal.pendingRequests.get(key)?.authorization;
+    return authorization?.state === "dispatch_started" ? authorization : null;
   }
 
   /** The preview tools (and the browser, when this computer has one) for a kind of work that runs a preview. */
@@ -1168,7 +1192,9 @@ export class RelayedSession {
     await this.deps.journal.pendingRequests.put({ ...journaled, closedAt: this.deps.clock.nowIso() });
     if (this.closed) return;
     this.deps.assertExecutionOwned?.();
-    await this.deps.runner.answer(ref, message.id, issuedAnswer(message, journaled.method));
+    const answer = issuedAnswer(message, journaled.method);
+    await this.capturePermissionInvocation(message.id, answer);
+    await this.deps.runner.answer(ref, message.id, answer);
   }
 
   private async onAuthorizedOperation(body: unknown, assertDeliveryCurrent: () => void = () => {}): Promise<void> {
@@ -1355,6 +1381,7 @@ export class RelayedSession {
     const answer = issuedAnswer(message, message.method);
     const verdict = this.deps.broker.answer(ref, message.id, answer);
     if (!verdict.ok) throw new RemoteInstanceError("operation_conflict", "The pending human answer is no longer admissible.");
+    await this.capturePermissionInvocation(message.id, answer);
     this.notePermissionAnswer(message.id, answer);
     const delivered = await this.deps.runner.answer(ref, message.id, answer);
     if (!delivered.delivered) throw new RemoteInstanceError("operation_interrupted", "Answer delivery is unproven.");
@@ -1470,6 +1497,7 @@ export class RelayedSession {
     // A working agent keeps its preview from stopping as idle.
     if (this.previewSessionId !== null) this.deps.preview?.touch(this.previewSessionId);
     this.observeStructuredText(update);
+    await this.coordinationCalls.observe(update);
     this.mcpCalls?.observe(update);
     this.folderAccess.observe(update);
     const bypass = this.toolGovernance?.observe(update, this.sessionCwd(), this.readOnlyRoots) ?? null;
@@ -1694,6 +1722,7 @@ export class RelayedSession {
     if (ref === null) return;
     const request = this.toolGovernance ? await this.governPermission(ref, requestId, params, this.toolGovernance) : params;
     if (request === null) return;
+    this.pendingToolPermissions.set(requestId, request);
     const decision = await this.deps.policy.evaluatePermission(request, this.permissionContext());
     if (this.closed) return;
     this.deps.assertExecutionOwned?.();
@@ -1801,8 +1830,24 @@ export class RelayedSession {
 
   /** Answer a permission request, telling a host agent's governance what was decided (Antigravity pairs its own reports with it). */
   private async answerPermission(ref: string, requestId: string, response: { outcome: { outcome: string; optionId?: string } }): Promise<void> {
+    try { await this.capturePermissionInvocation(requestId, response); }
+    catch {
+      this.logger.warn({ event: "coordination.invocation_capture_failed", assignmentId: this.assignment.id, attempt: this.assignment.attempt }, "native coordination call refused before provider dispatch");
+      response = cancelledPermission();
+    }
     this.notePermissionAnswer(requestId, response);
     await this.deps.runner.answer(ref, requestId, response);
+  }
+
+  private async capturePermissionInvocation(requestId: string, response: unknown): Promise<void> {
+    const request = this.pendingToolPermissions.get(requestId);
+    this.pendingToolPermissions.delete(requestId);
+    if (!request) return;
+    const answer = response as { outcome?: { outcome?: string; optionId?: string } };
+    if (answer.outcome?.outcome !== "selected") return;
+    const option = request.options.find(candidate => candidate.optionId === answer.outcome?.optionId);
+    if (option?.kind !== "allow_once") return;
+    await this.coordinationCalls.capture(request, this.assignment.agentRoute.agentId, this.platformServers, this.mcpCalls ?? undefined);
   }
 
   private notePermissionAnswer(requestId: string, response: unknown): void {

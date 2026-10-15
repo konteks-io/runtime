@@ -9,6 +9,7 @@ import { hostPressureRatio, UtilizationSignalsSchema, type SignalSampler } from 
 import type { InventorySnapshot } from "../inventory/snapshot.js";
 import type { RunnerPort } from "../runner-port.js";
 import { onboardCapabilities } from "../inventory/roles.js";
+import { coordinationInvocationAgent } from "../mcp/native-invocations.js";
 
 const readinessSchema = z.object({
   agent: ConnectedAgentViewSchema,
@@ -22,6 +23,8 @@ interface NativeInventoryOptions {
   bundleVersion: string;
   /** Live composition/ownership check; absence never advertises permit support. */
   executionPermitsReady?: () => boolean;
+  /** Trusted ACP call capture and the native journal are composed under current ownership. */
+  coordinationInvocationsReady?: () => boolean;
   /** Dedicated delivery protocol composition; Assistant support is not enough. */
   deliveryExecutionPermitsReady?: () => boolean;
   /** A person's answer to a pending question can reach this connector: it
@@ -163,6 +166,7 @@ export class NativeInventoryCollector {
     // This build names the person's coding sessions from Core's display label;
     // an older one rejects the field, so Core sends it only on this signal.
     if (ready.length > 0) capabilities.push(REMOTE_SESSION_LABEL_CAPABILITY);
+    capabilities.push(...this.coordinationCapabilities(ready));
     // Always, whatever agents are installed: this build reads the Core
     // wire-contract version (`coreContractVersion`) Core signs into the desired
     // configuration of a connector that asks for it, and takes Core's 7.1
@@ -173,6 +177,11 @@ export class NativeInventoryCollector {
     // This build's preview takes the app's own cookies and Authorization (D46).
     if (this.options.previewReady?.()) capabilities.push(REMOTE_PREVIEW_CAPABILITY, REMOTE_PREVIEW_APP_CREDENTIALS_CAPABILITY);
     return capabilities;
+  }
+
+  private coordinationCapabilities(agents: readonly ConnectedAgentView[]): string[] {
+    if (!this.options.coordinationInvocationsReady?.()) return [];
+    return agents.filter(agent => coordinationInvocationAgent(agent.agentId)).map(agent => `coordination-invocations-v1:${agent.agentId}`);
   }
 
   /** Signed execution and delivery permits, only while some agent is ready to use them. */

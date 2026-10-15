@@ -9,7 +9,7 @@ import { PermissionAnswerReceiver } from "../control/permission-answer-receiver.
 import { SupervisorJournal } from "../state/journal.js";
 import { NativeExecutionGate, NATIVE_EXECUTION_RENEWAL_BUDGET_MS } from "../native/execution-gate.js";
 import { terminalOperationDispositions } from "../state/operation-dispositions.js";
-import { RelayedSession } from "../session/relayed-session.js";
+import { RelayedSession, type RelayedSessionDeps } from "../session/relayed-session.js";
 import { PermissionBroker } from "../session/permissions.js";
 import { EvaluatorPolicyResponder } from "../session/policy-responder.js";
 import type { RunnerPort } from "../runner-port.js";
@@ -479,12 +479,12 @@ it.each(["valid", "lost-during-keys", "lost-during-admission", "wrong-producer",
 
 async function sessionFixture(work: RemoteWorkAssignment = assignment, acceptDeliveryOutput?: (authority: { claimId: string; invocationRef: string }) => Promise<RemoteDeliveryAcceptanceReceipt>,
   logger?: { warn: (...args: unknown[]) => void; info: (...args: unknown[]) => void; error: (...args: unknown[]) => void; debug: (...args: unknown[]) => void },
-  authority: Record<string, unknown> = {}) {
+  authority: Record<string, unknown> = {}, deps: Partial<RelayedSessionDeps> = {}) {
   const f = work.source.kind === "harness_delivery" ? await deliveryFixture() : await fixture();
   const entry = f.journal.assignments.get(`${work.id}:${work.attempt}`)!;
   await f.journal.assignments.put({ ...entry, kind: work.kind });
   const runner = { createSession: vi.fn(async () => ({ acpSessionRef: "acp", resumed: false, capabilities: { forkSession: false, sessionResume: false } })),
-    prompt: vi.fn(async () => undefined), cancel: vi.fn(async () => undefined),
+    prompt: vi.fn(async () => undefined), cancel: vi.fn(async () => undefined), answer: vi.fn(async () => ({ delivered: true })),
     // Mirrors NativeRunner: every completed native close returns the continuation receipt.
     closeSession: vi.fn(async (_ref: string, options?: { completed: true }) => options?.completed ? { completion: "native_continuation_ready" as const } : undefined),
     stopForRecovery: vi.fn(async () => undefined) };
@@ -500,7 +500,7 @@ async function sessionFixture(work: RemoteWorkAssignment = assignment, acceptDel
       ...(acceptDeliveryOutput ? { acceptDeliveryOutput } : {}) }),
     registerReady: async () => f.ready, redeemCapabilityToken: async () => { throw new Error("unexpected capability redemption"); },
     policy: new EvaluatorPolicyResponder(null, () => false), broker: new PermissionBroker({ clock: f.clock, deadlineSeconds: () => 60, onTimeout: async () => undefined }),
-    onUsage: async () => undefined, onClosed: async () => undefined, ...(logger ? { logger: logger as never } : {}) });
+    onUsage: async () => undefined, onClosed: async () => undefined, ...(logger ? { logger: logger as never } : {}), ...deps });
   sessions.push(session); await session.bootstrap(); send.mockClear();
   return { ...f, session, runner, send, beforePrompt };
 }
@@ -533,6 +533,25 @@ function stopOperation(f: SessionFixture, delivered: boolean) {
 }
 
 describe("native session dispatch uses genuine execution admission", () => {
+  it("durably captures a coordination call against the live signed prompt before giving the provider permission", async () => {
+    const work = { ...assignment, agentRoute: { ...assignment.agentRoute, mcpCapabilityTokenRef: "capability" } };
+    const f = await sessionFixture(work, undefined, undefined, {}, {
+      policy: new EvaluatorPolicyResponder({ evaluateToolUse: async () => ({ allowed: true }) }, () => false),
+      redeemCapabilityToken: async () => ({ mcpServer: { name: "konteks-platform", url: "https://mcp.example/mcp", headers: [{ name: "authorization", value: "Bearer fixture" }] }, expiresAt }),
+    });
+    await f.session.onToRuntime(f.envelope);
+    const tool = "platform__coordination__send";
+    const args = { body: "What is the shared interface?" };
+    await f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp", params: { sessionId: "acp", update: { sessionUpdate: "tool_call", toolCallId: "provider-call", rawInput: { server: "konteks-platform", tool, arguments: args }, _meta: { is_mcp_tool_call: true } } } } as never);
+    f.runner.answer.mockImplementationOnce(async () => {
+      const recovered = new SupervisorJournal(root); await recovered.load();
+      expect(recovered.coordinationInvocations.all()).toEqual([expect.objectContaining({ operationId: "operation", toolCallId: "provider-call", assignmentId: "assignment", attempt: 1, state: "captured" })]);
+      return { delivered: true };
+    });
+    await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp", requestId: "approval", params: { sessionId: "acp", toolCall: { toolCallId: "provider-call", kind: "other" }, options: [{ optionId: "allow", kind: "allow_once", name: "Allow" }, { optionId: "deny", kind: "reject_once", name: "Deny" }], _meta: { is_mcp_tool_approval: true } } } as never);
+    expect(f.runner.answer).toHaveBeenCalledWith("acp", "approval", { outcome: { outcome: "selected", optionId: "allow" } });
+    await f.session.close("cancelled");
+  });
   it("closes a prepared delivery assignment after its authorized pre-prompt cancellation", async () => {
     const work = { ...assignment, kind: "delivery" as const, taskId: "task", correlationId: "invocation",
       agentRoute: { agentId: "codex", requiredRole: "generator" as const, sessionConfig: { model: "model-a" } },

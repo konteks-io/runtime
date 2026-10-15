@@ -14,6 +14,17 @@ function fixture(executionPermitsReady?: () => boolean, cancellationDeliveryRead
 }
 
 describe("native host inventory", () => {
+  it("advertises coordination invocation capture only for its supported ready adapters with live ownership", async () => {
+    const readiness = vi.fn(async () => ({ agent, utilization: { activeSessions: 0, activeTurns: 0 } }));
+    let owned = true;
+    const inventory = new NativeInventoryCollector({ runners: new Map([["codex", { readiness }]]), sampler: { sample: async () => signals }, bundleVersion: "1.0.0", coordinationInvocationsReady: () => owned });
+    expect((await inventory.collect()).components[0]?.capabilities).toContain("coordination-invocations-v1:codex");
+    owned = false;
+    expect((await inventory.collect()).components[0]?.capabilities).not.toContain("coordination-invocations-v1:codex");
+    owned = true;
+    readiness.mockResolvedValue({ agent: { ...agent, readiness: "not_configured" }, utilization: { activeSessions: 0, activeTurns: 0 } });
+    expect((await inventory.collect()).components[0]?.capabilities).not.toContain("coordination-invocations-v1:codex");
+  });
   it("advertises workspace restoration only when the live composition supports it", async () => {
     let ready = false;
     const inventory = new NativeInventoryCollector({ runners: new Map(), sampler: { sample: async () => signals }, bundleVersion: "1.0.0", workspaceRecoveryReady: () => ready });
