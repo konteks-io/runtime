@@ -151,6 +151,28 @@ describe("native update coordinator", () => {
     const old = coordinator({ ledger: { schemaVersion: 1, attempts: [1, 2, 3].map(() => attempt({ manifestDigest: digest, startedAt: "2026-09-13T11:00:00Z" })) } });
     expect(await old.c.apply("periodic")).toMatchObject({ started: true });
   });
+  it("does not count attempts that only waited on active work against the release (10-15)", async () => {
+    const { m } = coordinator({});
+    const digest = m.newer.digest;
+    // taufan-mac, 10-15: a busy Codex and an active delivery deferred 0.17.0 three times, and the old limit then held it back for a day.
+    const deferred = (detail: string) => attempt({ manifestDigest: digest, outcome: "failed", detail: `deferred: ${detail}` });
+    const waited = coordinator({ ledger: { schemaVersion: 1, attempts: [deferred("internal: control operation failed"), deferred("The update waited for active work past its deadline"), deferred("internal: control operation failed")] } });
+    expect(await waited.c.apply("periodic")).toMatchObject({ started: true });
+    // Real failures still count.
+    const failing = coordinator({ ledger: { schemaVersion: 1, attempts: [1, 2, 3].map(() => attempt({ manifestDigest: digest, outcome: "failed", detail: "health gate failed" })) } });
+    expect(await failing.c.apply("periodic")).toMatchObject({ started: false, reason: expect.stringMatching(/failed 3 time\(s\)/) });
+  });
+  it("says once why a check of its own accord launched nothing", async () => {
+    const logger = createLogger({ name: "test", silent: true });
+    const info = vi.spyOn(logger, "info");
+    const { m } = coordinator({});
+    const digest = m.newer.digest;
+    const looping = coordinator({ logger, ledger: { schemaVersion: 1, attempts: [1, 2, 3].map(() => attempt({ manifestDigest: digest })) } });
+    await looping.c.apply("periodic");
+    await looping.c.apply("periodic");
+    const notes = info.mock.calls.map(([fields]) => fields as { event?: string; reason?: string }).filter(fields => fields.event === "native.update.not_launched");
+    expect(notes).toEqual([expect.objectContaining({ reason: expect.stringMatching(/rolled_back 3 time\(s\)/), current: "1.0.0" })]);
+  });
   it("acts on Core's update_required immediately and reports a launch failure without pretending", async () => {
     const { c, launch } = coordinator({});
     c.onUpdateRequired({ minimumSupportedBundle: "1.1.0" });

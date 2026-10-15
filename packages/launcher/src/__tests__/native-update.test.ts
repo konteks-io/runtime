@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { NATIVE_UPDATE_TARGET_ENV, bundleManifestSigningBytes, computeBundleManifestDigest, RemoteInstanceError, writeSecretFile } from "@konteks/remote-common";
 import { buildReleaseFixture, nativeServiceExecutable, resolveNativeConnectorExecutable, verifyNativeRelease, type CodeIdentity } from "@konteks/remote-release";
-import { acquireNativeRootLock, loadNativeInstallation, OPENCODE_MIN_BINARY_BYTES, readNativeUpdateLedger, SupervisorStore, verifyInstalledNativeConnector, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
+import { acquireNativeRootLock, isDeferredUpdateAttempt, loadNativeInstallation, OPENCODE_MIN_BINARY_BYTES, readNativeUpdateLedger, SupervisorStore, verifyInstalledNativeConnector, type NativeRuntimeRecord, type NativeUpdateAttempt } from "@konteks/remote-supervisor";
 import { installNative, readNativeRecord, restoreNativeRecord } from "../native/install.js";
 import { checkNativeUpdate, commitNativeUpdate, stageNativeUpdate } from "../native/update.js";
 import { earlierFailure, earlierFailureNote, keepLauncherCurrent, refreshInstalledLauncher, runNativeUpdate, selfUpdateNote, type NativeUpdateTransactionDeps } from "../native/update-transaction.js";
@@ -532,6 +532,10 @@ describe("native update transaction", () => {
     expect(h.calls).not.toContain("start");
     expect(h.currentRecord().releaseId).toBe("release-prev");
     expect(h.ledger.map(attempt => (attempt as { outcome: string }).outcome)).toEqual(["in_progress", "failed"]);
+    // The running release was never stopped: a deferral, which the supervisor does not count against the release.
+    expect(h.ledger.at(-1)).toMatchObject({ detail: "deferred: Codex has an active or unreadable loaded thread" });
+    expect(isDeferredUpdateAttempt(h.ledger.at(-1) as NativeUpdateAttempt)).toBe(true);
+    expect(earlierFailure(h.ledger as NativeUpdateAttempt[], (h.ledger.at(-1) as NativeUpdateAttempt).manifestDigest)).toBeNull();
   });
   it.each([false, true])("uses a verified private-socket inventory when the previous connector lacks the new preflight op (idle=%s)", async idle => {
     const h = harness({ previous: { ...previous, agents: ["codex"] } });

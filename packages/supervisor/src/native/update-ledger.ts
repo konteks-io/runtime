@@ -19,6 +19,18 @@ export const NativeUpdateAttemptSchema = z.object({
 export type NativeUpdateAttempt = z.infer<typeof NativeUpdateAttemptSchema>;
 
 /**
+ * An attempt that ended before the running release was stopped (it waited on
+ * active work, or Codex was busy) changed nothing and says nothing about the
+ * release. It keeps the `failed` outcome older connectors can read, and this
+ * detail prefix tells newer ones not to count it against the release.
+ */
+export const DEFERRED_UPDATE_DETAIL_PREFIX = "deferred: ";
+
+export function isDeferredUpdateAttempt(attempt: Pick<NativeUpdateAttempt, "outcome" | "detail">): boolean {
+  return attempt.outcome === "failed" && (attempt.detail?.startsWith(DEFERRED_UPDATE_DETAIL_PREFIX) ?? false);
+}
+
+/**
  * Durable memory of update attempts, written by the launcher transaction and
  * read by the supervisor before launching another. It survives the process
  * restart every update implies, so a release that keeps rolling back is

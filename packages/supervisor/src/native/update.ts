@@ -1,7 +1,7 @@
 import { RemoteInstanceError, type Logger, type NativeUpdateApply, type NativeUpdateStatus } from "@konteks/remote-common";
 import { verifyNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 import { compareSemver } from "../control/handlers.js";
-import type { NativeUpdateLedger } from "./update-ledger.js";
+import { isDeferredUpdateAttempt, type NativeUpdateLedger } from "./update-ledger.js";
 
 export type NativeUpdateTarget = { bundleVersion: string; manifestDigest: string };
 type AvailableRelease = NativeUpdateTarget;
@@ -92,6 +92,7 @@ export class NativeUpdateCoordinator {
   private recheckTimer: NodeJS.Timeout | null = null;
   /** Re-checks scheduled since the release last stopped waiting for Core. */
   private recheckStreak = 0;
+  private lastUnlaunchedReason: string | null = null;
   /** Set by the current check when the newest release waits only for Core's acceptance. */
   private awaitingAcceptance: AwaitingAcceptance | null = null;
   private applying: Promise<NativeUpdateApply> | null = null;
@@ -177,7 +178,7 @@ export class NativeUpdateCoordinator {
   /** Check, then launch at most one transaction; refusals are reported, never thrown, so callers see why. */
   apply(reason: NativeUpdateReason, target?: NativeUpdateTarget, assertCurrent?: () => void): Promise<NativeUpdateApply> {
     if (target && this.applying) return Promise.resolve(this.refuse("busy"));
-    this.applying ??= this.applyImpl(reason, target, assertCurrent).finally(() => {
+    this.applying ??= this.applyImpl(reason, target, assertCurrent).then(result => this.noteUnlaunched(result, target)).finally(() => {
       this.applying = null;
       this.scheduleAcceptanceRecheck();
     });
@@ -206,6 +207,19 @@ export class NativeUpdateCoordinator {
     this.recheckTimer.unref();
     this.options.logger.info({ event: "native.update.recheck_scheduled", ...awaiting, current: this.options.currentBundleVersion, delayMs },
       RECHECK_MESSAGES[awaiting.reason]);
+  }
+
+  /**
+   * A check of its own accord that launches nothing says why, once per
+   * reason, so a wait (backoff, Core's accepted release) is never silent.
+   */
+  private noteUnlaunched(result: NativeUpdateApply, target: NativeUpdateTarget | undefined): NativeUpdateApply {
+    if (result.started) this.lastUnlaunchedReason = null;
+    else if (!target && result.reason !== this.lastUnlaunchedReason) {
+      this.lastUnlaunchedReason = result.reason;
+      this.options.logger.info({ event: "native.update.not_launched", reason: result.reason, current: this.options.currentBundleVersion }, "the update check launched nothing");
+    }
+    return result;
   }
 
   private refuse(reason: string): NativeUpdateApply {
@@ -311,7 +325,7 @@ export class NativeUpdateCoordinator {
     const stale = this.options.staleAttemptMs ?? DEFAULT_STALE_ATTEMPT_MS;
     const live = ledger.attempts.find(attempt => attempt.outcome === "in_progress" && now - Date.parse(attempt.startedAt) < stale);
     if (live) return `an update transaction started at ${live.startedAt} is still in progress`;
-    const recentFailures = ledger.attempts.filter(attempt => attempt.manifestDigest === manifestDigest && attempt.outcome !== "applied" && attempt.outcome !== "in_progress" && now - Date.parse(attempt.startedAt) < window);
+    const recentFailures = ledger.attempts.filter(attempt => attempt.manifestDigest === manifestDigest && attempt.outcome !== "applied" && attempt.outcome !== "in_progress" && !isDeferredUpdateAttempt(attempt) && now - Date.parse(attempt.startedAt) < window);
     const max = this.options.maxAttemptsPerRelease ?? DEFAULT_MAX_ATTEMPTS;
     if (recentFailures.length >= max) return `release ${manifestDigest} was ${recentFailures[recentFailures.length - 1]!.outcome} ${recentFailures.length} time(s) within the retry window; waiting for a newer release or operator action`;
     return null;
