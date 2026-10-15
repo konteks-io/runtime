@@ -61,13 +61,14 @@ const INTEGRATION_LIST = JSON.stringify({ location: { directory: "/home" }, data
   { id: "snowflake-cortex", name: "Snowflake Cortex", methods: [{ type: "key", label: "Paste PAT", form: [{ key: "account", required: true, type: "string" }] }, { id: "browser", type: "oauth", label: "Login with Snowflake", form: [{ key: "account", required: true, type: "string" }] }], connections: [] },
   { id: "xai", name: "xAI", methods: [{ type: "key", label: "Manually enter API Key" }, { id: "device", type: "oauth", label: "SuperGrok Subscription" }], connections: [] },
   { id: "poe", name: "Poe", methods: [{ type: "key" }, { id: "browser", type: "oauth", label: "Login with Poe (browser)" }], connections: [] },
+  { id: "opencode-go", name: "OpenCode Go", methods: [{ type: "key" }, { type: "env" }], connections: [] },
   { id: "Bad Id", name: "x", methods: [{ type: "key" }], connections: [] },
 ] });
 
 describe("what the installed OpenCode can sign in to", () => {
   it("reads OpenCode's own integration list: methods it can drive, with the non-secret answers they need", () => {
     const integrations = parseOpenCodeIntegrations(INTEGRATION_LIST);
-    expect(integrations.map(integration => integration.id)).toEqual(["302ai", "opencode", "openai", "github-copilot", "gitlab", "snowflake-cortex", "xai", "poe"]);
+    expect(integrations.map(integration => integration.id)).toEqual(["302ai", "opencode", "openai", "github-copilot", "gitlab", "snowflake-cortex", "xai", "poe", "opencode-go"]);
     const byId = Object.fromEntries(integrations.map(integration => [integration.id, integration]));
     expect(byId.opencode!.methods).toEqual([
       { id: "key", kind: "api_key", label: "API key (service account)", answers: [] },
@@ -83,8 +84,11 @@ describe("what the installed OpenCode can sign in to", () => {
 
   it("advertises only the reviewed site sign-ins this OpenCode offers", () => {
     const all = parseOpenCodeIntegrations(INTEGRATION_LIST);
-    expect(openCodeSiteLoginOptions(all)).toEqual(["opencode-console", "chatgpt", "github-copilot", "supergrok", "gitlab", "poe"]);
-    expect(openCodeSiteLoginOptions(all.filter(integration => integration.id !== "xai" && integration.id !== "poe"))).toEqual(["opencode-console", "chatgpt", "github-copilot", "gitlab"]);
+    expect(openCodeSiteLoginOptions(all)).toEqual(["opencode-console", "opencode-go", "chatgpt", "github-copilot", "supergrok", "gitlab", "poe"]);
+    expect(openCodeSiteLoginOptions(all.filter(integration => integration.id !== "xai" && integration.id !== "poe" && integration.id !== "opencode-go"))).toEqual(["opencode-console", "chatgpt", "github-copilot", "gitlab"]);
+    // An OpenCode Go plan is offered wherever OpenCode takes its key: the key is typed on the computer.
+    const goKeyless = all.map(integration => integration.id === "opencode-go" ? { ...integration, methods: [] } : integration);
+    expect(openCodeSiteLoginOptions(goKeyless)).not.toContain("opencode-go");
   });
 });
 

@@ -269,11 +269,18 @@ export function isOpenCodeFreeModel(value: string): boolean {
   return /^opencode\/[^/\s]+-free$/i.test(value.trim());
 }
 
-/** The sign-ins the site may start on this machine, from what the installed OpenCode offers (reviewed options only). */
+/**
+ * The sign-ins the site may start on this machine, from what the installed
+ * OpenCode offers (reviewed options only). An option the person finishes on
+ * the computer (an OpenCode Go plan's key) needs only an API-key method there.
+ */
 export function openCodeSiteLoginOptions(integrations: readonly OpenCodeIntegration[]): OpenCodeLoginOptionId[] {
   return OPENCODE_LOGIN_OPTION_IDS.filter(id => {
     const option = OPENCODE_LOGIN_OPTIONS[id];
-    return integrations.some(integration => integration.id === option.integration && integration.methods.some(method => method.kind === "sign_in" && method.id === option.methodId));
+    const offered = (method: OpenCodeLoginMethod) => (option.method as string) === "on_computer"
+      ? method.kind === "api_key"
+      : method.kind === "sign_in" && method.id === option.methodId;
+    return integrations.some(integration => integration.id === option.integration && integration.methods.some(offered));
   });
 }
 
