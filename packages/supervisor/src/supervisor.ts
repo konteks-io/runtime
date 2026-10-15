@@ -119,6 +119,8 @@ import { EvaluatorPolicyResponder } from "./session/policy-responder.js";
 import { createWorkspaceToolPolicy, DIRECT_SESSION_BASH_BLOCKLIST } from "./session/workspace-tool-policy.js";
 import { ClaudeExecutableIdentity } from "./native/claude-executable-identity.js";
 import { SupervisorJournal, type JournalEntry } from "./state/journal.js";
+import { observeSlowJournalWork } from "./state/slow-work.js";
+import { EventLoopWatch } from "./event-loop-watch.js";
 import type { RuntimeRecoveryRecord } from "./state/runtime-recovery.js";
 import { DurableOutbox } from "./state/outbox.js";
 import { DEFAULT_CONFIG, MACHINE_KEY_LOST, SupervisorStore, type ConfigRecord, type ShutdownProgress } from "./state/store.js";
@@ -335,6 +337,7 @@ export class Supervisor {
   private pullTimer: NodeJS.Timeout | null = null;
   private reaperTimer: NodeJS.Timeout | null = null;
   private codexOrphanTimer: NodeJS.Timeout | null = null;
+  private eventLoopWatch: EventLoopWatch | null = null;
   private updates: NativeUpdateCoordinator | null = null;
   private runtimeUpdates: RuntimeUpdateReceiver | null = null;
   private muxTimer: NodeJS.Timeout | null = null;
@@ -1819,6 +1822,7 @@ export class Supervisor {
     this.reaperTimer.unref();
     this.codexOrphanTimer = setInterval(() => void this.releaseOrphanedCodexTurns(), CODEX_ORPHAN_SWEEP_MS);
     this.codexOrphanTimer.unref();
+    this.watchEventLoop();
     this.previews.startIdleSweep();
     this.ensureUpdates()?.start();
     this.ensureRuntimeUpdates()?.start();
@@ -2539,6 +2543,13 @@ export class Supervisor {
     return { draining: this.draining, reason: this.drainReason, activeAssignments: this.work.activeCount(), openSessions: this.work.openSessions() };
   }
 
+  /** Diagnostic only (D175): a held event loop, and the slow journal work before it, are logged. */
+  private watchEventLoop(): void {
+    observeSlowJournalWork(work => this.logger.info({ event: "journal.slow_work", ...work }, "slow journal work"));
+    this.eventLoopWatch ??= new EventLoopWatch(this.logger);
+    this.eventLoopWatch.start();
+  }
+
   /**
    * A Codex turn left waiting on a person after its Konteks session ended
    * would block every update and stop (10-15, taufan-mac). Swept only while no
@@ -3221,6 +3232,8 @@ export class Supervisor {
     this.turnActivityTimer = null;
     stopInterval(this.reaperTimer);
     stopInterval(this.codexOrphanTimer);
+    this.eventLoopWatch?.stop();
+    observeSlowJournalWork(undefined);
     stopInterval(this.livenessTimer);
     this.livenessTimer = null;
     this.updates?.stop();
