@@ -172,8 +172,18 @@ describe("fixed signed site runtime updates", () => {
     const delivery = f.make();
     f.clock.now += 30_000;
     await expect(receiver.receive(delivery, f.scope)).rejects.toMatchObject({ code: "recovery_required" });
-    await expect(receiver.receive(f.make({ issuedAt: new Date(f.clock.now + 1_001).toISOString() }), f.scope)).rejects.toMatchObject({ code: "recovery_required" });
+    const ahead = f.make();
+    f.clock.now -= 330_001; // this computer's estimate of Core's clock is more than the 300 s allowance behind
+    await expect(receiver.receive(ahead, f.scope)).rejects.toMatchObject({ code: "recovery_required", message: expect.stringContaining("issued_ahead") });
     expect(f.apply).not.toHaveBeenCalled();
+  });
+
+  it("accepts a delivery Core issued a few seconds ahead of this computer's estimate of its clock (10-16)", async () => {
+    const f = fixture();
+    const delivery = f.make();
+    f.clock.now -= 5_000; // Core is 5 s ahead of this computer's estimate
+    await f.receiver().receive(delivery, f.scope);
+    expect(f.apply).toHaveBeenCalledTimes(1);
   });
 
   it("accepts whole-second HTTP Date rounding without extending delivery expiry", async () => {
