@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { canOpenOnComputer, onComputerDone, onComputerScript, onComputerSettled, openCodeKeyPlan, openOnComputer, planOnComputer, readOnComputerWatches, releaseLauncher, removeOnComputerWatch, standInTerminalEnv, writeOnComputerWatch } from "../native/on-computer.js";
+import { canOpenOnComputer, onComputerDone, onComputerScript, onComputerSettled, openCodeKeyPlan, openOnComputer, planOnComputer, readOnComputerWatches, releaseLauncher, removeOnComputerWatch, standInTerminalEnv, withLiveCredentials, writeOnComputerWatch } from "../native/on-computer.js";
 
 describe("a step the site brings to the front on this computer (on-computer)", () => {
   const dirs: string[] = [];
@@ -115,6 +115,16 @@ describe("a step the site brings to the front on this computer (on-computer)", (
     expect(onComputerSettled(undefined, plan.until)).toBe(false);
     expect(onComputerSettled({ state: "ready" }, "ready")).toBe(true);
     expect(onComputerDone("ready", plan.until)).toBe(false);
+  });
+
+  it("reads a Go key step's end from the live agent view: the supported-agents entry carries no credentials (10-16)", () => {
+    const until = openCodeKeyPlan("opencode-go").until;
+    const entry = { agentId: "opencode", state: "ready" };
+    const view = { agentId: "opencode", credentials: [{ providerId: "opencode", state: "ready" }, { providerId: "opencode-go", state: "ready" }] };
+    expect(onComputerSettled(entry, until)).toBe(false);
+    expect(onComputerSettled(withLiveCredentials(entry, view), until)).toBe(true);
+    expect(withLiveCredentials(entry, { agentId: "opencode" })).toEqual(entry);
+    expect(withLiveCredentials(undefined, view)).toBeUndefined();
   });
 
   it("keeps a Go key step across a restart with its option, and drops a malformed provider", async () => {

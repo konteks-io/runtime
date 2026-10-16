@@ -222,6 +222,18 @@ export function onComputerDone(state: string | undefined, until: OnComputerPlan[
   return until === "added" ? !NOT_YET_ADDED.has(state) : state === "ready";
 }
 
+/**
+ * The agent's supported-agents entry with its live credentials. The entry
+ * carries no credentials, so a key step (an OpenCode Go plan) read from it
+ * alone never settled: on 10-16 the key was added and the site waited until
+ * the step ran out of time.
+ */
+export function withLiveCredentials<Entry extends object>(entry: Entry | undefined,
+  view: { credentials?: ReadonlyArray<{ providerId: string; state: string }> | undefined } | undefined): (Entry & { credentials?: ReadonlyArray<{ providerId: string; state: string }> }) | undefined {
+  if (!entry) return undefined;
+  return view?.credentials ? { ...entry, credentials: view.credentials } : entry;
+}
+
 /** Whether the agent as the connector sees it ends the step, a provider's credential included. */
 export function onComputerSettled(agent: { state?: string; credentials?: ReadonlyArray<{ providerId: string; state: string }> } | undefined, until: OnComputerPlan["until"]): boolean {
   if (!agent) return false;
