@@ -97,7 +97,7 @@ import { NativeInventoryCollector, machineHasDesktop } from "./native/inventory.
 import { windowsInstalledLauncher } from "./native/windows-launcher.js";
 import { antigravityRunnerCapabilities, openCodeRunnerCapabilities, siteLoginRelay } from "./native/site-login.js";
 import { FinishedLogins } from "./native/finished-logins.js";
-import { ON_COMPUTER_AGENTS, canOpenOnComputer, onComputerDone, onComputerScript, onComputerSettled, openCodeKeyPlan, openOnComputer, planOnComputer, readOnComputerWatches, releaseLauncher, removeOnComputerWatch, standInTerminalEnv, writeOnComputerWatch, type OnComputerAgent, type OnComputerPlan, type OnComputerWatch } from "./native/on-computer.js";
+import { ON_COMPUTER_AGENTS, canOpenOnComputer, onComputerDone, onComputerScript, onComputerSettled, openCodeKeyPlan, openOnComputer, planOnComputer, readOnComputerWatches, releaseLauncher, removeOnComputerWatch, standInTerminalEnv, withLiveCredentials, writeOnComputerWatch, type OnComputerAgent, type OnComputerPlan, type OnComputerWatch } from "./native/on-computer.js";
 import { antigravityDownloadState, withAntigravityDownload } from "./native/antigravity-download.js";
 import { antigravityDiskBytes, antigravityPin } from "./native/antigravity-installation.js";
 import { BROWSER_TOOL_CAPABILITY, resolveConnectorBrowser, withConnectorBrowser, type ConnectorBrowserStatus } from "./native/browser-capability.js";
@@ -2817,7 +2817,8 @@ export class Supervisor {
   }
 
   private onComputerFacts(agentId: OnComputerAgent) {
-    return this.supportedAgents(this.lastSnapshot?.agents ?? [])?.find(entry => entry.agentId === agentId);
+    const agents = this.lastSnapshot?.agents ?? [];
+    return withLiveCredentials(this.supportedAgents(agents)?.find(entry => entry.agentId === agentId), agents.find(agent => agent.agentId === agentId));
   }
 
   /**

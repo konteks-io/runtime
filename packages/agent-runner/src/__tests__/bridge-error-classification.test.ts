@@ -83,6 +83,13 @@ describe("OpenCode 2 turn failures (JSON-RPC -32603 with data.errorName)", () =>
     }
   });
 
+  it("says the provider's own plain sentence when it names what to do (10-16, a Go model outside the workspace's regions)", () => {
+    const words = "This Go model requires Global regions. Select Global in your workspace's Privacy settings to use it.";
+    expect(classifyBridgeError(failed(`Upstream request failed: ${words}`, "provider.invalid-request")))
+      .toEqual({ code: -32603, class: "provider_failure", retryable: false, message: words });
+    expect(classifyBridgeError(failed("Upstream request failed: E_42", "provider.invalid-request")).message).toBe("The provider could not handle this request.");
+  });
+
   it("leaves OpenCode's non-provider failures to the generic rules", () => {
     expect(classifyBridgeError(new RequestError(-32603, "Internal service failure", { service: "session", errorName: "Error" }))).toMatchObject({ class: "internal" });
     expect(classifyBridgeError(new RequestError(-32602, "session not found: ses_1", { sessionId: "ses_1" }))).toMatchObject({ class: "invalid_params" });
