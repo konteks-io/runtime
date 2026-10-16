@@ -492,7 +492,8 @@ export class ReportSender {
 
   async healHaltedConflicts(): Promise<void> {
     if (!this.options.confirmStopped || !this.options.canSend()) return;
-    for (const entry of this.options.journal.assignments.all()) {
+    // Only the rows it can heal are copied (D175: the whole log was cloned each pass).
+    for (const entry of this.options.journal.assignments.filter((candidate) => this.healableTerminal(candidate) !== null)) {
       const terminalSequence = this.healableTerminal(entry);
       if (terminalSequence !== null) await this.heal(entry, terminalSequence);
     }

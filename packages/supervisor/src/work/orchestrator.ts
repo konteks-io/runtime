@@ -1477,7 +1477,7 @@ export class WorkOrchestrator {
   private canStartFreshAfterUnresumableHarnessPredecessor(successor: RemoteWorkAssignment): boolean {
     if (successor.source.kind !== "harness_delivery" || !successor.source.turn.predecessor) return false;
     const expectedTurn = turnIdentity(successor.source.turn.predecessor);
-    const matches = this.deps.journal.assignments.all().filter(entry => {
+    const matches = this.deps.journal.assignments.filter(entry => {
       const predecessor = this.deps.journal.execution.start(entry.assignmentId, entry.attempt)?.assignment;
       if (!predecessor || predecessor.source.kind !== "harness_delivery") return false;
       // Only the identifying fields: a predecessor that itself continued a

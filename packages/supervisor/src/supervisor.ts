@@ -2183,7 +2183,7 @@ export class Supervisor {
         failed.push(assignmentId);
         continue;
       }
-      for (const entry of this.journal.assignments.all().filter((candidate) => candidate.assignmentId === assignmentId)) {
+      for (const entry of this.journal.assignments.filter((candidate) => candidate.assignmentId === assignmentId)) {
         await this.journal.assignments.remove(`${entry.assignmentId}:${entry.attempt}`);
       }
       await this.journal.planning.removeAssignment(assignmentId);
