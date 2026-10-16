@@ -3,7 +3,7 @@ import {
   type RuntimeUpdateDeliveryRequest, type RuntimeUpdateFailure, type RuntimeUpdateReport,
 } from "@konteks/remote-common";
 import type { CoreSignatureVerifier } from "../control/core-signature.js";
-import { deliveryNotCurrent } from "../control/delivery-scope.js";
+import { CORE_DELIVERY_CLOCK_SKEW_MS, deliveryStaleReason } from "../control/delivery-scope.js";
 import type { NativeUpdateCoordinator } from "./update.js";
 import type { NativeUpdateLedger } from "./update-ledger.js";
 import { RuntimeUpdateStore, type RuntimeUpdateJournal, type RuntimeUpdateRecord } from "./runtime-update-store.js";
@@ -77,14 +77,16 @@ export class RuntimeUpdateReceiver {
   private assertDelivery(request: RuntimeUpdateDeliveryRequest, scope: RuntimeUpdateScope): void {
     scope.assertCurrent();
     const intent = request.intent;
-    if (this.stopped || !allEqual([
+    const owned = !this.stopped && allEqual([
       [intent.instanceId, scope.instanceId], [intent.tenantId, scope.tenantId],
       [intent.leaseId, scope.leaseId], [intent.runnerIncarnation, scope.runnerIncarnation],
       [request.connectionEpoch, scope.connectionEpoch],
-    ]) || deliveryNotCurrent(request, { instanceId: scope.instanceId, workspaceId: scope.tenantId,
-      connectionEpoch: scope.connectionEpoch, leaseExpiresAt: scope.leaseExpiresAt }, this.deps.now(), 1_000)) {
-      throw new RemoteInstanceError("recovery_required", "Runtime update delivery ownership is not current.");
-    }
+    ]);
+    // The same allowance every Core delivery gets: this computer's estimate of Core's clock comes
+    // from 1 s Date headers over lopsided round trips, and 1 s here could refuse an Update now (10-16).
+    const stale = owned ? deliveryStaleReason(request, { instanceId: scope.instanceId, workspaceId: scope.tenantId,
+      connectionEpoch: scope.connectionEpoch, leaseExpiresAt: scope.leaseExpiresAt }, this.deps.now(), CORE_DELIVERY_CLOCK_SKEW_MS) : "ownership";
+    if (stale) throw new RemoteInstanceError("recovery_required", `Runtime update delivery ownership is not current (${stale}).`);
   }
 
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {
