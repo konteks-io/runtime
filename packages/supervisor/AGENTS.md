@@ -51,6 +51,13 @@ QA browser, structured results, updates and doctor/support.
   (`submit_result`). Never move the schema into a `session/prompt` request
   field: the native operation permit signs the parsed request's digest. The
   follow-up prompt (`<id>#konteks-result-follow-up`) is never sent to Core.
+- **Coordination calls.** Claude Code and Codex capture their provider tool-call
+  identity from ACP approval before `allow_once`; the native journal retains
+  only its bound operation identity and payload hash. The platform facade
+  requires one matching capture and supplies Core's invocation header itself.
+  Missing or ambiguous capture fails closed. Other adapters do not advertise
+  `coordination-invocations-v1:<agentId>`. A structured wait is only a request;
+  Harness owns blocker validation and publishing its durable checkpoint.
 - **Direct work** (`work/continued-session.ts`, `isDirectAssignment`): no
   preamble, no Konteks MCP servers, no preview/browser/result tool, policy root
   = the session's own folder, no repository selection.

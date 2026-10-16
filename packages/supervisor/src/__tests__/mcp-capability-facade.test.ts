@@ -37,6 +37,37 @@ function localHeaders(entry: Awaited<ReturnType<McpCapabilityFacade["start"]>>) 
 }
 
 describe("native MCP capability facade", () => {
+  it("replaces caller metadata with a captured coordination identity and keeps it across authentication replay", async () => {
+    const seen: Array<{ header: string | string[] | undefined; body: unknown }> = [];
+    const url = await upstream((request, response) => {
+      const chunks: Buffer[] = [];
+      request.on("data", chunk => chunks.push(chunk));
+      request.on("end", () => {
+        seen.push({ header: request.headers["x-konteks-native-invocation"], body: JSON.parse(Buffer.concat(chunks).toString()) });
+        response.writeHead(seen.length === 1 ? 401 : 200, { "Content-Type": "application/json" }).end("{}");
+      });
+    });
+    const invocation = { version: 1, workspaceId: "tenant", assignmentId: "assignment", attempt: 1, acpSessionRef: "session", operationId: "operation", toolCallId: "provider-call", tool: "platform__coordination__send", payloadHash: "a".repeat(43) };
+    const coordinationInvocation = vi.fn(() => invocation);
+    const { entry } = await started({ initial: issue(url, "old", Date.now() + 300_000), renew: async () => issue(url, "new", Date.now() + 300_000), coordinationInvocation });
+    const request = { jsonrpc: "2.0", id: 4, method: "tools/call", _meta: { nativeInvocation: "forged" }, params: { name: invocation.tool, arguments: { body: "hello" }, _meta: { nativeInvocation: "forged" } } };
+    expect((await fetch(entry.url, { method: "POST", headers: { ...localHeaders(entry), "x-konteks-native-invocation": "forged" }, body: JSON.stringify(request) })).status).toBe(200);
+    expect(coordinationInvocation).toHaveBeenCalledOnce();
+    expect(seen).toHaveLength(2);
+    expect(seen[0]?.header).toBe(Buffer.from(JSON.stringify(invocation)).toString("base64url"));
+    expect(seen[1]?.header).toBe(seen[0]?.header);
+    expect(seen[0]?.body).toEqual({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: invocation.tool, arguments: { body: "hello" } } });
+  });
+
+  it("refuses coordination mutations without captured identity before reaching Core", async () => {
+    const handler = vi.fn((_request, response) => response.end("{}"));
+    const url = await upstream(handler);
+    const { entry } = await started({ initial: issue(url, "token", Date.now() + 300_000), renew: vi.fn() });
+    const body = { jsonrpc: "2.0", id: "chosen-by-caller", method: "tools/call", params: { name: "platform__coordination__send", arguments: {} } };
+    expect((await fetch(entry.url, { method: "POST", headers: localHeaders(entry), body: JSON.stringify(body) })).status).toBe(403);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
   it("exposes only a loopback credential and forwards with the in-memory cloud bearer", async () => {
     let seenAuthorization = "";
     const url = await upstream((request, response) => {

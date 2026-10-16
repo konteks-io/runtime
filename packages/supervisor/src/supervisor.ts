@@ -607,6 +607,10 @@ export class Supervisor {
     this.inventory = new NativeInventoryCollector({ runners: this.runners, sampler: new SignalSampler(this.config.SUPERVISOR_DATA_DIR), bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION,
       gitVersion: () => this.git.version(),
       workspaceRecoveryReady: () => Boolean(native.git) && Boolean(this.work) && !this.stopping,
+      coordinationInvocationsReady: () => {
+        if (!this.work || !this.nativeOwnership || this.stopping) return false;
+        try { this.nativeOwnership.assertOwned(); return true; } catch { return false; }
+      },
       ...(claudeIdentity ? { claudeExecutable: () => claudeIdentity.capability() } : {}),
       executionPermitsReady: () => {
         // Native sessionDeps below always composes NativeExecutionGate.
@@ -2183,6 +2187,7 @@ export class Supervisor {
         await this.journal.assignments.remove(`${entry.assignmentId}:${entry.attempt}`);
       }
       await this.journal.planning.removeAssignment(assignmentId);
+      await this.journal.coordinationInvocations.rewrite(() => this.journal.coordinationInvocations.all().filter(record => record.assignmentId !== assignmentId));
     }
     return failed.length > 0 ? { failed, reason: "data_in_use" } : { failed };
   }
@@ -2193,6 +2198,7 @@ export class Supervisor {
       await this.work.drainSessions("drain");
       await this.journal.assignments.clear();
       await this.journal.pendingRequests.clear();
+      await this.journal.coordinationInvocations.clear();
       await this.journal.planning.clear();
       await this.outbox.clear();
       // Agent credential volumes are never touched by an erase directive; only `uninstall --purge` removes them.

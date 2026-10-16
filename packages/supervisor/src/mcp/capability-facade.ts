@@ -2,9 +2,10 @@ import { randomBytes } from "node:crypto";
 import { createServer, type IncomingHttpHeaders, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { createLogger, plainRecord, RemoteInstanceError, type Logger } from "@konteks/remote-common";
+import { NativeCoordinationInvocationSchema, createLogger, plainRecord, RemoteInstanceError, type Logger, type NativeCoordinationInvocation } from "@konteks/remote-common";
 import type { CapabilityTokenIssue } from "../core/client.js";
 import { bearerMatches, readBounded, sendJson } from "../loopback-http.js";
+import { coordinationInvocationTool } from "./native-invocations.js";
 
 const MAX_REQUEST_BYTES = 1024 * 1024;
 const MIN_REFRESH_LEAD_MS = 30_000;
@@ -48,6 +49,8 @@ interface McpCapabilityFacadeOptions {
   logger?: Logger;
   now?: () => number;
   onUnavailable?: () => void | Promise<void>;
+  /** Already captured at the trusted ACP approval boundary, never inferred from JSON-RPC id or model metadata. */
+  coordinationInvocation?: (tool: string, args: unknown) => NativeCoordinationInvocation | Promise<NativeCoordinationInvocation>;
   /**
    * Core answered `environment_open` for this session: the session's browser
    * may now reach these origins. Read only from Core's response to that one
@@ -175,7 +178,8 @@ export class McpCapabilityFacade {
       return this.fail(response, 413, "request_too_large");
     }
     try {
-      await this.proxy(request, body, response);
+      const prepared = await this.coordinationRequest(body);
+      await this.proxy(request, prepared.body, response, prepared.invocation);
     } catch (error) {
       this.proxyFailed(response, error);
     }
@@ -189,8 +193,19 @@ export class McpCapabilityFacade {
     return null;
   }
 
-  private async proxy(request: IncomingMessage, body: Buffer, response: ServerResponse): Promise<void> {
-    let upstream = await this.forward(request, body, false);
+  private async coordinationRequest(body: Buffer): Promise<{ body: Buffer; invocation?: NativeCoordinationInvocation }> {
+    const message = plainRecord(parsedJson(body.toString("utf8")));
+    const params = plainRecord(message?.params);
+    if (message?.method !== "tools/call" || typeof params?.name !== "string" || !coordinationInvocationTool(params.name)) return { body };
+    if (!this.options.coordinationInvocation) throw new RemoteInstanceError("operation_conflict", "Native coordination invocation was not captured.");
+    const invocation = NativeCoordinationInvocationSchema.parse(await this.options.coordinationInvocation(params.name, params.arguments));
+    const { _meta: _messageMeta, ...cleanMessage } = message;
+    const { _meta: _paramsMeta, ...cleanParams } = params;
+    return { body: Buffer.from(JSON.stringify({ ...cleanMessage, params: cleanParams })), invocation };
+  }
+
+  private async proxy(request: IncomingMessage, body: Buffer, response: ServerResponse, invocation?: NativeCoordinationInvocation): Promise<void> {
+    let upstream = await this.forward(request, body, false, invocation);
     try {
       // Core authenticates before dispatch, so only its 401 permits replay.
       if (upstream.response.status === 401) {
@@ -198,7 +213,7 @@ export class McpCapabilityFacade {
         this.settleRequest(upstream.controller);
         this.logger.warn({ event: "mcp_capability.auth_rejected", ...this.options.context, action: "refresh_and_replay" }, "upstream MCP capability was rejected before dispatch");
         await this.refresh(true, "auth_rejection");
-        upstream = await this.forward(request, body, true);
+        upstream = await this.forward(request, body, true, invocation);
       }
       if (this.closed) throw new RemoteInstanceError("execution_fenced", "The local MCP facade lost its assignment.");
       const observed = this.options.onBrowserAccess ? environmentOpenRequestId(body) : undefined;
@@ -208,7 +223,8 @@ export class McpCapabilityFacade {
   }
 
   private proxyFailed(response: ServerResponse, error: unknown): void {
-    if (!response.headersSent) this.fail(response, 503, "upstream_unavailable");
+    if (!response.headersSent && error instanceof RemoteInstanceError && error.code === "operation_conflict") this.fail(response, 403, "native_invocation_required");
+    else if (!response.headersSent) this.fail(response, 503, "upstream_unavailable");
     else response.destroy();
     this.logger.warn({
       event: "mcp_capability.proxy_failed",
@@ -217,7 +233,7 @@ export class McpCapabilityFacade {
     }, "local MCP capability facade request failed");
   }
 
-  private async forward(request: IncomingMessage, body: Buffer, refreshedAfterRejection: boolean) {
+  private async forward(request: IncomingMessage, body: Buffer, refreshedAfterRejection: boolean, invocation?: NativeCoordinationInvocation) {
     let issue: CapabilityTokenIssue;
     try {
       issue = await this.refresh(false, "request");
@@ -233,8 +249,7 @@ export class McpCapabilityFacade {
     const upstream = new URL(issue.mcpServer.url);
     const local = new URL(request.url ?? "/mcp", "http://127.0.0.1");
     upstream.search = local.search;
-    const headers = forwardedHeaders(request.headers);
-    headers.set("authorization", authorization(issue));
+    const headers = forwardedHeaders(request.headers, issue, invocation);
     const controller = new AbortController();
     this.retainRequest(controller);
     try {
@@ -480,11 +495,13 @@ function authorization(issue: CapabilityTokenIssue): string {
   return value;
 }
 
-function forwardedHeaders(input: IncomingHttpHeaders): Headers {
+function forwardedHeaders(input: IncomingHttpHeaders, issue: CapabilityTokenIssue, invocation?: NativeCoordinationInvocation): Headers {
   const output = new Headers();
   for (const [name, value] of Object.entries(input)) {
     if (!FORWARDED_REQUEST_HEADERS.has(name.toLowerCase()) || value === undefined) continue;
     output.set(name, Array.isArray(value) ? value.join(", ") : value);
   }
+  output.set("authorization", authorization(issue));
+  if (invocation) output.set("x-konteks-native-invocation", Buffer.from(JSON.stringify(invocation)).toString("base64url"));
   return output;
 }

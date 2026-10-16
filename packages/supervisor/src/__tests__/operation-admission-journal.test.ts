@@ -29,6 +29,15 @@ async function fixture() {
 }
 
 describe("native operations extend the durable pending-request journal", () => {
+  it("retains a typed coordination wait request for replay without turning the checkpoint into accepted output", async () => {
+    const f = await fixture(); await f.operations.admit(claims, "a.b.c", current); await f.operations.begin(f.key, current);
+    const waiting: SessionToCoreMessage = { ...completion, result: { stopReason: "end_turn", structuredOutput: { source: "tool", value: { outcome: "waiting_for_coordination", requestIds: ["request-1"] } } } };
+    await f.operations.complete(f.key, waiting);
+    const reopened = await fixture();
+    expect(reopened.journal.pendingRequests.get(f.key)?.authorization?.completion).toEqual(waiting);
+    expect(await reopened.operations.begin(f.key, current)).toBe(false);
+    expect(reopened.journal.assignments.all()).toEqual([]);
+  });
   it('projects real completion and retains ambiguous dispatch in the same journal before reporting', async () => {
     const f = await fixture(); await f.operations.admit(claims, 'a.b.c', current); await f.operations.begin(f.key, current);
     await f.operations.complete(f.key, completion);

@@ -11,6 +11,7 @@ import { timedJournalWork, timedJournalWorkAsync } from "./slow-work.js";
 import { RuntimeRecoveryJournal, RuntimeRecoveryRecordSchema, recoveryRecordKey, type RuntimeRecoveryRecord } from "./runtime-recovery.js";
 import { LocalExecutionJournal, LocalExecutionRecordSchema, localExecutionKey, type LocalExecutionRecord } from "./local-execution.js";
 import { AssignmentStreamJournal } from "./assignment-stream.js";
+import { CoordinationInvocationRecordSchema, coordinationInvocationKey, type CoordinationInvocationRecord } from "./coordination-invocation.js";
 import { PlanningTerminalJournal, PlanningTerminalRecordSchema, planningTerminalRecordKey, type PlanningTerminalRecord } from "./planning-terminal.js";
 import { CancellationInbox, CancellationInboxRecordSchema, type CancellationInboxRecord } from "./cancellation-inbox.js";
 import {
@@ -553,6 +554,7 @@ export class SupervisorJournal {
   private readonly recoveryLog: AppendLog<RuntimeRecoveryRecord>;
   readonly assignments: AppendLog<JournalEntry>;
   readonly pendingRequests: AppendLog<PendingRequest>;
+  readonly coordinationInvocations: AppendLog<CoordinationInvocationRecord>;
   readonly decisions: AppendLog<DecisionRecord>;
   readonly manifests: AppendLog<ReconciliationManifestRecord>;
   readonly erase: AppendLog<EraseRecord>;
@@ -594,6 +596,7 @@ export class SupervisorJournal {
     this.recovery = new RuntimeRecoveryJournal(this.recoveryLog);
     this.assignments = new AppendLog(dir, { name: "assignments", schema: JournalEntrySchema, key: (entry) => `${entry.assignmentId}:${entry.attempt}` }, MAX_JOURNAL_ENTRIES, mutate);
     this.pendingRequests = new AppendLog(dir, { name: "pending-requests", schema: PendingRequestSchema, key: (entry) => `${entry.acpSessionRef}:${entry.direction}:${entry.id}` }, MAX_JOURNAL_ENTRIES * 4, mutate);
+    this.coordinationInvocations = new AppendLog(dir, { name: "coordination-invocations", schema: CoordinationInvocationRecordSchema, key: coordinationInvocationKey }, MAX_JOURNAL_ENTRIES * 4, mutate);
     this.decisions = new AppendLog(dir, { name: "decisions", schema: DecisionRecordSchema, key: (entry) => `${entry.manifestId}:${entry.assignmentId}:${entry.attempt}` }, MAX_JOURNAL_ENTRIES, mutate);
     this.manifests = new AppendLog(dir, { name: "reconciliation-manifests", schema: ReconciliationManifestRecordSchema, key: entry => entry.manifestId }, MAX_JOURNAL_ENTRIES, mutate);
     this.erase = new AppendLog(dir, { name: "erase", schema: EraseRecordSchema, key: (entry) => entry.directiveId }, 500, mutate);
@@ -604,17 +607,32 @@ export class SupervisorJournal {
   }
 
   async load(): Promise<void> {
-    await Promise.all([this.assignments.load(), this.pendingRequests.load(), this.decisions.load(), this.manifests.load(), this.erase.load(), this.recoveryEvidence.load(), this.integrationWrites.load(), this.recoveryLog.load(), this.executionLog.load(), this.planningLog.load(), this.cancellationLog.load(), this.executionRevisionFenceLog.load(), this.diagnosticCompanionLog.load()]);
+    await Promise.all([this.assignments.load(), this.pendingRequests.load(), this.coordinationInvocations.load(), this.decisions.load(), this.manifests.load(), this.erase.load(), this.recoveryEvidence.load(), this.integrationWrites.load(), this.recoveryLog.load(), this.executionLog.load(), this.planningLog.load(), this.cancellationLog.load(), this.executionRevisionFenceLog.load(), this.diagnosticCompanionLog.load()]);
   }
 
   /** Bounded pruning: completed/cancelled entries beyond the bound go first, oldest first. */
   async prune(): Promise<void> {
+    await this.pruneCoordinationInvocations();
     const entries = this.assignments.all();
     if (entries.length <= MAX_JOURNAL_ENTRIES) return;
     const terminal = entries.filter((entry) => entry.state === "completed" || entry.state === "cancelled").sort((a, b) => (a.updatedAt < b.updatedAt ? -1 : 1));
     for (const entry of terminal.slice(0, entries.length - MAX_JOURNAL_ENTRIES)) {
       await this.assignments.remove(`${entry.assignmentId}:${entry.attempt}`);
     }
+  }
+
+  private async pruneCoordinationInvocations(): Promise<void> {
+    await this.coordinationInvocations.rewrite(() => {
+      const records = this.coordinationInvocations.all();
+      const retained = records.filter(record => this.retainCoordinationInvocation(record));
+      return retained.length === records.length ? undefined : retained;
+    });
+  }
+
+  private retainCoordinationInvocation(record: CoordinationInvocationRecord): boolean {
+    const assignment = this.assignments.get(`${record.assignmentId}:${record.attempt}`);
+    if (!assignment) return false;
+    return !["completed", "cancelled"].includes(assignment.state) || Date.parse(assignment.latestResumeAt) > Date.now();
   }
 
   activeAssignments(): JournalEntry[] {

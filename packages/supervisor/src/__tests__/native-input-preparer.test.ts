@@ -584,6 +584,19 @@ describe("native authorized input composition", () => {
       computeRemoteAssignmentInputSelectionDigest(f.selection),
     );
   });
+
+  it("isolates a server-selected answering context from the conversation's existing local memory", async () => {
+    const f = await fixture({ "CLAUDE.md": "Answer only this exchange" });
+    const ordinary = await createNativeInputPreparer(f.options)(assignment);
+    await writeFile(join(ordinary.cwd, "prior-local-memory.md"), "previous conversation");
+    Object.assign(f.selection, { contextIsolation: "assignment" });
+    const answering = await createNativeInputPreparer(f.options)(assignment);
+    expect(answering.cwd).not.toBe(ordinary.cwd);
+    expect(answering.cwd.startsWith(join(await realRoot(f.root), "assignment-"))).toBe(true);
+    await expect(readFile(join(answering.cwd, "prior-local-memory.md"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(join(ordinary.cwd, "prior-local-memory.md"), "utf8")).toBe("previous conversation");
+    expect((await createNativeInputPreparer(f.options)(assignment)).cwd).toBe(answering.cwd);
+  });
   it("refuses a tampered receipt and does not rewrite it", async () => {
     const f = await fixture(),
       prepared = await createNativeInputPreparer(f.options)(assignment);
