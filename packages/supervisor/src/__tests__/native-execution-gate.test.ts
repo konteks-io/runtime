@@ -896,6 +896,18 @@ describe("native session dispatch uses genuine execution admission", () => {
     expect(f.session.isClosed).toBe(true);
     expect(f.runner.closeSession).toHaveBeenCalledOnce();
     expect(f.send.mock.calls.map(call => call[0].body)).toContainEqual({ kind: "session_closed", assignmentId: "assignment", reason: "agent_exited" });
+    // An internal error is a plain agent exit.
+    expect(f.session.agentFailureReason()).toBeNull();
+  });
+
+  it.each(["provider_failure", "agent_auth_required"] as const)("keeps an agent's %s for the terminal result, while the wire still says agent_exited (10-16)", async errorClass => {
+    const f = await sessionFixture();
+    await f.session.onToRuntime(f.envelope);
+    await f.session.onRunnerEvent({ kind: "request_error", acpSessionRef: "acp", requestId: "request", method: "session/prompt",
+      code: -32603, class: errorClass, message: "The provider account OpenCode uses is out of credit.", retryable: false } as never);
+    expect(f.session.isClosed).toBe(true);
+    expect(f.session.agentFailureReason()).toBe(errorClass);
+    expect(f.send.mock.calls.map(call => call[0].body)).toContainEqual({ kind: "session_closed", assignmentId: "assignment", reason: "agent_exited" });
   });
 
   it("terminalizes a delivery whose local inputs fail before agent dispatch", async () => {

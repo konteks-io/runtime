@@ -192,6 +192,18 @@ export interface RelayedSessionDeps {
 
 export type SessionClosedReason = Extract<SessionToCoreMessage, { kind: "session_closed" }>["reason"];
 
+/** Why an agent exit failed, when the agent's own error says so; otherwise the exit reports `agent_failed`. */
+export type AgentFailureReason = "provider_failure" | "agent_auth_required";
+
+/**
+ * An agent's request error, as the terminal reason Core keeps (10-16: an
+ * OpenCode turn out of credit reached Core only as `agent_failed`, so the
+ * page later read "No answer came back").
+ */
+function reportedAgentFailure(errorClass: unknown): AgentFailureReason | null {
+  return errorClass === "provider_failure" || errorClass === "agent_auth_required" ? errorClass : null;
+}
+
 const HOLDER_REQUEST_METHODS = new Set(["session/prompt", "session/set_mode", "session/set_config_option"]);
 
 /** How long a prompt's local recheck runs before its relay frame is released. */
@@ -216,6 +228,8 @@ export class RelayedSession {
   get channelId(): string | null { return this.boundChannelId; }
   acpSessionRef: string | null = null;
   private closed = false;
+  /** The agent's own failure class when its request error closed the session. */
+  private agentFailure: AgentFailureReason | null = null;
   /** Ends a transient input preparation's backoff wait at once on close or recovery. */
   private wakeDeferral: (() => void) | null = null;
   private recoveryStopping = false;
@@ -1534,6 +1548,11 @@ export class RelayedSession {
     await this.onPromptResult(settled.requestId, settled.result);
   }
 
+  /** Why the agent's exit failed, for the terminal result (null: a plain agent exit). */
+  agentFailureReason(): AgentFailureReason | null {
+    return this.agentFailure;
+  }
+
   private async onRequestError(event: RunnerEventOf<"request_error">): Promise<void> {
     if (event.method === "session/prompt" && (await this.settledPromptError(event.requestId))) return;
     const accepted = await this.completeReceived(event.requestId, event.method, { kind: "acp_error", id: event.requestId, method: event.method, error: { code: event.code, class: event.class, message: event.message, retryable: event.retryable } });
@@ -1545,6 +1564,7 @@ export class RelayedSession {
       this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, code: event.code, errorClass: event.class, retryable: event.retryable,
         message: String(redactActivity(String(event.message ?? ""), this.sessionCwd())).slice(0, 240) },
         "native turn failed with a request error; closing the assignment as an agent exit");
+      this.agentFailure = reportedAgentFailure(event.class);
       await this.close("agent_exited");
     }
   }

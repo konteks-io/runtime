@@ -2773,6 +2773,9 @@ const UNCOMPLETED_CLOSES = {
 } as const satisfies Record<Exclude<SessionClosedReason, "completed">, { result: object; hashed: JsonValue }>;
 
 function closedSessionResult(session: RelayedSession, reason: SessionClosedReason) {
+  // An agent that failed on its provider or its sign-in says which, so the page can (10-16).
+  const failure = reason === "agent_exited" ? session.agentFailureReason() : null;
+  if (failure) return { class: "failed" as const, reason: failure, terminalResultHash: jcsDigest({ class: "failed", reason: failure }) };
   if (reason !== "completed") {
     const { result, hashed } = UNCOMPLETED_CLOSES[reason];
     return { ...result, terminalResultHash: jcsDigest(hashed) };
