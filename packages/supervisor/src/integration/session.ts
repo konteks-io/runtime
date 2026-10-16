@@ -150,6 +150,16 @@ function isClaudeNativeCall(claudeTool: unknown): claudeTool is string {
   return typeof claudeTool === "string" && claudeTool.length > 0 && !claudeTool.startsWith("mcp__") && !INTEGRATION_CLAUDE_TOOLS.includes(claudeTool);
 }
 
+/**
+ * A Codex tool item other than an MCP call or its context compaction (`think`):
+ * a command, a file read, search or edit, a web search. Codex runs these inside
+ * its read-only sandbox without asking, so they never reach the gate.
+ */
+function codexNativeKind(agentId: string, update: Record<string, unknown>, meta: Record<string, unknown> | undefined): string | null {
+  if (agentId !== "codex" || update.sessionUpdate !== "tool_call" || meta?.is_mcp_tool_call === true) return null;
+  return typeof update.kind === "string" && update.kind !== "think" ? `codex:${update.kind}` : null;
+}
+
 /** The session's own `konteks-result` tool, which is not a provider call. */
 function isOwnResultCall(codexServer: unknown, claudeTool: unknown): boolean {
   return codexServer === STRUCTURED_RESULT_MCP_SERVER_NAME || (typeof claudeTool === "string" && claudeTool.startsWith(`mcp__${STRUCTURED_RESULT_MCP_SERVER_NAME}__`));
@@ -381,13 +391,17 @@ export class IntegrationSession {
     const claudeTool = plainRecord(meta?.claudeCode)?.toolName;
     const codexServer = plainRecord(update.rawInput)?.server;
     if (isMcpCall(meta, claudeTool) && !isOwnResultCall(codexServer, claudeTool)) this.mcpCalls.add(id);
-    else if (isClaudeNativeCall(claudeTool)) this.nativeCalls.set(id, claudeTool);
+    else {
+      const native = isClaudeNativeCall(claudeTool) ? claudeTool : codexNativeKind(this.spec.agentId, update, meta);
+      if (native) this.nativeCalls.set(id, native);
+    }
   }
 
   /**
    * An MCP call that ran to completion without ever asking the gate went
    * around it: the route is not governed. So did a Claude built-in tool the
-   * session should not have (D165: Bash and a subagent ran without asking).
+   * session should not have (D165: Bash and a subagent ran without asking),
+   * or a Codex command or file read its sandbox let run without asking.
    * Stop instead of reporting.
    */
   private stopIfUngated(id: string, status: string): void {

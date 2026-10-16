@@ -76,7 +76,9 @@ is installed.
 - The connector's own observation of each allowed call is the evidence
   (`connector_observed`, bounded, hashed); the agent's `submit_result` is only
   `agentReport`. An MCP call that completes without reaching the gate cancels
-  the turn (`ungated_call`).
+  the turn (`ungated_call`), and so does a native tool that did: a Claude
+  built-in other than `ToolSearch`, or any Codex item but an MCP call or a
+  context compaction (its read-only sandbox runs commands and reads without asking).
 - A source the agent cannot hold (Claude: account connectors only; Codex:
   personal servers only) is a typed `operation_unsupported` result with no session.
 - `fixture_mcp` sources (loopback URLs, never commands) exist only when the
