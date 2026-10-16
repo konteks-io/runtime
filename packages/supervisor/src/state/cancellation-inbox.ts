@@ -12,6 +12,7 @@ export const CancellationInboxRecordSchema = z.object({
 });
 export type CancellationInboxRecord = z.infer<typeof CancellationInboxRecordSchema>;
 interface CancellationInboxLog {
+  /** Copies: the inbox hands them on as they are. */
   all(): CancellationInboxRecord[];
   update(key: string, derive: (existing: CancellationInboxRecord | undefined) => CancellationInboxRecord): Promise<void>;
 }
@@ -27,7 +28,8 @@ export class CancellationInbox {
   }
 
   pending(): CancellationInboxRecord[] {
-    return structuredClone(this.log.all());
+    // The log already hands back copies; a second clone doubled the cost (D175).
+    return this.log.all();
   }
 
   async receiveVerified(candidate: unknown, receivedAt: string, assertCurrent: () => void): Promise<CancellationInboxRecord> {

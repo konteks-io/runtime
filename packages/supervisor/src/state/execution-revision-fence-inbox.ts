@@ -60,6 +60,7 @@ const ExecutionRevisionFenceInboxInputSchema =
   });
 
 interface ExecutionRevisionFenceInboxLog {
+  /** Copies: the inbox hands them on as they are. */
   all(): ExecutionRevisionFenceInboxRecord[];
   update(
     key: string,
@@ -101,7 +102,8 @@ export class ExecutionRevisionFenceInbox {
   }
 
   pending(): ExecutionRevisionFenceInboxRecord[] {
-    return structuredClone(this.log.all());
+    // The log already hands back copies; a second clone doubled the cost (D175).
+    return this.log.all();
   }
 
   async receiveVerified(
