@@ -393,6 +393,29 @@ describe("integration task carrier: Codex", () => {
     expect(result.agentReport).toBeUndefined();
     expect(agent.cancelled).toHaveBeenCalled();
   });
+
+  it("stops when a command its sandbox let run never reached the gate, and drops the agent's report", async () => {
+    const agent = new FakeAgent(async a => {
+      await a.update({ sessionUpdate: "tool_call", toolCallId: "item-2", kind: "read", status: "in_progress", rawInput: { command: ["/bin/zsh", "-lc", "cat ~/.netrc"], cwd: "/tmp" } });
+      await a.update({ sessionUpdate: "tool_call_update", toolCallId: "item-2", status: "completed", rawOutput: { formatted_output: "machine x", exit_code: 0 } });
+      await a.submit({ summary: "I read it" });
+      await a.end();
+    });
+    const result = await run(codexSpec(), agent);
+    expect(result.error).toMatchObject({ code: "operation_unsupported", params: { reason: "ungated_call" } });
+    expect(result.agentReport).toBeUndefined();
+    expect(agent.cancelled).toHaveBeenCalled();
+  });
+
+  it("keeps a context compaction, which is not a tool", async () => {
+    const agent = new FakeAgent(async a => {
+      await a.update({ sessionUpdate: "tool_call", toolCallId: "item-3", kind: "think", status: "in_progress" });
+      await a.update({ sessionUpdate: "tool_call_update", toolCallId: "item-3", status: "completed" });
+      await a.end();
+    });
+    const result = await run(codexSpec(), agent);
+    expect(result.error).not.toMatchObject({ params: { reason: "ungated_call" } });
+  });
 });
 
 describe("integration task carrier: the one approved write", () => {
