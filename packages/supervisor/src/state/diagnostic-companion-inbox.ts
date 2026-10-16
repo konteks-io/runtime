@@ -42,6 +42,7 @@ const DiagnosticCompanionInboxInputSchema =
   DiagnosticCompanionInboxRecordBaseSchema.omit({ version: true, receivedAt: true });
 
 interface DiagnosticCompanionInboxLog {
+  /** Copies: the inbox hands them on as they are. */
   all(): DiagnosticCompanionInboxRecord[];
   update(
     key: string,
@@ -74,7 +75,8 @@ export class DiagnosticCompanionInbox {
   }
 
   all(): DiagnosticCompanionInboxRecord[] {
-    return structuredClone(this.log.all());
+    // The log already hands back copies; a second clone doubled the cost (D175).
+    return this.log.all();
   }
 
   async receiveVerified(
