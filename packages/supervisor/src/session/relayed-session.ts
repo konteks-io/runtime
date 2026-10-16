@@ -450,13 +450,20 @@ export class RelayedSession {
       preparationAttempt: deferral, delayMs, classification: transient.classification, diagnostic: transient.diagnostic,
       ...(transient.status === undefined ? {} : { status: transient.status }) },
     "native input preparation failed transiently; resuming with backoff");
-    if (this.closed) throw error;
+    if (this.closed) throw this.inputWaitEnded(deferral, "closed", error);
     await new Promise<void>(resolve => {
       const timer = setTimeout(() => { this.wakeDeferral = null; resolve(); }, delayMs);
       this.wakeDeferral = () => { clearTimeout(timer); this.wakeDeferral = null; resolve(); };
     });
-    if (this.closed) throw error;
-    this.deps.assertExecutionOwned?.();
+    if (this.closed) throw this.inputWaitEnded(deferral, "closed", error);
+    try { this.deps.assertExecutionOwned?.(); } catch (lost) { throw this.inputWaitEnded(deferral, "claim_lost", lost); }
+  }
+
+  /** Says why a resumed input preparation stopped waiting (10-15: a cancellation ended one with no line). */
+  private inputWaitEnded(deferral: number, reason: "closed" | "claim_lost", error: unknown): unknown {
+    this.logger.warn({ event: "native.inputs.prepare_ended", assignmentId: this.assignment.id, attempt: this.assignment.attempt,
+      preparationAttempt: deferral, reason }, "native input preparation stopped waiting");
+    return error;
   }
 
   private verifiedBinding(prepared: PreparedSessionInputs): RemoteTransferBinding {
