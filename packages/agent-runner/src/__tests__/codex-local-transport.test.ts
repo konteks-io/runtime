@@ -139,14 +139,15 @@ it.skipIf(process.platform === "win32")("reads many loaded threads past the old 
 });
 it.skipIf(process.platform === "win32")("fails closed when the owner stops answering one request", async () => {
   const f = await fixture();
-  let asked = false;
   slowServer(f, ["00000000-0000-7000-8000-000000000201"], false);
-  f.ws.on("connection", socket => socket.on("message", data => { if (JSON.parse(data.toString()).method === "thread/read") asked = true; }));
+  const asked = new Promise<void>(resolve => {
+    f.ws.on("connection", socket => socket.on("message", data => { if (JSON.parse(data.toString()).method === "thread/read") resolve(); }));
+  });
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   try {
     const read = codexLoadedThreadStatuses(f.socket);
     const refused = expect(read).rejects.toThrow(/inventory unavailable/);
-    await until(() => asked);
+    await asked;
     vi.advanceTimersByTime(10_000);
     await refused;
   } finally { vi.useRealTimers(); }
