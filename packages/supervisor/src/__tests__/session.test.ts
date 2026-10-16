@@ -1307,9 +1307,10 @@ describe("relayed session", () => {
     expect(warn.mock.calls.some(([fields]) => fields.event === "native.inputs.prepare_deferred")).toBe(false);
   });
 
-  it("ends a transient input wait at once when the session closes, and keeps it retryable (D132)", async () => {
+  it("ends a transient input wait at once when the session closes, says so, and keeps it retryable (D132)", async () => {
     const prepareInputs = vi.fn(async () => { throw transient503(); });
-    const { session } = await build({ prepareInputs, inputDeferralRandom: () => 0.5, logger: quietLogger() });
+    const warn = vi.fn();
+    const { session } = await build({ prepareInputs, inputDeferralRandom: () => 0.5, logger: quietLogger(warn) });
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
       const booting = session.bootstrap().catch(error => error);
@@ -1317,6 +1318,9 @@ describe("relayed session", () => {
       expect(prepareInputs).toHaveBeenCalledTimes(3);
       void session.close("cancelled").catch(() => undefined);
       expect(await booting).toMatchObject({ code: "temporarily_unavailable", retryable: true });
+      // 10-15: a cancellation ended a wait with no line; it now says why it stopped.
+      expect(warn).toHaveBeenCalledWith(expect.objectContaining({ event: "native.inputs.prepare_ended", reason: "closed", preparationAttempt: 3 }),
+        "native input preparation stopped waiting");
       await vi.advanceTimersByTimeAsync(600_000);
       expect(prepareInputs).toHaveBeenCalledTimes(3);
     } finally { vi.useRealTimers(); }
