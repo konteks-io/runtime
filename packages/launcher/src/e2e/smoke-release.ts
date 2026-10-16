@@ -88,7 +88,7 @@ export async function extendE2ESmokeRelease(options: E2EAdditionalPlatformOption
     url: `${origin}/__e2e/native/${agentName}`, digest: sha(archive), profileDigest: sha(profileBytes), sizeBytes: archive.length,
   };
   const manifest = extendedManifest(previous, options.bundleVersion, [connectorArtifact, agentArtifact],
-    signedMapping(bridgeMappingBody(`e2e-codex-${suffix}-model`, agentArtifact, [{ value: "e2e-model", canonicalProviderId: "e2e", canonicalModelId: "e2e-model" }]), root.keyId, privateKey), { keyId: root.keyId, privateKey });
+    signedMapping(bridgeMappingBody(`e2e-codex-${suffix}-model`, agentArtifact, [{ value: "gpt-5.6-sol", canonicalProviderId: "openai", canonicalModelId: "gpt-5.6-sol" }]), root.keyId, privateKey), { keyId: root.keyId, privateKey });
   await writeFile(join(options.directory, connectorName), connector, { flag: "wx", mode: 0o700 });
   await writeFile(join(options.directory, agentName), archive, { flag: "wx", mode: 0o600 });
   const scratch = await mkdtemp(join(options.directory, ".manifest-"));
@@ -333,9 +333,9 @@ function e2eModelIdentities(artifact: RemoteNativeArtifact): MappingBody["modelI
       { value: "haiku", canonicalProviderId: "anthropic", canonicalModelId: "claude-haiku-4-5-20251001" },
     ];
   }
-  return artifact.id.startsWith("e2e-fake-")
-    ? [{ value: "e2e-model", canonicalProviderId: "e2e", canonicalModelId: "e2e-model" }]
-    : [{ value: "gpt-5.6-sol", canonicalProviderId: "openai", canonicalModelId: "gpt-5.6-sol" }];
+  // Tier 2 simulates a reviewed provider offer; artifact IDs and UI names keep
+  // the fake explicit. This exercises routing, never provider intelligence.
+  return [{ value: "gpt-5.6-sol", canonicalProviderId: "openai", canonicalModelId: "gpt-5.6-sol" }];
 }
 
 /**
@@ -506,9 +506,9 @@ if (command === "app-server") {
 function fakeBridge(): string { return `#!/usr/bin/env node
 const fs = require("node:fs");
 const readline = require("node:readline");
-let sessions = 0;
+const crypto = require("node:crypto");
 const output = value => process.stdout.write(JSON.stringify(value) + "\\n");
-const modelOptions = currentValue => [{ id: "model", name: "Model", category: "model", type: "select", currentValue, options: [{ value: "e2e-model", name: "E2E deterministic model" }] }];
+const modelOptions = currentValue => [{ id: "model", name: "Model", category: "model", type: "select", currentValue, _meta: { konteksModelOffer: { source: "codex-model-list.v1", offeredValues: ["gpt-5.6-sol"], defaultValue: "gpt-5.6-sol" } }, options: [{ value: "gpt-5.6-sol", name: "E2E fixture: GPT-5.6 Sol" }] }, { id: "mode", name: "Mode", category: "mode", type: "select", currentValue: "read-only", options: [{ value: "read-only", name: "Read only" }] }];
 const planningProposal = request => {
   const text = Array.isArray(request.params && request.params.prompt)
     ? request.params.prompt.filter(part => part && part.type === "text").map(part => part.text).join("\\n")
@@ -529,10 +529,18 @@ const planningProposal = request => {
     try {
       const record = JSON.parse(line);
       const skillFile = record && record.skillFile;
-      if (typeof record.name !== "string" || !record.name.startsWith("org-") || typeof skillFile !== "string"
-        || !skillFile.includes("/workspaces/codex/skills/skills-") || !skillFile.includes("/org-")
+      if (typeof record.name !== "string" || typeof skillFile !== "string"
+        || !skillFile.includes("/workspaces/codex/skills/skills-")
         || !skillFile.endsWith("/SKILL.md")) continue;
+      const stat = fs.lstatSync(skillFile);
+      if (!stat.isFile() || stat.size > 65536) continue;
       const body = fs.readFileSync(skillFile, "utf8");
+      // Tier 2 still performs the real staged-file read before reporting it.
+      output({ jsonrpc: "2.0", method: "session/update", params: {
+        sessionId: request.params.sessionId,
+        update: { sessionUpdate: "tool_call", toolCallId: "e2e-skill-read-" + crypto.randomUUID(),
+          title: "Read required staged Skill", kind: "read", status: "completed", rawInput: { file_path: skillFile } }
+      } });
       if (body.includes("name: native-runtime-skill-probe-20260928") && body.includes("NATIVE_SKILL_RUNTIME_20260928_OK")) {
         skillValidation = " NATIVE_SKILL_RUNTIME_20260928_OK";
       }
@@ -561,10 +569,10 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     }
   });
   const result = request.method === "initialize" ? { protocolVersion: 1, agentCapabilities: { loadSession: true }, agentInfo: { name: "Konteks E2E Fake Codex ACP", version: "1.0.0" }, authMethods: [] }
-    : request.method === "session/new" ? { sessionId: "e2e-session-" + (++sessions), configOptions: modelOptions("e2e-model") }
+    : request.method === "session/new" ? { sessionId: "e2e-session-" + crypto.randomUUID(), configOptions: modelOptions("gpt-5.6-sol") }
     : request.method === "session/prompt" ? { stopReason: "end_turn", usage: { totalTokens: 2, inputTokens: 1, outputTokens: 1 } }
     : request.method === "session/load" || request.method === "session/cancel" || request.method === "session/set_mode" ? {}
-    : request.method === "session/set_config_option" && request.params.configId === "model" && request.params.value === "e2e-model" ? { configOptions: modelOptions(request.params.value) }
+    : request.method === "session/set_config_option" && ((request.params.configId === "model" && request.params.value === "gpt-5.6-sol") || (request.params.configId === "mode" && request.params.value === "read-only")) ? { configOptions: modelOptions("gpt-5.6-sol") }
     : null;
   if (result === null) output({ jsonrpc: "2.0", id: request.id, error: { code: -32601, message: "method not found" } });
   else output({ jsonrpc: "2.0", id: request.id, result });

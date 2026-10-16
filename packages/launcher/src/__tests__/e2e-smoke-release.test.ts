@@ -175,7 +175,7 @@ describe("signed E2E ACP releases", () => {
           bridgeArtifactDigest: artifact?.digest,
           configId: "model",
           optionType: "select",
-          modelIdentities: [{ value: "e2e-model", canonicalProviderId: "e2e", canonicalModelId: "e2e-model" }],
+          modelIdentities: [{ value: "gpt-5.6-sol", canonicalProviderId: "openai", canonicalModelId: "gpt-5.6-sol" }],
         }),
         // The person's own DeepSeek Harness: no artifact, bound by agent and supported versions.
         expect.objectContaining({
@@ -197,18 +197,33 @@ describe("signed E2E ACP releases", () => {
       try {
         const session = await bridge.connection.newSession({ cwd: workspace, mcpServers: [] });
         expect(session.sessionId).toMatch(/^e2e-session-/);
-        expect(session.configOptions).toEqual([
+        const secondProcess = execFileSync(process.execPath, [join(prefix, profile.bridge.entrypoint)], {
+          input: [
+            { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1, clientCapabilities: {} } },
+            { jsonrpc: "2.0", id: 2, method: "session/new", params: { cwd: workspace, mcpServers: [] } },
+          ].map(request => JSON.stringify(request)).join("\n") + "\n",
+          encoding: "utf8",
+        });
+        const secondSession = secondProcess.trim().split("\n").map(line => JSON.parse(line)).find(reply => reply.id === 2);
+        expect(secondSession.result.sessionId).not.toBe(session.sessionId);
+        expect(session.configOptions).toEqual(expect.arrayContaining([
           expect.objectContaining({
             id: "model",
             type: "select",
-            currentValue: "e2e-model",
-            options: [{ value: "e2e-model", name: "E2E deterministic model" }],
+            currentValue: "gpt-5.6-sol",
+            _meta: { konteksModelOffer: { source: "codex-model-list.v1", offeredValues: ["gpt-5.6-sol"], defaultValue: "gpt-5.6-sol" } },
+            options: [{ value: "gpt-5.6-sol", name: "E2E fixture: GPT-5.6 Sol" }],
           }),
-        ]);
+        ]));
+        const governed = await bridge.connection.setSessionConfigOption({ sessionId: session.sessionId, configId: "mode", value: "read-only" });
+        expect(governed.configOptions).toEqual(expect.arrayContaining([
+          expect.objectContaining({ id: "mode", type: "select", currentValue: "read-only" }),
+          expect.objectContaining({ id: "model", currentValue: "gpt-5.6-sol" }),
+        ]));
         await expect(bridge.connection.setSessionConfigOption({
           sessionId: session.sessionId,
           configId: "model",
-          value: "e2e-model",
+          value: "gpt-5.6-sol",
         })).resolves.toEqual({ configOptions: session.configOptions });
         const repositoryUrl = "https://git.example/konteks/native-smoke.git";
         const planningInput = { goal: "Prove native planning", repositories: [{ url: repositoryUrl }] };
@@ -258,11 +273,14 @@ describe("signed E2E ACP releases", () => {
         "",
       ].join("\n");
       const replies = execFileSync(join(prefix, "bridge", "fake-codex-acp"), [], { encoding: "utf8", input }).trim().split("\n").map(line => JSON.parse(line));
-      const chunk = replies.find(reply => reply.method === "session/update");
+      const chunk = replies.find(reply => reply.method === "session/update" && reply.params.update.sessionUpdate === "agent_message_chunk");
+      expect(replies).toEqual(expect.arrayContaining([expect.objectContaining({ method: "session/update", params: {
+        sessionId: "e2e-session-1", update: expect.objectContaining({ sessionUpdate: "tool_call", kind: "read", status: "completed", rawInput: { file_path: skillFile } }),
+      } })]));
       expect(JSON.parse(chunk.params.update.content.text).tasks[0].validation).toContain("NATIVE_SKILL_RUNTIME_20260928_OK");
       await writeFile(skillFile, "---\nname: native-runtime-skill-probe-20260928\n---\nmarker removed\n");
       const withoutMarker = execFileSync(join(prefix, "bridge", "fake-codex-acp"), [], { encoding: "utf8", input }).trim().split("\n").map(line => JSON.parse(line));
-      const secondChunk = withoutMarker.find(reply => reply.method === "session/update");
+      const secondChunk = withoutMarker.find(reply => reply.method === "session/update" && reply.params.update.sessionUpdate === "agent_message_chunk");
       expect(JSON.parse(secondChunk.params.update.content.text).tasks[0].validation).not.toContain("NATIVE_SKILL_RUNTIME_20260928_OK");
     } finally { await rm(root, { recursive: true, force: true }); }
   });
