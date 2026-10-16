@@ -54,6 +54,8 @@ export function planningTerminalRecordKey(record: PlanningTerminalRecord): strin
 interface PlanningLog {
   readonly revision: number;
   all(): PlanningTerminalRecord[];
+  filter(matches: (row: Readonly<PlanningTerminalRecord>) => boolean): PlanningTerminalRecord[];
+  find(matches: (row: Readonly<PlanningTerminalRecord>) => boolean): PlanningTerminalRecord | undefined;
   update(key: string, derive: (existing: PlanningTerminalRecord | undefined) => PlanningTerminalRecord): Promise<void>;
   batch(derive: () => PlanningTerminalRecord[]): Promise<void>;
   rewrite(derive: () => PlanningTerminalRecord[] | undefined): Promise<void>;
@@ -111,24 +113,24 @@ export class PlanningTerminalJournal {
   }
 
   cursor(instanceId: string): number {
-    const record = this.log.all().find(row => row.kind === "cursor" && row.instanceId === instanceId);
+    const record = this.log.find(row => row.kind === "cursor" && row.instanceId === instanceId);
     return record?.kind === "cursor" ? record.afterSequence : 0;
   }
 
   directive(instanceId: string, directiveId: string): PlanningDirectiveRecord | undefined {
-    const record = this.log.all().find(row => row.kind === "directive" && row.instanceId === instanceId && row.directiveId === directiveId);
-    return record?.kind === "directive" ? structuredClone(record) : undefined;
+    const record = this.log.find(row => row.kind === "directive" && row.instanceId === instanceId && row.directiveId === directiveId);
+    return record?.kind === "directive" ? record : undefined;
   }
 
   pendingDirectives(instanceId: string): PlanningControllerTerminalDirective[] {
-    return this.log.all().filter((row): row is PlanningDirectiveRecord => row.kind === "directive" && row.instanceId === instanceId && row.state !== "report_durable")
-      .sort((left, right) => left.directiveSequence - right.directiveSequence).map(row => structuredClone(row.directive));
+    return (this.log.filter(row => row.kind === "directive" && row.instanceId === instanceId && row.state !== "report_durable") as PlanningDirectiveRecord[])
+      .sort((left, right) => left.directiveSequence - right.directiveSequence).map(row => row.directive);
   }
 
   execution(admission: LocalAdmission): PlanningTranscriptState | undefined {
-    const record = this.log.all().find(row => row.kind === "execution" && row.admission.executionGeneration === admission.executionGeneration);
+    const record = this.log.find(row => row.kind === "execution" && row.admission.executionGeneration === admission.executionGeneration);
     if (record?.kind === "execution" && !equal(record.admission, admission)) throw new Error("Planning execution admission changed");
-    return record?.kind === "execution" ? structuredClone(record) : undefined;
+    return record?.kind === "execution" ? record : undefined;
   }
 
   async start(admissionCandidate: unknown, recoveryEpoch: number): Promise<void> {
@@ -171,7 +173,7 @@ export class PlanningTerminalJournal {
   }
 
   private assertSequenceUnused(instanceId: string, directive: PlanningControllerTerminalDirective): void {
-    const atSequence = this.log.all().find(row => row.kind === "directive" && row.instanceId === instanceId && row.directiveSequence === directive.directiveSequence);
+    const atSequence = this.log.find(row => row.kind === "directive" && row.instanceId === instanceId && row.directiveSequence === directive.directiveSequence);
     if (atSequence?.kind === "directive" && atSequence.directiveId !== directive.directiveId) throw new Error("Controller directive sequence was reused");
   }
 

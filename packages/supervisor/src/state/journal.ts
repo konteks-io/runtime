@@ -403,6 +403,30 @@ class AppendLog<T extends { [key: string]: unknown }> {
     return entry === undefined ? undefined : structuredClone(entry);
   }
 
+  /**
+   * The rows that match, each a copy: only matches are cloned (D175, 10-16:
+   * `all().filter(…)` cloned 1,727 assignment rows to keep a handful, for up
+   * to 8.6 s, and held the event loop 44 s). `matches` must not change a row.
+   */
+  filter(matches: (entry: Readonly<T>) => boolean): T[] {
+    if (this.writeUncertain) throw new Error("Journal write outcome requires recovery");
+    const found: T[] = [];
+    for (const entry of this.entries.values()) if (matches(entry)) found.push(structuredClone(entry));
+    return found;
+  }
+
+  /** The first row that matches, as a copy; see `filter`. */
+  find(matches: (entry: Readonly<T>) => boolean): T | undefined {
+    if (this.writeUncertain) throw new Error("Journal write outcome requires recovery");
+    for (const entry of this.entries.values()) if (matches(entry)) return structuredClone(entry);
+    return undefined;
+  }
+
+  /** How many rows the log holds, without copying them. */
+  get size(): number {
+    return this.entries.size;
+  }
+
   async put(entry: T): Promise<void> {
     const parsed = this.table.schema.parse(structuredClone(entry));
     return this.serialized(async () => {
@@ -613,10 +637,10 @@ export class SupervisorJournal {
   /** Bounded pruning: completed/cancelled entries beyond the bound go first, oldest first. */
   async prune(): Promise<void> {
     await this.pruneCoordinationInvocations();
-    const entries = this.assignments.all();
-    if (entries.length <= MAX_JOURNAL_ENTRIES) return;
-    const terminal = entries.filter((entry) => entry.state === "completed" || entry.state === "cancelled").sort((a, b) => (a.updatedAt < b.updatedAt ? -1 : 1));
-    for (const entry of terminal.slice(0, entries.length - MAX_JOURNAL_ENTRIES)) {
+    const count = this.assignments.size;
+    if (count <= MAX_JOURNAL_ENTRIES) return;
+    const terminal = this.assignments.filter((entry) => entry.state === "completed" || entry.state === "cancelled").sort((a, b) => (a.updatedAt < b.updatedAt ? -1 : 1));
+    for (const entry of terminal.slice(0, count - MAX_JOURNAL_ENTRIES)) {
       await this.assignments.remove(`${entry.assignmentId}:${entry.attempt}`);
     }
   }
@@ -636,11 +660,11 @@ export class SupervisorJournal {
   }
 
   activeAssignments(): JournalEntry[] {
-    return this.assignments.all().filter((entry) => entry.state === "claimed" || entry.state === "running" || entry.state === "checkpointed" || entry.state === "terminal_pending_report");
+    return this.assignments.filter((entry) => entry.state === "claimed" || entry.state === "running" || entry.state === "checkpointed" || entry.state === "terminal_pending_report");
   }
 
   recoveryRequired(): JournalEntry[] {
-    return this.assignments.all().filter((entry) => entry.state === "recovery_required");
+    return this.assignments.filter((entry) => entry.state === "recovery_required");
   }
 
   latestAttempt(assignmentId: string): JournalEntry | undefined {

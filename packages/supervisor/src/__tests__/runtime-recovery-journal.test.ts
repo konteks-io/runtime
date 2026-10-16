@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { computeRemoteReconciliationReceiptSnapshotDigest } from "@konteks/remote-common";
 import { SupervisorJournal } from "../state/journal.js";
 import { StateMutationGate } from "../state/mutation-gate.js";
@@ -29,6 +29,19 @@ describe("durable runtime recovery generations", () => {
     expect((await reload()).recovery.current("instance", "process")?.state).toBe("pending");
     await journal.recovery.acceptReceipt(intent, acceptance);
     expect((await reload()).recovery.current("instance", "process")?.state).toBe("applied");
+  });
+
+  it("reads the current record without copying the whole log, and hands back a copy (D175)", async () => {
+    await prepared();
+    await journal.recovery.prepareIntent({ ...intent, runnerIncarnation: "other", reconnectIntentId: "other-intent" });
+    const all = vi.spyOn(Object.getPrototypeOf(journal.assignments), "all");
+    const current = journal.recovery.current("instance", "process");
+    expect(current?.intent.reconnectIntentId).toBe("intent");
+    expect(all).not.toHaveBeenCalled();
+    // A copy: changing it changes nothing in the journal.
+    current!.state = "expired" as never;
+    expect(journal.recovery.current("instance", "process")?.state).toBe("pending");
+    all.mockRestore();
   });
 
   it("repairs torn recovery tails and rejects a complete tampered semantic record", async () => {

@@ -66,6 +66,7 @@ type TerminalDisposition = "expired" | "superseded" | "establishment_conflict";
 /** Supplied by the existing fsync/compaction/ownership-gated append log. */
 interface RecoveryLog {
   all(): RuntimeRecoveryRecord[];
+  filter(matches: (record: Readonly<RuntimeRecoveryRecord>) => boolean): RuntimeRecoveryRecord[];
   update(key: string, derive: (current: RuntimeRecoveryRecord | undefined) => RuntimeRecoveryRecord): Promise<void>;
 }
 export const recoveryRecordKey = (record: Pick<RuntimeRecoveryRecord, "intent">): string =>
@@ -90,7 +91,8 @@ export class RuntimeRecoveryJournal {
   constructor(private readonly log: RecoveryLog) {}
 
   current(instanceId: string, runnerIncarnation: string): RuntimeRecoveryRecord | undefined {
-    return this.log.all().filter(record => record.intent.instanceId === instanceId && record.intent.runnerIncarnation === runnerIncarnation).at(-1);
+    // Read on every renewal: copy only this runner's records, never the whole log (D175).
+    return this.log.filter(record => record.intent.instanceId === instanceId && record.intent.runnerIncarnation === runnerIncarnation).at(-1);
   }
 
   async prepareIntent(candidate: unknown): Promise<void> {
