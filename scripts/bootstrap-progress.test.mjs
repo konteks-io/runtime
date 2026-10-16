@@ -31,9 +31,13 @@ function psPresentation(body) {
       "-Command",
       `$ErrorActionPreference = 'Stop'; Remove-Item Env:KONTEKS_SETUP_HEADER_SHOWN -ErrorAction SilentlyContinue; ${definitions}\n${body}`,
     ],
-    { encoding: "utf8", timeout: 20000, windowsHide: true },
+    // The same 60 s the Windows bootstrap spawns allow: on some windows-11-arm runners every
+    // Windows PowerShell 5.1 process that loads a signed system module (Write-Host, Add-Type)
+    // pays ~20 s before it runs (bootstrap cases measured 22–25 s there, ~2 s on a healthy
+    // runner), and at 20 s these were killed with status null (10-15/16, runtime#113, #114, #117).
+    { encoding: "utf8", timeout: 60_000, windowsHide: true },
   );
-  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.equal(result.status, 0, `${result.error ? `${result.error.message}\n` : ""}${result.stdout}${result.stderr}`);
   return result.stdout;
 }
 
