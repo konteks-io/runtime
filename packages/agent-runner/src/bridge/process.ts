@@ -339,7 +339,20 @@ function openCodeProviderError(error: RequestError): BridgeErrorClass | null {
   const known = OPENCODE_PROVIDER_ERRORS[data.errorName];
   if (known) return { code: error.code, ...known };
   if (/\b(429|503)\b/.test(text)) return { code: error.code, ...OPENCODE_PROVIDER_ERRORS["provider.internal"]! };
-  return { code: error.code, class: "provider_failure", message: "The provider could not handle this request.", retryable: false };
+  return { code: error.code, class: "provider_failure", message: providerSentence(text), retryable: false };
+}
+
+/**
+ * The provider's own sentence, when it is one a person can act on: on 10-16 a
+ * Go model answered "This Go model requires Global regions. Select Global in
+ * your workspace's Privacy settings to use it." and the page said only that
+ * the provider could not handle the request. Anything that is not plain prose
+ * (JSON, a stack, a bare code) stays generic.
+ */
+function providerSentence(message: string): string {
+  const text = message.replace(/^Internal error:\s*/i, "").replace(/^Upstream request failed:\s*/i, "").split("\n")[0]!.trim();
+  const plain = text.length >= 16 && text.length <= 240 && /\s/.test(text) && /^[\p{L}\p{N}\s.,;:'’()/-]+$/u.test(text) && /\p{L}{3,}/u.test(text);
+  return plain ? text : "The provider could not handle this request.";
 }
 
 /**
