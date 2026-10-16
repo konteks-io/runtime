@@ -83,6 +83,26 @@ jobs:
         env:
           KONTEKS_TEST_POWERSHELL: pwsh.exe
         run: node --test --test-name-pattern="Windows bootstrap" scripts/bootstrap-install.test.mjs
+      - name: "Diagnostic (temporary): where Windows PowerShell 5.1 spends its start"
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $cases = [ordered]@{
+            'exit'                 = @('-NoLogo','-NoProfile','-NonInteractive','-Command','exit')
+            'Write-Host'           = @('-NoLogo','-NoProfile','-NonInteractive','-Command','Write-Host x')
+            'Write-Host, Bypass'   = @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-Command','Write-Host x')
+            'Add-Type'             = @('-NoLogo','-NoProfile','-NonInteractive','-Command','Add-Type -TypeDefinition "public class KonteksProbe {}"')
+            'Utility, Bypass'      = @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-Command','Import-Module Microsoft.PowerShell.Utility')
+            'Security'             = @('-NoLogo','-NoProfile','-NonInteractive','-Command','Import-Module Microsoft.PowerShell.Security')
+          }
+          Write-Host "ExecutionPolicy (machine): $(powershell.exe -NoProfile -Command 'Get-ExecutionPolicy -List | Out-String')"
+          foreach ($name in $cases.Keys) {
+            foreach ($round in 1..2) {
+              $watch = [Diagnostics.Stopwatch]::StartNew()
+              & powershell.exe @($cases[$name]) | Out-Null
+              Write-Host ("{0,-22} round {1}: {2,6} ms" -f $name, $round, $watch.ElapsedMilliseconds)
+            }
+          }
       - name: Setup identity and animated progress in Windows PowerShell 5.1
         shell: powershell
         run: node --test scripts/bootstrap-progress.test.mjs
