@@ -1085,6 +1085,11 @@ export class Supervisor {
         assertCurrent();
         await new NativeWorkspaceCheckpointStore({ root: runner.RUNNER_WORKSPACE_DIR, repositoryCacheRoot: native.repositoryCacheRoot,
           chunksSupported: () => coreContractAtLeast(this.coreContractVersion, REMOTE_WORKSPACE_CHUNK_MIN_CORE_CONTRACT_VERSION),
+          onRuntimeFailure: (fact, context) => {
+            const entry = this.journal.assignments.get(`${admission.assignmentId}:${admission.attempt}`);
+            if (!assignment || entry?.claimId !== admission.claimId) return;
+            return this.recordRuntimeFailure(assignment, fact, context);
+          },
           client: () => new NativeInputClient({ baseUrl: this.config.SUPERVISOR_CORE_URL, roots: this.roots, clock: this.clock,
             credential: () => this.lease.mode() === "active" ? (this.lease.current()?.lease ?? null) : null }) }).seal(admission, assertCurrent);
       },

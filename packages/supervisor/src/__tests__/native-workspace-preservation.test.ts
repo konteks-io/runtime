@@ -9,6 +9,7 @@ import { captureWorkspaceCheckpoint } from '../native/workspace-checkpoint.js';
 import { RemoteWorkspaceBeginRequestSchema, RemoteWorkspaceSealRequestSchema, RemoteWorkspaceAnySealRequestSchema, RemoteWorkspaceChunkWriteRequestSchema, computeRemoteFileTreeDigest, computeRemoteSkillCatalogDigest,
   type RemoteWorkAssignment, type RemoteAssignmentInputsEnvelope } from '@konteks/remote-common';
 import type { NativeInputClient } from '../native/input-client.js';
+import type { RuntimeFailureReporter } from '../runtime-failure-types.js';
 let root: string; let cwd: string; let baseline: string;
 let tool: Awaited<ReturnType<typeof testGitTool>>;
 const assignment: RemoteWorkAssignment = { id: 'assignment', instanceId: 'old', workspaceId: 'tenant', attempt: 1, kind: 'assistant_execution', placementId: 'placement', taskId: 'task', correlationId: 'correlation', expiresAt: '2026-10-13T02:00:00Z', requiredCapabilities: [], agentRoute: { agentId: 'codex', requiredRole: 'assistant' }, source: { kind: 'conversation', portability: 'portable_before_claim', sessionId: 'session', turnRef: 'turn' }, policy: { maxDurationSeconds: 600, maxArtifactBytes: 1024, evidenceUpload: 'structured_only', allowedArtifactKinds: [], recoveryMode: 'report_interrupted', latestResumeAt: '2026-10-13T02:00:00Z', permissionResponderDeadlineSeconds: 30, humanDeferralAllowed: false } };
@@ -40,12 +41,52 @@ it('persists the exact stopped workspace across a supervisor restart and retries
   const upload = RemoteWorkspaceSealRequestSchema.parse(api.workspace.mock.calls.at(-1)![2]);
   expect(Buffer.from(fileContent(upload.checkpoint.entries), 'base64').toString()).toBe('unfinished edits');
 });
+it.each(['returns', 'throws', 'rejects', 'pending'] as const)(
+  'reports a failed checkpoint seal without replacing its error or losing retained edits when the diagnostic callback %s',
+  async diagnostic => {
+    const api = client();
+    const failure = new Error('private-seal-response EACCES /private/retained-checkout');
+    const onRuntimeFailure = vi.fn<RuntimeFailureReporter>(() => {
+      if (diagnostic === 'throws') throw new Error('private-diagnostic-throw');
+      if (diagnostic === 'rejects') return Promise.reject(new Error('private-diagnostic-rejection'));
+      if (diagnostic === 'pending') return new Promise<void>(() => undefined);
+    });
+    const options = { root, client: () => api, onRuntimeFailure };
+    const store = new NativeWorkspaceCheckpointStore(options);
+    await store.begin({ assignment, claimId: 'claim', selectionDigest, cwd, baselineCommit: baseline, tool });
+    await writeFile(join(cwd, 'file.txt'), 'retained unfinished edits');
+    api.workspace.mockRejectedValueOnce(failure);
+
+    await expect(store.seal(admission, () => undefined)).rejects.toBe(failure);
+    expect(api.workspace.mock.calls.map(call => call[1])).toEqual(['begin', 'seal']);
+    expect(onRuntimeFailure).toHaveBeenCalledExactlyOnceWith({
+      phase: 'checkpoint', stage: 'workspace_seal', code: 'checkpoint_seal_failed',
+      evidence: { kind: 'runtime_exception' },
+    }, { assignmentId: assignment.id, attempt: assignment.attempt });
+    expect(JSON.stringify(onRuntimeFailure.mock.calls)).not.toMatch(/private-|EACCES|"message"|"stack"|"errno"/);
+    expect(await readFile(join(cwd, 'file.txt'), 'utf8')).toBe('retained unfinished edits');
+    const uncertain = RemoteWorkspaceSealRequestSchema.parse(api.workspace.mock.calls[1]![2]);
+
+    await writeFile(join(cwd, 'file.txt'), 'later unsaved edits');
+    await new NativeWorkspaceCheckpointStore(options).seal(admission, () => undefined);
+    const retried = RemoteWorkspaceSealRequestSchema.parse(api.workspace.mock.calls[2]![2]);
+    expect(retried).toEqual(uncertain);
+    expect(await readFile(join(cwd, 'file.txt'), 'utf8')).toBe('later unsaved edits');
+    expect(onRuntimeFailure).toHaveBeenCalledOnce();
+  },
+);
 it('refuses changed Git configuration after work begins and keeps the source edits', async () => {
-  const api = client(); const store = new NativeWorkspaceCheckpointStore({ root, client: () => api });
+  const api = client(); const onRuntimeFailure = vi.fn<RuntimeFailureReporter>();
+  const options = { root, client: () => api, onRuntimeFailure };
+  const store = new NativeWorkspaceCheckpointStore(options);
   await store.begin({ assignment, claimId: 'claim', selectionDigest, cwd, baselineCommit: baseline, tool });
   await writeFile(join(cwd, 'file.txt'), 'keep these edits');
   await testGitCommand(tool, cwd, ['config', 'core.autocrlf', 'true']);
-  await expect(new NativeWorkspaceCheckpointStore({ root, client: () => api }).seal(admission, () => undefined)).rejects.toMatchObject({ code: 'capability_unavailable' });
+  await expect(new NativeWorkspaceCheckpointStore(options).seal(admission, () => undefined)).rejects.toMatchObject({ code: 'capability_unavailable' });
+  expect(onRuntimeFailure).toHaveBeenCalledExactlyOnceWith({
+    phase: 'checkpoint', stage: 'workspace_capture', code: 'checkpoint_capture_failed',
+    evidence: { kind: 'runtime_exception' },
+  }, { assignmentId: assignment.id, attempt: assignment.attempt });
   expect(api.workspace).toHaveBeenCalledTimes(1);
   expect(await readFile(join(cwd, 'file.txt'), 'utf8')).toBe('keep these edits');
 });
@@ -122,6 +163,7 @@ function fileContent(entries: ReturnType<typeof RemoteWorkspaceSealRequestSchema
 
 it('replays the same durable chunks after an uncertain upload and a restart without the original checkout', async () => {
   const saved = new Map<string, string>(); let fail = true;
+  const onRuntimeFailure = vi.fn<RuntimeFailureReporter>();
   const api = { workspace: vi.fn(async (...[_assignment, operation, raw]: Parameters<NativeInputClient['workspace']>) => {
     if (operation === 'begin') return { checkpointId: RemoteWorkspaceBeginRequestSchema.parse(raw).checkpointId, state: 'writing' };
     if (operation === 'write-chunk') {
@@ -132,14 +174,22 @@ it('replays the same durable chunks after an uncertain upload and a restart with
     const request = RemoteWorkspaceAnySealRequestSchema.parse(raw);
     return { checkpointId: request.checkpointId, checkpointDigest: request.checkpoint.checkpointDigest, state: 'sealed' };
   }) };
-  const store = new NativeWorkspaceCheckpointStore({ root, client: () => api, chunksSupported: () => true });
+  const options = { root, client: () => api, chunksSupported: () => true, onRuntimeFailure };
+  const store = new NativeWorkspaceCheckpointStore(options);
   await store.begin({ assignment, claimId: 'claim', selectionDigest, cwd, baselineCommit: baseline, tool, format: 'konteks-workspace-checkpoint-v2' });
   await writeFile(join(cwd, 'file.txt'), 'keep this unfinished work');
   await expect(store.seal(admission, () => undefined)).rejects.toThrow('upload reply lost');
+  expect(onRuntimeFailure).toHaveBeenCalledExactlyOnceWith({
+    phase: 'checkpoint', stage: 'workspace_chunk_upload', code: 'checkpoint_upload_failed',
+    evidence: { kind: 'runtime_exception' },
+  }, { assignmentId: assignment.id, attempt: assignment.attempt });
+  expect(JSON.stringify(onRuntimeFailure.mock.calls)).not.toMatch(/upload reply lost|contentBase64|"errno"/);
+  expect(await readFile(join(cwd, 'file.txt'), 'utf8')).toBe('keep this unfinished work');
   await rm(cwd, { recursive: true });
-  await new NativeWorkspaceCheckpointStore({ root, client: () => api, chunksSupported: () => true }).seal(admission, () => undefined);
+  await new NativeWorkspaceCheckpointStore(options).seal(admission, () => undefined);
   const request = RemoteWorkspaceAnySealRequestSchema.parse(api.workspace.mock.calls.at(-1)![2]);
   const file = request.checkpoint.entries.find(entry => entry.path === 'file.txt');
   if (request.checkpoint.format !== 'konteks-workspace-checkpoint-v2' || file?.kind !== 'file' || !('chunks' in file)) throw new Error('Expected chunked work');
   expect(Buffer.from(saved.get(file.chunks[0]!.digest)!, 'base64').toString()).toBe('keep this unfinished work');
+  expect(onRuntimeFailure).toHaveBeenCalledOnce();
 });
