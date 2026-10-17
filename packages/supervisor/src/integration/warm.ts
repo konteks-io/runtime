@@ -67,7 +67,9 @@ export class WarmIntegrationSessions {
     const opened = entry!.opened!;
     try {
       runner.adoptSession!(opened.acpSessionRef, context);
-    } catch {
+    } catch (error) {
+      // Say why: every miss on 10-16/17 read only "not_adoptable".
+      this.deps.logger.info({ event: "integration.warm_session", outcome: "adopt_refused", agentId: shape.agentId, err: error }, "a warm integration session could not be taken over");
       this.logTake("missed", shape.agentId, context, "not_adoptable");
       await closeIntegrationSession(runner, opened, this.deps.logger, CLOSE_GRACE_MS);
       return undefined;

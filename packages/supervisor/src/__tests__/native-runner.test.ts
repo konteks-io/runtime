@@ -86,6 +86,19 @@ describe("native in-process runner", () => {
     await expect(f.runner.createSession({ ...f.input, integration: { admittedMcpServerNames: Array.from({ length: 9 }, (_, i) => `s${i}`), accountConnectors: false } })).rejects.toThrow();
   });
 
+  it("lets a task take over a new integration session with no durable owner, and never one with an owner (10-17)", async () => {
+    const f = fixture(); await f.runner.start();
+    const integration = { admittedMcpServerNames: ["atlassian"], accountConnectors: false };
+    // A warm read session is opened with no lifecycle; the runner's own guard must not make it owned.
+    const warm = await f.runner.createSession({ ...f.input, integration });
+    const task = { ...f.input.context, assignmentId: "asg-read-2" };
+    expect(() => f.runner.adoptSession(warm.acpSessionRef, task)).not.toThrow();
+    const g = fixture(); await g.runner.start();
+    const owned = await g.runner.createSession({ ...g.input, integration }, {
+      beforeCreate: async () => undefined, recordProcessOwner: async () => undefined, assertCurrent: () => undefined });
+    expect(() => g.runner.adoptSession(owned.acpSessionRef, task)).toThrow(/never-prompted integration session/);
+  });
+
   it("asks a direct session's agent only for the [konteks] prefix ahead of its own title", async () => {
     const f = fixture(); await f.runner.start();
     await f.runner.createSession({ ...f.input, agentTitled: true });

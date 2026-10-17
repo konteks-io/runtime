@@ -83,6 +83,8 @@ interface CreateSessionArgs {
     recordProcessOwner(owner: RetainedProcessOwner): Promise<void>;
     replaceProcessOwner?(previous: RetainedProcessOwner, replacement: RetainedProcessOwner): Promise<void>;
     assertCurrent(): void;
+    /** The runner's own guard with no durable owner behind it (the native runner always passes one). */
+    ownerless?: true;
   };
 }
 
@@ -99,9 +101,14 @@ interface IntegrationSessionAdmission {
   utility?: { model?: string | undefined } | undefined;
 }
 
-/** A new integration session with no durable owner may be taken over by the task that takes it warm. */
+/**
+ * A new integration session with no durable owner may be taken over by the
+ * task that takes it warm. The native runner always passes its own guard, so
+ * "no owner" is `ownerless`, not a missing lifecycle: on 10-16/17 taufan-mac's
+ * warm sessions were never reused (23 `not_adoptable`, 0 reuses).
+ */
 function adoption(args: Pick<CreateSessionArgs, "integration" | "lifecycle">): { adoptable?: true } {
-  return args.integration && !args.lifecycle ? { adoptable: true } : {};
+  return args.integration && (!args.lifecycle || args.lifecycle.ownerless === true) ? { adoptable: true } : {};
 }
 
 /** The `_meta` an integration session's `session/new` carries, versioned for the bridge patches. */
