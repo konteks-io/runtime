@@ -1,7 +1,7 @@
 import { mkdir, readFile } from "node:fs/promises";
 import type { InitializeResponse } from "@agentclientprotocol/sdk";
 import { join, resolve } from "node:path";
-import { RemoteInstanceError, createLogger, stopRetainedProcessOwner, withoutUndefined, writeSecretFile, type AgentLoginOptionId, type ConnectedAgentCredential, type ConnectedAgentView, type Logger, type RetainedProcessOwner } from "@konteks/remote-common";
+import { RemoteInstanceError, RuntimeFailureObservationSchema, createLogger, stopRetainedProcessOwner, withoutUndefined, writeSecretFile, type AgentLoginOptionId, type ConnectedAgentCredential, type ConnectedAgentView, type Logger, type RetainedProcessOwner } from "@konteks/remote-common";
 import type { AgentBridgeFamily } from "@konteks/remote-release";
 import { fallbackLoginIdentity, probeIdentity, type IdentityProbe } from "./auth/identity.js";
 import { runLogout, startLoginFlow, type LoginFailureReason, type LoginFlow } from "./auth/login-flow.js";
@@ -694,7 +694,8 @@ export class AgentRuntime {
       onSessionUpdate: params => this.sessions.onSessionUpdate(params, start.owner),
       onRequestPermission: params => this.sessions.onRequestPermission(params, start.owner),
       onCreateElicitation: params => this.sessions.onCreateElicitation(params, start.owner),
-      onExit: () => {
+      onExit: info => {
+        const failureEvidence = this.executionExitEvidence(info, record);
         if (binding?.authority) {
           void start.processOwner?.stop().catch(error => {
             record.stopping = true;
@@ -702,12 +703,21 @@ export class AgentRuntime {
           });
         } else this.releaseWorkingCopy(binding);
         if (!start.owner) { start.exitedDuringStart = true; return; }
-        this.sessions.closeAll("agent_exited", start.owner);
+        this.sessions.closeAll("agent_exited", start.owner, failureEvidence);
         this.observeExecutionExit(start.owner);
         // An execution exit does not reset control/login readiness, nor
         // automatically respawn an uncertain execution generation.
       },
     };
+  }
+
+  /** Capture only this owned child's unexpected exit, before its numeric facts are discarded. */
+  private executionExitEvidence(info: Parameters<BridgeClientHandlers["onExit"]>[0], record: ExecutionOwner) {
+    if (this.stopping || record.stopping) return undefined;
+    const schema = RuntimeFailureObservationSchema.shape.evidence;
+    const exitCode = schema.safeParse({ kind: "process_exit", exitCode: info.code });
+    const signal = schema.safeParse({ kind: "process_exit", signal: info.signal });
+    return { ...(exitCode.success ? exitCode.data : {}), ...(signal.success ? signal.data : {}), kind: "process_exit" as const };
   }
 
   /**

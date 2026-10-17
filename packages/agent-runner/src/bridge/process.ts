@@ -14,6 +14,7 @@ import {
 } from "@agentclientprotocol/sdk";
 import {
   RemoteInstanceError,
+  RuntimeFailureObservationSchema,
   captureRetainedProcessOwner,
   isProcessGroupAlive,
   createLogger,
@@ -22,6 +23,7 @@ import {
   type Logger,
   type PipedChildProcess,
   type RetainedProcessOwner,
+  type RuntimeFailureObservation,
 } from "@konteks/remote-common";
 import { instructionScopeObserver } from "./instruction-scope-observer.js";
 import type { BridgeSpawnSpec } from "./spec.js";
@@ -427,6 +429,13 @@ export function classifyBridgeError(error: unknown): {
   }
   const message = error instanceof Error ? error.message.slice(0, 1_024) : "bridge request failed";
   return { code: -32603, class: "internal", message, retryable: false };
+}
+
+/** Only the SDK's rejected protocol request attests a provider RPC code. */
+export function providerProtocolEvidence(error: unknown): RuntimeFailureObservation["evidence"] | undefined {
+  if (!(error instanceof RequestError)) return undefined;
+  const parsed = RuntimeFailureObservationSchema.shape.evidence.safeParse({ kind: "provider_protocol", rpcCode: error.code });
+  return parsed.success ? parsed.data : undefined;
 }
 
 /** JSON-RPC codes that are definite answers, never worth repeating. */

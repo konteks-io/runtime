@@ -1,6 +1,8 @@
 import { NativeWorkspaceCheckpointStore } from "./native/workspace-preservation.js";
 import { logicalSessionId } from "./work/continued-session.js";
 import { ObservationDelivery } from "./control/observation-delivery.js";
+import { RuntimeFailureDelivery } from "./control/runtime-failure-delivery.js";
+import type { RuntimeFailureContext, RuntimeFailureFact } from "./runtime-failure-types.js";
 import { readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
@@ -298,6 +300,7 @@ export class Supervisor {
   heartbeat!: HeartbeatPublisher;
   control!: ControlHandlers;
   private observationDelivery!: ObservationDelivery;
+  private runtimeFailureDelivery!: RuntimeFailureDelivery;
   private configurationAcks!: ConfigurationAckDelivery;
   private executionRevisionFenceReceipts!: ExecutionRevisionFenceReceiptDelivery;
   work!: WorkOrchestrator;
@@ -551,6 +554,13 @@ export class Supervisor {
       instanceId: () => this.instanceId ?? "", clock: this.clock, logger: this.logger,
       canSend: () => !this.stopping && Boolean(this.instanceId) && Boolean(this.lease.current()) && this.recoveryAuthority() !== null });
     this.observationDelivery.start();
+    this.runtimeFailureDelivery = new RuntimeFailureDelivery({
+      dataDir: this.config.SUPERVISOR_DATA_DIR, core: this.core, clock: this.clock, logger: this.logger,
+      instanceId: () => this.instanceId ?? "", coreContractVersion: () => this.coreContractVersion,
+      canSend: () => this.recoveryAuthority() !== null,
+      mutate: this.stateMutations.run,
+    });
+    this.runtimeFailureDelivery.start();
     this.configurationAcks = new ConfigurationAckDelivery({ outbox: this.outbox, core: this.core, instanceId: () => this.instanceId ?? "", clock: this.clock, canSend: () => !this.stopping && Boolean(this.instanceId) });
     this.executionRevisionFenceReceipts = new ExecutionRevisionFenceReceiptDelivery({ outbox: this.outbox, core: this.core, clock: this.clock, canSend: () => !this.stopping && Boolean(this.instanceId), logger: this.logger });
   }
@@ -1138,6 +1148,7 @@ export class Supervisor {
         journal: this.journal,
         transport: this.transport,
         runner,
+        onRuntimeFailure: (fact, context) => this.recordRuntimeFailure(assignment, fact, context),
         directModelSelectionSupported: () =>
           coreContractAtLeast(
             this.coreContractVersion,
@@ -1182,6 +1193,7 @@ export class Supervisor {
           },
         }),
         prepareInputs: native.prepareInputs ?? createNativeInputPreparer({
+          onRuntimeFailure: (fact, context) => this.recordRuntimeFailure(assignment, fact, context),
           workspaceRecovery: () => coreContractAtLeast(this.coreContractVersion, REMOTE_WORKSPACE_CHECKPOINT_MIN_CORE_CONTRACT_VERSION),
           workspaceChunks: () => coreContractAtLeast(this.coreContractVersion, REMOTE_WORKSPACE_CHUNK_MIN_CORE_CONTRACT_VERSION),
           workspaceKeptAside: () => coreContractAtLeast(this.coreContractVersion, REMOTE_WORKSPACE_KEPT_ASIDE_MIN_CORE_CONTRACT_VERSION),
@@ -2126,6 +2138,19 @@ export class Supervisor {
 
   private async sendUsageObservation(observation: AgentTurnUsageObservation): Promise<void> {
     await this.observationDelivery.submit(observation);
+  }
+
+  /** Retained claim identity is historical evidence, even after its execution or lease ends. */
+  private async recordRuntimeFailure(assignment: RemoteWorkAssignment, fact: RuntimeFailureFact, context: RuntimeFailureContext): Promise<void> {
+    if (context.assignmentId !== assignment.id || context.attempt !== assignment.attempt) return;
+    if (!this.nativeOwnership || this.instanceId !== assignment.instanceId || this.workspaceId !== assignment.workspaceId) return;
+    this.nativeOwnership.assertOwned();
+    const entry = this.journal.assignments.get(`${assignment.id}:${assignment.attempt}`);
+    if (!entry || !claimMatchesPlacement(entry, assignment)) return;
+    await this.runtimeFailureDelivery.submit({ ...fact, schemaVersion: 1, failureId: randomUUID(),
+      observedAt: new Date(this.clock.coreNow()).toISOString(), instanceId: assignment.instanceId,
+      scope: { kind: "assignment", assignmentId: assignment.id, attempt: assignment.attempt, claimId: entry.claimId },
+    });
   }
 
   // ── Drain / erase ──────────────────────────────────────────────────────────
@@ -3234,6 +3259,7 @@ export class Supervisor {
   }
 
   private stopWorkTimers(): void {
+    this.runtimeFailureDelivery?.stop();
     stopInterval(this.pullTimer);
     for (const watch of this.onComputerWatches.values()) clearInterval(watch);
     this.onComputerWatches.clear();
@@ -3556,10 +3582,12 @@ function sameRuntimeUpdateLeasePolicy(captured: ReturnType<typeof decodeLeaseCla
 
 /** The journal entry is still the live claim of exactly this assignment's placement, kind and agent. */
 function claimMatchesTarget(entry: JournalEntry, target: RemoteWorkAssignment): boolean {
-  return (
-    entry.workspaceId === target.workspaceId && entry.placementId === target.placementId && entry.kind === target.kind &&
-    entry.agentId === target.agentRoute.agentId && ["claimed", "running", "checkpointed"].includes(entry.state)
-  );
+  return claimMatchesPlacement(entry, target) && ["claimed", "running", "checkpointed"].includes(entry.state);
+}
+
+function claimMatchesPlacement(entry: JournalEntry, target: RemoteWorkAssignment): boolean {
+  return entry.assignmentId === target.id && entry.attempt === target.attempt && entry.workspaceId === target.workspaceId
+    && entry.placementId === target.placementId && entry.kind === target.kind && entry.agentId === target.agentRoute.agentId;
 }
 
 function stopInterval(timer: NodeJS.Timeout | null): void {

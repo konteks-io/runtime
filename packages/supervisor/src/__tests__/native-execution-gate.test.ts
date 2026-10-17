@@ -1,4 +1,5 @@
 import { generateKeyPairSync, sign } from "node:crypto";
+import { RequestError } from "@agentclientprotocol/sdk";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,6 +15,9 @@ import { PermissionBroker } from "../session/permissions.js";
 import { EvaluatorPolicyResponder } from "../session/policy-responder.js";
 import type { RunnerPort } from "../runner-port.js";
 import type { TransportManager } from "../transport/relay-transport.js";
+import { RunnerEventBus } from "../../../agent-runner/src/events.js";
+import { SessionManager, InMemorySessionRefStore } from "../../../agent-runner/src/sessions/manager.js";
+import type { BridgeProcess } from "../../../agent-runner/src/bridge/process.js";
 
 let root: string;
 const gates: NativeExecutionGate[] = [];
@@ -519,6 +523,33 @@ const deliveryTurn: RemoteWorkAssignment = { ...assignment, kind: "delivery", ta
     turn: { invocationId: "invocation", dispatchGeneration: 0 } } };
 type SessionFixture = Awaited<ReturnType<typeof sessionFixture>>;
 
+async function admittedProtocolFailure(failure: Error) {
+  const onRuntimeFailure = vi.fn((_fact: unknown, _context: unknown) => undefined);
+  const f = await sessionFixture(assignment, undefined, undefined, {}, { onRuntimeFailure });
+  const events = new RunnerEventBus();
+  const bridge: BridgeProcess = { exited: false, initializeResult: { protocolVersion: 1 }, stderrTail: () => [],
+    connection: { newSession: vi.fn(async () => ({ sessionId: "private-rpc-session" })),
+      prompt: vi.fn(async () => { throw failure; }), cancel: vi.fn(async () => undefined) } as never,
+    stop: vi.fn(async () => undefined) };
+  const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore() });
+  const created = await manager.create({ context: { instanceId: "instance", assignmentId: "assignment", attempt: 1, agentId: "codex" },
+    cwd: root, mcpServers: [], acpSessionRef: "acp", freshSessionWhenRestoreLost: true });
+  expect(created.acpSessionRef).toBe(f.ready.acpSessionRef);
+  expect(bridge.connection.newSession).toHaveBeenCalledOnce();
+  const handled: Promise<void>[] = [];
+  const seen: Array<{ kind: string }> = [];
+  const unsubscribe = events.subscribe(event => { seen.push(event); handled.push(f.session.onRunnerEvent(event)); });
+  vi.mocked(f.runner.prompt as RunnerPort["prompt"]).mockImplementation(async (ref, id, params) => {
+    manager.prompt(ref, id, params as Parameters<SessionManager["prompt"]>[2]);
+  });
+  await f.session.onToRuntime(f.envelope);
+  expect(f.client.consumeExecution).toHaveBeenCalledOnce();
+  await vi.waitFor(() => expect(seen.some(event => event.kind === "request_error")).toBe(true));
+  await Promise.all(handled);
+  return { ...f, onRuntimeFailure, seen,
+    dispose: async () => { unsubscribe(); manager.closeAll("closed"); await f.session.close("cancelled"); } };
+}
+
 /** Core's execution check for the fixture's turn: the delivery route or the Assistant/direct one. */
 function checkOf(f: SessionFixture) {
   return ("checkDeliveryExecution" in f.client ? f.client.checkDeliveryExecution : f.client.checkExecution) as ReturnType<typeof vi.fn>;
@@ -538,6 +569,32 @@ function stopOperation(f: SessionFixture, delivered: boolean) {
 }
 
 describe("native session dispatch uses genuine execution admission", () => {
+  it("captures genuine SDK protocol evidence through the actual runner prompt boundary", async () => {
+    const f = await admittedProtocolFailure(new RequestError(-32042, "private-rpc-message-canary", { detail: "private-rpc-data-canary" }));
+    try {
+      expect(f.seen).toContainEqual(expect.objectContaining({ kind: "request_error", requestId: "request", code: -32042 }));
+      expect(f.onRuntimeFailure).toHaveBeenCalledWith(expect.objectContaining({
+        evidence: { kind: "provider_protocol", rpcCode: -32042 },
+      }), { assignmentId: "assignment", attempt: 1 });
+      expect(JSON.stringify(f.onRuntimeFailure.mock.calls)).not.toMatch(/private-rpc|"message"|"stack"/);
+    } finally { await f.dispose(); }
+  });
+
+  it.each([
+    Object.assign(new Error("private-generic-rpc-canary"), { code: -32603, data: { errno: "EACCES" } }),
+    new RemoteInstanceError("agent_auth_required", "private-local-auth-canary"),
+  ])("does not promote a manufactured runner code to protocol provenance %#", async failure => {
+    const f = await admittedProtocolFailure(failure);
+    try {
+      const facts = f.onRuntimeFailure.mock.calls.map(([fact]) => fact as { evidence?: { kind?: string } });
+      expect(f.onRuntimeFailure).toHaveBeenCalledWith(expect.objectContaining({
+        evidence: { kind: "runtime_exception" },
+      }), { assignmentId: "assignment", attempt: 1 });
+      expect(facts.some(fact => fact.evidence?.kind === "provider_protocol")).toBe(false);
+      expect(JSON.stringify(f.onRuntimeFailure.mock.calls)).not.toMatch(/private-|EACCES/);
+    } finally { await f.dispose(); }
+  });
+
   it("durably captures a coordination call against the live signed prompt before giving the provider permission", async () => {
     const work = { ...assignment, agentRoute: { ...assignment.agentRoute, mcpCapabilityTokenRef: "capability" } };
     const f = await sessionFixture(work, undefined, undefined, {}, {
