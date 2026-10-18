@@ -61,7 +61,7 @@ export class RuntimeFailureQueue {
     this.outbox = new DurableOutbox(this.dir, this.mutate);
   }
 
-  async submit(body: unknown): Promise<boolean> {
+  async submit(body: unknown, options: { retained?: boolean } = {}): Promise<boolean> {
     const parsed = RuntimeFailureObservationSchema.safeParse(body);
     if (!parsed.success || parsed.data.instanceId !== this.options.instanceId()) {
       this.degraded(true);
@@ -69,7 +69,7 @@ export class RuntimeFailureQueue {
     }
     return this.serialized(async () => {
       try {
-        return await this.submitInternal(parsed.data);
+        return await this.submitInternal(parsed.data, options.retained === true);
       } catch {
         this.degraded(true);
         return false;
@@ -148,7 +148,7 @@ export class RuntimeFailureQueue {
     if (this.outbox.depth > CAPACITY) this.degraded(true);
   }
 
-  private async submitInternal(body: RuntimeFailureObservation): Promise<boolean> {
+  private async submitInternal(body: RuntimeFailureObservation, retained: boolean): Promise<boolean> {
     await this.load();
     if (body.instanceId !== this.options.instanceId()) {
       this.degraded(true);
@@ -158,7 +158,8 @@ export class RuntimeFailureQueue {
     if (existing) return sameBody(existing, body);
     await this.reserveSuppression();
     if (this.outbox.depth >= CAPACITY) {
-      await this.suppress(body.instanceId);
+      // An immutable source still owns this fact; capacity only defers its handoff.
+      if (!retained) await this.suppress(body.instanceId);
       return false;
     }
     return this.enqueue(body);

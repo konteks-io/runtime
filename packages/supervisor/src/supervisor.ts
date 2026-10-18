@@ -25,8 +25,10 @@ import {
   allEqual,
   SystemClock,
   connectorGit,
+  createRuntimeFailureCapture,
   createLogger,
   gitChoiceReport,
+  writeRuntimeFailureCapture,
   type GitChoice,
   parseRfc3339,
   signBody,
@@ -427,6 +429,19 @@ export class Supervisor {
     if (!native) throw new RemoteInstanceError("protocol_incompatible", "Native supervisor composition requires explicit native dependencies.");
     await this.openNativeState();
     const identity = await this.loadActivation(native);
+    try {
+      await this.startActivated(native, identity);
+    } catch (error) {
+      this.runtimeFailureDelivery?.stop();
+      await this.recordBootstrapFailure(identity).catch(() => {
+        try { this.logger.warn({ event: "runtime_failure.capture_unavailable" }, "Runtime startup failure could not be retained."); }
+        catch { /* A diagnostic cannot replace the startup failure. */ }
+      });
+      throw error;
+    }
+  }
+
+  private async startActivated(native: NativeOptions, identity: StoredIdentity): Promise<void> {
     await this.restoreStoredLease(identity.instanceId);
     await this.chooseGit(native);
     this.composeCoreDeliveries();
@@ -446,6 +461,20 @@ export class Supervisor {
     if (this.stopping) return;
     await this.enterLifecycle();
     this.startChannelTimers();
+  }
+
+  /** Preserve an owned post-activation failure before daemon cleanup releases this state. */
+  private recordBootstrapFailure(identity: StoredIdentity): Promise<void> {
+    return this.stateMutations.run(async () => {
+      const { instanceId, workspaceId } = identity;
+      if (!workspaceId || this.stopping || this.instanceId !== instanceId || this.workspaceId !== workspaceId) return;
+      const capture = createRuntimeFailureCapture(workspaceId, {
+        schemaVersion: 1, failureId: randomUUID(), observedAt: new Date(this.clock.coreNow()).toISOString(),
+        instanceId, scope: { kind: "runtime" }, phase: "supervisor",
+        stage: "runtime_start", code: "runtime_start_failed", evidence: { kind: "runtime_exception" },
+      });
+      await writeRuntimeFailureCapture(this.config.SUPERVISOR_DATA_DIR, capture);
+    });
   }
 
   /**
@@ -558,6 +587,13 @@ export class Supervisor {
       dataDir: this.config.SUPERVISOR_DATA_DIR, core: this.core, clock: this.clock, logger: this.logger,
       instanceId: () => this.instanceId ?? "", coreContractVersion: () => this.coreContractVersion,
       canSend: () => this.recoveryAuthority() !== null,
+      captureOwner: {
+        workspaceId: () => this.workspaceId ?? "",
+        assertOwned: () => {
+          if (this.stopping || !this.nativeOwnership) throw new RemoteInstanceError("temporarily_unavailable", "Native state ownership is unavailable.");
+          this.nativeOwnership.assertOwned();
+        },
+      },
       mutate: this.stateMutations.run,
     });
     this.runtimeFailureDelivery.start();

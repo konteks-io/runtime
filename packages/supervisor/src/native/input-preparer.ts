@@ -31,7 +31,7 @@ import {
   type PreparedSessionInputs,
 } from "../skills/session-inputs.js";
 import { continuedSession, isDirectAssignment } from "../work/continued-session.js";
-import { transientInputFailure, type NativeInputClient } from "./input-client.js";
+import { NativeInputResponseError, transientInputFailure, type NativeInputClient } from "./input-client.js";
 import type { NativeOutputClient } from "./output-client.js";
 import { captureNativeDeliveryOutput } from "./output-capture.js";
 import { NativeOutputSessionHeadStore, type NativeOutputRecord, type NativeOutputStore } from "./output-store.js";
@@ -134,13 +134,17 @@ async function writePrivate(path: string, bytes: Buffer, mode = 0o600): Promise<
  * agent planted), and the file itself is replaced by a rename, so a link at
  * its path is replaced rather than followed.
  */
-async function overlayPrivate(base: string, parts: string[], bytes: Buffer, mode = 0o600): Promise<void> {
+async function overlayPrivate(base: string, parts: string[], bytes: Buffer, mode = 0o600, onFailure?: SourceFailureObserver): Promise<void> {
   const directory = await realDirectories(base, parts.slice(0, -1));
   const name = parts.at(-1);
   if (!name || name === "." || name === "..") throw unavailable();
   const target = join(directory, name);
   const existing = await lstat(target).catch((error: unknown) => { if (isFsErrorWithCode(error, "ENOENT")) return null; throw error; });
-  if (existing?.isDirectory()) throw unavailable();
+  if (existing?.isDirectory()) {
+    onFailure?.({ phase: "preparation", stage: "source_overlay", code: "overlay_directory_conflict",
+      evidence: { kind: "runtime_exception" }, pathRole: "session_context" });
+    throw unavailable();
+  }
   await replacePrivate(target, bytes, mode);
 }
 
@@ -186,7 +190,25 @@ async function syncDirectory(path: string): Promise<void> {
     await handle.close();
   }
 }
-async function readReceipt(path: string) {
+type SourceFailureObserver = (fact: RuntimeFailureFact) => void;
+
+async function readReceipt(path: string, onFailure?: SourceFailureObserver) {
+  let bytes: Buffer;
+  try { bytes = await readReceiptBytes(path); }
+  catch (error) {
+    onFailure?.({ phase: "preparation", stage: "source_receipt_read", code: "local_preparation_failed",
+      evidence: filesystemFailureEvidence(error), pathRole: "session_context" });
+    throw error;
+  }
+  try { return ReceiptSchema.parse(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes))); }
+  catch (error) {
+    onFailure?.({ phase: "preparation", stage: "source_receipt_read", code: "receipt_schema_invalid",
+      evidence: { kind: "runtime_exception" }, pathRole: "session_context" });
+    throw error;
+  }
+}
+
+async function readReceiptBytes(path: string): Promise<Buffer> {
   const before = await lstat(path);
   privateNode(before, false);
   if (before.size > 16 * 1024) throw unavailable();
@@ -199,9 +221,7 @@ async function readReceipt(path: string) {
     const buffer = Buffer.alloc(stat.size + 1);
     const count = await readFully(handle, buffer);
     if (count !== stat.size) throw unavailable();
-    return ReceiptSchema.parse(
-      JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, count))),
-    );
+    return buffer.subarray(0, count);
   } finally {
     await handle.close();
   }
@@ -267,6 +287,7 @@ async function sourceWorkspace(
   fetchSource: () => Promise<FetchedTree>,
   needsGit: boolean,
   gitTool?: NativeGitTool,
+  onFailure?: SourceFailureObserver,
 ): Promise<SourceWorkspace> {
   if (needsGit && !gitTool) throw unavailable();
   // Xcode's license gate with no Command Line Tools: say so, never an unexplained failure.
@@ -283,8 +304,9 @@ async function sourceWorkspace(
   const cwd = join(destination, "source");
   const present = await pathExists(destination);
   const folder = { root, rootStat, destination, cwd, expected };
-  if (present && !needsGit) await refreshSessionWorkspace(folder, fetchSource);
-  if (!present) await materializeWorkspace(folder, fetchSource, needsGit, gitTool);
+  const readSource = () => readSourceTree(fetchSource, onFailure, needsGit ? undefined : "session_context");
+  if (present && !needsGit) await refreshSessionWorkspace(folder, readSource, onFailure);
+  if (!present) await materializeWorkspace(folder, readSource, needsGit, gitTool);
   return publishedWorkspace(folder, needsGit);
 }
 
@@ -303,10 +325,10 @@ interface WorkspaceFolder {
  * complete; a receipt that will not parse is tampering or corruption, and
  * that still refuses rather than being quietly rebuilt over.
  */
-async function refreshSessionWorkspace(folder: WorkspaceFolder, fetchSource: () => Promise<FetchedTree>): Promise<void> {
+async function refreshSessionWorkspace(folder: WorkspaceFolder, fetchSource: () => Promise<FetchedTree>, onFailure?: SourceFailureObserver): Promise<void> {
   const { root, rootStat, destination, cwd, expected } = folder;
   await sameDirectory(destination);
-  const receipt = await readReceipt(join(destination, "receipt.json"));
+  const receipt = await readReceipt(join(destination, "receipt.json"), onFailure);
   if (receipt.selectionDigest === expected.selectionDigest) return;
   // A different selection under the SAME claim is a substitution inside
   // one turn, not newer inputs: refuse, and leave local work untouched.
@@ -319,10 +341,37 @@ async function refreshSessionWorkspace(folder: WorkspaceFolder, fetchSource: () 
   await sameDirectory(root, rootStat);
   await sameDirectory(destination);
   for (const entry of tree.entries) {
-    await overlayPrivate(cwd, entry.path.split("/"), Buffer.from(entry.contentBase64, "base64"), entry.mode);
+    await overlayPrivate(cwd, entry.path.split("/"), Buffer.from(entry.contentBase64, "base64"), entry.mode, onFailure);
   }
   await replacePrivate(join(destination, "receipt.json"), Buffer.from(JSON.stringify(expected)));
   await syncDirectory(destination);
+}
+
+async function readSourceTree(fetchSource: () => Promise<FetchedTree>, onFailure: SourceFailureObserver | undefined, pathRole: RuntimeFailureFact["pathRole"]): Promise<FetchedTree> {
+  try { return await fetchSource(); }
+  catch (error) {
+    const code = sourceTransferFailureCode(error);
+    onFailure?.({ phase: "preparation", stage: "source_transfer_read", code,
+      evidence: { kind: "runtime_exception" }, ...(pathRole === undefined ? {} : { pathRole }) });
+    throw error;
+  }
+}
+
+function sourceTransferFailureCode(error: unknown): string {
+  if (error instanceof NativeInputResponseError) return error.fault;
+  return transientInputFailure(error) ? "temporarily_unavailable" : "local_preparation_failed";
+}
+
+/** Only a directly owned filesystem operation can attest an OS errno. */
+function filesystemFailureEvidence(error: unknown): RuntimeFailureFact["evidence"] {
+  const unknown = { kind: "runtime_exception" } as const;
+  try {
+    if (!(error instanceof Error)) return unknown;
+    const filesystem = error as NodeJS.ErrnoException;
+    if (typeof filesystem.syscall !== "string") return unknown;
+    const parsed = RuntimeFailureObservationSchema.shape.evidence.safeParse({ kind: "runtime_exception", errno: filesystem.code });
+    return parsed.success ? parsed.data : unknown;
+  } catch { return unknown; }
 }
 
 /** Write the inputs into a private temporary folder, then publish it at the destination in one rename. */
@@ -594,11 +643,12 @@ function withSessionContext(source: SourceWorkspace, prepared: PreparedSessionIn
   };
 }
 
-function failureFields(error: unknown, fallback: string): { code: string; retryable: boolean; diagnostic?: string } {
+function failureFields(error: unknown, fallback: string): { code: string; retryable: boolean; diagnostic?: string; status?: number } {
   return {
     code: error instanceof RemoteInstanceError ? error.code : fallback,
     retryable: transientInputFailure(error) !== null,
     ...(error instanceof RemoteInstanceError && error.diagnostic ? { diagnostic: error.diagnostic } : {}),
+    ...(error instanceof NativeInputResponseError ? { status: error.status } : {}),
   };
 }
 
@@ -606,6 +656,8 @@ function failureFields(error: unknown, fallback: string): { code: string; retrya
 class InputPreparation {
   stage = "claim";
   private stageStartedAt = Date.now();
+  private sourceFailure?: RuntimeFailureFact;
+  private readonly captureSourceFailure: SourceFailureObserver = fact => { this.sourceFailure = fact; };
 
   constructor(
     private readonly options: NativeInputPreparerOptions,
@@ -654,7 +706,7 @@ class InputPreparation {
   }
 
   recordFailure(error: unknown): void {
-    reportRuntimeFailure(this.options.onRuntimeFailure, {
+    reportRuntimeFailure(this.options.onRuntimeFailure, this.sourceFailure ?? {
       phase: "preparation", stage: this.stage,
       code: error instanceof RemoteInstanceError ? error.code : "local_preparation_failed",
       evidence: this.failureEvidence(error),
@@ -674,14 +726,7 @@ class InputPreparation {
 
   /** Only this owned filesystem boundary can attest an OS errno. */
   private failureEvidence(error: unknown): RuntimeFailureFact["evidence"] {
-    const unknown = { kind: "runtime_exception" } as const;
-    try {
-      if (this.stage !== "private_root" || !(error instanceof Error)) return unknown;
-      const filesystem = error as NodeJS.ErrnoException;
-      if (typeof filesystem.syscall !== "string") return unknown;
-      const parsed = RuntimeFailureObservationSchema.shape.evidence.safeParse({ kind: "runtime_exception", errno: filesystem.code });
-      return parsed.success ? parsed.data : unknown;
-    } catch { return unknown; }
+    return this.stage === "private_root" ? filesystemFailureEvidence(error) : { kind: "runtime_exception" };
   }
 
   private enter(stage: string): void {
@@ -706,6 +751,7 @@ class InputPreparation {
       () => inputs.read(inputs.selection.source.transferId),
       continuedSession(inputs.current.source) === null,
       git,
+      this.captureSourceFailure,
     );
     this.logStage("worktree", this.elapsed());
     return workspace;
@@ -716,7 +762,7 @@ class InputPreparation {
     if (!inputs.selection.source.fileCount) return worktree;
     const contextRoot = await privateRoot(join(root, "session-context"));
     const context = await sourceWorkspace(contextRoot, inputs.envelope,
-      () => inputs.read(inputs.selection.source.transferId), false);
+      () => inputs.read(inputs.selection.source.transferId), false, undefined, this.captureSourceFailure);
     return { ...worktree, contextDirectory: context.cwd, verify: async () => {
       await worktree.verify();
       await context.verify();

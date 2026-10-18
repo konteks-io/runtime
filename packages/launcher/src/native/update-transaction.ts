@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { chmod, copyFile, readFile, rename, rm, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { z } from "zod";
-import { DoctorReportSchema, fileSha256, NATIVE_UPDATE_TARGET_ENV, NativeUpdateTargetSchema, RemoteInstanceError, SupervisorStatusSchema, type ControlRequest } from "@konteks/remote-common";
+import { createRuntimeFailureCapture, DoctorReportSchema, fileSha256, NATIVE_UPDATE_TARGET_ENV, NativeUpdateTargetSchema, RemoteInstanceError, SupervisorStatusSchema, writeRuntimeFailureCapture, type ControlRequest, type RuntimeFailureCapture, type RuntimeFailureObservation } from "@konteks/remote-common";
 import { isHostAgentId, nativeConnectorFileNames, nativeServiceExecutable, resolveNativeConnectorExecutable } from "@konteks/remote-release";
 import { DEFERRED_UPDATE_DETAIL_PREFIX, NATIVE_SHUTDOWN_RECEIPT_FILE, assertLegacyCodexOwnerIdle, isDeferredUpdateAttempt, ownedByAnotherConnector, recordNativeUpdateAttempt, type NativeRuntimeRecord, type NativeUpdateAttempt } from "@konteks/remote-supervisor";
 import { SupervisorControl } from "../control.js";
@@ -35,6 +35,8 @@ export interface NativeUpdateTransactionDeps {
   commit: (options: { root: string; releaseId: string; output: NativeCommandContext["output"] }) => Promise<NativeRuntimeRecord>;
   restore: (root: string, expectedReleaseId: string, previous: NativeRuntimeRecord) => Promise<void>;
   recordAttempt: (root: string, attempt: NativeUpdateAttempt) => Promise<unknown>;
+  /** A local durable handoff; observation failures never change update recovery. */
+  observeFailure?: (input: { root: string; capture: RuntimeFailureCapture }) => Promise<unknown>;
   /** Only a verified stage and a running enrolled service may announce execution to Core. */
   beginProgress?: (input: {
     root: string;
@@ -114,6 +116,7 @@ export function productionUpdateDeps(input: { serviceDefinition: NativeUpdateTra
     commit: commitNativeUpdate,
     restore: restoreNativeRecord,
     recordAttempt: recordNativeUpdateAttempt,
+    observeFailure: ({ root, capture }) => writeRuntimeFailureCapture(join(root, "supervisor"), capture),
     beginProgress: beginNativeUpdateProgress,
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
     now: Date.now,
@@ -143,7 +146,8 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
 ): Promise<NativeUpdateOutcome> {
   setupLocale();
   const previous = await deps.readRecord(input.root);
-  const staged = await stageOrRecordFailure(input, deps);
+  const identity = Object.freeze({ instanceId: previous.instanceId, workspaceId: previous.workspaceId });
+  const staged = await stageOrRecordFailure(input, deps, identity);
   if (staged.status === "current") {
     setupLine(input.output, "updateCurrent", { version: staged.bundleVersion });
     const outcome: NativeUpdateOutcome = { state: "current", bundleVersion: staged.bundleVersion };
@@ -155,12 +159,12 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
     reason: attemptReason(input), startedAt: new Date(deps.now()).toISOString(), finishedAt: null, outcome: "in_progress", detail: null,
   };
   await deps.recordAttempt(input.root, attempt);
-  const service = await readUpdateService(input, deps, attempt);
+  const service = await readUpdateService(input, deps, attempt, identity);
   const progress = service.wasRunning
     ? await admittedProgress(input, deps, previous, attempt)
     : null;
   try {
-    const outcome = await new UpdateTransaction(input, deps, { previous, staged, attempt, ...service }).run();
+    const outcome = await new UpdateTransaction(input, deps, { previous, staged, attempt, identity, ...service }).run();
     await progress?.finish("succeeded").catch(() => undefined);
     return outcome;
   } catch (error) {
@@ -186,7 +190,7 @@ async function admittedProgress(
   }
 }
 
-async function readUpdateService(input: NativeUpdateInput, deps: NativeUpdateTransactionDeps, attempt: NativeUpdateAttempt,
+async function readUpdateService(input: NativeUpdateInput, deps: NativeUpdateTransactionDeps, attempt: NativeUpdateAttempt, identity: UpdateIdentity,
 ): Promise<{ definition: NativeServiceDefinition; wasRunning: boolean; owner: NativeServiceProcessOwner | null }> {
   try {
     const definition = await deps.serviceDefinition(input.root);
@@ -195,7 +199,8 @@ async function readUpdateService(input: NativeUpdateInput, deps: NativeUpdateTra
     assertUpdateTaskState(status, owner, deps);
     return { definition, wasRunning: status === 0 || owner !== null, owner };
   } catch (error) {
-    await finishUpdateAttempt(input.root, deps, attempt, "failed", errorText(error));
+    const terminal = await finishUpdateAttempt(input.root, deps, attempt, "failed", errorText(error));
+    await observeUpdateFailure(input, deps, identity, terminal, { stage: "native_update_service", code: "native_update_service_failed" });
     throw error;
   }
 }
@@ -204,8 +209,29 @@ function assertUpdateTaskState(status: number | null, owner: NativeServiceProces
   if (deps.serviceOwner && !owner && status !== 0 && status !== 1) throw setupError("temporarily_unavailable", "updateTaskUnconfirmed");
 }
 
-async function finishUpdateAttempt(root: string, deps: NativeUpdateTransactionDeps, attempt: NativeUpdateAttempt, outcome: NativeUpdateAttempt["outcome"], detail: string | null): Promise<void> {
-  await deps.recordAttempt(root, { ...attempt, outcome, detail: detail?.slice(0, 1_024) ?? null, finishedAt: new Date(deps.now()).toISOString() }).catch(() => undefined);
+async function finishUpdateAttempt(root: string, deps: NativeUpdateTransactionDeps, attempt: NativeUpdateAttempt, outcome: NativeUpdateAttempt["outcome"], detail: string | null): Promise<NativeUpdateAttempt> {
+  const terminal = { ...attempt, outcome, detail: detail?.slice(0, 1_024) ?? null, finishedAt: new Date(deps.now()).toISOString() };
+  await deps.recordAttempt(root, terminal).catch(() => undefined);
+  return terminal;
+}
+
+type UpdateIdentity = Pick<NativeRuntimeRecord, "instanceId" | "workspaceId">;
+type UpdateFailureFact = { stage: string; code: string; phase?: RuntimeFailureObservation["phase"] };
+
+async function observeUpdateFailure(input: NativeUpdateInput, deps: NativeUpdateTransactionDeps, identity: UpdateIdentity, attempt: NativeUpdateAttempt, fact: UpdateFailureFact): Promise<void> {
+  if (!deps.observeFailure || !attempt.finishedAt) return;
+  try {
+    const capture = createRuntimeFailureCapture(identity.workspaceId, {
+      schemaVersion: 1, failureId: attempt.id, observedAt: attempt.finishedAt,
+      instanceId: identity.instanceId, scope: { kind: "runtime" },
+      phase: fact.phase ?? "supervisor", stage: fact.stage, code: fact.code,
+      evidence: { kind: "runtime_exception" },
+    });
+    await deps.observeFailure({ root: input.root, capture });
+  } catch {
+    try { input.output.line("Runtime diagnostic capture is unavailable; update recovery is unchanged."); }
+    catch { /* A diagnostic cannot replace the original update failure. */ }
+  }
 }
 
 function attemptReason(input: NativeUpdateInput): NativeUpdateAttempt["reason"] {
@@ -217,12 +243,14 @@ function attemptReason(input: NativeUpdateInput): NativeUpdateAttempt["reason"] 
  * supervisor's ledger view must still see that a launched transaction ended
  * there.
  */
-async function stageOrRecordFailure(input: NativeUpdateInput, deps: NativeUpdateTransactionDeps): Promise<NativeUpdateStage> {
+async function stageOrRecordFailure(input: NativeUpdateInput, deps: NativeUpdateTransactionDeps, identity: UpdateIdentity): Promise<NativeUpdateStage> {
   try {
     return await deps.stage({ root: input.root, output: input.output, ...(input.deps ? { deps: input.deps } : {}) });
   } catch (error) {
     const startedAt = new Date(deps.now()).toISOString();
-    await deps.recordAttempt(input.root, { id: `update-${randomUUID()}`, ...failedStageTarget(), releaseId: null, reason: attemptReason(input), startedAt, finishedAt: startedAt, outcome: "failed", detail: errorText(error).slice(0, 1_024) }).catch(() => undefined);
+    const attempt: NativeUpdateAttempt = { id: `update-${randomUUID()}`, ...failedStageTarget(), releaseId: null, reason: attemptReason(input), startedAt, finishedAt: startedAt, outcome: "failed", detail: errorText(error).slice(0, 1_024) };
+    await deps.recordAttempt(input.root, attempt).catch(() => undefined);
+    await observeUpdateFailure(input, deps, identity, attempt, { phase: "preparation", stage: "native_update_stage", code: "native_update_stage_failed" });
     throw error;
   }
 }
@@ -245,12 +273,13 @@ class UpdateTransaction {
   private drained = false;
   private oldPid: number | null = null;
   private successor: NativeRuntimeRecord | undefined;
+  private failureStage = "native_update_commit";
 
   constructor(
     private readonly input: NativeUpdateInput,
     private readonly deps: NativeUpdateTransactionDeps,
     private readonly update: {
-      previous: NativeRuntimeRecord; staged: Extract<NativeUpdateStage, { status: "staged" }>; attempt: NativeUpdateAttempt;
+      previous: NativeRuntimeRecord; staged: Extract<NativeUpdateStage, { status: "staged" }>; attempt: NativeUpdateAttempt; identity: UpdateIdentity;
       definition: NativeServiceDefinition; wasRunning: boolean; owner: NativeServiceProcessOwner | null;
     },
   ) {
@@ -273,15 +302,21 @@ class UpdateTransaction {
     // The previous release's own doctor result is the baseline; null when it
     // could not be read, and then only the successor's own agents can count.
     const baseline = update.wasRunning ? await doctorStatuses(this.control).catch(() => null) : null;
-    if (update.wasRunning) await this.stopPrevious();
+    if (update.wasRunning) {
+      this.failureStage = "native_update_stop";
+      await this.stopPrevious();
+    }
     setupProgress(input.output, "phaseInstall");
+    this.failureStage = "native_update_commit";
     const successor = await commitOnceReleased(input, update.staged.releaseId, deps);
     this.successor = successor;
     if (update.wasRunning) {
       setupDetail(input.output, "updateStarting", { version: successor.bundleVersion, duration: setupDuration(input.output, deps.healthDeadlineMs ?? 180_000) });
       setupProgress(input.output, "phaseStart");
+      this.failureStage = "native_update_start";
       await deps.start(input);
       setupProgress(input.output, "phaseHealth");
+      this.failureStage = "native_update_health";
       await healthGate(input, deps.control(input.root, successor), { previous: update.previous, successor, baseline }, deps, update.definition);
     }
     await this.finish("applied", null);
@@ -352,7 +387,10 @@ class UpdateTransaction {
   }
 
   private async finish(outcome: NativeUpdateAttempt["outcome"], detail: string | null): Promise<void> {
-    await finishUpdateAttempt(this.input.root, this.deps, this.update.attempt, outcome, detail);
+    const terminal = await finishUpdateAttempt(this.input.root, this.deps, this.update.attempt, outcome, detail);
+    if (outcome === "applied" || isDeferredUpdateAttempt(terminal)) return;
+    const code = outcome === "rolled_back" ? "native_update_rolled_back" : `${this.failureStage}_failed`;
+    await observeUpdateFailure(this.input, this.deps, this.update.identity, terminal, { stage: this.failureStage, code });
   }
 
   /**
@@ -397,6 +435,7 @@ class UpdateTransaction {
       if (update.wasRunning) await this.restartPrevious(successor);
       await this.finish("rolled_back", detail);
     } catch (rollbackError) {
+      this.failureStage = "native_update_rollback";
       await this.finish("failed", `rollback failed after: ${detail}`);
       // Never leave this computer without its connector.
       if (update.wasRunning) await keepServiceRunning(input, update.definition, deps, restored ? update.previous : successor);

@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { NATIVE_UPDATE_TARGET_ENV, bundleManifestSigningBytes, computeBundleManifestDigest, RemoteInstanceError, writeSecretFile } from "@konteks/remote-common";
+import { NATIVE_UPDATE_TARGET_ENV, bundleManifestSigningBytes, computeBundleManifestDigest, jcsDigest, RemoteInstanceError, writeSecretFile, type JsonValue } from "@konteks/remote-common";
 import { buildReleaseFixture, nativeServiceExecutable, resolveNativeConnectorExecutable, verifyNativeRelease, type CodeIdentity } from "@konteks/remote-release";
 import { acquireNativeRootLock, isDeferredUpdateAttempt, loadNativeInstallation, OPENCODE_MIN_BINARY_BYTES, readNativeUpdateLedger, SupervisorStore, verifyInstalledNativeConnector, type NativeRuntimeRecord, type NativeUpdateAttempt } from "@konteks/remote-supervisor";
 import { installNative, readNativeRecord, restoreNativeRecord } from "../native/install.js";
@@ -1129,6 +1129,32 @@ describe("native update transaction", () => {
     expect(h.ledger.at(-1)).toMatchObject({ outcome: "failed" });
     expect(lines.some(line => /^Started 1\.1\.0 again so this computer stays connected/.test(line))).toBe(true);
   });
+  it.each(["stage", "commit"] as const)("contains a rejected lifecycle observer without replacing the original %s failure", async phase => {
+    const h = harness({ previous });
+    const original = new RemoteInstanceError("temporarily_unavailable", `original ${phase} failure`);
+    const observeFailure = vi.fn(async (_input: { root: string; capture: unknown }) => {
+      throw new Error("private-lifecycle-observer-fault-do-not-copy");
+    });
+    Object.assign(h.deps, { observeFailure });
+    h.deps[phase] = async () => { throw original; };
+    const lines: string[] = [];
+    const output = { ...h.output, line: (line: string) => { lines.push(line); } };
+    await expect(runNativeUpdate({ root: "/root", output }, h.deps)).rejects.toBe(original);
+    expect(h.currentRecord()).toEqual(previous);
+    expect(h.ledger.at(-1)).toMatchObject({ outcome: "failed" });
+    expect(observeFailure).toHaveBeenCalledOnce();
+    expect(observeFailure.mock.calls[0]![0]).toMatchObject({
+      root: "/root",
+      capture: {
+        workspaceId: previous.workspaceId,
+        observation: { instanceId: previous.instanceId, scope: { kind: "runtime" } },
+      },
+    });
+    expect(JSON.stringify(lines)).not.toContain("private-lifecycle-observer-fault-do-not-copy");
+    if (phase === "stage") expect(h.calls).toEqual([]);
+    else expect(h.calls).toContain("start");
+  });
+
   it("refreshes the person's konteks-remote launcher to the release it kept, and only then", async () => {
     const refreshed: string[] = [];
     const applied = harness({ previous });
@@ -1208,6 +1234,95 @@ describe("native update transaction", () => {
     expect((h.ledger[0] as { detail: string }).detail).toMatch(/channel could not be read/);
     expect(h.calls).toEqual([]);
   });
+  // Observe the updater's local handoff without replacing its failure or recovery flow.
+  function captureFailures(h: ReturnType<typeof harness>) {
+    const captures: { root: string; capture: unknown }[] = [];
+    Object.assign(h.deps, { observeFailure: async (input: { root: string; capture: unknown }) => { captures.push(input); } });
+    return captures;
+  }
+
+  function expectedCapture(attempt: NativeUpdateAttempt, stage: string, code: string, phase = "supervisor") {
+    const observation = {
+      schemaVersion: 1, failureId: attempt.id, observedAt: attempt.finishedAt,
+      instanceId: previous.instanceId, scope: { kind: "runtime" },
+      phase, stage, code, evidence: { kind: "runtime_exception" },
+    };
+    return {
+      root: "/root",
+      capture: { schemaVersion: 1, workspaceId: previous.workspaceId, observation, failureDigest: jcsDigest(observation as unknown as JsonValue) },
+    };
+  }
+
+  it("retains a bounded identity-bound stage failure even before Core progress can start", async () => {
+    const h = harness({ previous });
+    const captures = captureFailures(h);
+    const original = new Error("private URL https://signed.invalid/path?secret=do-not-copy and /Users/private/install");
+    h.deps.stage = async () => { throw original; };
+    h.deps.beginProgress = vi.fn();
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toBe(original);
+    expect(captures).toHaveLength(1);
+    const attempt = h.ledger.at(-1) as NativeUpdateAttempt;
+    expect(captures[0]).toEqual(expectedCapture(attempt, "native_update_stage", "native_update_stage_failed", "preparation"));
+    expect(JSON.stringify(captures[0]!.capture)).not.toMatch(/private|secret|https:|Users|detail|assignmentId|claimId/);
+    expect(Buffer.byteLength(JSON.stringify(captures[0]!.capture))).toBeLessThanOrEqual(4096);
+    expect(h.deps.beginProgress).not.toHaveBeenCalled();
+    expect(h.calls).toEqual([]);
+  });
+
+  it("captures failure to inspect the installed service against the original installation identity", async () => {
+    const h = harness({ previous });
+    const captures = captureFailures(h);
+    const original = new Error("private service-manager diagnostic");
+    h.deps.serviceOwner = async () => { throw original; };
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toBe(original);
+    const attempt = h.ledger.at(-1) as NativeUpdateAttempt;
+    expect(attempt.outcome).toBe("failed");
+    expect(captures[0]).toEqual(expectedCapture(attempt, "native_update_service", "native_update_service_failed"));
+    expect(captures).toHaveLength(1);
+    expect(h.currentRecord()).toEqual(previous);
+    expect(h.calls).not.toContain("commit");
+  });
+
+  it("retains the failed successor health fact after rollback without replacing recovery or inventing a claim", async () => {
+    const h = harness({ previous, gate: "no_answer" });
+    const captures = captureFailures(h);
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toThrow();
+    expect(h.currentRecord()).toEqual(previous);
+    const attempt = h.ledger.at(-1) as NativeUpdateAttempt;
+    expect(attempt.outcome).toBe("rolled_back");
+    expect(captures).toEqual([expectedCapture(attempt, "native_update_health", "native_update_rolled_back")]);
+  });
+
+  it("keeps successful replacement and active-work deferral out of failure capture", async () => {
+    const applied = harness({ previous });
+    const successfulCaptures = captureFailures(applied);
+    await runNativeUpdate({ root: "/root", output: applied.output }, applied.deps);
+    expect(applied.ledger.at(-1)).toMatchObject({ outcome: "applied" });
+    expect(successfulCaptures).toEqual([]);
+    const deferred = harness({ previous });
+    const deferredCaptures = captureFailures(deferred);
+    deferred.deps.control = () => ({ call: async (request, schema) => schema.parse(
+      request.op === "drain.status" ? { draining: true, reason: "update", activeAssignments: 1, openSessions: 1 } : { checks: [], generatedAt: "x" },
+    ) });
+    deferred.deps.drainDeadlineMs = 2_500;
+    await expect(runNativeUpdate({ root: "/root", output: deferred.output }, deferred.deps)).rejects.toMatchObject({ code: "active_work" });
+    expect(deferred.ledger.at(-1)).toMatchObject({ detail: expect.stringMatching(/^deferred: /) });
+    expect(deferredCaptures).toEqual([]);
+    expect(deferred.calls).not.toContain("stop");
+    expect(deferred.calls).not.toContain("commit");
+  });
+
+  it("does not mint an upload identity when installation identity cannot be loaded", async () => {
+    const h = harness({ previous });
+    const captures = captureFailures(h);
+    const original = new Error("private identity cannot be read");
+    h.deps.readRecord = async () => { throw original; };
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toBe(original);
+    expect(captures).toEqual([]);
+    expect(h.ledger).toEqual([]);
+    expect(h.calls).toEqual([]);
+  });
+
   it("writes the durable ledger the supervisor reads back", async () => {
     const root = await mkdtemp(join(tmpdir(), "native-update-ledger-")); roots.push(root);
     await mkdir(join(root, "supervisor"), { recursive: true });
@@ -1218,5 +1333,26 @@ describe("native update transaction", () => {
     const ledger = await readNativeUpdateLedger(root);
     expect(ledger.attempts).toHaveLength(1);
     expect(ledger.attempts[0]).toMatchObject({ outcome: "applied", reason: "unattended", bundleVersion: "1.1.0", releaseId: "release-next" });
+  });
+
+  it("keeps the terminal update ledger readable by strict v1 rollback readers", async () => {
+    const root = await mkdtemp(join(tmpdir(), "native-update-v1-compat-")); roots.push(root);
+    const h = harness({ previous });
+    const { recordNativeUpdateAttempt } = await import("@konteks/remote-supervisor");
+    h.deps.recordAttempt = recordNativeUpdateAttempt;
+    const original = new RemoteInstanceError("temporarily_unavailable", "the signed channel could not be read");
+    h.deps.stage = async () => { throw original; };
+    await expect(runNativeUpdate({ root, output: h.output }, h.deps)).rejects.toBe(original);
+    const raw = JSON.parse(await readFile(join(root, "update-ledger.json"), "utf8"));
+    expect(Object.keys(raw).sort()).toEqual(["attempts", "schemaVersion"]);
+    expect(raw.schemaVersion).toBe(1);
+    expect(raw.attempts).toHaveLength(1);
+    // Frozen v1 on-disk keys intentionally protect an older strict reader;
+    // capture metadata must remain outside this rollback contract.
+    expect(Object.keys(raw.attempts[0]).sort()).toEqual([
+      "bundleVersion", "detail", "finishedAt", "id", "manifestDigest", "outcome", "reason", "releaseId", "startedAt",
+    ]);
+    expect(raw.attempts[0]).toMatchObject({ outcome: "failed", releaseId: null });
+    await expect(readNativeUpdateLedger(root)).resolves.toEqual(raw);
   });
 });
