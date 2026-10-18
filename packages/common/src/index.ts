@@ -23,3 +23,4 @@ export * from "./https-proxy.js";
 export * from "./git-for-windows.js";
 export * from "./git-choice.js";
 export * from "./native-update-target.js";
+export * from "./runtime-failure-capture.js";

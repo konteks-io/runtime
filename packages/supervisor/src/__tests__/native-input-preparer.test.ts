@@ -415,6 +415,156 @@ describe("native authorized input composition", () => {
     }, { assignmentId: assignment.id, attempt: assignment.attempt });
   });
 
+  describe("source-workspace failure reporting", () => {
+    // Same selected shape as the retained planner failure: three context files,
+    // no repository/recovery selection and no assignment-isolation override.
+    const contextFiles = { "CLAUDE.md": "Estimate only the current request.\n", ...continuityFiles };
+    function expectNoPrivateErrorFields(fact: unknown): void {
+      for (const key of ["message", "path", "stack", "cause", "diagnostic"]) expect(fact).not.toHaveProperty(key);
+    }
+
+    it("reports the owned context-receipt read errno without changing the refusal or local work", async () => {
+      const f = await fixture(contextFiles);
+      expect(f.selection.source.fileCount).toBe(3);
+      expect(f.selection).not.toHaveProperty("repository");
+      expect(f.selection).not.toHaveProperty("workspaceRecovery");
+      expect(f.selection).not.toHaveProperty("contextIsolation");
+      const prepared = await createNativeInputPreparer(f.options)(assignment);
+      const receipt = join(dirname(prepared.cwd), "receipt.json");
+      await writeFile(join(prepared.cwd, "local-work.txt"), "retained private-receipt-path-canary");
+      await rm(receipt);
+      const rootEntries = await readdir(f.root);
+      const onRuntimeFailure = vi.fn(async (_fact: unknown, _context: unknown) => undefined);
+
+      await expect(createNativeInputPreparer({ ...f.options, onRuntimeFailure })(assignment))
+        .rejects.toMatchObject({ code: "capability_unavailable", retryable: false });
+      await expect(readFile(receipt)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readFile(join(prepared.cwd, "local-work.txt"), "utf8"))
+        .toBe("retained private-receipt-path-canary");
+      expect(await readFile(join(prepared.cwd, "CLAUDE.md"), "utf8")).toBe(contextFiles["CLAUDE.md"]);
+      expect(await readdir(f.root)).toEqual(rootEntries);
+      expectNoPrivateErrorFields(onRuntimeFailure.mock.calls[0]?.[0]);
+      const captured = JSON.stringify(onRuntimeFailure.mock.calls);
+      expect(captured).not.toContain(f.root);
+      expect(captured).not.toContain("private-receipt-path-canary");
+      expect(onRuntimeFailure).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        phase: "preparation", stage: "source_receipt_read", code: "local_preparation_failed",
+        evidence: { kind: "runtime_exception", errno: "ENOENT" }, pathRole: "session_context",
+      }), { assignmentId: assignment.id, attempt: assignment.attempt });
+    });
+
+    it("names an invalid context-receipt schema while leaving the receipt and agent work untouched", async () => {
+      const f = await fixture(contextFiles);
+      const prepared = await createNativeInputPreparer(f.options)(assignment);
+      const receipt = join(dirname(prepared.cwd), "receipt.json");
+      const invalidReceipt = JSON.stringify({ private_receipt_canary: "/private/person/provider-token" });
+      await writeFile(receipt, invalidReceipt);
+      await writeFile(join(prepared.cwd, "local-work.txt"), "retain this work");
+      f.fetchFn.mockClear();
+      const onRuntimeFailure = vi.fn(async (_fact: unknown, _context: unknown) => undefined);
+
+      await expect(createNativeInputPreparer({ ...f.options, onRuntimeFailure })(assignment))
+        .rejects.toMatchObject({ code: "capability_unavailable", retryable: false });
+      expect(await readFile(receipt, "utf8")).toBe(invalidReceipt);
+      expect(await readFile(join(prepared.cwd, "local-work.txt"), "utf8")).toBe("retain this work");
+      expect(f.fetchFn.mock.calls.filter(([url]) => String(url).endsWith("/inputs/read"))).toHaveLength(0);
+      expectNoPrivateErrorFields(onRuntimeFailure.mock.calls[0]?.[0]);
+      const captured = JSON.stringify(onRuntimeFailure.mock.calls);
+      expect(captured).not.toContain(f.root);
+      expect(captured).not.toContain("private_receipt_canary");
+      expect(captured).not.toContain("/private/person/provider-token");
+      expect(onRuntimeFailure).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        phase: "preparation", stage: "source_receipt_read", code: "receipt_schema_invalid",
+        evidence: { kind: "runtime_exception" }, pathRole: "session_context",
+      }), { assignmentId: assignment.id, attempt: assignment.attempt });
+    });
+
+    it("reports a refused context transfer without inventing filesystem errno or publishing a workspace", async () => {
+      const f = await fixture(contextFiles);
+      const served = f.fetchFn.getMockImplementation()!;
+      f.fetchFn.mockImplementation(async (url, init) =>
+        String(url).endsWith("/inputs/read") && JSON.parse(String(init?.body)).transferId === "source"
+          ? new Response("EACCES /private/transfer-provider-token-canary", {
+              status: 403, headers: { "content-type": "application/json" },
+            })
+          : served(url, init));
+      const onRuntimeFailure = vi.fn(async (_fact: unknown, _context: unknown) => undefined);
+
+      await expect(createNativeInputPreparer({ ...f.options, onRuntimeFailure })(assignment))
+        .rejects.toMatchObject({ code: "capability_unavailable", retryable: false });
+      expect(await readdir(f.root)).toEqual([]);
+      expect(f.fetchFn.mock.calls.filter(([url]) => String(url).endsWith("/inputs/read"))).toHaveLength(1);
+      expectNoPrivateErrorFields(onRuntimeFailure.mock.calls[0]?.[0]);
+      const captured = JSON.stringify(onRuntimeFailure.mock.calls);
+      expect(captured).not.toContain("EACCES");
+      expect(captured).not.toContain("transfer-provider-token-canary");
+      expect(captured).not.toContain(f.root);
+      expect(onRuntimeFailure).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        phase: "preparation", stage: "source_transfer_read", code: "response_status_invalid",
+        evidence: { kind: "runtime_exception" }, pathRole: "session_context",
+      }), { assignmentId: assignment.id, attempt: assignment.attempt });
+    });
+
+    it("omits a session-context role for a refused legacy repository file-tree transfer", async () => {
+      const f = await fixture();
+      const git = await testGitTool();
+      f.selection.source.revision = "a".repeat(40);
+      expect(f.selection).not.toHaveProperty("repository");
+      const target: RemoteWorkAssignment = {
+        ...assignment, kind: "delivery", agentRoute: { agentId: "codex", requiredRole: "generator" },
+        source: { kind: "repository_snapshot", portability: "portable_before_claim", repositoryRef: "repository", revision: f.selection.source.revision },
+      };
+      const served = f.fetchFn.getMockImplementation()!;
+      f.fetchFn.mockImplementation(async (url, init) =>
+        String(url).endsWith("/inputs/read") && JSON.parse(String(init?.body)).transferId === "source"
+          ? new Response("private-legacy-repository-transfer-canary", {
+              status: 403, headers: { "content-type": "application/json" },
+            })
+          : served(url, init));
+      const onRuntimeFailure = vi.fn(async (_fact: unknown, _context: unknown) => undefined);
+
+      await expect(createNativeInputPreparer({ ...f.options, git, onRuntimeFailure })(target))
+        .rejects.toMatchObject({ code: "capability_unavailable", retryable: false });
+      expect(await readdir(f.root)).toEqual([]);
+      expect(onRuntimeFailure).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        phase: "preparation", stage: "source_transfer_read", code: "response_status_invalid",
+        evidence: { kind: "runtime_exception" },
+      }), { assignmentId: target.id, attempt: target.attempt });
+      expect(onRuntimeFailure.mock.calls[0]![0]).not.toHaveProperty("pathRole");
+      expectNoPrivateErrorFields(onRuntimeFailure.mock.calls[0]![0]);
+      expect(JSON.stringify(onRuntimeFailure.mock.calls)).not.toContain("private-legacy-repository-transfer-canary");
+    });
+
+    it("names an owned overlay directory conflict without overwriting it or advancing the receipt", async () => {
+      const f = await fixture(contextFiles);
+      const prepared = await createNativeInputPreparer(f.options)(assignment);
+      const receipt = join(dirname(prepared.cwd), "receipt.json");
+      const priorReceipt = await readFile(receipt, "utf8");
+      const blockedFile = join(prepared.cwd, "CLAUDE.md");
+      await rm(blockedFile);
+      await mkdir(blockedFile, { mode: 0o700 });
+      await writeFile(join(blockedFile, "agent-work.txt"), "private-overlay-canary");
+      f.reclaim("later-context-claim");
+      const onRuntimeFailure = vi.fn(async (_fact: unknown, _context: unknown) => undefined);
+
+      await expect(createNativeInputPreparer({ ...f.options, onRuntimeFailure })(assignment))
+        .rejects.toMatchObject({ code: "capability_unavailable", retryable: false });
+      expect(await readFile(receipt, "utf8")).toBe(priorReceipt);
+      expect(await readFile(join(blockedFile, "agent-work.txt"), "utf8")).toBe("private-overlay-canary");
+      expect(await readFile(join(prepared.cwd, "memory/conversation.md"), "utf8"))
+        .toBe(contextFiles["memory/conversation.md"]);
+      expect((await readdir(prepared.cwd)).filter(name => name.startsWith(".konteks-"))).toEqual([]);
+      expectNoPrivateErrorFields(onRuntimeFailure.mock.calls[0]?.[0]);
+      const captured = JSON.stringify(onRuntimeFailure.mock.calls);
+      expect(captured).not.toContain(f.root);
+      expect(captured).not.toContain("private-overlay-canary");
+      expect(onRuntimeFailure).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        phase: "preparation", stage: "source_overlay", code: "overlay_directory_conflict",
+        evidence: { kind: "runtime_exception" }, pathRole: "session_context",
+      }), { assignmentId: assignment.id, attempt: assignment.attempt });
+    });
+  });
+
   it("keeps a transient 503 at selection retryable, and prepares once Core recovers (D132)", async () => {
     const f = await fixture();
     const warn = vi.fn();

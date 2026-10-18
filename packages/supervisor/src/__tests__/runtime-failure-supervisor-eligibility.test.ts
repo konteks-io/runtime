@@ -1,8 +1,8 @@
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { jcsDigest, RemoteWorkAssignmentSchema, RemoteWorkspaceBeginRequestSchema, RemoteWorkspaceSealRequestSchema, RuntimeFailureObservationSchema, type JsonValue } from "@konteks/remote-common";
+import { createRuntimeFailureCapture, jcsDigest, RemoteWorkAssignmentSchema, RemoteWorkspaceBeginRequestSchema, RemoteWorkspaceSealRequestSchema, RuntimeFailureObservationSchema, writeRuntimeFailureCapture, type JsonValue } from "@konteks/remote-common";
 import { RunnerConfigSchema } from "@konteks/remote-agent-runner";
 import { Supervisor, type SupervisorOptions } from "../supervisor.js";
 import { SupervisorConfigSchema } from "../config.js";
@@ -65,7 +65,7 @@ afterEach(async () => {
   await rm(dir, { recursive: true, force: true });
 });
 
-async function fixture(options: Eligibility) {
+async function fixture(options: Eligibility, waitForFlush = true) {
   const supervisor = new Supervisor(
     SupervisorConfigSchema.parse({
       SUPERVISOR_DATA_DIR: dir,
@@ -116,8 +116,59 @@ async function fixture(options: Eligibility) {
     });
   internal.composeCoreDeliveries();
   composed.push(internal);
-  await internal.runtimeFailureDelivery.flush();
+  if (waitForFlush) await internal.runtimeFailureDelivery.flush();
   return { supervisor, internal, send };
+}
+
+async function retainedLifecycle(failureId = "update-import", workspaceId = "tenant") {
+  const body = RuntimeFailureObservationSchema.parse({
+    schemaVersion: 1, failureId, observedAt: new Date(now).toISOString(),
+    instanceId: "instance", scope: { kind: "runtime" }, phase: "preparation",
+    stage: "native_update_stage", code: "native_update_stage_failed", evidence: { kind: "runtime_exception" },
+  });
+  const capture = createRuntimeFailureCapture(workspaceId, body);
+  const path = await writeRuntimeFailureCapture(dir, capture);
+  return { path, capture, body, bytes: await readFile(path, "utf8") };
+}
+
+async function failureOutbox() {
+  const outbox = new DurableOutbox(join(dir, "runtime-failures"));
+  await outbox.load();
+  return outbox;
+}
+
+async function fullFailureOutbox(): Promise<void> {
+  await mkdir(join(dir, "runtime-failures"), { recursive: true, mode: 0o700 });
+  const outbox = await failureOutbox();
+  for (let n = 0; n < 256; n += 1) {
+    const failureId = `occupied-${n}`;
+    const key = `runtime-failure:${jcsDigest(["instance", failureId])}`;
+    const body = RuntimeFailureObservationSchema.parse({
+      schemaVersion: 1, failureId, observedAt: new Date(now).toISOString(), instanceId: "instance",
+      scope: { kind: "runtime" }, phase: "supervisor", stage: "runtime_start", code: "runtime_failed", evidence: { kind: "runtime_exception" },
+    });
+    await outbox.enqueue({ id: key, key, channel: "observation", group: key, order: n, createdAt: new Date(now).toISOString(), body });
+  }
+}
+
+async function suppressedCount(): Promise<number> {
+  const bytes = await readFile(join(dir, "runtime-failures", "suppression.json"), "utf8").catch(error => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  });
+  return bytes === null ? 0 : JSON.parse(bytes).suppressedCount;
+}
+
+function holdNextEnqueue() {
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const original = DurableOutbox.prototype.enqueue;
+  const enqueue = vi.spyOn(DurableOutbox.prototype, "enqueue").mockImplementationOnce(async function (this: DurableOutbox, item) {
+    entered.resolve();
+    await release.promise;
+    return original.call(this, item);
+  });
+  return { entered, release, enqueue };
 }
 
 async function checkpointComposition(replaceClaim: boolean) {
@@ -240,5 +291,155 @@ describe("Supervisor diagnostic history admission", () => {
       });
       expect(JSON.stringify(fact)).not.toMatch(/private-checkpoint|"message"|"stack"/);
     }
+  });
+});
+
+describe("Supervisor lifecycle capture intake", () => {
+  it("hands off a private pre-publication capture on restart without a producer retry", async () => {
+    const source = await retainedLifecycle("update-before-publication");
+    const pending = `${source.path}.pending`;
+    await rename(source.path, pending);
+    expect((await lstat(pending)).nlink).toBe(1);
+    const held = holdNextEnqueue();
+    const { internal, send } = await fixture({ mode: "active" }, false);
+    const flushing = internal.runtimeFailureDelivery.flush();
+    try {
+      const phase = await Promise.race([held.entered.promise.then(() => "commit-held"), flushing.then(() => "flight-ended")]);
+      expect(phase).toBe("commit-held");
+      expect(await readFile(pending, "utf8")).toBe(source.bytes);
+      expect((await failureOutbox()).depth).toBe(0);
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      held.release.resolve();
+      await flushing;
+    }
+    expect(held.enqueue).toHaveBeenCalledOnce();
+    expect(send.mock.calls).toEqual([["instance", source.body]]);
+    await expect(lstat(pending)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(lstat(source.path)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("hands a real producer capture to the owned queue while network authority is unavailable", async () => {
+    const source = await retainedLifecycle();
+    const { send } = await fixture({ mode: "drain_only", expired: true });
+    expect((await failureOutbox()).all().map(item => item.body)).toEqual([source.body]);
+    await expect(lstat(source.path)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("coalesces intake and keeps its immutable source until the real durable queue commit finishes", async () => {
+    const source = await retainedLifecycle();
+    const held = holdNextEnqueue();
+    const { internal, send } = await fixture({ mode: "active" }, false);
+    const flushing = internal.runtimeFailureDelivery.flush();
+    expect(internal.runtimeFailureDelivery.flush()).toBe(flushing);
+    try {
+      const phase = await Promise.race([held.entered.promise.then(() => "commit-held"), flushing.then(() => "flight-ended")]);
+      expect(phase).toBe("commit-held");
+      expect(await readFile(source.path, "utf8")).toBe(source.bytes);
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      held.release.resolve();
+      await flushing;
+    }
+    expect(held.enqueue).toHaveBeenCalledOnce();
+    expect(send.mock.calls).toEqual([["instance", source.body]]);
+    await expect(lstat(source.path)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("retains a real source after failed durable admission and retries that same fact", async () => {
+    const source = await retainedLifecycle();
+    const enqueue = vi.spyOn(DurableOutbox.prototype, "enqueue").mockRejectedValueOnce(new Error("private queue write failed"));
+    const { internal, send } = await fixture({ mode: "active" });
+    expect(enqueue).toHaveBeenCalledOnce();
+    expect(await readFile(source.path, "utf8")).toBe(source.bytes);
+    expect(send).not.toHaveBeenCalled();
+    await internal.runtimeFailureDelivery.flush();
+    expect(send.mock.calls).toEqual([["instance", source.body]]);
+    await expect(lstat(source.path)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("defers a retained source at full capacity without counting every retry as a lost fact", async () => {
+    const source = await retainedLifecycle();
+    await fullFailureOutbox();
+    const { supervisor, internal, send } = await fixture({ mode: "drain_only", expired: true });
+    await internal.runtimeFailureDelivery.flush();
+    await internal.runtimeFailureDelivery.flush();
+    expect(await readFile(source.path, "utf8")).toBe(source.bytes);
+    expect((await failureOutbox()).depth).toBe(256);
+    expect(await suppressedCount()).toBe(0);
+    supervisor.lease.set({
+      lease: "fixture-lease", mode: "active", workspaceId: "tenant",
+      issuedAt: new Date(now - 1_000).toISOString(), expiresAt: new Date(now + 60_000).toISOString(), drainDeadline: new Date(now + 30_000).toISOString(),
+    });
+    await internal.runtimeFailureDelivery.flush();
+    await internal.runtimeFailureDelivery.flush();
+    const custody = [...(await failureOutbox()).all().map(item => item.body), ...send.mock.calls.map(([, body]) => body)];
+    expect(custody).toContainEqual(source.body);
+    await expect(lstat(source.path)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await suppressedCount()).toBe(0);
+  });
+
+  it("does not retire a replacement file after admission of an earlier immutable source", async () => {
+    const source = await retainedLifecycle();
+    const held = holdNextEnqueue();
+    const { internal, send } = await fixture({ mode: "active" }, false);
+    const flushing = internal.runtimeFailureDelivery.flush();
+    const changed = createRuntimeFailureCapture("tenant", { ...source.body, code: "different_failure" });
+    const replacement = JSON.stringify(changed);
+    try {
+      const phase = await Promise.race([held.entered.promise.then(() => "commit-held"), flushing.then(() => "flight-ended")]);
+      expect(phase).toBe("commit-held");
+      await rename(source.path, `${source.path}.kept`);
+      await writeFile(source.path, replacement, { mode: 0o600 });
+    } finally {
+      held.release.resolve();
+      await flushing;
+    }
+    expect(send.mock.calls).toEqual([["instance", source.body]]);
+    expect(await readFile(source.path, "utf8")).toBe(replacement);
+    expect(await readFile(`${source.path}.kept`, "utf8")).toBe(source.bytes);
+  });
+
+  it("leaves the source intact when stop and owner loss interrupt an uncommitted intake", async () => {
+    const source = await retainedLifecycle();
+    const held = holdNextEnqueue();
+    const { internal, send } = await fixture({ mode: "active" }, false);
+    const flushing = internal.runtimeFailureDelivery.flush();
+    try {
+      const phase = await Promise.race([held.entered.promise.then(() => "commit-held"), flushing.then(() => "flight-ended")]);
+      expect(phase).toBe("commit-held");
+      expect(internal.runtimeFailureDelivery.stop()).toBeUndefined();
+      vi.spyOn(internal.nativeOwnership, "assertOwned").mockImplementation(() => { throw new Error("owner lost"); });
+    } finally {
+      held.release.resolve();
+      await flushing;
+    }
+    internal.runtimeFailureDelivery.start();
+    await internal.runtimeFailureDelivery.flush();
+    expect(send).not.toHaveBeenCalled();
+    expect(await readFile(source.path, "utf8")).toBe(source.bytes);
+    expect((await failureOutbox()).depth).toBe(0);
+  });
+
+  it("imports the current tenant's fact without retagging a foreign tenant's capture", async () => {
+    const owned = await retainedLifecycle("update-owned");
+    const foreign = await retainedLifecycle("update-foreign", "other-tenant");
+    const { send } = await fixture({ mode: "active" });
+    expect(send.mock.calls).toEqual([["instance", owned.body]]);
+    expect(await readFile(foreign.path, "utf8")).toBe(foreign.bytes);
+    await expect(lstat(owned.path)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.skipIf(process.platform === "win32")("rejects capture links and nonprivate files while importing a valid owned source", async () => {
+    const owned = await retainedLifecycle("update-owned");
+    const insecure = await retainedLifecycle("update-nonprivate");
+    await chmod(insecure.path, 0o644);
+    const linked = join(dirname(owned.path), `${"A".repeat(43)}.json`);
+    await symlink(owned.path, linked);
+    const { send } = await fixture({ mode: "active" });
+    expect(send.mock.calls).toEqual([["instance", owned.body]]);
+    expect((await lstat(linked)).isSymbolicLink()).toBe(true);
+    expect(await readFile(insecure.path, "utf8")).toBe(insecure.bytes);
   });
 });

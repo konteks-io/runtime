@@ -37,6 +37,15 @@ const failure = (failureId = "failure-one") => ({
   toolCallId: failureId,
 });
 
+function lifecycleFailure(failureId: string) {
+  return {
+    schemaVersion: 1, failureId, observedAt, instanceId: "instance",
+    scope: { kind: "runtime" }, phase: "supervisor",
+    stage: "native_update_health", code: "native_update_rolled_back",
+    evidence: { kind: "runtime_exception" },
+  };
+}
+
 function receipt(value: unknown, status: "stored" | "duplicate" | "expired" = "stored") {
   const body = value as { instanceId: string; failureId: string };
   return {
@@ -128,6 +137,43 @@ async function seedSuppression(suppressedCount: number, pendingBatch?: unknown) 
 }
 
 describe("Runtime failure delivery", () => {
+  it("replays a claim-free lifecycle failure after offline restart with unchanged canonical bytes", async () => {
+    const body = {
+      schemaVersion: 1, failureId: "update-stable-attempt", observedAt,
+      instanceId: "instance", scope: { kind: "runtime" }, phase: "preparation",
+      stage: "native_update_stage", code: "native_update_stage_failed",
+      evidence: { kind: "runtime_exception" },
+    };
+    const offline = fixture();
+    offline.disable();
+    await expect(offline.delivery.submit(body)).resolves.toBe(true);
+    await offline.delivery.flush();
+    expect(offline.submitRuntimeFailure).not.toHaveBeenCalled();
+    expect((await pending()).all()[0]!.body).toEqual(body);
+    const lost = fixture(async () => { throw new Error("lost response"); });
+    await lost.delivery.flush();
+    expect((await pending()).depth).toBe(1);
+    const online = fixture();
+    await online.delivery.flush();
+    expect(online.submitRuntimeFailure.mock.calls[0]).toEqual(lost.submitRuntimeFailure.mock.calls[0]);
+    expect(online.submitRuntimeFailure.mock.calls[0]).toEqual(["instance", body]);
+    expect((await pending()).depth).toBe(0);
+  });
+
+  it("refuses a lifecycle record belonging to another installation instead of retagging it", async () => {
+    const f = fixture();
+    const body = {
+      schemaVersion: 1, failureId: "update-foreign-attempt", observedAt,
+      instanceId: "other-instance", scope: { kind: "runtime" }, phase: "supervisor",
+      stage: "native_update_health", code: "native_update_rolled_back",
+      evidence: { kind: "runtime_exception" },
+    };
+    await expect(f.delivery.submit(body)).resolves.toBe(false);
+    await f.delivery.flush();
+    expect(f.submitRuntimeFailure).not.toHaveBeenCalled();
+    expect((await pending()).depth).toBe(0);
+  });
+
   it("commits a separate immutable record and does not await network delivery", async () => {
     const f = fixture();
     const value = failure();
@@ -427,6 +473,90 @@ describe("Runtime failure delivery", () => {
       instanceId: "instance",
       suppressedCount: 0,
     });
+  });
+
+  it("does not confirm lifecycle handoff admission before durable outbox commit returns", async () => {
+    const f = fixture();
+    const value = lifecycleFailure("update-durable-admission");
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const enqueue = DurableOutbox.prototype.enqueue;
+    vi.spyOn(DurableOutbox.prototype, "enqueue").mockImplementationOnce(async function (this: DurableOutbox, item) {
+      entered.resolve();
+      await release.promise;
+      return enqueue.call(this, item);
+    });
+    let settled = false;
+    const admission = f.delivery.submit(value).then(result => { settled = true; return result; });
+    try {
+      await entered.promise;
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(settled).toBe(false);
+      expect((await pending()).depth).toBe(0);
+      expect(f.submitRuntimeFailure).not.toHaveBeenCalled();
+    } finally {
+      release.resolve();
+      await admission;
+    }
+    await expect(admission).resolves.toBe(true);
+    expect((await pending()).all().map(item => item.body)).toEqual([value]);
+  });
+
+  it("stops new lifecycle sends without waiting for an already pending network request", async () => {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const first = lifecycleFailure("update-stop-first");
+    const second = lifecycleFailure("update-stop-second");
+    const f = fixture(async (_id, value) => {
+      entered.resolve();
+      await release.promise;
+      return receipt(value);
+    });
+    await f.delivery.submit(first);
+    await f.delivery.submit(second);
+    const flushing = f.delivery.flush();
+    try {
+      await entered.promise;
+      expect(f.delivery.stop()).toBeUndefined();
+      f.delivery.start();
+      expect(f.submitRuntimeFailure).toHaveBeenCalledOnce();
+      expect((await pending()).depth).toBe(2);
+    } finally {
+      release.resolve();
+      await flushing;
+    }
+    expect(f.submitRuntimeFailure).toHaveBeenCalledOnce();
+    expect((await pending()).all().map(item => item.body)).toEqual([second]);
+    const restarted = fixture();
+    await restarted.delivery.flush();
+    expect(restarted.submitRuntimeFailure.mock.calls).toEqual([["instance", second]]);
+    expect((await pending()).depth).toBe(0);
+  });
+
+  it("reuses the exact lifecycle identity after an accepted record was acknowledged before source retirement", async () => {
+    const committed = new Map<string, string>();
+    const received: unknown[] = [];
+    const send: Sender = async (_id, value) => {
+      const body = value as { failureId: string };
+      const digest = jcsDigest(value as JsonValue);
+      const prior = committed.get(body.failureId);
+      if (prior !== undefined && prior !== digest) throw new Error("failure identity was rebound");
+      received.push(structuredClone(value));
+      committed.set(body.failureId, digest);
+      return receipt(value, prior === undefined ? "stored" : "duplicate");
+    };
+    const value = lifecycleFailure("update-ack-before-source-retire");
+    const first = fixture(send);
+    await first.delivery.submit(value);
+    await first.delivery.flush();
+    expect((await pending()).depth).toBe(0);
+    first.delivery.stop();
+    const restarted = fixture(send);
+    await expect(restarted.delivery.submit(structuredClone(value))).resolves.toBe(true);
+    await restarted.delivery.flush();
+    expect(received).toEqual([value, value]);
+    expect(committed.size).toBe(1);
+    expect((await pending()).depth).toBe(0);
   });
 
   it("reports an unknown omitted count when atomic suppression persistence fails", async () => {

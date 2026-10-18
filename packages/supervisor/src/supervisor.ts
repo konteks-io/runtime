@@ -558,6 +558,13 @@ export class Supervisor {
       dataDir: this.config.SUPERVISOR_DATA_DIR, core: this.core, clock: this.clock, logger: this.logger,
       instanceId: () => this.instanceId ?? "", coreContractVersion: () => this.coreContractVersion,
       canSend: () => this.recoveryAuthority() !== null,
+      captureOwner: {
+        workspaceId: () => this.workspaceId ?? "",
+        assertOwned: () => {
+          if (this.stopping || !this.nativeOwnership) throw new RemoteInstanceError("temporarily_unavailable", "Native state ownership is unavailable.");
+          this.nativeOwnership.assertOwned();
+        },
+      },
       mutate: this.stateMutations.run,
     });
     this.runtimeFailureDelivery.start();
