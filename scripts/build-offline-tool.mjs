@@ -36,7 +36,8 @@ try {
   mkdirSync(root, { recursive: true, mode: 0o700 });
   // Install scripts run on purpose: some grammars ship no prebuilt binary and
   // are compiled here, once, instead of on the person's laptop.
-  execFileSync(npm, ["install", "--no-audit", "--no-fund", "--no-package-lock", "--omit=dev", "--prefix", root, `${tool.package}@${tool.version}`], { stdio: "inherit", shell, env: buildEnvironment });
+  console.log("Installing Graft package and native grammars");
+  execFileSync(npm, ["install", "--foreground-scripts", "--loglevel=info", "--no-audit", "--no-fund", "--no-package-lock", "--omit=dev", "--prefix", root, `${tool.package}@${tool.version}`], { stdio: "inherit", shell, env: buildEnvironment });
   const cli = join(root, "node_modules", ...tool.package.split("/"), ...tool.entrypoint.split("/"));
   if (!existsSync(cli)) throw new Error(`${tool.package} has no ${tool.entrypoint}`);
   if (macOptions) {

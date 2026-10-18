@@ -63,9 +63,12 @@ function inventory(root) {
   };
 }
 
-function execBoundary(state, command, args) {
+function execBoundary(state, command, args, options) {
   if (command === "npm" || command === "npm.cmd") {
     state.root = args[args.indexOf("--prefix") + 1];
+    state.install = { command, args: [...args], options };
+    state.output?.push("controlled npm lifecycle output");
+    if (state.installFailure) throw state.installFailure;
     seedGraft(state.root);
     if (state.developmentCli) seedDevelopmentCli(state.root);
     state.before = inventory(state.root);
@@ -85,17 +88,17 @@ function builderContext(directory, coordinate, state) {
     // Existing prebuild-only fixtures do not model the separate reviewed CLI graph.
     pruneGraftDevelopmentCli: state.developmentCli ? helperExports.pruneGraftDevelopmentCli : () => [],
     mkdtempSync: () => work,
-    execFileSync: (command, args) => execBoundary(state, command, args),
+    execFileSync: (command, args, options) => execBoundary(state, command, args, options),
     process: { platform: coordinate.platform, arch: coordinate.nodeArch, version: process.version, execPath: process.execPath, env: {}, argv: [process.execPath, "builder", "--tool", "graft", "--architecture", coordinate.architecture, "--config", config, "--out", join(directory, "fixture.tgz")] },
     macOsArtifactOptions: architecture => ({ architecture, minimumOS: "13" }),
     assertMacOsArtifactTree: root => { state.guard = inventory(root); state.cliAtGuard = existsSync(join(root, "node_modules/tree-sitter-cli/tree-sitter")); state.calls.push({ command: "compatibility", args: [] }); },
-    console: { log: () => {} },
+    console: { log: value => state.output?.push(String(value)) },
   };
 }
 
 function buildFixture(coordinate, developmentCli = false) {
   const directory = mkdtempSync(join(tmpdir(), "graft-builder-characterization-"));
-  const state = { calls: [], developmentCli };
+  const state = { calls: [], developmentCli, output: [] };
   try {
     const source = readFileSync(join(scriptDirectory, "build-offline-tool.mjs"), "utf8").replace(/^import .+;\r?$/gm, "");
     runInNewContext(source, builderContext(directory, coordinate, state), { timeout: 5_000 });
@@ -105,6 +108,34 @@ function buildFixture(coordinate, developmentCli = false) {
     rmSync(directory, { recursive: true, force: true });
   }
 }
+
+test("Graft builder requests visible npm lifecycle progress before native inspection", () => {
+  const state = buildFixture(coordinates[0]);
+  assert.ok(state.install.args.includes("--foreground-scripts"));
+  assert.ok(state.install.args.includes("--loglevel=info"));
+  assert.equal(state.install.options.stdio, "inherit");
+  const start = state.output.indexOf("Installing Graft package and native grammars");
+  const progress = state.output.indexOf("controlled npm lifecycle output");
+  assert.ok(start >= 0 && start < progress, "the fixed marker must precede inherited npm progress");
+});
+
+test("Graft builder preserves npm install failure and removes unpublished work", () => {
+  const directory = mkdtempSync(join(tmpdir(), "graft-builder-characterization-"));
+  const failure = Object.assign(new Error("controlled npm lifecycle failure"), { status: 23 });
+  const state = { calls: [], output: [], installFailure: failure };
+  try {
+    const source = readFileSync(join(scriptDirectory, "build-offline-tool.mjs"), "utf8").replace(/^import .+;\r?$/gm, "");
+    assert.throws(() => runInNewContext(source, builderContext(directory, coordinates[4], state), { timeout: 5_000 }), error => error === failure);
+    assert.equal(state.install.command, "npm.cmd");
+    assert.equal(state.install.options.shell, true);
+    assert.equal(state.install.options.stdio, "inherit");
+    assert.deepEqual(state.calls, [], "a failed install must not reach CLI smoke or archive creation");
+    assert.equal(existsSync(join(directory, "work")), false, "the builder's finally must remove its failed staging tree");
+  } finally {
+    assert.equal(dirname(resolve(directory)), resolve(tmpdir()));
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 for (const coordinate of coordinates) {
   test(`Graft builder preserves selected bindings on ${coordinate.platform}/${coordinate.nodeArch}`, () => {
