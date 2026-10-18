@@ -300,6 +300,61 @@ describe("Supervisor diagnostic history admission", () => {
 });
 
 describe("Supervisor lifecycle capture intake", () => {
+  it("discards only its unadmitted candidate after a refused first publication link", async () => {
+    const sources = [await retainedLifecycle("first-link-one"), await retainedLifecycle("first-link-two")];
+    for (const source of sources) await rm(source.path);
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    vi.mocked(link).mockImplementation(async (from, to) => {
+      if (sources.some(source => String(from) === `${source.path}.pending.writing` && String(to) === `${source.path}.pending`)) {
+        throw Object.assign(new Error("simulated first publication link failure"), { code: "ENOSPC" });
+      }
+      return actual.link(from, to);
+    });
+    try {
+      for (const source of sources) {
+        await expect(writeRuntimeFailureCapture(dir, source.capture)).rejects.toMatchObject({ code: "ENOSPC" });
+        expect(await readdir(dirname(source.path))).toEqual([]);
+      }
+    } finally {
+      vi.mocked(link).mockImplementation(actual.link);
+    }
+    const { internal, send } = await fixture({ mode: "active" });
+    expect(send).not.toHaveBeenCalled();
+    expect((await failureOutbox()).depth).toBe(0);
+    await writeRuntimeFailureCapture(dir, sources[0]!.capture);
+    await internal.runtimeFailureDelivery.flush();
+    expect(send.mock.calls).toEqual([["instance", sources[0]!.body]]);
+  });
+
+  it.skipIf(process.platform === "win32")("retains the admitted pending fact when the final directory durability barrier fails", async () => {
+    const source = await retainedLifecycle("update-final-sync-refused");
+    await rm(source.path);
+    const directory = await lstat(dirname(source.path));
+    const probe = await open(dir, "r");
+    const prototype = Object.getPrototypeOf(probe);
+    const sync = prototype.sync;
+    await probe.close();
+    const syncing = vi.spyOn(prototype, "sync").mockImplementation(async function (this: FileHandle) {
+      const current = await this.stat();
+      if (current.isDirectory() && current.dev === directory.dev && current.ino === directory.ino) {
+        const published = await lstat(source.path).then(() => true, () => false);
+        if (published) throw Object.assign(new Error("simulated final directory durability failure"), { code: "EIO" });
+      }
+      await sync.call(this);
+    });
+    try {
+      await expect(writeRuntimeFailureCapture(dir, source.capture)).rejects.toMatchObject({ code: "EIO" });
+      await expect(readFile(`${source.path}.pending`, "utf8")).resolves.toBe(source.bytes);
+      expect((await lstat(source.path)).nlink).toBe(2);
+    } finally {
+      syncing.mockRestore();
+    }
+    const { send } = await fixture({ mode: "active" });
+    expect(send.mock.calls).toEqual([["instance", source.body]]);
+    await expect(lstat(`${source.path}.pending`)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(lstat(source.path)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("retains the completed pending fact after final-link failure for ordinary intake on restart", async () => {
     const source = await retainedLifecycle("update-final-link-refused");
     await rm(source.path);

@@ -123,19 +123,31 @@ async function unchangedDirectory(directory: OwnedDirectory): Promise<void> {
 
 async function publishCapture(directory: OwnedDirectory, target: string, bytes: string): Promise<void> {
   const temporary = `${target}.pending`;
-  let identity: Stats | null = null;
-  try {
-    identity = await preparePublication(temporary, bytes);
-    await unchangedDirectory(directory);
-    await link(temporary, target).catch(async error => {
-      if (!isFsErrorWithCode(error, "EEXIST")) throw error;
-      if (!(await existingCapture(target, bytes))) throw unavailable();
-    });
-  } finally {
-    if (identity) await removePending(temporary, identity);
-  }
+  const identity = await preparePublication(temporary, bytes);
+  await publishPreparedCapture(directory, temporary, target, identity, bytes);
+}
+
+/** A source stays in custody until its exact destination is verified and durable. */
+async function publishPreparedCapture(directory: OwnedDirectory, source: string, target: string, identity: Stats, bytes: string): Promise<void> {
+  await unchangedDirectory(directory);
+  await link(source, target).catch(error => { if (!isFsErrorWithCode(error, "EEXIST")) throw error; });
   await syncDirectory(directory.path);
   await unchangedDirectory(directory);
+  await verifyPublication(target, source, identity, bytes);
+  await removePending(source, identity);
+  await syncDirectory(directory.path);
+  await unchangedDirectory(directory);
+}
+
+/** Validate without the reader's recovery cleanup, including a known hard-link sibling. */
+async function verifyPublication(target: string, source: string, identity: Stats, bytes: string): Promise<void> {
+  const before = await lstat(target);
+  if (!pendingFile(before)) throw unavailable();
+  const published = await readCaptureFile(target, before, before.nlink);
+  if (published.bytes !== bytes) throw unavailable();
+  if (before.nlink === 1) return;
+  const sibling = await lstat(source);
+  if (!sameVersion(published.identity, sibling) || !sameEntry(identity, sibling)) throw unavailable();
 }
 
 async function preparePublication(path: string, bytes: string): Promise<Stats> {
@@ -143,20 +155,29 @@ async function preparePublication(path: string, bytes: string): Promise<Stats> {
   if (existing) return existing.identity;
   // A pending name is visible only after its complete immutable bytes were synced and closed.
   const writing = `${path}.writing`;
-  let identity: Stats | null = null;
-  try {
-    identity = await writeCandidate(writing, bytes);
-    await link(writing, path).catch(async error => {
-      if (!isFsErrorWithCode(error, "EEXIST")) throw error;
-      if (!(await retainedPublication(path, bytes))) throw unavailable();
-    });
-  } finally {
-    if (identity) await removePending(writing, identity);
+  const identity = await writeCandidate(writing, bytes);
+  const directory = await ownedDirectory(dirname(path));
+  try { await publishPreparedCapture(directory, writing, path, identity, bytes); }
+  catch (error) {
+    await discardUnadmittedCandidate(path, writing, identity, bytes).catch(() => undefined);
+    throw error;
   }
-  await syncDirectory(dirname(path));
   const prepared = await retainedPublication(path, bytes);
   if (!prepared) throw unavailable();
   return prepared.identity;
+}
+
+
+/** Only this unchanged private candidate may be discarded before any pending handoff exists. */
+async function discardUnadmittedCandidate(target: string, source: string, identity: Stats, bytes: string): Promise<void> {
+  if (await optionalStat(target)) return;
+  const candidate = await readCaptureFile(source, await lstat(source), 1);
+  if (candidate.bytes !== bytes || !sameVersion(identity, candidate.identity)) return;
+  if (await optionalStat(target)) return;
+  const current = await lstat(source);
+  if (!privateFile(current, 1) || !sameVersion(identity, current)) return;
+  await rm(source);
+  await syncDirectory(dirname(source));
 }
 
 async function writeCandidate(path: string, bytes: string): Promise<Stats> {
@@ -225,6 +246,7 @@ async function recoverPublication(directory: OwnedDirectory, target: string, bef
   const pending = `${target}.${target.endsWith(".pending") ? "writing" : "pending"}`;
   const sibling = await lstat(pending);
   if (!privateFile(sibling, 2) || !sameVersion(published.identity, sibling)) throw unavailable();
+  await syncDirectory(directory.path);
   if (!sameVersion(published.identity, await lstat(target))) throw unavailable();
   await removePending(pending, sibling);
   await syncDirectory(directory.path);
