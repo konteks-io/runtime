@@ -83,7 +83,7 @@ test('the real collector still refuses duplicate assets in two selected native p
 });
 
 test('actual Mac packaging preflight has its build prerequisites before it starts', () => {
-  const preflight = ciNative.indexOf('      - name: Preflight the actual offline Mac agent and Graft packages before release\n');
+  const preflight = ciNative.indexOf('      - name: Preflight the actual offline Mac agent packages before release\n');
   assert.ok(preflight >= 0);
   const prerequisites = ciNative.slice(0, preflight);
   assert.ok(prerequisites.includes(setup), 'Mac packaging currently reaches its guard before the source-build tools are provisioned');
@@ -104,7 +104,7 @@ test('the real release packager uses the same Mac prerequisites as preflight', (
 });
 
 test('a failed package preflight retains its evidence without starting another resource build', () => {
-  const preflight = ciNative.indexOf('      - name: Preflight the actual offline Mac agent and Graft packages before release\n');
+  const preflight = ciNative.indexOf('      - name: Preflight the actual offline Mac agent packages before release\n');
   const after = ciNative.indexOf('      - name: ', preflight + 20);
   assert.ok(preflight >= 0 && after > preflight);
   const following = ciNative.slice(after);
@@ -112,6 +112,7 @@ test('a failed package preflight retains its evidence without starting another r
   assert.ok(following.includes('mac13-resource-probe-evidence/logs/*.log'));
   assert.ok(following.includes('mac13-resource-probe-evidence/receipt.json'));
   assert.ok(following.includes("steps.macos-offline-preflight.outcome == 'failure'"));
+  assert.ok(following.includes("steps.macos-graft-preflight.outcome == 'failure'"));
   assert.ok(following.includes("steps.mac13-resource-diagnostic-bounds.outputs.ready == 'true'"));
 });
 

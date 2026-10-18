@@ -9,6 +9,7 @@ const source = readFileSync(new URL('./probe.mjs', import.meta.url), 'utf8');
 const workflow = readFileSync(new URL('../../.github/workflows/ci.yaml', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 const setup = readFileSync(new URL('../../.github/actions/setup-macos-resources/action.yml', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 const gate = "runner.os == 'macOS' && !cancelled() && (steps.macos-offline-preflight.outcome == 'success' || steps.macos-offline-preflight.outcome == 'failure')";
+const diagnosticGate = "runner.os == 'macOS' && !cancelled() && (steps.macos-offline-preflight.outcome == 'success' || steps.macos-offline-preflight.outcome == 'failure' || steps.macos-graft-preflight.outcome == 'success' || steps.macos-graft-preflight.outcome == 'failure')";
 
 function functionSource(start, end) {
   const begin = source.indexOf(start);
@@ -130,11 +131,17 @@ test('finite shared Mac prerequisites keep official conditional autoconf provisi
 });
 
 test('packaging enters the real builder once with no post-preflight resource compilation', () => {
-  const value = step('Preflight the actual offline Mac agent and Graft packages before release');
+  const value = step('Preflight the actual offline Mac agent packages before release');
   assert.ok(value.includes("if: runner.os == 'macOS'"));
   assert.match(value, /timeout-minutes: 120/);
   assert.equal(value.includes('command -v autoconf'), false);
   assert.ok(value.includes('node scripts/build-offline-agent.mjs'));
+  assert.equal(value.includes('node scripts/build-offline-tool.mjs'), false);
+  const graft = step('Preflight the actual offline Mac Graft package before release');
+  assert.match(graft, /timeout-minutes: 45\n/);
+  assert.ok(graft.includes(`if: ${gate}`));
+  assert.ok(graft.includes('node scripts/build-offline-tool.mjs --tool graft'));
+  assert.equal(graft.includes('node scripts/build-offline-agent.mjs'), false);
   const following = workflow.slice(workflow.indexOf(value) + value.length);
   assert.equal(/node[^\n]*scripts\/mac13-resource-probe\/probe\.mjs/.test(following), false);
 });
@@ -205,11 +212,15 @@ test('the CI jobs, five coordinates and shipping preflight stay present without 
   const jobs = workflow.slice(workflow.indexOf('jobs:\n'));
   assert.deepEqual(Array.from(jobs.matchAll(/^  ([a-z-]+):$/gm), value => value[1]), ['check', 'windows-bootstrap', 'stable-path', 'windows-native']);
   assert.match(workflow, /os: \[macos-26, macos-15-intel, ubuntu-24\.04, ubuntu-24\.04-arm, windows-2022\]/);
-  const preflight = step('Preflight the actual offline Mac agent and Graft packages before release');
+  const preflight = step('Preflight the actual offline Mac agent packages before release');
   assert.ok(preflight.includes('exit "$failed"'));
   assert.equal(preflight.includes('continue-on-error'), false);
+  const graft = step('Preflight the actual offline Mac Graft package before release');
+  assert.equal(graft.includes('continue-on-error'), false);
+  const bounds = step('Bound the selected resource measurement diagnostics before upload');
+  assert.ok(bounds.includes(`if: ${diagnosticGate}`));
   const upload = step('Retain bounded Mac resource measurements only');
-  assert.ok(upload.includes(`if: ${gate}`));
+  assert.ok(upload.includes(`if: ${diagnosticGate}`));
   assert.ok(upload.includes("steps.mac13-resource-diagnostic-bounds.outputs.ready == 'true'"));
   assert.ok(upload.includes('logs/*.log'));
   assert.ok(upload.includes('/receipt.json'));
