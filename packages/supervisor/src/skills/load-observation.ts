@@ -42,7 +42,7 @@ function text(value: unknown): string | undefined {
 
 function isReadCall(update: RecordValue): boolean {
   if (typeof update.kind === "string" && update.kind.toLowerCase() === "read") return true;
-  return [update.name, update.title].some((value) => {
+  return [update.name].some((value) => {
     const name = text(value)?.toLowerCase();
     if (!name) return false;
     const first = name.split(/\s+/, 1)[0]!;
@@ -88,10 +88,19 @@ function completedCallKey(authority: SkillReadAuthorityContext, toolCallId: stri
   return `${authority.executionId}\0${authority.turnId}\0${toolCallId}`;
 }
 
+function readAuthorityKey(authority: SkillReadAuthorityContext): string {
+  return JSON.stringify([
+    authority.instanceId, authority.agentId, authority.executionId, authority.sessionId,
+    authority.assignmentId, authority.attempt, authority.claimId, authority.recoveryEpoch,
+    authority.readyRevision, authority.runnerIncarnation, authority.acpSessionRef,
+    authority.executionRevision, authority.leaseSetId, authority.turnId,
+  ]);
+}
+
 /** Counts only a completed, structured file-read call for an exact staged Skill file. */
 export class ManagedSkillReadTracker {
   private readonly targets = new Map<string, ManagedSkillReadTarget>();
-  private readonly pending = new Map<string, ManagedSkillReadTarget>();
+  private readonly pending = new Map<string, { target: ManagedSkillReadTarget; authorityKey: string }>();
   private readonly completedCalls = new Set<string>();
   private readonly loadedSkills = new Set<string>();
   private invalidTargetCount = 0;
@@ -155,14 +164,14 @@ export class ManagedSkillReadTracker {
     authority: SkillReadAuthorityContext | null,
     observedAt: string,
   ): AgentSkillReadObservation | null {
-    if (!isReadCall(update)) return null;
+    if (!authority || !isReadCall(update)) return null;
     const file = requestedFile(update);
     if (!file) return null;
     const target = this.targetFor(file);
     if (!target) return null;
     if (terminalStatus(update.status) === "completed")
       return this.complete(callId, target, authority, observedAt);
-    this.pending.set(callId, target);
+    this.pending.set(callId, { target, authorityKey: readAuthorityKey(authority) });
     return null;
   }
 
@@ -172,13 +181,13 @@ export class ManagedSkillReadTracker {
     authority: SkillReadAuthorityContext | null,
     observedAt: string,
   ): AgentSkillReadObservation | null {
-    const target = this.pending.get(callId);
-    if (!target) return null;
+    const pending = this.pending.get(callId);
+    if (!pending || !authority || pending.authorityKey !== readAuthorityKey(authority)) return null;
     const status = terminalStatus(update.status);
     if (status === "other") return null;
     this.pending.delete(callId);
     if (status !== "completed") return null;
-    return this.complete(callId, target, authority, observedAt);
+    return this.complete(callId, pending.target, authority, observedAt);
   }
 
   private targetFor(file: string): ManagedSkillReadTarget | undefined {

@@ -25,6 +25,24 @@ const authority = {
 };
 
 describe("managed Skill read observations", () => {
+  it("does not infer a verified read from a display title", () => {
+    const tracker = new ManagedSkillReadTracker("/private/work", [skill]);
+    const call = { sessionUpdate: "tool_call", toolCallId: "title-only", title: "read_file", status: "completed", rawInput: { path: skill.skillFile } };
+    expect(tracker.isRequiredSkillRead({ toolCall: call })).toBe(false);
+    expect(tracker.observe(call, authority, "2026-10-18T00:00:00.000Z")).toBeNull();
+    expect(tracker.allRequiredSkillsLoaded()).toBe(false);
+  });
+
+  it.each([null, { ...authority, turnId: "previous-turn" }, { ...authority, runnerIncarnation: "previous-runner" }])(
+    "does not complete a read begun without the same verified authority: %j",
+    startedAuthority => {
+      const tracker = new ManagedSkillReadTracker("/private/work", [skill]);
+      tracker.observe({ sessionUpdate: "tool_call", toolCallId: "read", kind: "read", status: "in_progress", rawInput: { path: skill.skillFile } }, startedAuthority, "2026-10-18T00:00:00.000Z");
+      expect(tracker.observe({ sessionUpdate: "tool_call_update", toolCallId: "read", status: "completed" }, authority, "2026-10-18T00:00:01.000Z")).toBeNull();
+      expect(tracker.allRequiredSkillsLoaded()).toBe(false);
+    },
+  );
+
   it("returns a catalog load proof only after every exact required Skill file is read", () => {
     const revision = `sha256:${"a".repeat(64)}`;
     const second = { ...skill, skillId: "8c928cc2-5e58-4e27-8425-6f1ad40265ea", skillFile: "/private/skills/second/SKILL.md" };
