@@ -343,6 +343,8 @@ it("allows a supported no-official-signal agent to recover after a successful of
 it("stops the exact session bridge once without touching its sibling or control owner", async () => {
   const f = await fixture();
   const first = await f.runtime.sessions.create(f.input), second = await f.runtime.sessions.create(f.input);
+  const seen: unknown[] = [];
+  f.runtime.events.subscribe(event => seen.push(event));
   await f.runtime.sessions.stopForRecovery(first.acpSessionRef);
   await f.runtime.stopExecutionBridge(first.acpSessionRef);
   await f.runtime.stopExecutionBridge(first.acpSessionRef);
@@ -350,6 +352,7 @@ it("stops the exact session bridge once without touching its sibling or control 
   expect(f.owners[0]!.bridge.stop).not.toHaveBeenCalled();
   expect(f.owners[2]!.bridge.stop).not.toHaveBeenCalled();
   f.owners[1]!.handlers.onExit({ code: 0, signal: null });
+  expect(seen).not.toContainEqual(expect.objectContaining({ kind: "session_exited", acpSessionRef: first.acpSessionRef }));
   f.runtime.sessions.prompt(second.acpSessionRef, "b", { prompt: [] });
   expect(f.owners[2]!.bridge.connection.prompt).toHaveBeenCalledOnce();
   expect(f.runtime.readiness().connectionState).toBe("ready");

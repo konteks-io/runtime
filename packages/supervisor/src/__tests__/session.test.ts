@@ -22,7 +22,9 @@ import { PreviewWorktreePermits } from "../preview/worktree-permits.js";
 import type { OutboundMessage } from "../transport/transport.js";
 import { RunnerEventBus } from "../../../agent-runner/src/events.js";
 import { InMemorySessionRefStore, SessionManager } from "../../../agent-runner/src/sessions/manager.js";
-import type { BridgeProcess } from "../../../agent-runner/src/bridge/process.js";
+import type { BridgeProcess, SpawnBridgeOptions } from "../../../agent-runner/src/bridge/process.js";
+import { AgentRuntime } from "../../../agent-runner/src/runtime.js";
+import { RunnerConfigSchema } from "../../../agent-runner/src/config.js";
 
 let dir = "";
 beforeEach(async () => {
@@ -164,6 +166,82 @@ describe("relayed session", () => {
     });
     return { session, sent, runner, runnerCalls, journal, closed, transport };
   }
+
+  async function runnerFailureCapture() {
+    const onRuntimeFailure = vi.fn((_fact: unknown, _context: unknown) => undefined);
+    const base = await build({ onRuntimeFailure });
+    const owners: Array<{ bridge: BridgeProcess; handlers: SpawnBridgeOptions["handlers"] }> = [];
+    const runtime = new AgentRuntime({
+      config: RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "codex", RUNNER_CREDENTIAL_DIR: dir, RUNNER_WORKSPACE_DIR: dir }),
+      executionBridgeLimit: () => 2,
+      spawn: async input => {
+        const privateId = `private-runtime-failure-${owners.length}`;
+        const selected = new Map<string, string>();
+        const bridge: BridgeProcess = { exited: false, initializeResult: { protocolVersion: 1 }, stderrTail: () => [],
+          connection: {
+            newSession: vi.fn(async () => ({ sessionId: privateId })),
+            prompt: vi.fn(async () => ({ stopReason: "end_turn" })),
+            cancel: vi.fn(async () => undefined),
+            setSessionConfigOption: vi.fn(async ({ configId, value }: { configId: string; value: string }) => {
+              selected.set(configId, value);
+              return { configOptions: [...selected].map(([id, currentValue]) => ({
+                id, name: id, type: "select" as const, currentValue, options: [{ value: currentValue, name: currentValue }],
+              })) };
+            }),
+          } as never, stop: vi.fn(async () => undefined) };
+        owners.push({ bridge, handlers: input.handlers });
+        return bridge;
+      },
+    });
+    const handled: Promise<void>[] = [];
+    const unsubscribe = runtime.events.subscribe(event => {
+      handled.push(base.session.onRunnerEvent(event));
+    });
+    vi.mocked(base.runner.createSession).mockImplementation((args, lifecycle) => runtime.sessions.create({ ...args, cwd: dir, ...(lifecycle ? { lifecycle } : {}) }));
+    await runtime.ensureBridge();
+    const { acpSessionRef } = await base.session.bootstrap();
+    expect(owners).toHaveLength(2);
+    expect(owners[0]!.bridge.connection.newSession).not.toHaveBeenCalled();
+    expect(owners[1]!.bridge.connection.newSession).toHaveBeenCalledOnce();
+    return { ...base, onRuntimeFailure, runtime, owners, handled, acpSessionRef,
+      dispose: async () => { unsubscribe(); await base.session.close("cancelled"); await runtime.stop(); } };
+  }
+
+  it.each([{ code: 17, signal: null, evidence: { kind: "process_exit", exitCode: 17 } },
+    { code: null, signal: "SIGTERM" as const, evidence: { kind: "process_exit", signal: "SIGTERM" } },
+    { code: null, signal: "SIGPIPE" as const, evidence: { kind: "process_exit" } }])(
+    "captures unexpected owned child-exit facts before the session closes %#", async ({ code, signal, evidence }) => {
+      const f = await runnerFailureCapture();
+      try {
+        expect(f.owners).toHaveLength(2);
+        f.owners[1]!.handlers.onExit({ code, signal });
+        await Promise.all(f.handled);
+        expect(f.onRuntimeFailure).toHaveBeenCalledWith(expect.objectContaining({ evidence }), { assignmentId: "asg", attempt: 1 });
+        expect(JSON.stringify(f.onRuntimeFailure.mock.calls)).not.toMatch(/private-runtime-failure|"message"|"stack"/);
+        expect(f.closed).toEqual(["agent_exited"]);
+      } finally { await f.dispose(); }
+    },
+  );
+
+  it("does not report an intentionally stopped execution as an unexpected child failure", async () => {
+    const f = await runnerFailureCapture();
+    try {
+      await f.runtime.stopExecutionBridge(f.acpSessionRef);
+      f.owners[1]!.handlers.onExit({ code: null, signal: "SIGTERM" });
+      await Promise.all(f.handled);
+      expect(f.onRuntimeFailure).not.toHaveBeenCalled();
+    } finally { await f.dispose(); }
+  });
+
+  it("does not attach a control-process exit to the active execution session", async () => {
+    const f = await runnerFailureCapture();
+    try {
+      f.owners[0]!.handlers.onExit({ code: 23, signal: null });
+      await Promise.all(f.handled);
+      expect(f.onRuntimeFailure).not.toHaveBeenCalled();
+      expect(f.closed).toEqual([]);
+    } finally { await f.dispose(); }
+  });
 
   it.each([false, true])("admits a legacy Codex reference only when the pinned owner proves it unloaded (unloaded=%s)", async unloaded => {
     const assertLegacyCodexThreadUnloaded = vi.fn(async () => unloaded);
@@ -1613,6 +1691,92 @@ describe("relayed session", () => {
     expect(serialized).not.toContain(SECRET_CANARIES.bearer);
     expect(serialized).toContain("Bearer [redacted]");
     expect(session.counters.malformedResponses).toBe(0);
+  });
+
+  it("captures only the failed tool fact before forwarding its stripped public lifecycle", async () => {
+    const order: string[] = [];
+    // NEW optional callback contract; baseline executes the existing session
+    // and fails on missing behavior, rather than importing a proposed module.
+    const onRuntimeFailure = vi.fn(async (_fact: unknown, _context: unknown) => { order.push("diagnostic"); });
+    const overrides = { onRuntimeFailure, onUsage: vi.fn(async () => undefined) };
+    const f = await build(overrides);
+    try {
+      await f.session.bootstrap();
+      const send = vi.spyOn(f.transport, "send").mockImplementation(message => { order.push("public"); f.sent.push(message); });
+      for (const status of ["pending", "in_progress", "completed"] as const) {
+        await f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: {
+          sessionId: "acp-1", update: { sessionUpdate: "tool_call_update", toolCallId: `nonfailure-${status}`, status },
+        } });
+      }
+      expect(onRuntimeFailure).not.toHaveBeenCalled(); order.length = 0;
+      await f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: {
+        sessionId: "acp-1", update: { sessionUpdate: "tool_call_update", toolCallId: "failed-tool", status: "failed",
+          rawInput: { token: SECRET_CANARIES.openAiKey },
+          rawOutput: { errno: "EACCES", rpcCode: -32001, message: "private-provider-output-canary /Users/private-person/file" },
+          _meta: { private: "private-metadata-canary" },
+        },
+      } });
+      expect(onRuntimeFailure).toHaveBeenCalledExactlyOnceWith({
+        phase: "tool", stage: "tool_terminal", code: "tool_failed",
+        evidence: { kind: "tool_status", status: "failed" }, toolCallId: "failed-tool",
+      }, { assignmentId: assignment.id, attempt: assignment.attempt });
+      expect(order).toEqual(["diagnostic", "public"]);
+      expect(f.sent.at(-1)?.body).toMatchObject({ kind: "acp", method: "session/update", params: {
+        update: { toolCallId: "failed-tool", status: "failed" },
+      } });
+      expect(JSON.stringify([onRuntimeFailure.mock.calls, f.sent]))
+        .not.toMatch(/private-provider-output-canary|private-metadata-canary|private-person|rawInput|rawOutput|rpcCode|EACCES/);
+      expect(JSON.stringify(onRuntimeFailure.mock.calls)).not.toContain(SECRET_CANARIES.openAiKey);
+      expect(f.session.agentFailureReason()).toBeNull(); expect(f.closed).toEqual([]);
+      send.mockRestore();
+    } finally { await f.session.close("cancelled"); }
+  });
+
+  it.each(["throw", "reject", "pending"] as const)("keeps usage and native successful settlement independent when diagnostics %s", async fault => {
+    let release!: () => void;
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    const onRuntimeFailure = vi.fn((_fact: unknown, _context: unknown) => {
+      if (fault === "throw") throw new Error("private diagnostic failure");
+      return fault === "reject" ? Promise.reject(new Error("private diagnostic failure")) : blocked;
+    });
+    const onUsage = vi.fn(async () => undefined), recordCompletedSettlement = vi.fn(async () => undefined);
+    const overrides = { onRuntimeFailure, onUsage, recordCompletedSettlement,
+      reserveChannel: () => vi.fn(), reserveExecutionReference: async () => undefined,
+      recordExecutionProcessOwner: async () => undefined };
+    const f = await build(overrides);
+    vi.mocked(f.runner.createSession).mockImplementation(async (_input, lifecycle) => {
+      await lifecycle!.beforeCreate("acp-1"); lifecycle!.assertCurrent();
+      return { acpSessionRef: "acp-1", resumed: false, capabilities: { forkSession: false, sessionResume: true } };
+    });
+    vi.mocked(f.runner.closeSession).mockResolvedValue({ completion: "native_continuation_ready" });
+    let updateOutcome: Promise<{ ok: boolean }> | undefined;
+    let completionOutcome: Promise<{ ok: boolean }> | undefined;
+    try {
+      await f.session.bootstrap();
+      let updateSettled = false;
+      updateOutcome = f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: {
+        sessionId: "acp-1", update: { sessionUpdate: "tool_call_update", toolCallId: "recoverable-tool", status: "failed" },
+      } }).then(() => ({ ok: true }), () => ({ ok: false })).then(outcome => { updateSettled = true; return outcome; });
+      // A wrong implementation that awaits the reporter fails promptly; the
+      // finally block releases only this fixture's diagnostic promise.
+      await vi.waitFor(() => expect(updateSettled).toBe(true), { timeout: 1_000 });
+      expect(await updateOutcome).toEqual({ ok: true });
+      const usage = { instanceId: "inst", assignmentId: "asg", attempt: 1, agentId: "codex",
+        observedAt: clock.nowIso(), moneyBasis: "unavailable_local_subscription" as const, outputTokens: 3 };
+      await f.session.onRunnerEvent({ kind: "usage_observation", acpSessionRef: "acp-1", observation: usage });
+      expect(onUsage).toHaveBeenCalledExactlyOnceWith(usage);
+      await f.journal.pendingRequests.put({ acpSessionRef: "acp-1", id: "p1", method: "session/prompt", direction: "received",
+        openedAt: clock.nowIso(), closedAt: null, deadlineAt: null, requestDigest: null });
+      let completionSettled = false;
+      completionOutcome = f.session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p1", result: { stopReason: "end_turn" } })
+        .then(() => ({ ok: true }), () => ({ ok: false })).then(outcome => { completionSettled = true; return outcome; });
+      await vi.waitFor(() => expect(completionSettled).toBe(true), { timeout: 1_000 });
+      expect(await completionOutcome).toEqual({ ok: true });
+      expect(onRuntimeFailure).toHaveBeenCalledOnce(); expect(f.closed).toEqual(["completed"]);
+      expect(recordCompletedSettlement).toHaveBeenCalledExactlyOnceWith("acp-1");
+      expect(f.runner.cancel).not.toHaveBeenCalled(); expect(f.session.agentFailureReason()).toBeNull();
+      expect(f.sent.at(-1)?.body).toMatchObject({ kind: "session_closed", reason: "completed" });
+    } finally { release(); await Promise.all([updateOutcome, completionOutcome]); await f.session.close("cancelled"); }
   });
 
   it("allows an oversized private tool result without forwarding it", async () => {

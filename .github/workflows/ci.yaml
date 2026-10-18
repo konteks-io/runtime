@@ -198,7 +198,7 @@ jobs:
         timeout-minutes: 35
         if: runner.os == 'macOS'
         uses: ./.github/actions/setup-macos-resources
-      - name: Preflight the actual offline Mac agent and Graft packages before release
+      - name: Preflight the actual offline Mac agent packages before release
         id: macos-offline-preflight
         timeout-minutes: 120
         if: runner.os == 'macOS'
@@ -223,14 +223,28 @@ jobs:
               failed=1
             fi
           done
-          echo "Inspecting the complete Graft package for macos/$architecture"
-          if ! node scripts/build-offline-tool.mjs --tool graft --architecture "$architecture" --out "$output/konteks-graft-macos-$architecture.tgz"; then
-            failed=1
-          fi
           exit "$failed"
+      - name: Preflight the actual offline Mac Graft package before release
+        id: macos-graft-preflight
+        timeout-minutes: 45
+        if: runner.os == 'macOS' && !cancelled() && (steps.macos-offline-preflight.outcome == 'success' || steps.macos-offline-preflight.outcome == 'failure')
+        shell: bash
+        env:
+          MATRIX_OS: ${{ matrix.os }}
+        run: |
+          set -euo pipefail
+          case "$MATRIX_OS" in
+            macos-26) architecture=arm64 ;;
+            macos-15-intel) architecture=amd64 ;;
+            *) echo "Unsupported Mac package preflight coordinate: $MATRIX_OS"; exit 1 ;;
+          esac
+          output="$RUNNER_TEMP/konteks-offline-compatibility"
+          mkdir -p "$output"
+          echo "Inspecting the complete Graft package for macos/$architecture"
+          node scripts/build-offline-tool.mjs --tool graft --architecture "$architecture" --out "$output/konteks-graft-macos-$architecture.tgz"
       - name: Bound the selected resource measurement diagnostics before upload
         id: mac13-resource-diagnostic-bounds
-        if: runner.os == 'macOS' && !cancelled() && (steps.macos-offline-preflight.outcome == 'success' || steps.macos-offline-preflight.outcome == 'failure')
+        if: runner.os == 'macOS' && !cancelled() && (steps.macos-offline-preflight.outcome == 'success' || steps.macos-offline-preflight.outcome == 'failure' || steps.macos-graft-preflight.outcome == 'success' || steps.macos-graft-preflight.outcome == 'failure')
         timeout-minutes: 2
         shell: bash
         run: |
@@ -273,7 +287,7 @@ jobs:
           }
           NODE
       - name: Retain bounded Mac resource measurements only
-        if: runner.os == 'macOS' && !cancelled() && (steps.macos-offline-preflight.outcome == 'success' || steps.macos-offline-preflight.outcome == 'failure') && steps.mac13-resource-diagnostic-bounds.outputs.ready == 'true'
+        if: runner.os == 'macOS' && !cancelled() && (steps.macos-offline-preflight.outcome == 'success' || steps.macos-offline-preflight.outcome == 'failure' || steps.macos-graft-preflight.outcome == 'success' || steps.macos-graft-preflight.outcome == 'failure') && steps.mac13-resource-diagnostic-bounds.outputs.ready == 'true'
         timeout-minutes: 5
         uses: actions/upload-artifact@v4
         with:

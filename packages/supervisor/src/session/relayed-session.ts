@@ -12,6 +12,7 @@ import {
   isGitXcodeLicenseError,
   directModelSelectionsEqual,
   allEqual,
+  plainRecord,
   createLogger,
   type AcpJsonRpcError,
   type AgentTurnUsageObservation,
@@ -28,6 +29,7 @@ import {
   type SessionToRuntimeMessage,
 } from "@konteks/remote-common";
 import { BROWSER_MCP_SERVER_NAME, type RunnerEvent } from "@konteks/remote-agent-runner";
+import { reportRuntimeFailure, type RuntimeFailureReporter } from "../runtime-failure-types.js";
 import type { RunnerPort, RunnerSessionCreated, RunnerSessionInput, RunnerSessionLifecycle } from "../runner-port.js";
 import type { PendingRequest, SupervisorJournal } from "../state/journal.js";
 import type { TransportManager } from "../transport/relay-transport.js";
@@ -174,6 +176,8 @@ export interface RelayedSessionDeps {
   /** Rechecked immediately before a local prompt crosses into the bridge. */
   assertPromptAllowed?: () => void;
   onUsage: (observation: AgentTurnUsageObservation) => Promise<void>;
+  /** Typed historical facts, independent of usage and terminal settlement. */
+  onRuntimeFailure?: RuntimeFailureReporter;
   /** A turn started or ended: the computer's busy state changed. */
   onTurnActivity?: () => void;
   onClosed: (session: RelayedSession, reason: SessionClosedReason) => Promise<void>;
@@ -1525,12 +1529,19 @@ export class RelayedSession {
       await this.sendToCore({ kind: "acp", method: "elicitation/complete", params: (event as RunnerEventOf<"elicitation_complete">).params as never });
     }],
     ["session_exited", async event => {
-      await this.close((event as RunnerEventOf<"session_exited">).reason === "agent_exited" ? "agent_exited" : "completed");
+      const exited = event as RunnerEventOf<"session_exited">;
+      if (exited.failureEvidence?.kind === "process_exit") {
+        reportRuntimeFailure(this.deps.onRuntimeFailure, {
+          phase: "turn", stage: "agent_process", code: "agent_process_exited", evidence: exited.failureEvidence,
+        }, { assignmentId: this.assignment.id, attempt: this.assignment.attempt });
+      }
+      await this.close(exited.reason === "agent_exited" ? "agent_exited" : "completed");
     }],
   ]);
 
   private async onSessionUpdate(event: RunnerEventOf<"session_update">): Promise<void> {
     const update = (event.params as { update?: unknown } | null)?.update;
+    this.recordToolFailure(update);
     // A working agent keeps its preview from stopping as idle.
     if (this.previewSessionId !== null) this.deps.preview?.touch(this.previewSessionId);
     this.observeStructuredText(update);
@@ -1540,6 +1551,17 @@ export class RelayedSession {
     const bypass = this.toolGovernance?.observe(update, this.sessionCwd(), this.readOnlyRoots) ?? null;
     await this.sendUpdate(event.params);
     if (bypass) await this.onToolGovernanceBypass(bypass);
+  }
+
+  /** ACP's observed status is a fact; private tool output is not an OS error. */
+  private recordToolFailure(update: unknown): void {
+    const tool = plainRecord(update);
+    if (!tool || tool.status !== "failed" || typeof tool.toolCallId !== "string") return;
+    if (tool.sessionUpdate !== "tool_call" && tool.sessionUpdate !== "tool_call_update") return;
+    reportRuntimeFailure(this.deps.onRuntimeFailure, {
+      phase: "tool", stage: "tool_terminal", code: "tool_failed",
+      evidence: { kind: "tool_status", status: "failed" }, toolCallId: tool.toolCallId,
+    }, { assignmentId: this.assignment.id, attempt: this.assignment.attempt });
   }
 
   private async onPromptCompletion(event: RunnerEventOf<"prompt_result">): Promise<void> {
@@ -1554,6 +1576,7 @@ export class RelayedSession {
   }
 
   private async onRequestError(event: RunnerEventOf<"request_error">): Promise<void> {
+    this.recordRequestFailure(event);
     if (event.method === "session/prompt" && (await this.settledPromptError(event.requestId))) return;
     const accepted = await this.completeReceived(event.requestId, event.method, { kind: "acp_error", id: event.requestId, method: event.method, error: { code: event.code, class: event.class, message: event.message, retryable: event.retryable } });
     if (accepted && event.method === "session/prompt" && isNativeTurn(this.assignment)) {
@@ -1567,6 +1590,17 @@ export class RelayedSession {
       this.agentFailure = reportedAgentFailure(event.class);
       await this.close("agent_exited");
     }
+  }
+
+  /** A local exception is known; only SDK evidence attests a provider protocol code. */
+  private recordRequestFailure(event: RunnerEventOf<"request_error">): void {
+    const evidence = event.failureEvidence;
+    if (event.class === "cancelled" || !evidence || (evidence.kind !== "provider_protocol" && evidence.kind !== "runtime_exception")) return;
+    reportRuntimeFailure(this.deps.onRuntimeFailure, {
+      phase: "turn", stage: "session_prompt",
+      code: evidence.kind === "provider_protocol" ? "provider_protocol_error" : "agent_request_failed", evidence,
+      requestId: event.requestId, retryable: event.retryable,
+    }, { assignmentId: this.assignment.id, attempt: this.assignment.attempt });
   }
 
   /** A failed prompt that a structured follow-up settles (or that is its follow-up still running); false for an ordinary failure. */

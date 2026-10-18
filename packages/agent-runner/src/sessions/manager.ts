@@ -13,9 +13,9 @@ import type {
   SetSessionModeRequest,
   Usage,
 } from "@agentclientprotocol/sdk";
-import { AcpNativeObservationSchema, RemoteInstanceError, type AgentTurnUsageObservation, type Logger, type RetainedProcessOwner, createLogger } from "@konteks/remote-common";
+import { AcpNativeObservationSchema, RemoteInstanceError, type AgentTurnUsageObservation, type Logger, type RetainedProcessOwner, type RuntimeFailureObservation, createLogger } from "@konteks/remote-common";
 import type { BridgeProcess } from "../bridge/process.js";
-import { classifyBridgeError } from "../bridge/process.js";
+import { classifyBridgeError, providerProtocolEvidence } from "../bridge/process.js";
 import type { RunnerEventBus } from "../events.js";
 import type { HostPromptPrelude, HostPromptSession, HostTurnError } from "../host/host-agent.js";
 import { konteksAgentTitledMetadata, konteksCodingSessionTitle, konteksSessionMetadata, type KonteksSessionLabel } from "./title.js";
@@ -1081,7 +1081,7 @@ export class SessionManager {
     return false;
   }
 
-  closeAll(reason: "agent_exited" | "closed", bridge?: BridgeProcess): void {
+  closeAll(reason: "agent_exited" | "closed", bridge?: BridgeProcess, failureEvidence?: RuntimeFailureObservation["evidence"]): void {
     for (const ref of [...this.sessions.keys()]) {
       const record = this.sessions.get(ref);
       if (!record || (bridge && record.bridge !== bridge)) continue;
@@ -1090,7 +1090,7 @@ export class SessionManager {
       this.sessions.delete(ref);
       this.byBridgeId.delete(record.bridgeSessionId);
       this.markUnclosed(record.bridge, 1);
-      this.options.events.publish({ kind: "session_exited", acpSessionRef: ref, reason });
+      this.options.events.publish({ kind: "session_exited", acpSessionRef: ref, reason, ...(failureEvidence ? { failureEvidence } : {}) });
     }
   }
 
@@ -1199,9 +1199,12 @@ export class SessionManager {
       .then(result => this.settlePrompt(record, requestId, result, publishMeasured))
       .catch((error: unknown) => {
         const classified = classifyBridgeError(error);
+        const failureEvidence = classified.class === "cancelled" ? undefined
+          : providerProtocolEvidence(error) ?? { kind: "runtime_exception" as const };
         if (classified.class === "agent_auth_required") this.options.onAuthRequired?.();
         publishMeasured();
-        this.options.events.publish({ kind: "request_error", acpSessionRef, requestId, method: "session/prompt", ...classified });
+        this.options.events.publish({ kind: "request_error", acpSessionRef, requestId, method: "session/prompt", ...classified,
+          ...(failureEvidence ? { failureEvidence } : {}) });
         throw error;
       })
       .finally(() => {

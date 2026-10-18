@@ -2,18 +2,19 @@ import { spawn } from "node:child_process";
 import { createHash, sign } from "node:crypto";
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { NATIVE_UPDATE_TARGET_ENV, bundleManifestSigningBytes, computeBundleManifestDigest, RemoteInstanceError, writeSecretFile } from "@konteks/remote-common";
 import { buildReleaseFixture, nativeServiceExecutable, resolveNativeConnectorExecutable, verifyNativeRelease, type CodeIdentity } from "@konteks/remote-release";
 import { acquireNativeRootLock, isDeferredUpdateAttempt, loadNativeInstallation, OPENCODE_MIN_BINARY_BYTES, readNativeUpdateLedger, SupervisorStore, verifyInstalledNativeConnector, type NativeRuntimeRecord, type NativeUpdateAttempt } from "@konteks/remote-supervisor";
 import { installNative, readNativeRecord, restoreNativeRecord } from "../native/install.js";
-import { checkNativeUpdate, commitNativeUpdate, stageNativeUpdate } from "../native/update.js";
+import { checkNativeUpdate, commitNativeUpdate, stageNativeUpdate, type NativeUpdateDeps } from "../native/update.js";
 import { earlierFailure, earlierFailureNote, keepLauncherCurrent, refreshInstalledLauncher, runNativeUpdate, selfUpdateNote, type NativeUpdateTransactionDeps } from "../native/update-transaction.js";
 import { createOutput } from "../output.js";
 import { activateServiceExecutable } from "../native/service-executable.js";
 import { nativePlatform, nativeServiceDefinition, startNativeServiceDefinition, type NativeServiceCommand } from "../native/service.js";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
+import { testGitCommand, testGitTool } from "../../../supervisor/src/__tests__/native-git-fixture.js";
 
 function requestUrl(input: Parameters<typeof fetch>[0]): string {
   return typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
@@ -67,6 +68,63 @@ async function fixture({ oldVersion = "1.0.0", nextVersion = "1.1.0", openCode =
   await writeFile(join(root, "credentials", "claude-code", "keep"), "credential-owned-by-agent");
   const deps = { roots: trust, platform, fetchFn };
   return { root, output, trust, platform, manifest, oldManifest, fetchFn, installed, deps };
+}
+
+async function directoryBytes(directory: string): Promise<Record<string, string>> {
+  const files: Record<string, string> = {};
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) {
+      const nested = await directoryBytes(path);
+      for (const [name, bytes] of Object.entries(nested)) files[join(entry.name, name)] = bytes;
+    } else {
+      files[entry.name] = (await readFile(path)).toString("base64");
+    }
+  }
+  return files;
+}
+
+async function retainedWorkspace(root: string) {
+  const workspaceRoot = join(root, "workspaces", "claude-code");
+  const cwd = join(workspaceRoot, "retained-ticket");
+  await mkdir(cwd, { recursive: true });
+  const tool = await testGitTool();
+  const git = (args: string[]) => testGitCommand(tool, cwd, args);
+  await git(["init", "--initial-branch=main"]);
+  for (const name of ["tracked.txt", "staged.txt", "deleted.txt"]) await writeFile(join(cwd, name), "baseline\n");
+  await writeFile(join(cwd, ".gitignore"), "ignored.txt\n");
+  await git(["add", "."]);
+  await git(["-c", "user.name=Update fixture", "-c", "user.email=update@example.invalid", "-c", "commit.gpgSign=false", "commit", "-m", "retained baseline"]);
+  await writeFile(join(cwd, "tracked.txt"), "unstaged edit\n");
+  await writeFile(join(cwd, "staged.txt"), "staged contents\n");
+  await git(["add", "staged.txt"]);
+  await writeFile(join(cwd, "staged.txt"), "unstaged contents after staging\n");
+  await rm(join(cwd, "deleted.txt"));
+  await writeFile(join(cwd, "untracked.txt"), "untracked contents\n");
+  await writeFile(join(cwd, "ignored.txt"), "ignored contents\n");
+  // Opaque retained bytes: this fixture never opens an agent or claims these records establish ownership.
+  const retained = {
+    "workspaces/claude-code/.workspace-recovery/retained.owner.json": '{"checkpointId":"retained","state":"writing"}\n',
+    "workspaces/claude-code/.workspace-recovery/retained.checkpoint.json": '{"retained":"local checkpoint bytes"}\n',
+    "supervisor/journal/assignments.jsonl": '{"assignmentId":"retained","attempt":1,"state":"completed"}\n',
+    "supervisor/journal/local-execution.jsonl": '{"claimId":"retained-claim","phase":"settled"}\n',
+    "credentials/claude-code/session-refs.json": '{"retained-session":"retained-provider-reference"}\n',
+  };
+  for (const [name, bytes] of Object.entries(retained)) {
+    const path = join(root, name);
+    await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+    await writeSecretFile(path, bytes);
+  }
+  const directories = [workspaceRoot, join(root, "supervisor", "journal"), join(root, "credentials", "claude-code")];
+  const snapshot = async () => ({
+    files: await Promise.all(directories.map(directoryBytes)),
+    status: await git(["--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=all", "--ignored"]),
+    index: await git(["ls-files", "--stage"]),
+  });
+  const before = await snapshot();
+  for (const status of [" M tracked.txt", "MM staged.txt", " D deleted.txt", "?? untracked.txt", "!! ignored.txt"]) expect(before.status).toContain(status);
+  expect(await git(["show", ":staged.txt"])).toBe("staged contents\n");
+  return { assertPreserved: async () => expect(await snapshot()).toEqual(before) };
 }
 
 describe("native update staging and commit", () => {
@@ -188,6 +246,7 @@ describe("native update staging and commit", () => {
   });
   it("refuses same-version, untrusted and tampered releases without touching the record", async () => {
     const f = await fixture();
+    const retained = await retainedWorkspace(f.root);
     expect(await stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, manifest: f.oldManifest } })).toMatchObject({ status: "current" });
     await expect(stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, roots: [], manifest: f.manifest } })).rejects.toMatchObject({ code: "bundle_untrusted" });
     // A digest mismatch during download leaves no candidate behind.
@@ -195,6 +254,7 @@ describe("native update staging and commit", () => {
     await expect(stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, fetchFn: corrupt, manifest: f.manifest, retryDelayMs: 0 } })).rejects.toThrow(/connector-1\.1\.0: native artifact size or digest mismatch/);
     expect((await readdir(join(f.root, "releases"))).filter(name => name.startsWith(".candidate-"))).toEqual([]);
     expect(await readNativeRecord(f.root)).toEqual(f.installed);
+    await retained.assertPreserved();
     // A staged release whose connector bytes change before commit is refused.
     const staged = await stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, manifest: f.manifest } });
     if (staged.status !== "staged") throw new Error("unreachable");
@@ -202,13 +262,14 @@ describe("native update staging and commit", () => {
     await expect(commitNativeUpdate({ root: f.root, releaseId: staged.releaseId, output: f.output, deps: f.deps })).rejects.toMatchObject({ code: "bundle_untrusted" });
     expect(await readNativeRecord(f.root)).toEqual(f.installed);
     await expect(commitNativeUpdate({ root: f.root, releaseId: "../escape", output: f.output, deps: f.deps })).rejects.toMatchObject({ code: "install_state_corrupt" });
+    await retained.assertPreserved();
   });
 });
 
 describe("the publisher identity an update must keep", () => {
   const signedBy = (publisher: string): CodeIdentity => ({ signed: true, publisher });
   /** The installed connector reads as `installed`, the staged candidate as `candidate`. */
-  const identities = (installed: CodeIdentity, candidate: CodeIdentity) => vi.fn(async (file: string) => (file.includes(".candidate-") ? candidate : installed));
+  const identities = (installed: CodeIdentity, candidate: CodeIdentity) => vi.fn<NonNullable<NativeUpdateDeps["codeIdentity"]>>(async (file) => (file.includes(".candidate-") ? candidate : installed));
   const capture = (f: Awaited<ReturnType<typeof fixture>>) => {
     const lines: string[] = [];
     return { lines, output: { ...f.output, line: (line: string) => { lines.push(line); } } };
@@ -255,8 +316,9 @@ describe("the publisher identity an update must keep", () => {
 describe("the one executable path the service runs", () => {
   const stable = (root: string) => nativeServiceExecutable(root, "macos");
 
-  it("puts the record's connector at the stable path, replaces it on update and returns the previous one on rollback", async () => {
+  it("replaces and rolls back the stable connector while preserving a dirty worktree, index and retained private bytes", async () => {
     const f = await fixture();
+    const retained = await retainedWorkspace(f.root);
     const before = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
     expect(stable(f.root)).toBe(join(f.root, "bin", "konteks-connector"));
     expect(await activateServiceExecutable({ root: f.root, platform: f.platform, releaseId: f.installed.releaseId, release: before.release })).toBe(true);
@@ -264,12 +326,22 @@ describe("the one executable path the service runs", () => {
     // Already current: nothing is rewritten.
     expect(await activateServiceExecutable({ root: f.root, platform: f.platform, releaseId: f.installed.releaseId, release: before.release })).toBe(false);
 
+    const unrelated = `${stable(f.root)}.keep`;
+    const setAside = `${stable(f.root)}.old.replaced`;
+    await writeFile(unrelated, "unrelated bin bytes\n");
+    await writeFile(setAside, "inactive managed executable copy\n");
+
     const staged = await stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, manifest: f.manifest } });
     if (staged.status !== "staged") throw new Error("unreachable");
+    await retained.assertPreserved();
     const successor = await commitNativeUpdate({ root: f.root, releaseId: staged.releaseId, output: f.output, deps: f.deps });
+    await retained.assertPreserved();
     const after = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
     expect(await activateServiceExecutable({ root: f.root, platform: f.platform, releaseId: successor.releaseId, release: after.release })).toBe(true);
     expect(await readFile(stable(f.root))).toEqual(Buffer.from("test-native-executable-not-run-1.1.0"));
+    await retained.assertPreserved();
+    await expect(readFile(setAside)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(unrelated, "utf8")).toBe("unrelated bin bytes\n");
     // The service definition names the same path on both releases.
     // The service definition is always rendered for the host it runs on, and names the same path on both releases.
     const host = nativePlatform().os;
@@ -280,9 +352,11 @@ describe("the one executable path the service runs", () => {
     const restored = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
     expect(await activateServiceExecutable({ root: f.root, platform: f.platform, releaseId: restored.record.releaseId, release: restored.release })).toBe(true);
     expect(await readFile(stable(f.root))).toEqual(Buffer.from("test-native-executable-not-run-1.0.0"));
+    await retained.assertPreserved();
     // Rollback copies stay in their release folders.
     expect(await readFile(join(f.root, "releases", successor.releaseId, "konteks-connector"))).toEqual(Buffer.from("test-native-executable-not-run-1.1.0"));
-    expect((await readdir(join(f.root, "bin"))).sort()).toEqual(["konteks-connector"]);
+    expect((await readdir(join(f.root, "bin"))).sort()).toEqual([basename(stable(f.root)), basename(unrelated)].sort());
+    expect(await readFile(unrelated, "utf8")).toBe("unrelated bin bytes\n");
   });
 
   it("refuses a release folder whose connector no longer matches its signed digest, leaving the stable executable as it was", async () => {

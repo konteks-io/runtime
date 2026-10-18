@@ -10,6 +10,7 @@ import { NativeWorkspaceChunkStore, workspaceCheckpointChunks } from "./workspac
 import { captureWorkspaceCheckpoint } from "./workspace-checkpoint.js";
 import { inspectWorkspaceGitControl, WorkspaceGitControlSchema } from "./workspace-git-control.js";
 import type { NativeGitTool } from "./git-workspace.js";
+import { reportRuntimeFailure, type RuntimeFailureReporter } from "../runtime-failure-types.js";
 
 const unavailable = () => new RemoteInstanceError("recovery_required", "The latest unfinished workspace could not be preserved. Its original checkout was kept.");
 const digest = z.string().regex(/^sha256:[a-f0-9]{64}$/);
@@ -25,7 +26,7 @@ type Begin = { assignment: RemoteWorkAssignment; claimId: string; selectionDiges
 /** Private durable outbox. A lost upload answer never causes another capture
  * or deletes the original checkout. Only the process-stop owner may seal it. */
 export class NativeWorkspaceCheckpointStore {
-  constructor(private readonly options: { root: string; repositoryCacheRoot?: string | undefined; client: () => Pick<NativeInputClient, "workspace">; chunksSupported?: (() => boolean) | undefined }) {}
+  constructor(private readonly options: { root: string; repositoryCacheRoot?: string | undefined; client: () => Pick<NativeInputClient, "workspace">; chunksSupported?: (() => boolean) | undefined; onRuntimeFailure?: RuntimeFailureReporter }) {}
 
   private async folder(): Promise<string> {
     await privateWorkspaceDirectory(this.options.root);
@@ -62,15 +63,28 @@ export class NativeWorkspaceCheckpointStore {
 
   async seal(admission: Admission, assertCurrent: () => void): Promise<void> {
     assertCurrent();
-    const owner = await this.loadOwner(admission);
-    if (!owner) return;
-    const { folder, record } = owner;
-    const checkpoint = await this.checkpoint(folder, record, assertCurrent);
-    if (checkpoint.format === "konteks-workspace-checkpoint-v2") await this.uploadChunks(folder, record, checkpoint, assertCurrent);
-    assertCurrent();
-    const result = await this.options.client().workspace(record.assignment, "seal", { ...this.request(record), stop: "processes_stopped", checkpoint });
-    assertCurrent();
-    if (!isReceipt(result, record.checkpointId, "sealed") || result.checkpointDigest !== checkpoint.checkpointDigest) throw unavailable();
+    let operation = { stage: "workspace_owner", code: "checkpoint_owner_failed" };
+    try {
+      const owner = await this.loadOwner(admission);
+      if (!owner) return;
+      const { folder, record } = owner;
+      operation = { stage: "workspace_capture", code: "checkpoint_capture_failed" };
+      const checkpoint = await this.checkpoint(folder, record, assertCurrent);
+      if (checkpoint.format === "konteks-workspace-checkpoint-v2") {
+        operation = { stage: "workspace_chunk_upload", code: "checkpoint_upload_failed" };
+        await this.uploadChunks(folder, record, checkpoint, assertCurrent);
+      }
+      assertCurrent();
+      operation = { stage: "workspace_seal", code: "checkpoint_seal_failed" };
+      const result = await this.options.client().workspace(record.assignment, "seal", { ...this.request(record), stop: "processes_stopped", checkpoint });
+      assertCurrent();
+      if (!isReceipt(result, record.checkpointId, "sealed") || result.checkpointDigest !== checkpoint.checkpointDigest) throw unavailable();
+    } catch (error) {
+      reportRuntimeFailure(this.options.onRuntimeFailure, {
+        phase: "checkpoint", ...operation, evidence: { kind: "runtime_exception" },
+      }, { assignmentId: admission.assignmentId, attempt: admission.attempt });
+      throw error;
+    }
   }
 
   private async loadOwner(admission: Admission): Promise<{ folder: string; record: Record } | null> {

@@ -8,6 +8,16 @@
  * the wire names.
  */
 export { AcpNativeObservationSchema } from "@konteks/backstage-plugin-common/remote-instance-internal";
+export {
+  RuntimeFailureObservationSchema,
+  RuntimeFailureReceiptSchema,
+  REMOTE_RUNTIME_FAILURE_MIN_CORE_CONTRACT_VERSION,
+  RUNTIME_FAILURE_OBSERVATION_MAX_BYTES,
+} from "@konteks/backstage-plugin-common/remote-instance-internal";
+export type {
+  RuntimeFailureObservation,
+  RuntimeFailureReceipt,
+} from "@konteks/backstage-plugin-common/remote-instance-internal";
 export { CoordinationAgentToolNames, NativeCoordinationInvocationSchema, coordinationPayloadHash } from "@konteks/backstage-plugin-common";
 export type { NativeCoordinationInvocation } from "@konteks/backstage-plugin-common";
 export {

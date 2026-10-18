@@ -51,6 +51,12 @@ QA browser, structured results, updates and doctor/support.
   (`submit_result`). Never move the schema into a `session/prompt` request
   field: the native operation permit signs the parsed request's digest. The
   follow-up prompt (`<id>#konteks-result-follow-up`) is never sent to Core.
+- **Failure history.** Capture bounded typed facts at operation owners; the
+  supervisor supplies the instance and exact retained claim. The separate
+  bounded durable queue requires native recovery authority and Core 7.12,
+  and checks instance, failure ID and digest before acknowledging a receipt.
+  Diagnostics never settle work, meter usage or delay an operation or stop.
+  Never include raw logs, provider text, private paths or inferred causes.
 - **Coordination calls.** Claude Code and Codex capture their provider tool-call
   identity from ACP approval before `allow_once`; the native journal retains
   only its bound operation identity and payload hash. The platform facade

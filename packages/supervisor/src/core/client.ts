@@ -1,10 +1,13 @@
 import { AgentTurnUsageObservationSchema, RuntimeAgentLoginReportSchema, RuntimeUpdateReportSchema,
   RuntimeUpdateLocalBeginRequestSchema,
   RuntimeUpdateLocalBeginResultSchema,
+  RuntimeFailureObservationSchema,
+  RuntimeFailureReceiptSchema,
   allEqual, withoutUndefined,
   directModelSelectionsEqual, createLogger, type Logger, type RuntimeUpdateReport,
   type RuntimeUpdateLocalBeginRequest,
   type RuntimeUpdateLocalBeginResult,
+  type RuntimeFailureReceipt,
 } from "@konteks/remote-common";
 
 import { z } from "zod";
@@ -115,7 +118,7 @@ type RuntimeAgentLoginReport = ReturnType<typeof RuntimeAgentLoginReportSchema.p
  * `:id/readiness`, `:id/heartbeat`, `:id/reconnect`,
  * `:id/runtime-owner/resolve`, `:id/reconciliation/applied`,
  * `:id/execution-revision-controls/receipt`,
- * `:id/assignments/{pull,claim,report}`, `:id/observations`,
+ * `:id/assignments/{pull,claim,report}`, `:id/observations`, `:id/runtime-failures`,
  * `:id/permissions/deferred`, and `:id/capability-tokens/redeem`. Every
  * HTTPS-fallback message carries the same schema and idempotency key as its
  * relay channel ("the HTTPS endpoints above remain the semantic definition
@@ -151,6 +154,7 @@ const CORE_PATHS = Object.freeze({
   claim: (instanceId: string) => instancePath(instanceId, "assignments/claim"),
   report: (instanceId: string) => instancePath(instanceId, "assignments/report"),
   observations: (instanceId: string) => instancePath(instanceId, "observations"),
+  runtimeFailures: (instanceId: string) => instancePath(instanceId, "runtime-failures"),
   permissionsDeferred: (instanceId: string) => instancePath(instanceId, "permissions/deferred"),
   capabilityTokenRedeem: (instanceId: string) => instancePath(instanceId, "capability-tokens/redeem"),
   // CONTRACT-GAP: the onboarding contract names the App BFF route
@@ -793,6 +797,27 @@ export class CoreClient {
       schema: ObservationReceiptSchema, idempotencyKey: `observation:${expectedId}`, operationPolicy: "progressRead" });
     if (result.observationId !== expectedId || result.observationDigest !== digest)
       throw new RemoteInstanceError("registration_mismatch", "Observation receipt does not match submitted bytes");
+  }
+
+  /** Upload immutable diagnostic history without changing usage or terminal work. */
+  async submitRuntimeFailure(instanceId: string, body: unknown): Promise<RuntimeFailureReceipt> {
+    const parsed = RuntimeFailureObservationSchema.safeParse(body);
+    if (!parsed.success) throw new RemoteInstanceError("schema_invalid", "Runtime failure observation is invalid.");
+    const observation = parsed.data;
+    if (observation.instanceId !== instanceId) throw new RemoteInstanceError("registration_mismatch", "Runtime failure instance mismatch.");
+    const digest = jcsDigest(observation as unknown as JsonValue);
+    const result = await this.http.request({ method: "POST", path: CORE_PATHS.runtimeFailures(instanceId), body: observation,
+      schema: { safeParse: (value: unknown) => RuntimeFailureReceiptSchema.safeParse(value), parse: (value: unknown): RuntimeFailureReceipt => {
+        const receipt = RuntimeFailureReceiptSchema.safeParse(value);
+        if (!receipt.success) throw new RemoteInstanceError("schema_invalid", "Runtime failure receipt is invalid.");
+        return receipt.data;
+      } },
+      idempotencyKey: `runtime-failure:${jcsDigest([instanceId, observation.failureId])}:${observation.failureId}`,
+      operationPolicy: "progressRead" });
+    if (!allEqual([[result.instanceId, instanceId], [result.failureId, observation.failureId], [result.failureDigest, digest]])) {
+      throw new RemoteInstanceError("registration_mismatch", "Runtime failure receipt does not match submitted bytes.");
+    }
+    return result;
   }
 
   async observations(instanceId: string, observations: unknown[]): Promise<number> {

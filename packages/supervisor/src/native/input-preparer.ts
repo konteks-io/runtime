@@ -14,6 +14,7 @@ import {
   requireConnectorGit,
   sha256Hex,
   RemoteInstanceError,
+  RuntimeFailureObservationSchema,
   RemoteTransferManifestSchema,
   RemoteWorkAssignmentSchema,
   isFsErrorWithCode,
@@ -43,6 +44,7 @@ import {
   type NativeGitTool,
 } from "./git-workspace.js";
 import { NativeRepositoryCache } from "./repository-cache.js";
+import { reportRuntimeFailure, type RuntimeFailureFact, type RuntimeFailureReporter } from "../runtime-failure-types.js";
 
 interface NativeInputPreparerOptions {
   /** Signed Core contract gate; older Core never receives checkpoint requests. */
@@ -67,6 +69,8 @@ interface NativeInputPreparerOptions {
    * starts (`PreparedSessionInputs.toolWiring`). */
   prepareRepositoryWorktree?: (cwd: string, agentId: string) => Promise<void | "unavailable" | "skipped" | "wired">;
   outputClient?: () => NativeOutputClient;
+  /** Bounded historical facts only; never holds input preparation on delivery. */
+  onRuntimeFailure?: RuntimeFailureReporter;
   logger?: Pick<Logger, "warn"> & Partial<Pick<Logger, "info">>;
   /** How often a prompt recheck still waiting on one step logs it; tests shorten it. */
   recheckWatchMs?: number;
@@ -649,7 +653,12 @@ class InputPreparation {
     };
   }
 
-  logFailure(error: unknown): void {
+  recordFailure(error: unknown): void {
+    reportRuntimeFailure(this.options.onRuntimeFailure, {
+      phase: "preparation", stage: this.stage,
+      code: error instanceof RemoteInstanceError ? error.code : "local_preparation_failed",
+      evidence: this.failureEvidence(error),
+    }, { assignmentId: this.assignment.id, attempt: this.assignment.attempt });
     this.options.logger?.warn(
       {
         event: "native.inputs.prepare_failed",
@@ -661,6 +670,18 @@ class InputPreparation {
       },
       "native input preparation failed",
     );
+  }
+
+  /** Only this owned filesystem boundary can attest an OS errno. */
+  private failureEvidence(error: unknown): RuntimeFailureFact["evidence"] {
+    const unknown = { kind: "runtime_exception" } as const;
+    try {
+      if (this.stage !== "private_root" || !(error instanceof Error)) return unknown;
+      const filesystem = error as NodeJS.ErrnoException;
+      if (typeof filesystem.syscall !== "string") return unknown;
+      const parsed = RuntimeFailureObservationSchema.shape.evidence.safeParse({ kind: "runtime_exception", errno: filesystem.code });
+      return parsed.success ? parsed.data : unknown;
+    } catch { return unknown; }
   }
 
   private enter(stage: string): void {
@@ -898,7 +919,7 @@ export function createNativeInputPreparer(
       try {
         return await preparation.prepare();
       } catch (error) {
-        preparation.logFailure(error);
+        preparation.recordFailure(error);
         // A transient upstream failure stays retryable for the session to
         // resume (D132); anything else is withheld behind one refusal.
         throw isGitXcodeLicenseError(error) || transientInputFailure(error) ? error : unavailable();

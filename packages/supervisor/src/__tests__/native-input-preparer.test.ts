@@ -372,6 +372,49 @@ describe("repository session continuity inputs", () => {
 });
 
 describe("native authorized input composition", () => {
+  it("captures the genuine preparation errno before the public refusal masks the private filesystem error", async () => {
+    const f = await fixture();
+    const root = join(f.root, "private-filesystem-path-canary");
+    await writeFile(root, "this file cannot become the private workspace root");
+    // NEW optional callback contract. The existing production function is
+    // exercised at baseline; a missing callback invocation is behavioral RED.
+    const onRuntimeFailure = vi.fn(async (_fact: unknown, _context: unknown) => undefined);
+    const options = { ...f.options, root, onRuntimeFailure };
+    await expect(createNativeInputPreparer(options)(assignment))
+      .rejects.toMatchObject({ code: "capability_unavailable", retryable: false });
+    expect(onRuntimeFailure).toHaveBeenCalledExactlyOnceWith({
+      phase: "preparation", stage: "private_root", code: "local_preparation_failed",
+      evidence: { kind: "runtime_exception", errno: "EEXIST" },
+    }, { assignmentId: assignment.id, attempt: assignment.attempt });
+    expect(JSON.stringify(onRuntimeFailure.mock.calls)).not.toContain("private-filesystem-path-canary");
+  });
+
+  it.each(["throw", "reject"] as const)("preserves the preparation refusal when its diagnostic reporter can %s", async fault => {
+    const f = await fixture();
+    const root = join(f.root, "blocked-root"); await writeFile(root, "occupied");
+    const onRuntimeFailure = vi.fn((_fact: unknown, _context: unknown) => {
+      if (fault === "throw") throw new Error("private diagnostic failure");
+      return Promise.reject(new Error("private diagnostic failure"));
+    });
+    const options = { ...f.options, root, onRuntimeFailure };
+    await expect(createNativeInputPreparer(options)(assignment))
+      .rejects.toMatchObject({ code: "capability_unavailable", retryable: false });
+    expect(onRuntimeFailure).toHaveBeenCalledOnce();
+    await Promise.resolve();
+  });
+
+  it("does not infer errno from preparation error prose", async () => {
+    const f = await fixture(); const client = f.options.client();
+    vi.spyOn(client, "prepare").mockRejectedValueOnce(new Error("EACCES at /Users/private-person/provider-token"));
+    const onRuntimeFailure = vi.fn(async (_fact: unknown, _context: unknown) => undefined);
+    const options = { ...f.options, client: () => client, onRuntimeFailure };
+    await expect(createNativeInputPreparer(options)(assignment)).rejects.toMatchObject({ code: "capability_unavailable" });
+    expect(onRuntimeFailure).toHaveBeenCalledExactlyOnceWith({
+      phase: "preparation", stage: "selection", code: "local_preparation_failed",
+      evidence: { kind: "runtime_exception" },
+    }, { assignmentId: assignment.id, attempt: assignment.attempt });
+  });
+
   it("keeps a transient 503 at selection retryable, and prepares once Core recovers (D132)", async () => {
     const f = await fixture();
     const warn = vi.fn();
