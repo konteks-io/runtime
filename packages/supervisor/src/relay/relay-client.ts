@@ -42,6 +42,10 @@ import {
 import { CORE_AUDIENCE } from "../core/client.js";
 import { SupervisorConfigSchema } from "../config.js";
 import type { ChannelMux } from "./channel-mux.js";
+import {
+  RuntimeSkillCatalogChangedSchema,
+  type RuntimeSkillCatalogChanged,
+} from "@konteks/backstage-plugin-common/remote-instance-internal";
 
 const HANDSHAKE_BUFFER_MAX_FRAMES = 256;
 const HANDSHAKE_BUFFER_MAX_BYTES = SupervisorConfigSchema.shape.SUPERVISOR_REPLAY_BUFFER_BYTES.parse(undefined);
@@ -62,7 +66,7 @@ type RelayState = "offline" | "connecting" | "handshaking" | "connected" | "reco
 /** What the relay may send once its handshake result has arrived, buffered until the handshake is adopted. */
 type InboundEnvelope = ToRuntimeRelayFrame | AssignmentReplyFrame | RelayAck | RelayReplayRequest | RuntimeCancellationDeliveryRequest
   | RuntimePermissionAnswerDeliveryRequest | RemoteExecutionRevisionControlDeliveryRequest | RuntimeAgentLoginDeliveryRequest | RuntimeUpdateDeliveryRequest
-  | DiagnosticCarrierCompanionDeliveryRequest | RuntimeAssignmentAvailableDeliveryRequest;
+  | RuntimeSkillCatalogChanged | DiagnosticCarrierCompanionDeliveryRequest | RuntimeAssignmentAvailableDeliveryRequest;
 
 /** What a receiver made of a control delivery; a receiver that returns nothing handled it. */
 export type ControlDeliveryOutcome = "handled" | "duplicate";
@@ -107,7 +111,7 @@ function namesHolderReplayRequest(header: string | string[] | undefined): boolea
 
 /** Post-handshake envelopes in the order they are recognised; anything else must be a channel frame. */
 const POST_HANDSHAKE_SCHEMAS: ReadonlyArray<{ safeParse(value: unknown): { success: boolean; data?: unknown } }> = [
-  RuntimePermissionAnswerDeliveryRequestSchema, RuntimeAgentLoginDeliveryRequestSchema, RuntimeUpdateDeliveryRequestSchema, RuntimeCancellationDeliveryRequestSchema,
+  RuntimePermissionAnswerDeliveryRequestSchema, RuntimeAgentLoginDeliveryRequestSchema, RuntimeUpdateDeliveryRequestSchema, RuntimeSkillCatalogChangedSchema, RuntimeCancellationDeliveryRequestSchema,
   RuntimeAssignmentAvailableDeliveryRequestSchema,
   RemoteExecutionRevisionControlDeliveryRequestSchema, DiagnosticCarrierCompanionDeliveryRequestSchema, RelayReplayRequestSchema, RelayAckSchema, AssignmentReplyFrameSchema,
 ];
@@ -208,6 +212,8 @@ export interface RelayClientOptions {
   onAgentLogin?: DeliveryReceiver<RuntimeAgentLoginDeliveryRequest>;
   /** A fixed signed runtime update, outside the work channel and its cursors. */
   onRuntimeUpdate?: DeliveryReceiver<RuntimeUpdateDeliveryRequest>;
+  /** A signed catalog hint triggers a fresh authorized fetch; it grants no Skill access. */
+  onSkillCatalogChanged?: (notice: RuntimeSkillCatalogChanged, connection: { connectionEpoch: number; assertCurrent(): void }) => Promise<void>;
   /** Core's nudge that work is queued for this runtime: pull now. */
   onAssignmentAvailable?: DeliveryReceiver<RuntimeAssignmentAvailableDeliveryRequest>;
   /** Dedicated safety-control intake; never a mux cursor or receipt ACK. */
@@ -520,7 +526,8 @@ export class RelayClient {
   /** Envelopes that arrive while the handshake is being adopted wait, bounded, for that adoption. */
   private bufferDuringHandshake(attempt: SocketAttempt, parsed: unknown, bytes: number): void {
     const envelope = postHandshakeEnvelope(parsed);
-    if (envelope === null || envelope.connectionEpoch !== attempt.validatedEpoch) {
+    const envelopeEpoch = envelope && "connectionEpoch" in envelope ? envelope.connectionEpoch : attempt.validatedEpoch;
+    if (envelope === null || envelopeEpoch !== attempt.validatedEpoch) {
       return this.rejectProtocol(attempt, "protocol", "relay sent an invalid post-handshake envelope");
     }
     if (attempt.pending.length >= HANDSHAKE_BUFFER_MAX_FRAMES || attempt.pendingBytes + bytes > HANDSHAKE_BUFFER_MAX_BYTES) {
@@ -609,6 +616,7 @@ export class RelayClient {
       this.receiverFor(this.options.onPermissionAnswer), "Permission answer receiver is unavailable")],
     ["runtime_agent_login_delivery", (attempt, value) => this.deliverLogin(attempt, value)],
     ["runtime_update_delivery", (attempt, value) => this.deliverRuntimeUpdate(attempt, value)],
+    ["runtime_skill_catalog_changed", (attempt, value) => this.deliverSkillCatalogChanged(attempt, value)],
     ["runtime_assignment_available_delivery", (attempt, value) => this.deliverAssignmentAvailable(attempt, value)],
     ["runtime_cancellation_delivery", (attempt, value) => this.deliver(attempt, RuntimeCancellationDeliveryRequestSchema.parse(value), "Cancellation",
       this.receiverFor(this.options.onCancellation), "Cancellation receiver is unavailable")],
@@ -715,6 +723,28 @@ export class RelayClient {
       // Update now left no reason). A refusal never tears down ordinary work
       // transport.
       this.logger.warn({ event: "runtime.update_delivery_refused", err: error }, "runtime update delivery refused");
+      return refused(error);
+    }
+  }
+
+  /** A catalog hint is best effort and triggers an authenticated snapshot read, never installs bytes itself. */
+  private async deliverSkillCatalogChanged(attempt: SocketAttempt, value: unknown): Promise<ControlDeliveryResult> {
+    try {
+      const request = RuntimeSkillCatalogChangedSchema.parse(value);
+      const epoch = attempt.validatedEpoch;
+      const assertCurrent = () => {
+        if (!this.socketCurrent(attempt) || epoch === null || attempt.validatedEpoch !== epoch) {
+          throw new RemoteInstanceError("recovery_required", "Skill catalog notification socket ownership is not current");
+        }
+      };
+      assertCurrent();
+      const receiver = this.options.onSkillCatalogChanged;
+      if (!receiver) throw new RemoteInstanceError("recovery_required", "Skill catalog notification receiver is unavailable");
+      await receiver(request, { connectionEpoch: epoch!, assertCurrent });
+      assertCurrent();
+      return { outcome: "handled" };
+    } catch (error) {
+      this.logger.warn({ event: "skills.catalog_notification_refused", code: error instanceof RemoteInstanceError ? error.code : "temporarily_unavailable" }, "Skill catalog notification was not applied");
       return refused(error);
     }
   }

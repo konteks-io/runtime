@@ -188,7 +188,10 @@ export class NativeInputClient {
     claimId: string,
   ): RemoteAssignmentInputsEnvelope {
     const parsed = RemoteAssignmentInputsEnvelopeSchema.safeParse(value);
-    if (!parsed.success) throw unavailable("envelope_schema_invalid");
+    if (!parsed.success) {
+      this.logger.warn({ event: "native.inputs.schema_rejected", issues: parsed.error.issues.map(issue => ({ code: issue.code, path: issue.path })) }, "Core input envelope does not match the runtime contract");
+      throw unavailable("envelope_schema_invalid");
+    }
     const envelope = parsed.data;
     const { signature, ...unsigned } = envelope;
     const now = this.options.clock.coreNow();

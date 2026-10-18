@@ -93,12 +93,29 @@ function useSharedCodexHome(config: RunnerConfig, family: AgentBridgeFamily, pro
  * Like bb, reuse the operator's own installed CLI and its official login
  * (macOS keychain / ~/.claude). Konteks never copies or reads credentials.
  */
-function usePersonalClaude(config: RunnerConfig, family: AgentBridgeFamily, profile: NativeAgentPackageProfile | undefined, executable: string, env: NodeJS.ProcessEnv): void {
-  if (!personalRunner(config, family, profile, "claude-code") || !localAbsolutePath(executable)) {
+function assertPersonalClaudeConfig(
+  config: RunnerConfig,
+  family: AgentBridgeFamily,
+  profile: NativeAgentPackageProfile | undefined,
+  executable: string,
+): asserts profile is NativeAgentPackageProfile {
+  if (!personalRunner(config, family, profile, "claude-code")) {
     throw new RemoteInstanceError("agent_unavailable", "A personal Claude Code profile requires a native personal Claude runner and an absolute local executable.");
   }
+  if (!localAbsolutePath(executable)) {
+    throw new RemoteInstanceError("agent_unavailable", "A personal Claude Code profile requires a native personal Claude runner and an absolute local executable.");
+  }
+  const configDir = config.RUNNER_NATIVE_CLAUDE_CONFIG_DIR;
+  if (configDir !== undefined && !localAbsolutePath(configDir)) {
+    throw new RemoteInstanceError("agent_unavailable", "A personal Claude Code profile requires a native personal Claude runner and an absolute local executable.");
+  }
+}
+
+function usePersonalClaude(config: RunnerConfig, family: AgentBridgeFamily, profile: NativeAgentPackageProfile | undefined, executable: string, env: NodeJS.ProcessEnv): void {
+  assertPersonalClaudeConfig(config, family, profile, executable);
   const operator = userInfo();
   env.CLAUDE_CODE_EXECUTABLE = executable;
+  if (config.RUNNER_NATIVE_CLAUDE_CONFIG_DIR !== undefined) env.CLAUDE_CONFIG_DIR = config.RUNNER_NATIVE_CLAUDE_CONFIG_DIR;
   env.HOME = operator.homedir;
   env.USER = operator.username;
   env.LOGNAME = operator.username;

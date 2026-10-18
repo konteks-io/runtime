@@ -45,6 +45,16 @@ describe("bridge spawn spec", () => {
     expect(() => bridgeEnvironment(native, findAgentBridge("codex")!)).toThrow(/native personal Claude/);
     expect(() => bridgeEnvironment({ ...native, RUNNER_NATIVE_CLAUDE_EXECUTABLE: "claude" }, family)).toThrow(/native personal Claude/);
   });
+  it("uses only the locally bound Claude config directory, without inheriting an unvalidated profile", () => {
+    vi.stubEnv("CLAUDE_CONFIG_DIR", "/unvalidated/inherited");
+    const config = RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "claude-code" });
+    const family = findAgentBridge("claude-code")!;
+    expect(bridgeEnvironment(config, family).CLAUDE_CONFIG_DIR).toBeUndefined();
+    const native = { ...config, RUNNER_NATIVE_PACKAGE_PROFILE: offlineFixture().profile,
+      RUNNER_NATIVE_CLAUDE_EXECUTABLE: "/operator/.local/bin/claude", RUNNER_NATIVE_CLAUDE_CONFIG_DIR: "/operator/.claude-deepseek" };
+    expect(bridgeEnvironment(native, family).CLAUDE_CONFIG_DIR).toBe("/operator/.claude-deepseek");
+    expect(() => bridgeEnvironment({ ...native, RUNNER_NATIVE_CLAUDE_CONFIG_DIR: "relative" }, family)).toThrow(/personal Claude/);
+  });
   it("points Claude Code on Windows at Git Bash with CLAUDE_CODE_GIT_BASH_PATH, from the connector's own environment", async () => {
     const dir = await mkdtemp(join(tmpdir(), "git-bash-"));
     try {

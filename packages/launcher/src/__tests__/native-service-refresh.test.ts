@@ -184,9 +184,11 @@ describe("Windows login startup refresh", () => {
     const { definition, files, value, execute } = setup();
     expect(await keepServiceOnOwnDefinition("root", value)).toBe("next_start");
     expect(files.get(definition.supportFiles![0]!.path)).toBe(definition.supportFiles![0]!.contents);
+    expect(files.get(definition.path)).toBe(definition.contents);
     expect(execute.mock.calls).toEqual(definition.install.map(command => [command]));
     expect(execute).not.toHaveBeenCalledWith(definition.start);
     expect(await keepServiceOnOwnDefinition("root", value)).toBe("current");
+    expect(files.get(definition.supportFiles![0]!.path)).toBe(definition.supportFiles![0]!.contents);
     // Only asked whether the shortcut exists; not registered again.
     expect(execute.mock.calls.filter(call => (call as unknown[])[0] === definition.install[0])).toHaveLength(definition.install.length);
   });
@@ -204,6 +206,9 @@ describe("Windows login startup refresh", () => {
     files.set(definition.path, encodeServiceDefinition(definition));
     expect(await keepServiceOnOwnDefinition("root", value)).toBe("next_start");
     expect(execute).not.toHaveBeenCalledWith(definition.install[0]);
+    const registrationsAfterRepair = execute.mock.calls.filter(call => (call as unknown[])[0] === definition.install[0]).length;
+    expect(await keepServiceOnOwnDefinition("root", value)).toBe("current");
+    expect(execute.mock.calls.filter(call => (call as unknown[])[0] === definition.install[0])).toHaveLength(registrationsAfterRepair);
     files.clear();
     expect(await keepServiceOnOwnDefinition("root", value)).toBe("not_installed");
     expect(files.size).toBe(0);

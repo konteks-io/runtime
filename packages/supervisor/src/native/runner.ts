@@ -36,6 +36,7 @@ const inputSchema = z.object({
   acpSessionRef: z.string().min(1).max(256).optional(),
   restoreAcpSessionRef: z.string().min(1).max(256).optional(),
   freshProviderSessionOnRestore: z.boolean().optional(),
+  freshProviderSessionOnContinue: z.boolean().optional(),
   freshSessionWhenRestoreLost: z.boolean().optional(),
   sessionLabel: RemoteSessionLabelSchema.optional(),
   agentTitled: z.literal(true).optional(),
@@ -52,6 +53,7 @@ const inputSchema = z.object({
     utility: z.object({ model: z.string().min(1).max(256).optional() }).strict().optional(),
   }).strict().optional(),
 }).strict().refine(value => value.acpSessionRef === undefined || value.restoreAcpSessionRef === undefined)
+  .refine(value => value.freshProviderSessionOnContinue !== true || value.acpSessionRef !== undefined)
   .refine(
     (value) =>
       value.integration === undefined ||
@@ -249,7 +251,7 @@ export class NativeRunner implements RunnerPort {
     const { context, readinessDeadlineAt, cwd, readOnlyRoots, sessionConfig,
       modelSelectionPolicy,
       modelSelection,
-      acpSessionRef, freshProviderSessionOnRestore, freshSessionWhenRestoreLost, sessionLabel, agentTitled, browser, integration,
+      acpSessionRef, freshProviderSessionOnRestore, freshProviderSessionOnContinue, freshSessionWhenRestoreLost, sessionLabel, agentTitled, browser, integration,
     } = data;
     // The session's browser is a stdio MCP server the agent launches (its own
     // package's, or the connector's for an agent without one); composed here,
@@ -261,7 +263,7 @@ export class NativeRunner implements RunnerPort {
       ...withoutUndefined({ sessionConfig,
         modelSelectionPolicy,
         modelSelection,
-        acpSessionRef, freshProviderSessionOnRestore, freshSessionWhenRestoreLost, sessionLabel,
+        acpSessionRef, freshProviderSessionOnRestore, freshProviderSessionOnContinue, freshSessionWhenRestoreLost, sessionLabel,
       }),
       ...(agentTitled ? { agentTitled } : {}),
       ...withoutUndefined({ integration }),

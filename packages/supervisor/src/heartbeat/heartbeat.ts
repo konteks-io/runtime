@@ -35,6 +35,8 @@ export interface HeartbeatOptions {
    * older Core, or nothing detected yet). Never throws the heartbeat away.
    */
   supportedAgents?: (agents: HeartbeatMessage["agents"]) => readonly SupportedAgentEntry[] | undefined;
+  /** Last reconciled Skill status; omitted until the runtime has a report. */
+  skillStatus?: () => HeartbeatMessage["skillStatus"];
   /**
    * The `konteks-remote` commands this installed release has;
    * undefined to leave it out (an older Core, or no table). Sent on the
@@ -150,7 +152,7 @@ export class HeartbeatPublisher {
     this.timer = setTimeout(() => {
       this.timer = null;
       this.publish()
-        .catch(() => this.logger.warn("heartbeat failed; retrying on the next bounded interval"));
+        .catch(error => this.logger.warn({ err: error }, "heartbeat failed; retrying on the next bounded interval"));
     }, delay);
     this.timer.unref();
   }
@@ -232,6 +234,7 @@ export class HeartbeatPublisher {
     this.lastRoles = roles;
     const utilization = this.utilization(snapshot, pending);
     const supportedAgents = this.supportedAgents(snapshot.agents);
+    const skillStatus = this.skillStatus();
     const commands = this.unsentConnectorCommands(runnerIncarnation);
     const previews = this.previews();
     this.stage = "sequence";
@@ -250,7 +253,7 @@ export class HeartbeatPublisher {
       activeAssignmentIds: this.options.activeAssignmentIds().slice(0, 256),
       configRevision: this.options.configRevision(),
       bundleVersion: this.options.bundleVersion,
-      ...this.optionalReports(supportedAgents, commands.manifest, previews),
+      ...this.optionalReports(supportedAgents, commands.manifest, skillStatus, previews),
     });
     // The wire carries a top-level `signature` and no `proof` envelope, but the
     // bytes signed are the instance proof's: binding the audience, the
@@ -301,6 +304,15 @@ export class HeartbeatPublisher {
     }
   }
 
+  private skillStatus(): HeartbeatMessage["skillStatus"] {
+    try {
+      return this.options.skillStatus?.();
+    } catch (error) {
+      this.logger.warn({ err: error }, "Skill freshness not reported on this heartbeat");
+      return undefined;
+    }
+  }
+
   private previews(): HeartbeatMessage["previews"] {
     try {
       return this.options.previews?.()?.slice(0, MAX_REPORTED_PREVIEWS);
@@ -323,10 +335,11 @@ export class HeartbeatPublisher {
   }
 
   private optionalReports(supportedAgents: readonly SupportedAgentEntry[] | undefined, connectorCommands: ConnectorCommandsManifest | undefined,
-    previews: HeartbeatMessage["previews"]): Record<string, unknown> {
+    skillStatus: HeartbeatMessage["skillStatus"], previews: HeartbeatMessage["previews"]): Record<string, unknown> {
     return {
       ...(this.options.modelCapabilitySnapshots ? { modelCapabilitySnapshots: this.options.modelCapabilitySnapshots() } : {}),
       ...(supportedAgents ? { supportedAgents } : {}),
+      ...(skillStatus ? { skillStatus } : {}),
       ...(connectorCommands ? { connectorCommands } : {}),
       ...(previews ? { previews } : {}),
     };

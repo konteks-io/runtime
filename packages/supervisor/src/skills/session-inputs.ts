@@ -2,6 +2,7 @@ import { lstat, realpath } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { RemoteInstanceError, RemoteSkillCatalogSchema, type RemoteDeliveryAcceptanceReceipt, type RemoteTransferBinding, type SessionToCoreMessage } from "@konteks/remote-common";
 import { stageOrganizationSkills, type StageOrganizationSkillsOptions, type StagedOrganizationSkills } from "./staging.js";
+import type { ManagedSkillReadTarget } from "./load-observation.js";
 
 /** Local-only preparation result: paths/instructions never enter relay frames. */
 export interface PreparedSessionInputs {
@@ -9,6 +10,10 @@ export interface PreparedSessionInputs {
   cwd: string;
   /** Verified selected organization-skill directories; read authority only, local to this session. */
   readOnlyRoots?: readonly string[];
+  /** Exact staged Skill files eligible for completed-read usage observations. Local only. */
+  managedSkills?: readonly ManagedSkillReadTarget[];
+  /** Stable owner catalog revision represented by these staged session Skills. */
+  managedSkillCatalogRevision?: string;
   skillInstructions: string;
   beforePrompt: () => Promise<void>;
   /** Delivery-only terminal barrier. Public ACP completion waits for its durable cloud receipt. */
@@ -59,18 +64,25 @@ export async function prepareDirectSessionInputs(options: { cwd: string; binding
 }
 
 /** Caller resolves the approved source checkout and authoritative skill selection. */
-export async function prepareOrganizationSkillSession(options: StageOrganizationSkillsOptions & { cwd: string }): Promise<PreparedSessionInputs> {
+export async function prepareOrganizationSkillSession(options: StageOrganizationSkillsOptions & { cwd: string; agentHomes?: readonly string[] }): Promise<PreparedSessionInputs> {
   try {
+    // Session-bound Skills can be initiative-restricted. Keep them in the
+    // private session staging root; a shared discovery home outlives this turn.
+    if (options.agentHomes?.length) throw new Error("session-bound Skills cannot enter shared discovery homes");
     const cwd = await checkedDirectory(options.cwd);
     const snapshot = {
       ...options,
       catalog: RemoteSkillCatalogSchema.parse(options.catalog),
       authority: { binding: { ...options.authority.binding }, catalogDigest: options.authority.catalogDigest },
     };
+    const catalogRevision = snapshot.catalog.catalogRevision;
+    if (snapshot.catalog.skills.length && !catalogRevision) throw new Error("required Skill catalog revision is unknown");
     const staged = await stageOrganizationSkills(snapshot);
     return {
       binding: { ...snapshot.authority.binding }, cwd,
       readOnlyRoots: Object.freeze(staged.skills.map(skill => skill.directory)),
+      managedSkills: Object.freeze(staged.skills.map(({ skillId, version, skillFile }) => ({ skillId, version, skillFile }))),
+      ...(staged.skills.length && catalogRevision ? { managedSkillCatalogRevision: catalogRevision } : {}),
       skillInstructions: organizationSkillInstructions(staged),
       beforePrompt: async () => {
         try {

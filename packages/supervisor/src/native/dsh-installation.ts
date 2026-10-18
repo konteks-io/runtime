@@ -147,8 +147,13 @@ async function packageRootsFor(candidate: string): Promise<string[]> {
 
 function globalPackageRoots(env: NodeJS.ProcessEnv, operatorHome: string, platform: NodeJS.Platform): string[] {
   const perUser = process.getuid?.() !== 0; // root must not inherit a user-writable per-user install
+  const configuredPrefix = env.npm_config_prefix;
+  if (configuredPrefix !== undefined) {
+    if (!isAbsolute(configuredPrefix)) return [];
+    return [join(configuredPrefix, platform === "win32" ? "node_modules" : "lib/node_modules", "@deepseek-ai", "dsh")];
+  }
   if (platform === "win32") {
-    const prefixes = [env.npm_config_prefix, env.APPDATA ? join(env.APPDATA, "npm") : undefined];
+    const prefixes = [env.APPDATA ? join(env.APPDATA, "npm") : undefined];
     return prefixes.filter((prefix): prefix is string => Boolean(prefix && isAbsolute(prefix))).map(prefix => join(prefix, "node_modules", "@deepseek-ai", "dsh"));
   }
   const prefixes = [env.npm_config_prefix, ...(perUser ? [join(operatorHome, ".npm-global"), join(operatorHome, ".local")] : []), "/opt/homebrew", "/usr/local", "/usr"];

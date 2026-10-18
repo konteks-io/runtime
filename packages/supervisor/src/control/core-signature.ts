@@ -2,6 +2,14 @@ import type { KeyObject } from "node:crypto";
 import { PlanningControllerTerminalDirectiveSchema, RemoteControlSigningKeySchema, planningControllerTerminalDirectiveSigningBytes, remoteControlSigningBytes, ed25519PublicKeyFromJwk, ed25519Verify, type JsonValue, type PlanningControllerTerminalDirective } from "@konteks/remote-common";
 import type { EmbeddedReleaseRoot } from "@konteks/remote-release";
 import {
+  RuntimeSkillCatalogChangedSchema,
+  RuntimeSkillSyncEnvelopeSchema,
+  runtimeSkillCatalogChangedSigningBytes,
+  runtimeSkillSyncSigningBytes,
+  type RuntimeSkillCatalogChanged,
+  type RuntimeSkillSyncEnvelope,
+} from "@konteks/backstage-plugin-common/remote-instance-internal";
+import {
   diagnosticCarrierCompanionSigningBytes,
   DiagnosticCarrierCompanionDeliveryRequestSchema,
   executionRevisionControlSigningBytes,
@@ -85,6 +93,35 @@ export class CoreSignatureVerifier {
     catch { return false; }
   }
 
+  /** Owner Skill catalogs use a dedicated signature domain and bind to one runtime. */
+  verifyRuntimeSkillSyncEnvelope(candidate: unknown, instanceId: string): boolean {
+    const parsed = RuntimeSkillSyncEnvelopeSchema.safeParse(candidate);
+    if (!parsed.success) return false;
+    if (parsed.data.instanceId !== instanceId) return false;
+    return this.verifyRuntimeSkillSyncSignature(parsed.data);
+  }
+
+  /** A content-free catalog hint can trigger reconciliation, never authorize the catalog itself. */
+  verifyRuntimeSkillCatalogChanged(candidate: unknown): candidate is RuntimeSkillCatalogChanged {
+    const parsed = RuntimeSkillCatalogChangedSchema.safeParse(candidate);
+    if (!parsed.success || this.keys.size === 0 || !canonicalSignature(parsed.data.signature)) return false;
+    try {
+      const bytes = runtimeSkillCatalogChangedSigningBytes(parsed.data);
+      for (const key of this.keys.values()) if (ed25519Verify(key, bytes, parsed.data.signature)) return true;
+    } catch { return false; }
+    return false;
+  }
+
+  private verifyRuntimeSkillSyncSignature(envelope: RuntimeSkillSyncEnvelope): boolean {
+    const { signature } = envelope;
+    if (this.keys.size === 0 || !canonicalSignature(signature)) return false;
+    try {
+      const bytes = runtimeSkillSyncSigningBytes(envelope);
+      for (const key of this.keys.values()) if (ed25519Verify(key, bytes, signature)) return true;
+    } catch { return false; }
+    return false;
+  }
+
   /** Unlike legacy directives, the outer delivery names its exact signing key.
    * The inner directive may use another explicitly retained rotation key. */
   verifyCancellationDelivery(candidate: unknown): boolean {
@@ -165,4 +202,9 @@ export class CoreSignatureVerifier {
     return false;
   }
 
+}
+
+function canonicalSignature(signature: string): boolean {
+  return /^[A-Za-z0-9_-]{86}$/.test(signature) &&
+    Buffer.from(signature, "base64url").toString("base64url") === signature;
 }

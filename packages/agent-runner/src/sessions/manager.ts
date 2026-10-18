@@ -59,6 +59,8 @@ interface CreateSessionArgs {
   acpSessionRef?: string;
   /** Restart recovery whose durable context was staged outside the provider transcript. */
   freshProviderSessionOnRestore?: boolean;
+  /** A sealed live predecessor is replaced with this turn's staged context instead of being resumed. */
+  freshProviderSessionOnContinue?: boolean;
   /**
    * A person's turn: when the agent's own transcript cannot be reopened
    * (`agent_session_lost`), open one new session for this turn instead of
@@ -572,14 +574,11 @@ export class SessionManager {
   ): Promise<CreatedSession> {
     if (bridge.exited) throw new RemoteInstanceError("agent_unavailable", "Creating bridge has exited.");
     const capabilities = capabilitiesOf(bridge);
-    // The Claude SDK persists its deferred-tool registry in the provider
-    // transcript. Loading that transcript after a process restart can retain a
-    // former assignment's smaller or expired MCP view even though ACP receives
-    // the current mcpServers. Konteks already stages the durable conversation
-    // and tool-call memory into every restarted native turn, so create a fresh
-    // provider query for Claude: it preserves logical continuation without
-    // replaying a large transcript or inheriting stale authority. Live,
-    // same-process continuation still uses continueLive below.
+    // A resumed conversation with governed Skills must not inherit an older
+    // provider-side Skill cache. Konteks restages durable conversation and
+    // tool-call context, so its logical history survives a fresh provider
+    // session. Claude also always gets a fresh context to avoid restoring a
+    // stale deferred-tool registry.
     const loadProviderHistory = loadFromRef !== undefined && args.freshProviderSessionOnRestore !== true;
     const opened = loadProviderHistory
       ? await this.loadPriorOrFresh(args, bridge, acpSessionRef, loadFromRef, capabilities.sessionResume, reserveBridgeId, bootstrapAttempt)
@@ -802,7 +801,7 @@ export class SessionManager {
     if (error instanceof RemoteInstanceError && error.retryable) return error;
     fenceRecord(record);
     this.logger.warn({ assignmentId: args.context.assignmentId, attempt: args.context.attempt,
-      code: "session_config_unconfirmed", resumed, err: classifyBridgeError(error).class },
+      code: "session_config_unconfirmed", resumed, configIds: Object.keys(args.sessionConfig ?? {}), err: classifyBridgeError(error).class },
     "admitted session configuration was not confirmed; session fenced");
     return new RemoteInstanceError("agent_unavailable", "The agent did not confirm the admitted session configuration. Refresh its model capabilities and retry with an available selection.", {
       recoveryActions: [{ kind: "run_doctor" }],
@@ -916,6 +915,7 @@ export class SessionManager {
     args = this.withDefaultSessionConfig(args);
     const { ref, record } = this.livePredecessor(args);
     const bridge = this.requireBridge(record);
+    this.assertCanRefreshContinuedSkillContext(args, bridge);
     // The predecessor's own fence is deliberately NOT asserted here: a sealed
     // completion belongs to a turn whose owner has closed and settled, so its
     // fence rejects by design (exactly as releaseSealed must not depend on
@@ -925,21 +925,35 @@ export class SessionManager {
     this.assertAdmittedModes(args.sessionConfig);
     await args.lifecycle?.beforeCreate(ref);
     try {
-      // The supervisor has already durably transferred this sealed reference.
-      // A different fixed file authority needs a verified old-group stop and
-      // a fresh bound child before any provider load or resume.
-      const continuedBridge = await this.rebindContinuation(args, record, bridge);
-      record.bridge = continuedBridge;
-      adoptSuccessor(record, args);
-      record.assertCurrent?.();
-      const refreshed = await this.refreshReboundAuthority(continuedBridge, bridge, record, args);
-      const modelSelection = await this.confirmContinuation(args, record, refreshed);
-      return { acpSessionRef: ref, resumed: true, capabilities: capabilitiesOf(continuedBridge),
-        ...(modelSelection ? { modelSelection } : {}),
-      };
+      return await this.continueLiveAfterTransfer(args, ref, record, bridge);
     } catch (error) {
       throw fenceRecord(record, error);
     }
+  }
+
+  private assertCanRefreshContinuedSkillContext(args: CreateSessionArgs, bridge: BridgeProcess): void {
+    if (args.freshProviderSessionOnContinue !== true || bridge.initializeResult.agentCapabilities?.sessionCapabilities?.close != null) return;
+    throw new RemoteInstanceError("recovery_required", "This agent cannot close its prior context to refresh governed Skills.", {
+      diagnostic: "managed_skill_context_close_unsupported",
+    });
+  }
+
+  private async continueLiveAfterTransfer(args: CreateSessionArgs, ref: string, record: SessionRecord, bridge: BridgeProcess): Promise<CreatedSession> {
+    if (args.freshProviderSessionOnContinue === true) record.recoveryStopping = true;
+    // The supervisor has already durably transferred this sealed reference.
+    // A different fixed file authority needs a verified old-group stop and
+    // a fresh bound child before any provider load or resume.
+    const continuedBridge = await this.rebindContinuation(args, record, bridge);
+    record.bridge = continuedBridge;
+    adoptSuccessor(record, args);
+    record.assertCurrent?.();
+    if (args.freshProviderSessionOnContinue === true) {
+      const modelSelection = await this.replaceLiveProviderContext(args, ref, record, continuedBridge, bridge);
+      return continuedSessionResult(ref, continuedBridge, modelSelection);
+    }
+    const refreshed = await this.refreshReboundAuthority(continuedBridge, bridge, record, args);
+    const modelSelection = await this.confirmContinuation(args, record, refreshed);
+    return continuedSessionResult(ref, continuedBridge, modelSelection);
   }
 
   private async rebindContinuation(args: CreateSessionArgs, record: SessionRecord, bridge: BridgeProcess): Promise<BridgeProcess> {
@@ -966,6 +980,40 @@ export class SessionManager {
       await Promise.race([bridge.connection.closeSession({ sessionId: record.bridgeSessionId }), deadline]);
       args.lifecycle?.assertCurrent();
     } finally { if (timer) clearTimeout(timer); }
+  }
+
+  /** Replaces a completed agent transcript with a new ACP context on the same logical Konteks session. */
+  private async replaceLiveProviderContext(
+    args: CreateSessionArgs,
+    ref: string,
+    record: SessionRecord,
+    bridge: BridgeProcess,
+    previous: BridgeProcess,
+  ): Promise<DirectModelSelection | undefined> {
+    const previousSessionId = record.bridgeSessionId;
+    if (bridge === previous) await this.closeContinuationForRebind(args, record, bridge);
+    this.byBridgeId.delete(previousSessionId);
+    const reservation = { bridgeId: null as string | null };
+    const opened = await this.newBridgeSession(args, bridge, ref, id => this.reserveBridgeId(id, reservation), 1);
+    const bridgeSessionId = opened.bridgeSessionId;
+    if (reservation.bridgeId !== bridgeSessionId) throw new RemoteInstanceError("recovery_required", "Fresh provider session ownership was not retained.");
+    this.creatingBridgeIds.delete(bridgeSessionId);
+    record.bridge = bridge;
+    record.bridgeSessionId = bridgeSessionId;
+    const modelValue = currentModel(opened.response.configOptions);
+    if (modelValue === undefined) delete record.modelValue;
+    else record.modelValue = modelValue;
+    record.sessionCostUsd = 0;
+    delete record.turnCostStartUsd;
+    record.costReported = false;
+    this.byBridgeId.set(bridgeSessionId, record);
+    await this.options.refStore.put(ref, bridgeSessionId);
+    record.assertCurrent?.();
+    this.options.verifySession?.(opened.response);
+    record.recoveryStopping = false;
+    record.operationFailed = false;
+    const configured = await this.applySessionConfig(args, record, opened.response.configOptions, false, 1);
+    return configured.modelSelection;
   }
 
   private async refreshReboundAuthority(bridge: BridgeProcess, previous: BridgeProcess, record: SessionRecord, args: CreateSessionArgs): Promise<BootstrapResponse | null | undefined> {
@@ -1739,6 +1787,12 @@ function capabilitiesOf(bridge: BridgeProcess | null): { forkSession: boolean; s
   return {
     forkSession: caps?.sessionCapabilities?.fork != null,
     sessionResume: caps?.loadSession === true || caps?.sessionCapabilities?.resume != null,
+  };
+}
+
+function continuedSessionResult(ref: string, bridge: BridgeProcess, modelSelection: DirectModelSelection | undefined): CreatedSession {
+  return { acpSessionRef: ref, resumed: true, capabilities: capabilitiesOf(bridge),
+    ...(modelSelection ? { modelSelection } : {}),
   };
 }
 

@@ -7,9 +7,9 @@ import { z } from "zod";
 import { EMBEDDED_RELEASE_ROOTS, findAgentBridge, nativeServiceExecutable, verifyNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 import { createNativeService, hostAgentInstallAdapter, loadNativeInstallation, ownedByAnotherConnector, readNativeUpdateLedger, verifyInstalledNativeConnector, NATIVE_SHUTDOWN_RECEIPT_FILE, type HostAgentInstallAdapter, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { ReleaseAcceptedSchema, RemoteInstanceError, SupervisorStatusSchema, runCommand, sanitizeInheritedChildProcessEnv, writeSecretFile } from "@konteks/remote-common";
-import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyList, gitKeyRemove, previewStatus, status, supportBundle, type ControlContext } from "./control-commands.js";
+import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyList, gitKeyRemove, previewStatus, skillsList, skillsShare, skillsSync, skillsUnshare, status, supportBundle, type ControlContext } from "./control-commands.js";
 import { SupervisorControl } from "../control.js";
-import { addNativeAgent, fetchHostAgent, installNative, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, removeNativeAgent, restoreNativeRecord, stageNativeEnrollment } from "./install.js";
+import { addNativeAgent, configureNativeSkillHomes, fetchHostAgent, installNative, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, removeNativeAgent, restoreNativeRecord, stageNativeEnrollment } from "./install.js";
 import { terminalFetchConsent, type FetchConsent } from "./consent.js";
 import { closeAgentSetup, ensurePersonalAgent, isPersonalAgent, PERSONAL_AGENTS, productionAgentClosingDeps, setUpPersonalAgent } from "./agent-setup.js";
 import { confirm } from "../prompt.js";
@@ -523,10 +523,14 @@ const CONTROL_OPERATIONS: Readonly<Record<ControlInput["operation"], ControlOper
   "git.key.add": (context, input) => gitKeyAdd(context, input.title),
   "git.key.list": context => gitKeyList(context),
   "git.key.remove": (context, input) => gitKeyRemove(context, input.keyRef!),
+  "skills.sync": context => skillsSync(context),
+  "skills.list": context => skillsList(context),
+  "skills.share": (context, input) => skillsShare(context, input),
+  "skills.unshare": (context, input) => skillsUnshare(context, input.skill!, input.confirm === true),
 };
 
 /** Operations that act through the running connector, and so wait for one that is starting. */
-const WAITS_FOR_CONNECTOR: ReadonlySet<string> = new Set(["status", "preview.status", "agents", "auth.status", "auth.login", "auth.logout", "git.key.add", "git.key.list", "git.key.remove"]);
+const WAITS_FOR_CONNECTOR: ReadonlySet<string> = new Set(["status", "preview.status", "agents", "auth.status", "auth.login", "auth.logout", "git.key.add", "git.key.list", "git.key.remove", "skills.sync", "skills.list", "skills.share", "skills.unshare"]);
 
 const productionNativeStopDeps: NativeStopDeps = {
   definition: serviceDefinition,
@@ -1253,6 +1257,11 @@ export const nativeCliActions: NativeCliActions = {
     confirm: question => confirmOnTerminal(question),
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)), now: Date.now, platform: nativePlatform(),
   }),
+  configureSkills: async input => {
+    const record = await configureNativeSkillHomes({ root: input.root });
+    input.output.line("Local Skill folders are configured. Start the connector through its normal lifecycle; the next authorized session refreshes shared Skills.");
+    input.output.result({ state: "configured", agentSkillHomes: record.agentSkillHomes });
+  },
   serve: async input => {
     if (await runsReplacedServiceExecutable(input.root)) {
       process.stderr.write("the background service's connector was replaced by the installed release; restarting onto it\n");

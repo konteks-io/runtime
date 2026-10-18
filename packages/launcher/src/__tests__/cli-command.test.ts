@@ -81,6 +81,8 @@ describe("commandHintText", () => {
     expect(commandHintText("To add DeepSeek Harness: konteks-remote agent add dsh", full)).toBe(`To add DeepSeek Harness: ${full} agent add dsh`);
     expect(commandHintText("run `konteks-remote doctor`, then `konteks-remote auth login codex`", full))
       .toBe(`run \`${full} doctor\`, then \`${full} auth login codex\``);
+    expect(commandHintText("Sync with konteks-remote skills sync, then inspect `konteks-remote skills list --json`", full))
+      .toBe(`Sync with ${full} skills sync, then inspect \`${full} skills list --json\``);
     expect(commandHintText("To see every step, run konteks-remote --verbose start.", full)).toBe(`To see every step, run ${full} --verbose start.`);
   });
 

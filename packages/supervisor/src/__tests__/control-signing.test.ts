@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { sign } from "node:crypto";
+import { sign as ed25519Sign } from "node:crypto";
 import { generateEd25519, remoteControlSigningBytes } from "@konteks/remote-common";
+import {
+  computeRuntimeSkillSyncCatalogDigest, RuntimeSkillSyncEnvelopeSchema, runtimeSkillSyncSigningBytes,
+  RuntimeSkillCatalogChangedSchema,
+} from "@konteks/backstage-plugin-common/remote-instance-internal";
 import { CoreSignatureVerifier } from "../control/core-signature.js";
 // Cross-repository interoperability proof: the actual Core producer beside the
 // actual connector consumer. It runs only next to a Core checkout; the public
@@ -8,7 +12,10 @@ import { CoreSignatureVerifier } from "../control/core-signature.js";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 const CORE_SIGNING_SERVICE = fileURLToPath(new URL("../../../../../core/plugins/remote-instance-backend/src/services/CoreControlSigningService.ts", import.meta.url));
-const coreSigning: { CoreControlSigningService: new (options: never) => { sign(payload: Record<string, unknown>): Promise<unknown> } } | null =
+const coreSigning: { CoreControlSigningService: new (options: never) => {
+  sign(payload: Record<string, unknown>): Promise<unknown>;
+  signRuntimeSkillCatalogChanged(payload: Record<string, unknown>): Promise<string>;
+} } | null =
   existsSync(CORE_SIGNING_SERVICE) ? await import(CORE_SIGNING_SERVICE) : null;
 
 const body = { type: "drain", instanceId: "instance", reason: "user", issuedAt: "2026-09-06T00:00:00Z" };
@@ -41,6 +48,63 @@ describe.skipIf(coreSigning === null)("Core/connector detached control signature
     expect(new CoreSignatureVerifier([next.root]).verify(body, oldSignature)).toBe(false);
     expect(new CoreSignatureVerifier([{ ...old.root, coreControlKeys: [] }]).verify(body, oldSignature)).toBe(false);
     expect(() => new CoreSignatureVerifier([{ ...old.root, coreControlKeys: [old.root.coreControlKeys[0]!, { ...next.root.coreControlKeys[0]!, keyId: "control-1" }] }])).toThrow();
+  });
+});
+
+describe("Core-signed runtime Skill catalogs", () => {
+  it("verifies the dedicated signature and refuses changed or foreign catalogs", () => {
+    const key = generateEd25519();
+    const root = {
+      keyId: "release",
+      publicKeyJwk: generateEd25519().publicJwk,
+      coreControlKeys: [{ keyId: "control-1", publicKeyJwk: key.publicJwk }],
+    };
+    const binding = { workspaceId: "tenant-a", instanceId: "instance-a", syncId: "sync-a" };
+    const catalog = { version: 1 as const, complete: true as const, binding, catalogRevision: `sha256:${"a".repeat(64)}`, skills: [] };
+    const body = {
+      type: "runtime_skill_sync" as const,
+      instanceId: binding.instanceId,
+      catalog,
+      catalogDigest: computeRuntimeSkillSyncCatalogDigest(catalog),
+      issuedAt: "2026-10-13T00:00:00.000Z",
+      expiresAt: "2026-10-13T00:01:00.000Z",
+    };
+    const unsigned = RuntimeSkillSyncEnvelopeSchema.parse({ ...body, signature: "A".repeat(86) });
+    const signature = ed25519Sign(null, runtimeSkillSyncSigningBytes(unsigned), key.privateKey).toString("base64url");
+    const verifier = new CoreSignatureVerifier([root]);
+    const envelope = { ...body, signature };
+
+    expect(verifier.verifyRuntimeSkillSyncEnvelope(envelope, binding.instanceId)).toBe(true);
+    expect(verifier.verifyRuntimeSkillSyncEnvelope({ ...envelope, catalog: { ...catalog, binding: { ...binding, workspaceId: "tenant-b" } } }, binding.instanceId)).toBe(false);
+    expect(verifier.verifyRuntimeSkillSyncEnvelope(envelope, "another-instance")).toBe(false);
+    expect(new CoreSignatureVerifier([{ ...root, coreControlKeys: [] }]).verifyRuntimeSkillSyncEnvelope(envelope, binding.instanceId)).toBe(false);
+  });
+});
+
+describe("Core-signed runtime Skill catalog change hints", () => {
+  it.skipIf(coreSigning === null)("verifies Core's signed bounded notice and rejects tenant, instance, and revision tampering", async () => {
+    const f = fixture();
+    const now = Date.now();
+    const body = {
+      type: "runtime_skill_catalog_changed" as const,
+      workspaceId: "tenant-a",
+      instanceId: "instance-a",
+      notificationId: "notice-a",
+      catalogRevision: `sha256:${"a".repeat(64)}`,
+      changeKind: "updated" as const,
+      issuedAt: new Date(now).toISOString(),
+      expiresAt: new Date(now + 30_000).toISOString(),
+    };
+    const signature = await f.signer.signRuntimeSkillCatalogChanged(body);
+    RuntimeSkillCatalogChangedSchema.parse({ ...body, signature });
+    const notice = { ...body, signature };
+
+    expect(f.verifier.verifyRuntimeSkillCatalogChanged(notice)).toBe(true);
+    expect(f.verifier.verifyRuntimeSkillCatalogChanged({ ...notice, workspaceId: "tenant-b" })).toBe(false);
+    expect(f.verifier.verifyRuntimeSkillCatalogChanged({ ...notice, instanceId: "instance-b" })).toBe(false);
+    expect(f.verifier.verifyRuntimeSkillCatalogChanged({ ...notice, catalogRevision: `sha256:${"b".repeat(64)}` })).toBe(false);
+    expect(f.verifier.verifyRuntimeSkillCatalogChanged({ ...notice, skillContents: "must never be delivered" })).toBe(false);
+    expect(new CoreSignatureVerifier([{ ...f.root, coreControlKeys: [] }]).verifyRuntimeSkillCatalogChanged(notice)).toBe(false);
   });
 });
 describe.skipIf(coreSigning === null)("site-started agent login delivery", () => {
@@ -93,7 +157,7 @@ describe("assignment-available nudge delivery", () => {
   it("accepts a signed nudge and rejects one moved to another runtime or key", () => {
     const key = generateEd25519();
     const verifier = new CoreSignatureVerifier([{ keyId: "release", publicKeyJwk: generateEd25519().publicJwk, coreControlKeys: [{ keyId: "control-1", publicKeyJwk: key.publicJwk }] }]);
-    const signature = sign(null, remoteControlSigningBytes(unsigned), key.privateKey).toString("base64url");
+    const signature = ed25519Sign(null, remoteControlSigningBytes(unsigned), key.privateKey).toString("base64url");
     expect(verifier.verifyAssignmentAvailableDelivery({ ...unsigned, signature })).toBe(true);
     expect(verifier.verifyAssignmentAvailableDelivery({ ...unsigned, intent: { ...unsigned.intent, tenantId: "other" }, signature })).toBe(false);
     expect(verifier.verifyAssignmentAvailableDelivery({ ...unsigned, keyId: "control-2", signature })).toBe(false);

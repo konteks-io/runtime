@@ -37,6 +37,7 @@ import { deferredPermissionBody, PermissionBroker, registerDeferral, sanitizeEli
 import type { CapabilityTokenIssue, DeferredPermissionBody } from "../core/client.js";
 import { deferredPermissionRequest, type AdmittedMcpTool, type PolicyDecision, type PolicyResponder } from "./policy-responder.js";
 import type { PreparedSessionInputs } from "../skills/session-inputs.js";
+import { ManagedSkillReadTracker } from "../skills/load-observation.js";
 import { McpCapabilityFacade, type McpLocalTransportIdentity } from "../mcp/capability-facade.js";
 import { NativeCoordinationInvocations } from "../mcp/native-invocations.js";
 import { PREVIEW_WORK_KINDS, PreviewMcpServer, type SessionPreviewAccess } from "../preview/mcp-server.js";
@@ -178,6 +179,13 @@ export interface RelayedSessionDeps {
   onUsage: (observation: AgentTurnUsageObservation) => Promise<void>;
   /** Typed historical facts, independent of usage and terminal settlement. */
   onRuntimeFailure?: RuntimeFailureReporter;
+  /** Durable delivery of a completed read of an exact, staged managed Skill. */
+  onSkillRead?: (observation: import("@konteks/backstage-plugin-common/remote-instance-internal").AgentSkillReadObservation) => Promise<void>;
+  /** Local proof that the selected agent completed reads for every required Skill in one admitted catalog. */
+  onSkillLoadProof?: (proof: { agentId: string; catalogRevision: string }) => void;
+  onSkillProfilePrepared?: (proof: { agentId: string; catalogRevision: string }) => void;
+  onSkillProfileClosed?: () => void;
+
   /** A turn started or ended: the computer's busy state changed. */
   onTurnActivity?: () => void;
   onClosed: (session: RelayedSession, reason: SessionClosedReason) => Promise<void>;
@@ -282,6 +290,8 @@ export class RelayedSession {
   private toolFormTold = false;
   private readonly logger: Logger;
   private preparedInputs: PreparedSessionInputs | null = null;
+  private skillReadTracker: ManagedSkillReadTracker | null = null;
+  private skillLoadProofReported = false;
   private readOnlyRoots: readonly string[] = Object.freeze([]);
   private readonly executionGate: NativeExecutionGate | null;
   /** Durable key of the last prompt admitted on this session (see promptBusy). */
@@ -428,6 +438,9 @@ export class RelayedSession {
     const binding = this.verifiedBinding(prepared);
     const readOnlyRoots = Object.freeze([...(prepared.readOnlyRoots ?? [])]);
     this.preparedInputs = prepared;
+    this.skillReadTracker = skillReadTrackerFor(prepared);
+    this.skillLoadProofReported = false;
+    this.recordPreparedSkillProfile(prepared);
     this.readOnlyRoots = readOnlyRoots;
     // Input preparation verifies Core's claim-bound selection. Use its logical
     // session identity, never a bridge ref or an assignment-local random ID.
@@ -743,10 +756,20 @@ export class RelayedSession {
       mcpServers,
       ...(this.assignment.agentRoute.sessionConfig ? { sessionConfig: this.assignment.agentRoute.sessionConfig } : {}),
       ...this.directModelOptions(),
-      ...(priorRef ? { acpSessionRef: priorRef } : {}),
-      ...this.restoreOptions(restoreRef),
+      ...this.sessionReferenceOptions(priorRef, restoreRef),
       ...this.titleOptions(),
       ...(browser ? { browser } : {}),
+    };
+  }
+
+  private sessionReferenceOptions(priorRef: string | undefined, restoreRef: string | undefined): Partial<RunnerSessionInput> {
+    const hasManagedSkills = (this.preparedInputs?.managedSkills?.length ?? 0) > 0;
+    return {
+      ...(priorRef ? { acpSessionRef: priorRef } : {}),
+      ...this.restoreOptions(restoreRef, hasManagedSkills),
+      ...(priorRef && hasManagedSkills && this.assignment.source.kind === "conversation"
+        ? { freshProviderSessionOnContinue: true }
+        : {}),
     };
   }
 
@@ -771,9 +794,10 @@ export class RelayedSession {
    * whose transcript cannot be reopened gets a new session rather than a
    * refusal that every later message would repeat.
    */
-  private restoreOptions(restoreRef: string | undefined): Partial<RunnerSessionInput> {
+  private restoreOptions(restoreRef: string | undefined, hasManagedSkills: boolean): Partial<RunnerSessionInput> {
     if (!restoreRef) return {};
-    const fresh = this.assignment.source.kind === "conversation" && this.assignment.agentRoute.agentId === "claude-code";
+    const fresh = this.assignment.source.kind === "conversation" &&
+      (this.assignment.agentRoute.agentId === "claude-code" || hasManagedSkills);
     if (fresh) return { restoreAcpSessionRef: restoreRef, freshProviderSessionOnRestore: true };
     return { restoreAcpSessionRef: restoreRef, ...(continuedSession(this.assignment.source) ? { freshSessionWhenRestoreLost: true } : {}) };
   }
@@ -1548,6 +1572,7 @@ export class RelayedSession {
     await this.coordinationCalls.observe(update);
     this.mcpCalls?.observe(update);
     this.folderAccess.observe(update);
+    await this.recordManagedSkillRead(update);
     const bypass = this.toolGovernance?.observe(update, this.sessionCwd(), this.readOnlyRoots) ?? null;
     await this.sendUpdate(event.params);
     if (bypass) await this.onToolGovernanceBypass(bypass);
@@ -1562,6 +1587,41 @@ export class RelayedSession {
       phase: "tool", stage: "tool_terminal", code: "tool_failed",
       evidence: { kind: "tool_status", status: "failed" }, toolCallId: tool.toolCallId,
     }, { assignmentId: this.assignment.id, attempt: this.assignment.attempt });
+  }
+
+  private recordPreparedSkillProfile(prepared: PreparedSessionInputs): void {
+    if (this.skillReadTracker && prepared.managedSkillCatalogRevision) {
+      this.deps.onSkillProfilePrepared?.({ agentId: this.assignment.agentRoute.agentId, catalogRevision: prepared.managedSkillCatalogRevision });
+    }
+  }
+
+  private recordSkillLoadProof(tracker: ManagedSkillReadTracker, agentId: string): void {
+    const catalogRevision = tracker.loadedCatalogRevision();
+    if (!this.skillLoadProofReported && catalogRevision) {
+      this.skillLoadProofReported = true;
+      this.deps.onSkillLoadProof?.({ agentId, catalogRevision });
+    }
+  }
+
+  private async recordManagedSkillRead(update: unknown): Promise<void> {
+    const tracker = this.skillReadTracker;
+    const deliver = this.deps.onSkillRead;
+    if (!tracker) return;
+    const observation = tracker.observe(
+      update,
+      this.executionGate?.skillReadObservationContext() ?? null,
+      this.deps.clock.nowIso(),
+    );
+    if (!observation) return;
+    this.recordSkillLoadProof(tracker, observation.agentId);
+    if (!deliver) return;
+    try { await deliver(observation); }
+    catch {
+      this.logger.warn({ event: "skill.read_observation_persist_failed", assignmentId: this.assignment.id,
+        attempt: this.assignment.attempt, capabilityId: observation.capabilityId, version: observation.version },
+      "a completed managed Skill read could not be retained for usage reporting");
+    }
+
   }
 
   private async onPromptCompletion(event: RunnerEventOf<"prompt_result">): Promise<void> {
@@ -1618,6 +1678,24 @@ export class RelayedSession {
   /** A prompt's completion (with any structured result already attached) goes to its holder. */
   private async onPromptResult(requestId: string, result: Record<string, unknown>): Promise<void> {
     this.deps.onTurnActivity?.();
+    if (await this.rejectUnprovenSkillTurn(requestId)) return;
+    await this.forwardPromptResult(requestId, result);
+  }
+
+  private async rejectUnprovenSkillTurn(requestId: string): Promise<boolean> {
+    const tracker = this.skillReadTracker;
+    if (!tracker || tracker.allRequiredSkillsLoaded()) return false;
+    const accepted = await this.completeReceived(requestId, "session/prompt", {
+      kind: "acp_error", id: requestId, method: "session/prompt",
+      error: { code: -32001, class: "policy_denied",
+        message: "managed_skill_load_proof_missing: required Skills were not read from their verified staged versions; the turn result was not accepted.",
+        retryable: false },
+    });
+    if (accepted && isNativeTurn(this.assignment)) await this.closeEndedTurn("managed_skill_load_proof_missing");
+    return true;
+  }
+
+  private async forwardPromptResult(requestId: string, result: Record<string, unknown>): Promise<void> {
     if (this.assignment.kind === "delivery" && this.assignment.source.kind === "harness_delivery") return this.deliverPromptResult(requestId, result);
     const accepted = await this.completeReceived(requestId, "session/prompt", { kind: "acp_result", id: requestId, method: "session/prompt", result: result as never });
     if (accepted && isNativeTurn(this.assignment)) await this.closeEndedTurn((result as { stopReason?: string })?.stopReason);
@@ -1797,9 +1875,15 @@ export class RelayedSession {
   private async onPermissionRequest(requestId: string, params: RequestPermissionRequest): Promise<void> {
     const ref = this.acpSessionRef;
     if (ref === null) return;
+    if (await this.refuseBeforeSkillLoadProof(ref, requestId, params)) return;
     const request = this.toolGovernance ? await this.governPermission(ref, requestId, params, this.toolGovernance) : params;
     if (request === null) return;
     this.pendingToolPermissions.set(requestId, request);
+    await this.evaluatePermissionRequest(ref, requestId, request);
+  }
+
+  private async evaluatePermissionRequest(ref: string, requestId: string, request: RequestPermissionRequest): Promise<void> {
+
     const decision = await this.deps.policy.evaluatePermission(request, this.permissionContext());
     if (this.closed) return;
     this.deps.assertExecutionOwned?.();
@@ -1807,6 +1891,15 @@ export class RelayedSession {
     this.logPolicyRefusal(request, decision);
     if (decision.kind === "deny") return this.denyByPolicy(ref, requestId, request, decision);
     return this.deferPermission(ref, requestId, request, decision);
+  }
+
+  private async refuseBeforeSkillLoadProof(ref: string, requestId: string, params: RequestPermissionRequest): Promise<boolean> {
+    const tracker = this.skillReadTracker;
+    if (!tracker || tracker.allRequiredSkillsLoaded() || tracker.isRequiredSkillRead(params)) return false;
+    await this.noteRefusedToolCall(ref, params.toolCall.toolCallId,
+      "Load every required Skill from its verified staged file before using other tools. This operation was refused until that proof is available.");
+    await this.answerPermission(ref, requestId, cancelledPermission());
+    return true;
   }
 
   /**
@@ -2184,12 +2277,17 @@ export class RelayedSession {
       // its final frame, replay buffer and sequence space stay for the next turn.
       if (!this.recoveryStopping) await this.deps.onClosed(this, reason);
       this.deps.assertExecutionOwned?.();
+      this.closeSkillProfile();
     } catch (error) {
       if (nativeCompletion) this.logUnconfirmedCompletion(settlement.recorded);
       throw error;
     } finally {
       await this.afterClose(reason, nativeCompletion);
     }
+  }
+
+  private closeSkillProfile(): void {
+    if (!this.recoveryStopping) this.deps.onSkillProfileClosed?.();
   }
 
   private logUnconfirmedCompletion(recorded: boolean): void {
@@ -2446,6 +2544,12 @@ type SessionMcpServer = { type: "http"; name: string; url: string; headers: Arra
 type SessionBrowser = { proxyUrl: string; outputDir: string; browsersPath: string };
 type SessionReferences = { priorRef: string | undefined; restoreRef: string | undefined };
 type ExecutionActivation = Awaited<ReturnType<NonNullable<RelayedSessionDeps["activateExecution"]>>>;
+
+function skillReadTrackerFor(prepared: PreparedSessionInputs): ManagedSkillReadTracker | null {
+  return prepared.managedSkills?.length
+    ? new ManagedSkillReadTracker(prepared.cwd, prepared.managedSkills, prepared.managedSkillCatalogRevision)
+    : null;
+}
 type ReadyProjection = Pick<RemoteExecutionReadyResult, "attempt" | "recoveryEpoch" | "readyRevision">;
 
 function sessionClosed(): RemoteInstanceError {

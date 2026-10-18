@@ -28,10 +28,10 @@ function resolve(root: Command, line: string): { path: string; command: Command 
   let command = root;
   const path: string[] = [];
   const argumentsGiven: string[] = [];
-  for (const word of words.slice(1)) {
+  for (let index = 1; index < words.length; index += 1) {
+    const word = words[index]!;
     if (word.startsWith("--")) {
-      const known = [...command.options, ...(command === root ? [] : root.options)].some(option => option.long === word);
-      expect(known, `${line}: ${word} is not an option of "${path.join(" ") || "konteks-remote"}"`).toBe(true);
+      index += optionValueOffset(root, command, word, words, index, line, path);
       continue;
     }
     const sub = command.commands.find(candidate => candidate.name() === word);
@@ -42,6 +42,14 @@ function resolve(root: Command, line: string): { path: string; command: Command 
   expect(argumentsGiven.length, `${line}: more arguments than "${path.join(" ")}" takes`).toBeLessThanOrEqual(registered.length);
   expect(argumentsGiven.length, `${line}: a required argument is missing`).toBeGreaterThanOrEqual(registered.filter(argument => argument.required).length);
   return { path: path.join(" "), command };
+}
+
+function optionValueOffset(root: Command, command: Command, word: string, words: string[], index: number, line: string, path: string[]): number {
+  const option = [...command.options, ...(command === root ? [] : root.options)].find(candidate => candidate.long === word);
+  expect(option, `${line}: ${word} is not an option of "${path.join(" ") || "konteks-remote"}"`).toBeDefined();
+  if (!option?.required && !option?.optional) return 0;
+  expect(words[index + 1], `${line}: ${word} needs a value`).toMatch(/^<.+>$|^\[.+\]$/);
+  return 1;
 }
 
 function leaves(command: Command, prefix: string[] = []): string[] {

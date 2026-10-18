@@ -155,6 +155,21 @@ it("dispatches delivery exactly once through dedicated consumption and check rou
   expect(f.journal.pendingRequests.get(operation.key)?.authorization?.claims).toMatchObject({ workloadKind: "harness_delivery" });
 });
 
+it("exposes Skill-read attribution only while execution authority is current", async () => {
+  const f = await fixture();
+  expect(f.gate.skillReadObservationContext()).toBeNull();
+  const operation = await f.gate.admit(f.envelope);
+  await f.gate.begin(operation);
+
+  expect(f.gate.skillReadObservationContext()).toMatchObject({
+    instanceId: "instance", agentId: "codex", executionId: "execution", sessionId: "session",
+    assignmentId: "assignment", attempt: 1, acpSessionRef: "acp", turnId: "turn",
+  });
+
+  f.gate.stop();
+  expect(f.gate.skillReadObservationContext()).toBeNull();
+});
+
 it("gives a renewal near or past the verified lease its whole I/O budget", async () => {
   vi.useFakeTimers();
   const f = await fixture();
@@ -484,9 +499,24 @@ it.each(["valid", "core-clock-ahead", "fractional-core-clock", "lost-during-keys
   } else { await expect(receiver.receive(body)).rejects.toThrow(); expect(dispatched).not.toHaveBeenCalled(); }
 });
 
+interface SkillFixtureProof {
+    catalogRevision: string;
+    managedSkills: readonly { skillId: string; version: string; skillFile: string }[];
+    onSkillRead?: (observation: import("@konteks/backstage-plugin-common/remote-instance-internal").AgentSkillReadObservation) => Promise<void>;
+    onSkillLoadProof?: (proof: { agentId: string; catalogRevision: string }) => void;
+}
+
+function skillProofCallbacks(proof?: SkillFixtureProof) {
+  return {
+    ...(proof?.onSkillRead ? { onSkillRead: proof.onSkillRead } : {}),
+    ...(proof?.onSkillLoadProof ? { onSkillLoadProof: proof.onSkillLoadProof } : {}),
+  };
+}
+
 async function sessionFixture(work: RemoteWorkAssignment = assignment, acceptDeliveryOutput?: (authority: { claimId: string; invocationRef: string }) => Promise<RemoteDeliveryAcceptanceReceipt>,
   logger?: { warn: (...args: unknown[]) => void; info: (...args: unknown[]) => void; error: (...args: unknown[]) => void; debug: (...args: unknown[]) => void },
-  authority: Record<string, unknown> = {}, deps: Partial<RelayedSessionDeps> = {}) {
+  authority: Record<string, unknown> = {}, deps: Partial<RelayedSessionDeps> = {}, skillProof?: SkillFixtureProof) {
+
   const f = work.source.kind === "harness_delivery" ? await deliveryFixture() : await fixture();
   const entry = f.journal.assignments.get(`${work.id}:${work.attempt}`)!;
   await f.journal.assignments.put({ ...entry, kind: work.kind });
@@ -504,10 +534,14 @@ async function sessionFixture(work: RemoteWorkAssignment = assignment, acceptDel
     // The orchestrator wires settlement recording for every native session.
     recordCompletedSettlement: async () => undefined,
     prepareInputs: async () => ({ binding: { workspaceId: "tenant", instanceId: "instance", sessionId: "session", assignmentId: "assignment", attempt: 1 }, cwd: root, skillInstructions: "trusted local skill", beforePrompt,
+      ...(skillProof ? { managedSkills: skillProof.managedSkills, managedSkillCatalogRevision: skillProof.catalogRevision } : {}),
       ...(acceptDeliveryOutput ? { acceptDeliveryOutput } : {}) }),
     registerReady: async () => f.ready, redeemCapabilityToken: async () => { throw new Error("unexpected capability redemption"); },
     policy: new EvaluatorPolicyResponder(null, () => false), broker: new PermissionBroker({ clock: f.clock, deadlineSeconds: () => 60, onTimeout: async () => undefined }),
-    onUsage: async () => undefined, onClosed: async () => undefined, ...(logger ? { logger: logger as never } : {}), ...deps });
+    onUsage: async () => undefined, onClosed: async () => undefined,
+    ...skillProofCallbacks(skillProof),
+    ...(logger ? { logger: logger as never } : {}), ...deps });
+
   sessions.push(session); await session.bootstrap(); send.mockClear();
   return { ...f, session, runner, send, beforePrompt };
 }
@@ -613,6 +647,41 @@ describe("native session dispatch uses genuine execution admission", () => {
     await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp", requestId: "approval", params: { sessionId: "acp", toolCall: { toolCallId: "provider-call", kind: "other" }, options: [{ optionId: "allow", kind: "allow_once", name: "Allow" }, { optionId: "deny", kind: "reject_once", name: "Deny" }], _meta: { is_mcp_tool_approval: true } } } as never);
     expect(f.runner.answer).toHaveBeenCalledWith("acp", "approval", { outcome: { outcome: "selected", optionId: "allow" } });
     await f.session.close("cancelled");
+  });
+
+  it("reports the admitted owner revision only after the agent reads every required staged Skill", async () => {
+    const catalogRevision = `sha256:${"a".repeat(64)}`;
+    const firstPath = join(root, "skills", "review", "SKILL.md");
+    const secondPath = join(root, "skills", "security", "SKILL.md");
+    const onSkillRead = vi.fn(async () => undefined);
+    const onSkillLoadProof = vi.fn();
+    const f = await sessionFixture(assignment, undefined, undefined, {}, {}, {
+      catalogRevision,
+      managedSkills: [
+        { skillId: "11111111-1111-4111-8111-111111111111", version: "1.2.3", skillFile: firstPath },
+        { skillId: "22222222-2222-4222-8222-222222222222", version: "2.0.0", skillFile: secondPath },
+      ],
+      onSkillRead,
+      onSkillLoadProof,
+    });
+    const read = async (toolCallId: string, filePath: string) => {
+      await f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp", params: { sessionId: "acp", update: {
+        sessionUpdate: "tool_call", toolCallId, kind: "read", status: "in_progress", rawInput: { file_path: filePath },
+      } } } as never);
+      await f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp", params: { sessionId: "acp", update: {
+        sessionUpdate: "tool_call_update", toolCallId, status: "completed",
+      } } } as never);
+    };
+    try {
+      await f.session.onToRuntime(f.envelope);
+      await read("read-review", firstPath);
+      expect(onSkillLoadProof).not.toHaveBeenCalled();
+      await read("read-security", secondPath);
+      expect(onSkillRead).toHaveBeenCalledTimes(2);
+      expect(onSkillLoadProof).toHaveBeenCalledOnce();
+      expect(onSkillLoadProof).toHaveBeenCalledWith({ agentId: "codex", catalogRevision });
+    } finally { await f.session.close("cancelled"); }
+
   });
   it("closes a prepared delivery assignment after its authorized pre-prompt cancellation", async () => {
     const work = { ...assignment, kind: "delivery" as const, taskId: "task", correlationId: "invocation",

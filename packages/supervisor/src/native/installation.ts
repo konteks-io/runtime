@@ -2,7 +2,7 @@ import { constants, type Stats } from "node:fs";
 import { createHash } from "node:crypto";
 import { lstat, open, realpath, type FileHandle } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join, parse, resolve } from "node:path";
+import { isAbsolute as pathIsAbsolute, join, parse, resolve } from "node:path";
 import { z } from "zod";
 import { isRetiredAgentId } from "@konteks/backstage-plugin-common";
 import { CORE_PERMISSION_ANSWER_PRODUCER, RemoteInstanceError } from "@konteks/remote-common";
@@ -50,6 +50,10 @@ export const NativeRuntimeRecordSchema = z.object({
   codexSocket: z.string().min(1).max(4096).optional(),
   /** The operator's own installed Claude Code CLI, located at install time. */
   claudeExecutable: z.string().min(1).max(4096).optional(),
+  /** Optional local Claude profile path, captured by the installer; it contains no credential values. */
+  claudeConfigDir: z.string().min(1).max(4096).refine(value => pathIsAbsolute(value) && !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(value)).optional(),
+  /** Local discovery folders bound by the installer, never by cloud assignment data. */
+  agentSkillHomes: z.array(z.string().min(1).max(4096).refine(value => pathIsAbsolute(value) && !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(value))).optional(),
   /** The person's own installed DeepSeek Harness package root, located at install time. */
   dshRoot: z.string().min(1).max(4096).optional(),
   /** The person's Node that runs it (the connector cannot run another script). */
@@ -220,6 +224,8 @@ class InstallationLoader {
       RUNNER_CREDENTIAL_DIR: credentials, RUNNER_WORKSPACE_DIR: workspace,
       ...(codexHome ? { RUNNER_NATIVE_CODEX_HOME: codexHome } : {}),
       ...(claudeExecutable ? { RUNNER_NATIVE_CLAUDE_EXECUTABLE: claudeExecutable } : {}),
+      ...(record.claudeConfigDir ? { RUNNER_NATIVE_CLAUDE_CONFIG_DIR: record.claudeConfigDir } : {}),
+      ...(record.agentSkillHomes ? { RUNNER_NATIVE_SKILL_HOMES: record.agentSkillHomes } : {}),
       // The supervisor owns this shared service lifecycle. Its default socket
       // is per connector; only the official CODEX_HOME remains shared.
       ...await codexSocketSetting(root, codexHome, profile.codexLocalProxy, record.codexSocket),
@@ -342,18 +348,24 @@ function hostAgentUnavailable(error: unknown): error is RemoteInstanceError {
  * A host agent's runner configuration from the record: its private folders
  * (checked again) and the settings its adapter re-locates and re-verifies.
  */
+async function assertPrivateRunnerDirectory(path: string): Promise<void> {
+  const info = await lstat(path);
+  if (!info.isDirectory() || !privateOwner(info)) throw invalid();
+}
+
 export async function nativeHostRunnerConfig(root: string, record: NativeRuntimeRecord, agent: string): Promise<RunnerConfig> {
   const host = hostAgentInstallAdapter(agent);
-  if (!host || !record.agents.includes(agent as NativeRuntimeRecord["agents"][number])) throw invalid();
+  if (!host) throw invalid();
+  if (!record.agents.includes(agent as NativeRuntimeRecord["agents"][number])) throw invalid();
   const credentials = join(root, "credentials", agent);
   const workspace = join(root, "workspaces", agent);
-  for (const path of [credentials, workspace]) {
-    const info = await lstat(path);
-    if (!info.isDirectory() || !privateOwner(info)) throw invalid();
-  }
+  await assertPrivateRunnerDirectory(credentials);
+  await assertPrivateRunnerDirectory(workspace);
   return RunnerConfigSchema.parse({
     RUNNER_AGENT_ID: agent, RUNNER_AUTH_MODE: "agent_local_subscription",
     RUNNER_CREDENTIAL_DIR: credentials, RUNNER_WORKSPACE_DIR: workspace,
+    ...(record.agentSkillHomes ? { RUNNER_NATIVE_SKILL_HOMES: record.agentSkillHomes } : {}),
+    ...(agent === "claude-code" && record.claudeConfigDir ? { RUNNER_NATIVE_CLAUDE_CONFIG_DIR: record.claudeConfigDir } : {}),
     ...await host.runnerSettings(record, { root }),
   });
 }

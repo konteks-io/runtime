@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { createInterface } from "node:readline/promises";
 import { join } from "node:path";
 import { Command, InvalidArgumentError } from "commander";
 import { isRetiredAgentId, retiredAgentMessage } from "@konteks/backstage-plugin-common";
@@ -18,18 +19,20 @@ const NATIVE_AGENT_IDS = ["claude-code", "codex", "dsh", "opencode", "antigravit
 type NativeAgentId = (typeof NATIVE_AGENT_IDS)[number];
 
 export interface NativeCommandContext { root: string; output: Output }
+type SkillShareAudience = { level: "organization" } | { level: "systems"; systemIds: string[] };
 export interface NativeCliActions {
   install(input: NativeCommandContext & { activationId?: string; enroll?: boolean; coreUrl: string; relayUrl: string; agents?: string[] }): Promise<void>;
   onboard(input: NativeCommandContext & { answer?: string; cwd?: string }): Promise<void>;
   stageEnrollment(input: NativeCommandContext): Promise<void>;
   addAgent(input: NativeCommandContext & { agent: NativeAgentId; yes?: boolean }): Promise<void>;
   removeAgent(input: NativeCommandContext & { agent: NativeAgentId; yes?: boolean }): Promise<void>;
+  configureSkills(input: NativeCommandContext): Promise<void>;
   serve(input: NativeCommandContext): Promise<void>;
   start(input: NativeCommandContext): Promise<void>;
   stop(input: NativeCommandContext): Promise<void>;
   update(input: NativeCommandContext & { check: boolean; unattended: boolean }): Promise<void>;
   uninstall(input: NativeCommandContext): Promise<void>;
-  control(input: NativeCommandContext & { operation: "status" | "agents" | "doctor" | "support" | "preview.status" | "auth.status" | "auth.login" | "auth.logout" | "git.key.add" | "git.key.list" | "git.key.remove"; agent?: string; organization?: boolean; provider?: string; method?: string; reuse?: boolean; project?: string; location?: string; title?: string; keyRef?: string }): Promise<void>;
+  control(input: NativeCommandContext & { operation: "status" | "agents" | "doctor" | "support" | "preview.status" | "auth.status" | "auth.login" | "auth.logout" | "git.key.add" | "git.key.list" | "git.key.remove" | "skills.sync" | "skills.list" | "skills.share" | "skills.unshare"; agent?: string; organization?: boolean; provider?: string; method?: string; reuse?: boolean; project?: string; location?: string; title?: string; keyRef?: string; skill?: string; audience?: SkillShareAudience; initiativeIds?: string[]; confirmOngoing?: true; confirm?: true }): Promise<void>;
 }
 
 /** One customer architecture: the native connector. No provider-key or cloud-agent fallback switch. */
@@ -125,6 +128,41 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     support: "collect a support bundle to share with Konteks support",
   } as const;
   for (const operation of ["status", "agents", "doctor", "support"] as const) program.command(operation).description(CONTROL_HELP[operation]).action(async () => actions.control({ ...context(), operation }));
+  const skills = program.command("skills").description("shared Skills in your local coding agent profiles");
+  skills.command("configure").description("bind local Codex and Claude Skill folders for this installation; requires the connector to be stopped")
+    .action(async () => actions.configureSkills(context()));
+  skills.command("sync").description("reconcile the latest Skills this runtime is allowed to use")
+    .action(async () => actions.control({ ...context(), operation: "skills.sync" }));
+  skills.command("list").description("show Skill versions and sync status for this runtime's agent profiles")
+    .action(async () => actions.control({ ...context(), operation: "skills.list" }));
+  const scopeId = (value: string): string => {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)) throw new InvalidArgumentError("expected a system or initiative ID");
+    return value;
+  };
+  const repeatedScopeId = (value: string, previous: string[] = []): string[] => [...previous, scopeId(value)];
+  const share = skills.command("share").description("share a complete Skill and automatically publish future edits")
+    .argument("<skill>", "Skill name, ID, or local folder")
+    .option("--system <id>", "share with an application or repository system; repeat for more systems", repeatedScopeId, [])
+    .option("--organization", "share with this organization")
+    .option("--initiative <id>", "limit use to an initiative; repeat for more initiatives", repeatedScopeId, [])
+    .option("--yes", "confirm automatic publication of future edits", false);
+  share.action(async (skill: string, options: { system: string[]; organization: boolean; initiative: string[]; yes: boolean }) => {
+    const interactive = process.stdin.isTTY === true && !program.opts<{ json: boolean }>().json;
+    const audience = await chooseSkillShareAudience(options, interactive);
+    const confirmOngoing = options.yes || await confirmOngoingSkillSharing(interactive);
+    if (!confirmOngoing) throw new InvalidArgumentError("Skill sharing was cancelled; no future edits were published.");
+    await actions.control({ ...context(), operation: "skills.share", skill, audience,
+      initiativeIds: [...new Set(options.initiative)], confirmOngoing: true });
+  });
+  const unshare = skills.command("unshare").description("stop sharing this runtime's Skill while keeping its local source")
+    .argument("<skill>", "the same Skill name, ID, or local folder used when sharing")
+    .option("--yes", "confirm that this Skill will no longer be available through its shared audience", false);
+  unshare.action(async (skill: string, options: { yes: boolean }) => {
+    const interactive = process.stdin.isTTY === true && !program.opts<{ json: boolean }>().json;
+    const confirmed = options.yes || await confirmSkillUnsharing(interactive);
+    if (!confirmed) throw new InvalidArgumentError("Skill unsharing was cancelled; its shared access is unchanged.");
+    await actions.control({ ...context(), operation: "skills.unshare", skill, confirm: true });
+  });
   // Read-only. Whether this computer serves previews is switched per machine
   // in Konteks (Customize → Runtimes), never here.
   const preview = program.command("preview").description("live previews of sessions' work, served from this computer");
@@ -174,6 +212,49 @@ export function createNativeProgram(actions: NativeCliActions): Command {
   program.command("uninstall").description("remove Konteks from this computer after running work finishes; your repositories and your agents' own sign-ins stay")
     .action(async () => actions.uninstall(context()));
   return program;
+}
+
+async function terminalAnswer(question: string): Promise<string> {
+  const prompt = createInterface({ input: process.stdin, output: process.stderr });
+  try { return await prompt.question(question); }
+  finally { prompt.close(); }
+}
+
+async function chooseSkillShareAudience(options: { system: string[]; organization: boolean }, interactive: boolean): Promise<SkillShareAudience> {
+  const systems = [...new Set(options.system)];
+  if (options.organization && systems.length) throw new InvalidArgumentError("choose either --organization or one or more --system options");
+  if (options.organization) return { level: "organization" };
+  if (systems.length) return { level: "systems", systemIds: systems };
+  if (!interactive) throw new InvalidArgumentError("choose a sharing audience with --system <id> or --organization");
+  return promptSkillShareAudience();
+}
+
+async function promptSkillShareAudience(): Promise<SkillShareAudience> {
+  const choice = (await terminalAnswer("Share with this organization or selected systems? Type 'organization' or 'systems': ")).trim().toLowerCase();
+  if (choice === "organization") return { level: "organization" };
+  if (choice !== "systems") throw new InvalidArgumentError("choose 'organization' or 'systems'; no Skill was shared");
+  return { level: "systems", systemIds: parseSkillSystemIds(await terminalAnswer("Enter one or more system IDs separated by commas: ")) };
+}
+
+function parseSkillSystemIds(raw: string): string[] {
+  const ids = [...new Set(raw.split(",").map(value => value.trim()).filter(Boolean).map(value => {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)) throw new InvalidArgumentError("expected a system ID");
+    return value;
+  }))];
+  if (!ids.length) throw new InvalidArgumentError("at least one system ID is required; no Skill was shared");
+  return ids;
+}
+
+async function confirmOngoingSkillSharing(interactive: boolean): Promise<boolean> {
+  if (!interactive) throw new InvalidArgumentError("sharing also publishes future edits automatically; confirm with --yes");
+  const answer = (await terminalAnswer("Future edits to this Skill will be shared automatically. Type 'yes' to continue: ")).trim().toLowerCase();
+  return answer === "yes";
+}
+
+async function confirmSkillUnsharing(interactive: boolean): Promise<boolean> {
+  if (!interactive) throw new InvalidArgumentError("unsharing stops access for the current audience; confirm with --yes");
+  const answer = (await terminalAnswer("Stop sharing this Skill? Its local files will stay on this computer. Type 'yes' to continue: ")).trim().toLowerCase();
+  return answer === "yes";
 }
 
 type LoginOptions = { organization: boolean; provider?: string; method?: string; reuse: boolean; apiKey: boolean; enterprise: boolean; project?: string; location?: string };

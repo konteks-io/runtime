@@ -85,7 +85,7 @@ function fixture() {
     fileCount: 1,
     expiresAt: "2026-09-06T02:00:00Z",
   };
-  const catalog = { version: 1, binding, skills: [] };
+  const catalog = { version: 1, binding, catalogRevision: `sha256:${'a'.repeat(64)}`, skills: [] };
   const selection = {
     version: 1,
     binding,
@@ -347,11 +347,15 @@ describe("native claim-scoped input client", () => {
       },
     });
     const { signature: _, ...unsigned } = f.envelope;
+    // Published Core predates owner revisions. Keep its signed v1 bytes exact.
+    const { catalogRevision: _revision, catalogDigest: _catalogDigest, ...legacyCatalog } = unsigned.selection.skills;
+    unsigned.selection.skills = { ...legacyCatalog, catalogDigest: computeRemoteSkillCatalogDigest(legacyCatalog) };
+    unsigned.selectionDigest = computeRemoteAssignmentInputSelectionDigest(unsigned.selection);
     const signature = await producer.sign(unsigned);
     f.fetchFn.mockResolvedValue(f.response({ ...unsigned, signature }));
     expect(
       (await new NativeInputClient(f.options).prepare(assignment, "claim")).selectionDigest,
-    ).toBe(f.envelope.selectionDigest);
+    ).toBe(unsigned.selectionDigest);
   });
   it("clears its deadline when the fetch adapter throws synchronously", async () => {
     vi.useFakeTimers();

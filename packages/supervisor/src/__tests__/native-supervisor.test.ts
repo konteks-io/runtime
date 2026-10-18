@@ -278,14 +278,19 @@ describe("native Supervisor composition", () => {
     const f = await fixture(), supervisor = new Supervisor(f.config, f.options);
     supervisors.push(supervisor);
     await supervisor.start();
-    const internals = supervisor as unknown as { hostSettings: { openCodeFreeModels: boolean; coreAcceptsRouteBilling: boolean }; applyHostSettings(configuration: Record<string, unknown>): void };
+    const internals = supervisor as unknown as { hostSettings: { openCodeFreeModels: boolean; coreAcceptsRouteBilling: boolean; coreAcceptsSkillStatus: boolean }; applyHostSettings(configuration: Record<string, unknown>): void };
     const apply = (configuration: Record<string, unknown>) => { internals.applyHostSettings(configuration); return { ...internals.hostSettings }; };
-    expect(apply({ coreContractVersion: "7.1" })).toEqual({ openCodeFreeModels: false, coreAcceptsRouteBilling: true });
-    expect(apply({ coreContractVersion: "7.2", openCodeFreeModelsEnabled: true })).toEqual({ openCodeFreeModels: true, coreAcceptsRouteBilling: true });
-    expect(apply({ openCodeFreeModelsEnabled: true })).toEqual({ openCodeFreeModels: true, coreAcceptsRouteBilling: false });
-    expect(apply({ openCodeFreeModelsEnabled: false })).toEqual({ openCodeFreeModels: false, coreAcceptsRouteBilling: false });
-    expect(apply({ coreContractVersion: "7.0" })).toEqual({ openCodeFreeModels: false, coreAcceptsRouteBilling: false });
-    expect(apply({})).toEqual({ openCodeFreeModels: false, coreAcceptsRouteBilling: false });
+    expect(apply({ coreContractVersion: "7.1" })).toEqual({ openCodeFreeModels: false, coreAcceptsRouteBilling: true, coreAcceptsSkillStatus: false });
+    expect(apply({ coreContractVersion: "7.2", openCodeFreeModelsEnabled: true })).toEqual({ openCodeFreeModels: true, coreAcceptsRouteBilling: true, coreAcceptsSkillStatus: false });
+    expect(apply({ coreContractVersion: "7.7" })).toEqual({ openCodeFreeModels: false, coreAcceptsRouteBilling: true, coreAcceptsSkillStatus: false });
+    expect(apply({ coreContractVersion: "7.10" })).toEqual({ openCodeFreeModels: false, coreAcceptsRouteBilling: true, coreAcceptsSkillStatus: false });
+    expect(apply({ coreContractVersion: "7.11" })).toEqual({ openCodeFreeModels: false, coreAcceptsRouteBilling: true, coreAcceptsSkillStatus: false });
+    expect(apply({ coreContractVersion: "7.12" })).toEqual({ openCodeFreeModels: false, coreAcceptsRouteBilling: true, coreAcceptsSkillStatus: false });
+    expect(apply({ coreContractVersion: "7.13" })).toEqual({ openCodeFreeModels: false, coreAcceptsRouteBilling: true, coreAcceptsSkillStatus: true });
+    expect(apply({ openCodeFreeModelsEnabled: true })).toEqual({ openCodeFreeModels: true, coreAcceptsRouteBilling: false, coreAcceptsSkillStatus: false });
+    expect(apply({ openCodeFreeModelsEnabled: false })).toEqual({ openCodeFreeModels: false, coreAcceptsRouteBilling: false, coreAcceptsSkillStatus: false });
+    expect(apply({ coreContractVersion: "7.0" })).toEqual({ openCodeFreeModels: false, coreAcceptsRouteBilling: false, coreAcceptsSkillStatus: false });
+    expect(apply({})).toEqual({ openCodeFreeModels: false, coreAcceptsRouteBilling: false, coreAcceptsSkillStatus: false });
   });
 
   it("cancels a local login when its control caller disconnects", async () => {

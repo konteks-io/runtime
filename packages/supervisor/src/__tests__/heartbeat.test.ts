@@ -29,6 +29,20 @@ async function fixture() {
   return { store, key, heartbeat, transport, inventory, onResult, onFailure, publisher, result, options };
 }
 describe("signed HTTPS heartbeat lifecycle", () => {
+  it("retains the failure reason when a scheduled heartbeat retries", async () => {
+    const f = await fixture();
+    const failure = new Error("Core rejected heartbeat schema");
+    const warn = vi.fn();
+    const publisher = new HeartbeatPublisher({ ...f.options, runnerIncarnation: () => "process", logger: { warn } as unknown as HeartbeatOptions["logger"] } as HeartbeatOptions);
+    publishers.push(publisher);
+    f.heartbeat.mockRejectedValueOnce(failure);
+    vi.useFakeTimers();
+    await publisher.start();
+    await vi.advanceTimersByTimeAsync(5000);
+    await publisher.settle();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(warn).toHaveBeenCalledWith({ err: failure }, "heartbeat failed; retrying on the next bounded interval");
+  });
   it("publishes the whole freshly collected inventory to its local consumer before sending it", async () => {
     const f = await fixture();
     const snapshot: InventorySnapshot = {
@@ -148,6 +162,32 @@ describe("signed HTTPS heartbeat lifecycle", () => {
     const older = new HeartbeatPublisher({ ...f.options, runnerIncarnation: () => "process" } as HeartbeatOptions); publishers.push(older);
     await older.start();
     expect(Object.keys(await older.publish())).not.toContain("supportedAgents");
+  });
+  it("carries the last reconciled Skill freshness in the signed heartbeat", async () => {
+    const f = await fixture();
+    const skillStatus = {
+      syncing: false,
+      agents: [{
+        agentId: "codex",
+        desiredCatalogRevision: `sha256:${"a".repeat(64)}`,
+        installedCatalogRevision: `sha256:${"a".repeat(64)}`,
+        loadedCatalogRevision: null,
+        syncStatus: "synchronized" as const,
+        loadStatus: "unknown" as const,
+        reasonCode: "load_proof_unavailable" as const,
+      }],
+      lastSuccess: null,
+    };
+    f.options.skillStatus = () => skillStatus;
+    const previews = [{ sessionId: "session-1", startedAt: "2026-09-06T00:00:00.000Z", agentActiveAt: "2026-09-06T00:02:00.000Z" }];
+    f.options.previews = () => previews;
+    const publisher = new HeartbeatPublisher({ ...f.options, runnerIncarnation: () => "process" } as HeartbeatOptions);
+    publishers.push(publisher);
+    await publisher.start();
+    expect(await publisher.publish()).toMatchObject({ skillStatus, previews });
+    const { signature, ...sent } = f.heartbeat.mock.calls.at(-1)![0] as HeartbeatMessage & { signature: string };
+    expect(HeartbeatMessageSchema.parse(sent)).toMatchObject({ skillStatus, previews });
+    expect(verifyInstanceProof(f.key.publicKey, { method: "heartbeat", audience: CORE_AUDIENCE, subject: "instance", body: sent as never }, { algorithm: "ES256", nonce: `seq:${sent.sequence}`, signature })).toBe(true);
   });
   it("carries the agent's previews inside the signed body as the contract's schema reads them, and a failing provider never costs the heartbeat", async () => {
     const f = await fixture();

@@ -1,6 +1,7 @@
 import { generateKeyPairSync } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { FixedClock, jcsDigest, generateInstanceKey, verifyInstanceProof, remoteExecutionInstanceProofSubject } from "@konteks/remote-common";
+import type { AgentSkillReadObservation } from "@konteks/backstage-plugin-common/remote-instance-internal";
 import { CoreClient, CORE_AUDIENCE, SIGNING_KEY_STALE_MAX_MS } from "../core/client.js";
 
 function fixture(response: object) {
@@ -24,6 +25,28 @@ describe("observation HTTPS receipts", () => {
   it.each([{ observationDigest: "x".repeat(43) }, { observationId: "other" }, { accepted: 1 }])("rejects an unbound receipt", async patch => {
     const f = fixture({ ...receipt, ...patch });
     await expect(f.client.submitObservation("instance", usage)).rejects.toBeDefined();
+  });
+
+  it("signs completed Skill reads and verifies the content-bound Core receipt", async () => {
+    const observation: AgentSkillReadObservation = {
+      instanceId: "instance", agentId: "codex", executionId: "execution", sessionId: "session",
+      assignmentId: "assignment", attempt: 1, claimId: "claim", recoveryEpoch: 0, readyRevision: 1,
+      runnerIncarnation: "runner", acpSessionRef: "acp-session", executionRevision: 1,
+      leaseSetId: "lease-set", kind: "skill_read_completed", eventId: "skill-read-event",
+      turnId: "turn", toolCallId: "tool-call", capabilityId: "abf086ab-74ae-4a7c-9204-7a77852f50e7",
+      version: "1.2.3", observedAt: "2026-09-22T00:00:00Z",
+    };
+    const digest = jcsDigest(observation);
+    const f = fixture({ stored: true, observationId: `ri:skill:${digest}`, observationDigest: digest });
+
+    await expect(f.client.submitObservation("instance", observation)).resolves.toBeUndefined();
+    const [url, init] = f.fetchFn.mock.calls[0]!;
+    expect(String(url)).toBe("https://core.example/api/remote-instances/internal/remote-instances/instance/observations");
+    const { proof, ...request } = JSON.parse(String(init?.body));
+    expect(request).toEqual({ observation });
+    expect(verifyInstanceProof(f.key.publicKey, {
+      method: "skill_usage_observation", audience: CORE_AUDIENCE, subject: "instance", body: request,
+    }, proof)).toBe(true);
   });
 });
 

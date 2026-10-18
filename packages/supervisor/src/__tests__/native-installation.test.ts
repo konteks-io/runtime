@@ -121,6 +121,13 @@ describe("closed native runtime installation", () => {
     try { await expect(loadNativeInstallation(root, f.options)).rejects.toThrow(); }
     finally { inspect.mockRestore(); syncBuiltinESMExports(); verify.mockRestore(); }
   });
+  it("passes only installer-bound Skill homes to the runner and leaves legacy installs opt-in", async () => {
+    const f = await fixture();
+    expect((await loadNativeInstallation(root, f.options)).runners[0]).not.toHaveProperty("RUNNER_NATIVE_SKILL_HOMES");
+    const agentSkillHomes = [".codex", ".agents", ".claude", ".claude-dsh", ".opencode", ".antigravity", ".codex-custom"].map(home => join(root, home));
+    await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, agentSkillHomes }));
+    expect((await loadNativeInstallation(root, f.options)).runners[0]!.RUNNER_NATIVE_SKILL_HOMES).toEqual(agentSkillHomes);
+  });
   it("loads only the digest-matching installer-selected Git executable", async () => {
     const f = await fixture(), git = await testGitTool();
     await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, git }));

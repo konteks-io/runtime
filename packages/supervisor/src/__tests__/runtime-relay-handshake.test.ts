@@ -118,6 +118,39 @@ describe("relay socket lease rotation (2026-10-03)", () => {
 });
 
 describe("native runtime relay handshake validation boundary", () => {
+  it("delivers catalog-change hints on the current WSS generation without treating them as channel frames", async () => {
+    const notice = {
+      type: "runtime_skill_catalog_changed",
+      workspaceId: "workspace",
+      instanceId: "instance",
+      notificationId: "notification-a",
+      catalogRevision: `sha256:${"a".repeat(64)}`,
+      changeKind: "updated",
+      issuedAt: confirmed.runtimeReconciliation.acceptedAt,
+      expiresAt: "2026-09-06T00:01:00.000Z",
+      signature: "c2lnbmVk",
+    } as const;
+    let current = false;
+    const onSkillCatalogChanged = vi.fn<NonNullable<RelayClientOptions["onSkillCatalogChanged"]>>(async (_request, connection) => {
+      expect(connection.connectionEpoch).toBe(confirmed.connectionEpoch);
+      connection.assertCurrent();
+      current = true;
+    });
+    const f = delayedAdoption({ onSkillCatalogChanged });
+    const receive = vi.spyOn(f.mux, "receive");
+    await flush();
+    expect(onSkillCatalogChanged).not.toHaveBeenCalled();
+    f.socket.message(notice);
+    await flush();
+    expect(onSkillCatalogChanged).not.toHaveBeenCalled();
+    f.adoption.resolve();
+    await flush();
+    expect(onSkillCatalogChanged).toHaveBeenCalledWith(notice, expect.objectContaining({ connectionEpoch: confirmed.connectionEpoch }));
+    expect(current).toBe(true);
+    expect(receive).not.toHaveBeenCalled();
+    f.client.stop();
+  });
+
   const runtimeUpdate = () => ({ type: "runtime_update_delivery", method: "POST", path: { instanceId: "instance" },
     nodeId: "node", connectionRef: "connection", connectionEpoch: 7,
     intent: { updateId: "update", tenantId: "tenant", instanceId: "instance", leaseId: "lease", runnerIncarnation: "process",

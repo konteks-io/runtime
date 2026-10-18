@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { AgentTurnUsageObservationSchema, createLogger, jcsDigest,
-  RemoteInstanceError, type Clock, type Logger, type JsonValue } from "@konteks/remote-common";
+  RemoteInstanceError, type AgentTurnUsageObservation, type Clock, type Logger, type JsonValue } from "@konteks/remote-common";
+import {
+  AgentSkillReadObservationSchema,
+  type AgentSkillReadObservation,
+} from "@konteks/backstage-plugin-common/remote-instance-internal";
 import type { CoreClient } from "../core/client.js";
 import type { DurableOutbox } from "../state/outbox.js";
 
@@ -27,7 +31,10 @@ export class ObservationDelivery {
     await this.flushing;
   }
   async submit(body: unknown): Promise<void> {
-    const observation = AgentTurnUsageObservationSchema.parse(body);
+    const skillRead = AgentSkillReadObservationSchema.safeParse(body);
+    const observation: AgentTurnUsageObservation | AgentSkillReadObservation = skillRead.success
+      ? skillRead.data
+      : AgentTurnUsageObservationSchema.parse(body);
     if (observation.instanceId !== this.options.instanceId()) throw new Error("Observation instance mismatch");
     await this.options.outbox.enqueue({ id: randomUUID(), channel: "observation",
       key: `observation:${jcsDigest(observation as unknown as JsonValue)}`, group: "observation", order: this.options.clock.now(),

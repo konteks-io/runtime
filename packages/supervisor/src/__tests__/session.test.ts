@@ -274,6 +274,76 @@ describe("relayed session", () => {
     await session.close("cancelled");
   });
 
+  it("starts a continued conversation with a fresh provider context when it has governed skills", async () => {
+    const catalogRevision = `sha256:${"a".repeat(64)}`;
+    const onSkillProfilePrepared = vi.fn();
+    const onSkillLoadProof = vi.fn();
+    const onSkillProfileClosed = vi.fn();
+    const prepareInputs = vi.fn(async (target: RemoteWorkAssignment) => ({
+      binding: { workspaceId: target.workspaceId, sessionId: "s", assignmentId: target.id, instanceId: target.instanceId, attempt: target.attempt },
+      cwd: "/private/native/checkout",
+      readOnlyRoots: ["/private/native/checkout/.konteks/skills"],
+      managedSkills: [{ skillId: "skill-1", version: "1.2.3", skillFile: "/private/native/checkout/.konteks/skills/skill-1/SKILL.md" }],
+      managedSkillCatalogRevision: catalogRevision,
+      skillInstructions: "Read the current governed skill before work.",
+      beforePrompt: async () => undefined,
+    }));
+    const f = await build({
+      prepareInputs,
+      onSkillProfilePrepared,
+      onSkillLoadProof,
+      onSkillProfileClosed,
+      activateExecution: async () => ({ restoreReference: "prior-acp-ref" }),
+      assertLegacyCodexThreadUnloaded: async () => true,
+    });
+    try {
+      await f.session.bootstrap();
+      expect(onSkillProfilePrepared).toHaveBeenCalledWith({ agentId: "codex", catalogRevision });
+      expect(onSkillLoadProof).not.toHaveBeenCalled();
+      expect(f.runner.createSession).toHaveBeenCalledWith(expect.objectContaining({
+        restoreAcpSessionRef: "prior-acp-ref",
+        freshProviderSessionOnRestore: true,
+      }), undefined);
+    } finally {
+      await f.session.close("cancelled");
+      expect(onSkillProfileClosed).toHaveBeenCalledOnce();
+    }
+  });
+
+  it("keeps profile freshness retained when governed closure is unconfirmed", async () => {
+    const onSkillProfileClosed = vi.fn();
+    const f = await build({ onSkillProfileClosed,
+      onClosed: async () => { throw new Error("closure unconfirmed"); } });
+    await f.session.bootstrap();
+    await expect(f.session.close("cancelled")).rejects.toThrow("closure unconfirmed");
+    expect(onSkillProfileClosed).not.toHaveBeenCalled();
+  });
+
+  it("replaces a live provider transcript when a continued conversation has governed skills", async () => {
+    const work = {
+      ...assignment,
+      agentRoute: { ...assignment.agentRoute, agentId: "claude-code" },
+    } as RemoteWorkAssignment;
+    const prepareInputs = async (target: RemoteWorkAssignment) => ({
+      binding: { workspaceId: target.workspaceId, sessionId: "s", assignmentId: target.id, instanceId: target.instanceId, attempt: target.attempt },
+      cwd: "/private/native/checkout",
+      managedSkills: [{ skillId: "skill-1", version: "1.2.3", skillFile: "/private/native/checkout/.konteks/skills/skill-1/SKILL.md" }],
+      skillInstructions: "Read the current governed skill before work.",
+      beforePrompt: async () => undefined,
+    });
+    const f = await build({
+      prepareInputs,
+      activateExecution: async () => ({ continueReference: "prior-acp-ref" }),
+    }, work);
+    try {
+      await f.session.bootstrap();
+      expect(f.runner.createSession).toHaveBeenCalledWith(expect.objectContaining({
+        acpSessionRef: "prior-acp-ref",
+        freshProviderSessionOnContinue: true,
+      }), undefined);
+    } finally { await f.session.close("cancelled"); }
+  });
+
   it.each(["live", "restored"] as const)("keeps a %s Codex thread's MCP transport bound to only the current fenced turn", async continuation => {
     const seen: string[] = [];
     let holdNext = false;
@@ -2108,6 +2178,51 @@ describe("relayed session", () => {
     expect(journal.openRequests("acp-1")).toHaveLength(0);
     await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p1", result: { stopReason: "end_turn" } });
     expect(session.counters.unknownCompletions).toBe(2);
+  });
+
+  it("blocks non-Skill tool permissions until every required staged Skill has been read", async () => {
+    const skillFile = `${dir}/skills/review/SKILL.md`;
+    const prepareInputs = async (target: RemoteWorkAssignment) => ({
+      binding: { workspaceId: target.workspaceId, sessionId: "s", assignmentId: target.id, instanceId: target.instanceId, attempt: target.attempt },
+      cwd: `${dir}/workspace`, managedSkills: [{ skillId: "skill-review", version: "1.2.3", skillFile }],
+      skillInstructions: "Read the required Skill.", beforePrompt: async () => undefined,
+    });
+    const policy = new EvaluatorPolicyResponder({ evaluateToolUse: async () => ({ allowed: true }) }, () => true);
+    const f = await build({ prepareInputs, policy }, validation);
+    try {
+      await f.session.bootstrap();
+      await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: "write", params: {
+        sessionId: "acp-1", toolCall: { toolCallId: "write-call", kind: "edit", rawInput: { file_path: `${dir}/workspace/src/a.ts` } },
+        options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" }],
+      } } as never);
+      expect(f.runner.answer).toHaveBeenCalledWith("acp-1", "write", { outcome: { outcome: "cancelled" } });
+      expect(f.sent.some(message => JSON.stringify(message.body).includes("Load every required Skill"))).toBe(true);
+
+      await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: "read", params: {
+        sessionId: "acp-1", toolCall: { toolCallId: "read-call", kind: "read", rawInput: { file_path: skillFile } },
+        options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" }],
+      } } as never);
+      expect(f.runner.answer).toHaveBeenCalledWith("acp-1", "read", { outcome: { outcome: "selected", optionId: "allow" } });
+    } finally { await f.session.close("cancelled"); }
+  });
+
+  it("does not accept a completed turn until required Skill load proof exists", async () => {
+    const prepareInputs = async (target: RemoteWorkAssignment) => ({
+      binding: { workspaceId: target.workspaceId, sessionId: "s", assignmentId: target.id, instanceId: target.instanceId, attempt: target.attempt },
+      cwd: `${dir}/workspace`, managedSkills: [{ skillId: "skill-review", version: "1.2.3", skillFile: `${dir}/skills/review/SKILL.md` }],
+      skillInstructions: "Read the required Skill.", beforePrompt: async () => undefined,
+    });
+    const f = await build({ prepareInputs }, validation);
+    try {
+      await f.session.bootstrap();
+      await f.session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p-skill", params: {
+        sessionId: "acp-1", prompt: [{ type: "text", text: "Do the work" }],
+      } });
+      await f.session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p-skill", result: { stopReason: "end_turn" } } as never);
+      expect(f.sent.at(-1)?.body).toMatchObject({ kind: "acp_error", id: "p-skill", method: "session/prompt",
+        error: { class: "policy_denied", message: expect.stringContaining("managed_skill_load_proof_missing"), retryable: false } });
+      expect(f.sent.some(message => (message.body as { kind?: string }).kind === "acp_result" && (message.body as { id?: string }).id === "p-skill")).toBe(false);
+    } finally { await f.session.close("cancelled"); }
   });
 
   describe("structured result (submit_result)", () => {

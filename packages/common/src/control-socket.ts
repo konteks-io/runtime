@@ -22,6 +22,11 @@ export const CONTROL_TOKEN_FILE_NAME = "control.token";
 const agentIdSchema = z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/);
 const providerIdSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/);
 const methodIdSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/);
+const skillScopeIdSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
+const skillShareAudienceSchema = z.discriminatedUnion("level", [
+  z.object({ level: z.literal("organization") }).strict(),
+  z.object({ level: z.literal("systems"), systemIds: z.array(skillScopeIdSchema).min(1).max(32).refine(ids => new Set(ids).size === ids.length) }).strict(),
+]);
 
 export const ControlRequestSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("status") }).strict(),
@@ -55,6 +60,20 @@ export const ControlRequestSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("git.key.add"), title: z.string().trim().min(1).max(256).optional() }).strict(),
   z.object({ op: z.literal("git.key.list") }).strict(),
   z.object({ op: z.literal("git.key.remove"), keyRef: z.string().trim().min(1).max(200) }).strict(),
+  z.object({ op: z.literal("skills.sync") }).strict(),
+  z.object({ op: z.literal("skills.list") }).strict(),
+  z.object({
+    op: z.literal("skills.unshare"),
+    skill: z.string().trim().min(1).max(4096).refine(value => !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(value)),
+    confirm: z.literal(true),
+  }).strict(),
+  z.object({
+    op: z.literal("skills.share"),
+    skill: z.string().trim().min(1).max(4096).refine(value => !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(value)),
+    audience: skillShareAudienceSchema,
+    initiativeIds: z.array(skillScopeIdSchema).max(32).refine(ids => new Set(ids).size === ids.length),
+    confirmOngoing: z.literal(true),
+  }).strict(),
   z.object({ op: z.literal("drain"), reason: z.enum(["user", "update", "remove"]) }).strict(),
   z.object({ op: z.literal("drain.status") }).strict(),
   /** Verify the shared Codex owner before a cancellable update drain becomes service stop. */
@@ -126,7 +145,7 @@ export const ControlLoginEventSchema = z.discriminatedUnion("kind", [
       loginId: z.string(),
       label: z.string().max(256),
       secret: z.boolean(),
-      /** A choice typed in the open (OpenCode's provider pick); otherwise the launcher reads it hidden. */
+      /** A non-secret answer typed in the open; otherwise the launcher reads it hidden. */
       visible: z.literal(true).optional(),
     })
     .strict(),

@@ -11,7 +11,7 @@ import { delimiter, join, resolve } from "node:path";
 export const CLI_NAME = "konteks-remote";
 
 /** The connector's top-level commands: a hint is the name followed by one of them. */
-const COMMANDS = ["agent", "agents", "auth", "doctor", "git", "install", "onboard", "preview", "serve", "start", "status", "stop", "support", "uninstall", "update"];
+const COMMANDS = ["agent", "agents", "auth", "doctor", "git", "install", "onboard", "preview", "serve", "skills", "start", "status", "stop", "support", "uninstall", "update"];
 const HINT = new RegExp(`(?<![\\w./\\\\"'-])${CLI_NAME}(?= (?:--[a-z-]+ )*(?:${COMMANDS.join("|")})\\b)`, "g");
 
 export interface CliCommandInput {

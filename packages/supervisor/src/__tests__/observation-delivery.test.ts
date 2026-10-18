@@ -10,6 +10,11 @@ beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "observation-ack-"))
 afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
 const usage = { instanceId: "i", assignmentId: "a", agentId: "claude-code", attempt: 1,
   moneyBasis: "unavailable_local_subscription" as const, observedAt: "2026-09-22T00:00:00Z", outputTokens: 3 };
+const skillRead = { instanceId: "i", agentId: "codex", executionId: "execution", sessionId: "session",
+  assignmentId: "assignment", attempt: 1, claimId: "claim", recoveryEpoch: 0, readyRevision: 1,
+  runnerIncarnation: "runner", acpSessionRef: "acp-session", executionRevision: 1, leaseSetId: "lease-set",
+  kind: "skill_read_completed" as const, eventId: "skill-read-event", turnId: "turn", toolCallId: "tool-call",
+  capabilityId: "abf086ab-74ae-4a7c-9204-7a77852f50e7", version: "1.2.3", observedAt: "2026-09-22T00:00:00Z" };
 async function fixture() {
   const outbox = new DurableOutbox(dir); await outbox.load();
   let enabled = true;
@@ -35,6 +40,13 @@ it("retains the exact record after local ACK persistence fails", async () => {
   expect(f.outbox.depth).toBe(1);
   await f.delivery.flush(); expect(f.outbox.depth).toBe(0);
   expect(f.submitObservation.mock.calls[0]).toEqual(f.submitObservation.mock.calls[1]);
+});
+it("durably queues completed Skill reads through the same receipt reconciler", async () => {
+  const f = await fixture();
+  await f.delivery.submit(skillRead);
+  await f.delivery.flush();
+  expect(f.submitObservation).toHaveBeenCalledWith("i", skillRead);
+  expect(f.outbox.depth).toBe(0);
 });
 it("does not send foreign-instance history or send while recovery is blocked", async () => {
   const f = await fixture(); f.disable();

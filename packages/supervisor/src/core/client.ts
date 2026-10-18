@@ -11,7 +11,12 @@ import { AgentTurnUsageObservationSchema, RuntimeAgentLoginReportSchema, Runtime
 } from "@konteks/remote-common";
 
 import { z } from "zod";
-import { createHash, createPublicKey, type KeyObject } from "node:crypto";
+import { createHash, createPublicKey, randomUUID, type KeyObject } from "node:crypto";
+import {
+  AgentSkillReadObservationSchema,
+  RemoteSkillReadObservationReceiptSchema,
+  type AgentSkillReadObservation,
+} from "@konteks/backstage-plugin-common/remote-instance-internal";
 import {
   BoundedJsonValueSchema,
   ClaimResultSchema,
@@ -107,6 +112,23 @@ import {
   type WorkAvailable,
 } from "@konteks/remote-common";
 import { decodeLeaseClaims } from "../lease/lease.js";
+import {
+  LocalRuntimeSkillShareSchema,
+  LocalRuntimeSkillUnshareSchema,
+  RemoteFileTreeSchema,
+  RuntimeSkillSyncEnvelopeSchema,
+  RuntimeSkillSyncFileRequestSchema,
+  RuntimeSkillSyncPrepareRequestSchema,
+  RuntimeSkillSyncPublishRequestSchema,
+  RuntimeSkillSyncOwnerPublishResponseSchema,
+  RuntimeSkillSyncOwnerUnshareResponseSchema,
+  type RuntimeSkillSyncOwnerPublishResponse,
+  type LocalRuntimeSkillShare,
+  type LocalRuntimeSkillUnshare,
+  type RuntimeSkillSyncOwnerUnshareResponse,
+  type RuntimeSkillSyncEnvelope,
+  type RemoteFileTree,
+} from "@konteks/backstage-plugin-common/remote-instance-internal";
 
 type RuntimeAgentLoginReport = ReturnType<typeof RuntimeAgentLoginReportSchema.parse>;
 
@@ -119,6 +141,8 @@ type RuntimeAgentLoginReport = ReturnType<typeof RuntimeAgentLoginReportSchema.p
  * `:id/runtime-owner/resolve`, `:id/reconciliation/applied`,
  * `:id/execution-revision-controls/receipt`,
  * `:id/assignments/{pull,claim,report}`, `:id/observations`, `:id/runtime-failures`,
+ * `:id/skills/sync/*`,
+
  * `:id/permissions/deferred`, and `:id/capability-tokens/redeem`. Every
  * HTTPS-fallback message carries the same schema and idempotency key as its
  * relay channel ("the HTTPS endpoints above remain the semantic definition
@@ -155,6 +179,8 @@ const CORE_PATHS = Object.freeze({
   report: (instanceId: string) => instancePath(instanceId, "assignments/report"),
   observations: (instanceId: string) => instancePath(instanceId, "observations"),
   runtimeFailures: (instanceId: string) => instancePath(instanceId, "runtime-failures"),
+  runtimeSkillSync: (instanceId: string, operation: "prepare" | "read" | "authorize" | "share" | "unshare") => instancePath(instanceId, `skills/sync/${operation}`),
+
   permissionsDeferred: (instanceId: string) => instancePath(instanceId, "permissions/deferred"),
   capabilityTokenRedeem: (instanceId: string) => instancePath(instanceId, "capability-tokens/redeem"),
   // CONTRACT-GAP: the onboarding contract names the App BFF route
@@ -789,6 +815,11 @@ export class CoreClient {
 
   /** The mounted Core route accepts one body, and replies only after commit. */
   async submitObservation(instanceId: string, body: unknown): Promise<void> {
+    const skillRead = AgentSkillReadObservationSchema.safeParse(body);
+    if (skillRead.success) {
+      await this.submitSkillReadObservation(instanceId, skillRead.data);
+      return;
+    }
     const observation = AgentTurnUsageObservationSchema.parse(body);
     if (observation.instanceId !== instanceId) throw new RemoteInstanceError("registration_mismatch", "Observation instance mismatch");
     const digest = jcsDigest(observation as unknown as JsonValue);
@@ -818,6 +849,19 @@ export class CoreClient {
       throw new RemoteInstanceError("registration_mismatch", "Runtime failure receipt does not match submitted bytes.");
     }
     return result;
+  }
+
+  private async submitSkillReadObservation(instanceId: string, observation: AgentSkillReadObservation): Promise<void> {
+    if (observation.instanceId !== instanceId) throw new RemoteInstanceError("registration_mismatch", "Skill observation instance mismatch");
+    const request = { observation };
+    const digest = jcsDigest(observation as unknown as JsonValue);
+    const expectedId = `ri:skill:${digest}`;
+    const result = await this.http.request({ method: "POST", path: CORE_PATHS.observations(instanceId),
+      bodyFactory: () => ({ ...request, proof: this.proof("skill_usage_observation", instanceId, request as unknown as { [key: string]: JsonValue }) }),
+      schema: RemoteSkillReadObservationReceiptSchema, idempotencyKey: `skill-observation:${expectedId}`, operationPolicy: "progressRead" });
+    if (result.observationId !== expectedId || result.observationDigest !== digest)
+      throw new RemoteInstanceError("registration_mismatch", "Skill observation receipt does not match submitted bytes");
+
   }
 
   async observations(instanceId: string, observations: unknown[]): Promise<number> {
@@ -942,6 +986,59 @@ export class CoreClient {
       schema: z.object({ accepted: z.boolean() }).strict(),
       idempotencyKey: `runtime-update:${body.updateId}:${body.state}`,
       ...options,
+    });
+  }
+
+  /** Current Skill metadata is lease-authorized by Core and signed with a release-rooted control key. */
+  async prepareRuntimeSkillSync(instanceId: string): Promise<RuntimeSkillSyncEnvelope> {
+    const body = RuntimeSkillSyncPrepareRequestSchema.parse({});
+    return this.http.request({
+      method: "POST", path: CORE_PATHS.runtimeSkillSync(instanceId, "prepare"), body,
+      schema: RuntimeSkillSyncEnvelopeSchema,
+      idempotencyKey: `runtime-skill-sync-prepare:${instanceId}:${randomUUID()}`,
+    });
+  }
+
+  async readRuntimeSkillSync(instanceId: string, envelope: RuntimeSkillSyncEnvelope, skillId: string): Promise<RemoteFileTree> {
+    if (envelope.instanceId !== instanceId) throw new RemoteInstanceError("registration_mismatch", "Skill artifact request belongs to another runtime.");
+    const body = RuntimeSkillSyncFileRequestSchema.parse({ envelope, skillId });
+    return this.http.request({
+      method: "POST", path: CORE_PATHS.runtimeSkillSync(instanceId, "read"), body,
+      schema: RemoteFileTreeSchema,
+      idempotencyKey: `runtime-skill-sync-read:${envelope.catalog.binding.syncId}:${skillId}`,
+    });
+  }
+
+  async authorizeRuntimeSkillSync(instanceId: string, envelope: RuntimeSkillSyncEnvelope): Promise<void> {
+    if (envelope.instanceId !== instanceId) throw new RemoteInstanceError("registration_mismatch", "Skill authorization belongs to another runtime.");
+    const body = RuntimeSkillSyncPublishRequestSchema.parse({ envelope });
+    await this.http.request({
+      method: "POST", path: CORE_PATHS.runtimeSkillSync(instanceId, "authorize"), body,
+      schema: z.object({ authorized: z.literal(true) }).strict(),
+      idempotencyKey: `runtime-skill-sync-authorize:${envelope.catalog.binding.syncId}:${envelope.catalogDigest}`,
+    });
+  }
+
+  async shareRuntimeSkillSync(instanceId: string, value: LocalRuntimeSkillShare): Promise<RuntimeSkillSyncOwnerPublishResponse> {
+    const body = LocalRuntimeSkillShareSchema.parse(value);
+    const bodyDigest = createHash("sha256").update(JSON.stringify(body)).digest("hex");
+    return this.http.request({
+      method: "POST",
+      path: CORE_PATHS.runtimeSkillSync(instanceId, "share"),
+      body,
+      schema: RuntimeSkillSyncOwnerPublishResponseSchema,
+      idempotencyKey: `runtime-skill-sync-share:${instanceId}:${bodyDigest}`,
+    });
+  }
+
+  async unshareRuntimeSkillSync(instanceId: string, value: LocalRuntimeSkillUnshare): Promise<RuntimeSkillSyncOwnerUnshareResponse> {
+    const body = LocalRuntimeSkillUnshareSchema.parse(value);
+    return this.http.request({
+      method: "POST",
+      path: CORE_PATHS.runtimeSkillSync(instanceId, "unshare"),
+      body,
+      schema: RuntimeSkillSyncOwnerUnshareResponseSchema,
+      idempotencyKey: `runtime-skill-sync-unshare:${instanceId}:${body.localId}:${randomUUID()}`,
     });
   }
 

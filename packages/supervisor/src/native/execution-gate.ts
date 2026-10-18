@@ -13,6 +13,8 @@ import type { CoreClient } from "../core/client.js";
 import type { SupervisorJournal } from "../state/journal.js";
 import { OperationAdmissionJournal, admittedOperationKey } from "../state/operation-admission.js";
 import { conversationTurnSource } from "../work/continued-session.js";
+import type { SkillReadAuthorityContext } from "../skills/load-observation.js";
+
 
 export interface NativeExecutionGateOptions {
   assignment: RemoteWorkAssignment;
@@ -116,6 +118,30 @@ export class NativeExecutionGate {
     this.logger = options.logger ?? createLogger({ name: "native-execution-gate" });
     this.operations = new OperationAdmissionJournal(options.journal, options.clock);
     this.monotonic = options.monotonicNow ?? (() => performance.now());
+  }
+
+  /** A read observation may use only this gate's currently checked, unfenced execution. */
+  skillReadObservationContext(): SkillReadAuthorityContext | null {
+    const authority = this.authority;
+    if (!authority) return null;
+    try { this.assertDispatchCurrent(authority); }
+    catch { return null; }
+    return {
+      instanceId: authority.instanceId,
+      agentId: authority.agentId,
+      executionId: authority.executionId,
+      sessionId: authority.sessionId,
+      assignmentId: authority.assignmentId,
+      attempt: authority.attempt,
+      claimId: authority.claimId,
+      recoveryEpoch: authority.recoveryEpoch,
+      readyRevision: authority.readyRevision,
+      runnerIncarnation: authority.runnerIncarnation,
+      acpSessionRef: authority.acpSessionRef,
+      executionRevision: authority.executionRevision,
+      leaseSetId: authority.leaseSetId,
+      turnId: delivery(authority) ? authority.deliveryIdentity.invocationId : authority.turnRef,
+    };
   }
 
   async admit(raw: unknown): Promise<AuthorizedNativeOperation> {

@@ -65,21 +65,22 @@ describe("native DeepSeek Harness discovery", () => {
     const latest = await npx(join(home, ".npm"), "1b", "0.1.5-rc.3");
     await npx(join(home, ".npm"), "2c", "0.1.8");
     await mkdir(join(home, ".npm", "_npx", "3d", "node_modules"), { recursive: true });
-    await expect(resolveNativeDshInstallation({ PATH: "" }, home, "darwin")).resolves.toEqual(expected(latest, "0.1.5-rc.3"));
+    const emptyPrefix = join(base, "empty-global-prefix");
+    await expect(resolveNativeDshInstallation({ PATH: "", npm_config_prefix: emptyPrefix }, home, "darwin")).resolves.toEqual(expected(latest, "0.1.5-rc.3"));
     const next = await npx(join(home, ".npm"), "4e", "0.1.7-rc.2");
-    await expect(resolveNativeDshInstallation({ PATH: "" }, home, "linux")).resolves.toEqual(expected(next));
+    await expect(resolveNativeDshInstallation({ PATH: "", npm_config_prefix: emptyPrefix }, home, "linux")).resolves.toEqual(expected(next));
     // An installed copy still wins over the cache; npm_config_cache and Windows' %LOCALAPPDATA% are honoured.
     const prefix = join(base, "prefix");
     const installed = await pkg(join(prefix, "lib", "node_modules", "@deepseek-ai", "dsh"), { version: "0.1.5-rc.3" });
     await expect(resolveNativeDshInstallation({ PATH: "", npm_config_prefix: prefix }, home, "linux")).resolves.toEqual(expected(installed, "0.1.5-rc.3"));
     const custom = await npx(join(base, "custom-cache"), "5f", "0.1.5-rc.3");
-    await expect(resolveNativeDshInstallation({ PATH: "", npm_config_cache: join(base, "custom-cache") }, join(base, "other"), "linux")).resolves.toEqual(expected(custom, "0.1.5-rc.3"));
+    await expect(resolveNativeDshInstallation({ PATH: "", npm_config_prefix: emptyPrefix, npm_config_cache: join(base, "custom-cache") }, join(base, "other"), "linux")).resolves.toEqual(expected(custom, "0.1.5-rc.3"));
     const local = await npx(join(base, "Local", "npm-cache"), "6a", "0.1.5-rc.3");
     await expect(resolveNativeDshInstallation({ PATH: "", LOCALAPPDATA: join(base, "Local") }, join(base, "winhome"), "win32")).resolves.toEqual(expected(local, "0.1.5-rc.3"));
     // Only unsupported copies: say so, not "not installed".
-    await expect(resolveNativeDshInstallation({ PATH: "" }, join(base, "only-old"), "linux").catch(() => null)).resolves.toBeNull();
+    await expect(resolveNativeDshInstallation({ PATH: "", npm_config_prefix: emptyPrefix }, join(base, "only-old"), "linux").catch(() => null)).resolves.toBeNull();
     await npx(join(base, "only-old", ".npm"), "7b", "0.1.3-alpha.2");
-    await expect(resolveNativeDshInstallation({ PATH: "" }, join(base, "only-old"), "linux")).rejects.toMatchObject({ diagnostic: "dsh_unsupported_version" });
+    await expect(resolveNativeDshInstallation({ PATH: "", npm_config_prefix: emptyPrefix }, join(base, "only-old"), "linux")).rejects.toMatchObject({ diagnostic: "dsh_unsupported_version" });
   });
 
   it("honours an absolute operator override naming the package root or its launcher", async () => {
@@ -114,7 +115,7 @@ describe("native DeepSeek Harness discovery", () => {
     await expect(verifyNativeDshRoot(await pkg(join(base, "other"), { name: "dsh-lookalike" }), "linux")).rejects.toMatchObject({ code: "prerequisite_missing" });
     await expect(verifyNativeDshRoot(await pkg(join(base, "escape"), { bin: { dsh: "../outside.js" } }), "linux")).rejects.toMatchObject({ code: "prerequisite_missing" });
     await expect(verifyNativeDshRoot(await pkg(join(base, "nobin"), { bin: { other: "lib/bin.js" } }), "linux")).rejects.toMatchObject({ code: "prerequisite_missing" });
-    await expect(resolveNativeDshInstallation({ PATH: join(base, "missing") }, join(base, "home"), "linux")).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "dsh_not_found" });
+    await expect(resolveNativeDshInstallation({ PATH: join(base, "missing"), npm_config_prefix: join(base, "empty-global-prefix") }, join(base, "home"), "linux")).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "dsh_not_found" });
   });
 
   it.runIf(posix)("refuses an installation other users can modify", async () => {

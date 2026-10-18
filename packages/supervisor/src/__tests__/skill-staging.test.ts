@@ -21,7 +21,7 @@ function tree(missingSkill = false) {
   return { format: "konteks-file-tree-v1" as const, treeDigest: computeRemoteFileTreeDigest(entries), entries };
 }
 function catalog(t = tree(), scope = binding) {
-  const body = { version: 1 as const, binding: scope, skills: [{ skillId: "skill1", version: "v1", name: "review", description: "Review source", required: true as const, transfer: {
+  const body = { version: 1 as const, binding: scope, catalogRevision: `sha256:${"a".repeat(64)}`, skills: [{ skillId: "skill1", version: "v1", name: "review", description: "Review source", required: true as const, transfer: {
     version: 1 as const, transferId: "t1", binding: scope, direction: "to_runtime" as const, purpose: "organization_skill" as const, revision: "skill-v1", artifactRef: "artifact:one", treeDigest: t.treeDigest,
     sizeBytes: t.entries.reduce((n, e) => n + e.sizeBytes, 0), fileCount: t.entries.length, expiresAt: "2026-09-06T11:00:00Z",
   } }] };

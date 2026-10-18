@@ -5,8 +5,13 @@ import { join } from "node:path";
 import { createNativeProgram, installedReleaseVersion } from "../native/cli.js";
 
 function fixture() {
-  const actions = { install: vi.fn(async () => {}), addAgent: vi.fn(async () => {}), removeAgent: vi.fn(async () => {}), serve: vi.fn(async () => {}), start: vi.fn(async () => {}), stop: vi.fn(async () => {}), update: vi.fn(async () => {}), uninstall: vi.fn(async () => {}), control: vi.fn(async () => {}) };
-  const program = createNativeProgram(actions).exitOverride().configureOutput({ writeOut: () => {}, writeErr: () => {} });
+  const actions = { install: vi.fn(async () => {}), configureSkills: vi.fn(async () => {}), addAgent: vi.fn(async () => {}), removeAgent: vi.fn(async () => {}), serve: vi.fn(async () => {}), start: vi.fn(async () => {}), stop: vi.fn(async () => {}), update: vi.fn(async () => {}), uninstall: vi.fn(async () => {}), control: vi.fn(async () => {}) };
+  const program = createNativeProgram(actions).configureOutput({ writeOut: () => {}, writeErr: () => {} });
+  const allowExitOverride = (command: Command): void => {
+    command.exitOverride();
+    command.commands.forEach(allowExitOverride);
+  };
+  allowExitOverride(program);
   return { program, actions };
 }
 
@@ -15,6 +20,37 @@ describe("native customer entry point", () => {
     const { program, actions } = fixture();
     await program.parseAsync(["auth", "login", "claude"], { from: "user" });
     expect(actions.control).toHaveBeenCalledWith(expect.objectContaining({ operation: "auth.login", agent: "claude-code" }));
+  });
+  it("lets an existing installation explicitly bind local Skill profiles", async () => {
+    const { program, actions } = fixture();
+    await program.parseAsync(["--root", "/private/native-root", "skills", "configure"], { from: "user" });
+    expect(actions.configureSkills).toHaveBeenCalledWith(expect.objectContaining({ root: "/private/native-root" }));
+    expect(actions.install).not.toHaveBeenCalled();
+    expect(actions.start).not.toHaveBeenCalled();
+  });
+  it("exposes explicit Skill sync and catalog listing through the connected runtime", async () => {
+    const { program, actions } = fixture();
+    await program.parseAsync(["skills", "sync"], { from: "user" });
+    expect(actions.control).toHaveBeenLastCalledWith(expect.objectContaining({ operation: "skills.sync" }));
+    await program.parseAsync(["skills", "list", "--json"], { from: "user" });
+    expect(actions.control).toHaveBeenLastCalledWith(expect.objectContaining({ operation: "skills.list" }));
+  });
+  it("shares only to an explicit audience and confirms ongoing publication", async () => {
+    const { program, actions } = fixture();
+    await expect(program.parseAsync(["skills", "share", "my-skill"], { from: "user" })).rejects.toThrow(/audience|--yes/i);
+    await expect(program.parseAsync(["skills", "share", "my-skill", "--organization"], { from: "user" })).rejects.toThrow(/--yes|ongoing|confirm/i);
+    await expect(program.parseAsync(["skills", "share", "my-skill", "--organization", "--system", "system-1", "--yes"], { from: "user" })).rejects.toThrow(/audience|choose/i);
+    expect(actions.control).not.toHaveBeenCalled();
+
+    const skill = "my-skill";
+    await program.parseAsync(["skills", "share", skill, "--organization", "--initiative", "initiative-1", "--yes"], { from: "user" });
+    expect(actions.control).toHaveBeenLastCalledWith(expect.objectContaining({
+      operation: "skills.share", skill, audience: { level: "organization" }, initiativeIds: ["initiative-1"], confirmOngoing: true,
+    }));
+    await program.parseAsync(["skills", "share", "./my-skill", "--system", "system-1", "--system", "system-2", "--yes"], { from: "user" });
+    expect(actions.control).toHaveBeenLastCalledWith(expect.objectContaining({
+      operation: "skills.share", skill: "./my-skill", audience: { level: "systems", systemIds: ["system-1", "system-2"] }, initiativeIds: [], confirmOngoing: true,
+    }));
   });
   it("exposes native lifecycle without a BYOK or appliance command", () => {
     const { program } = fixture();

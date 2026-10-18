@@ -117,6 +117,68 @@ describe("session manager bootstrap", () => {
     expect(manager.activeSessions).toBe(1);
   });
 
+  it("replaces a continued provider context when governed skills must be refreshed", async () => {
+    const createdSessions: unknown[] = [];
+    const newSession = vi.fn(async (input: unknown) => {
+      createdSessions.push(input);
+      return { sessionId: createdSessions.length === 1 ? "bridge-s1" : "bridge-s2" };
+    });
+    const closeSession = vi.fn(async () => ({}));
+    const { bridge, calls } = fakeBridge({ newSession, closeSession }, {
+      agentCapabilities: { sessionCapabilities: { close: {} } },
+    });
+    const events = new RunnerEventBus();
+    const refStore = new InMemorySessionRefStore();
+    const manager = new SessionManager({ bridge: () => bridge, events, refStore });
+    const first = await manager.create({ context, cwd: "/w", mcpServers: [] });
+    const completed = nextEvent(events, "prompt_result");
+    manager.prompt(first.acpSessionRef, "p1", { prompt: [] });
+    await completed;
+    await manager.sealCompletedTurn(first.acpSessionRef);
+
+    const continued = await manager.continueLive({
+      context: { ...context, assignmentId: "asg-2" }, cwd: "/w", mcpServers: [],
+      acpSessionRef: first.acpSessionRef, freshProviderSessionOnContinue: true,
+      lifecycle: { beforeCreate: async () => undefined, recordProcessOwner: async () => undefined, assertCurrent: () => undefined },
+    });
+
+    expect(continued).toMatchObject({ acpSessionRef: first.acpSessionRef, resumed: true });
+    expect(continued).not.toHaveProperty("modelSelection");
+    expect(closeSession).toHaveBeenCalledWith({ sessionId: "bridge-s1" });
+    expect(createdSessions).toHaveLength(2);
+    expect(calls.resumeSession).toBeUndefined();
+    expect(calls.loadSession).toBeUndefined();
+    expect(await refStore.get(first.acpSessionRef)).toBe("bridge-s2");
+
+    const next = nextEvent(events, "prompt_result");
+    manager.prompt(first.acpSessionRef, "p2", { prompt: [] });
+    await next;
+    expect(calls.prompt?.[1]).toMatchObject({ sessionId: "bridge-s2" });
+  });
+
+  it("blocks a Skill-bearing continuation when the agent cannot close its cached context", async () => {
+    const { bridge, calls } = fakeBridge({}, { agentCapabilities: { loadSession: true } });
+    const events = new RunnerEventBus();
+    const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore() });
+    const first = await manager.create({ context, cwd: "/w", mcpServers: [] });
+    const completed = nextEvent(events, "prompt_result");
+    manager.prompt(first.acpSessionRef, "p1", { prompt: [] });
+    await completed;
+    await manager.sealCompletedTurn(first.acpSessionRef);
+    const beforeCreate = vi.fn(async () => undefined);
+
+    await expect(manager.continueLive({
+      context: { ...context, assignmentId: "asg-2" }, cwd: "/w", mcpServers: [],
+      acpSessionRef: first.acpSessionRef, freshProviderSessionOnContinue: true,
+      lifecycle: { beforeCreate, recordProcessOwner: async () => undefined, assertCurrent: () => undefined },
+    })).rejects.toMatchObject({ diagnostic: "managed_skill_context_close_unsupported" });
+
+    expect(beforeCreate).not.toHaveBeenCalled();
+    expect(calls.newSession).toHaveLength(1);
+    expect(calls.resumeSession).toBeUndefined();
+    expect(calls.loadSession).toBeUndefined();
+  });
+
   it("closes and resumes a live session the agent will not resume while open, so the next prompt continues", async () => {
     let active = true;
     const resumeSession = vi.fn(async () => {

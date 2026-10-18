@@ -37,6 +37,8 @@ export interface RunnerSessionInput {
   restoreAcpSessionRef?: string;
   /** Start with staged platform context rather than loading the provider transcript. */
   freshProviderSessionOnRestore?: boolean;
+  /** Replace a live provider transcript when a continued governed turn has new Skill context. */
+  freshProviderSessionOnContinue?: boolean;
   /** A person's turn: when the agent's transcript cannot be reopened, open one new session instead of failing. */
   freshSessionWhenRestoreLost?: boolean;
   /** Display-only naming for the provider session list; never authority. */

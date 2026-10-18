@@ -39,7 +39,7 @@ export interface StageOrganizationSkillsOptions {
 export interface StagedOrganizationSkills {
   root: string;
   catalogDigest: string;
-  skills: Array<{ skillId: string; version: string; name: string; description: string; directory: string; skillFile: string }>;
+  skills: Array<{ skillId: string; version: string; name: string; description: string; directory: string; skillFile: string; treeDigest: string; fileModes: Record<string, 384 | 448> }>;
 }
 
 const unavailable = () => new RemoteInstanceError("capability_unavailable", "Required organization skills could not be staged safely.");
@@ -137,12 +137,13 @@ async function readTree(root: string, modes: Record<string, 384 | 448>): Promise
   return { format: "konteks-file-tree-v1", entries: reader.entries, treeDigest: computeRemoteFileTreeDigest(reader.entries) };
 }
 
-function result(root: string, catalog: RemoteSkillCatalog): StagedOrganizationSkills {
+function result(root: string, catalog: RemoteSkillCatalog, modes: Record<string, Record<string, 384 | 448>>): StagedOrganizationSkills {
   return {
     root, catalogDigest: catalog.catalogDigest,
     skills: catalog.skills.map(skill => {
       const directory = join(root, skill.name);
-      return { skillId: skill.skillId, version: skill.version, name: skill.name, description: skill.description, directory, skillFile: join(directory, "SKILL.md") };
+      return { skillId: skill.skillId, version: skill.version, name: skill.name, description: skill.description, directory, skillFile: join(directory, "SKILL.md"),
+        treeDigest: skill.transfer.treeDigest, fileModes: { ...modes[skill.name] } };
     }),
   };
 }
@@ -153,7 +154,7 @@ async function current(options: StageOrganizationSkillsOptions, catalog: RemoteS
   if (!Number.isFinite(now) || catalog.skills.some(s => Date.parse(s.transfer.expiresAt) <= now)) throw unavailable();
 }
 
-async function verifyCatalog(root: string, catalog: RemoteSkillCatalog, now: number): Promise<void> {
+async function verifyCatalog(root: string, catalog: RemoteSkillCatalog, now: number): Promise<Record<string, Record<string, 384 | 448>>> {
   privateNode(await lstat(root), true);
   const actual = (await readdir(root)).sort();
   const expected = [".catalog.json", ...catalog.skills.map(s => s.name)].sort();
@@ -169,6 +170,7 @@ async function verifyCatalog(root: string, catalog: RemoteSkillCatalog, now: num
     if (!tree.entries.some(e => e.path === "SKILL.md")) throw unavailable();
     if (!validateRemoteTransfer(skill.transfer, tree, { binding: catalog.binding, manifestDigest: computeRemoteTransferManifestDigest(skill.transfer), now }).valid) throw unavailable();
   }
+  return parsed.data.modes;
 }
 
 export async function stageOrganizationSkills(options: StageOrganizationSkillsOptions): Promise<StagedOrganizationSkills> {
@@ -178,6 +180,79 @@ export async function stageOrganizationSkills(options: StageOrganizationSkillsOp
   const destination = join(scratch, `skills-${skillContentIdentity(catalog)}`);
   if (await stagedAlready(destination)) return reuseStaged(destination, catalog, options);
   return stageFresh(scratch, destination, { catalog, binding }, options);
+}
+
+/** Retain one verified immutable tree outside agent discovery. The caller owns
+ * and locks the destination parent; existing content is verified, never replaced. */
+type RetainSkill = StagedOrganizationSkills["skills"][number];
+type RetainedTree = Awaited<ReturnType<typeof readTree>>;
+
+async function verifyRetainedTree(skill: RetainSkill, root: string): Promise<RetainedTree> {
+  const tree = RemoteFileTreeSchema.parse(await readTree(root, skill.fileModes));
+  if (tree.treeDigest !== skill.treeDigest || !tree.entries.some(entry => entry.path === "SKILL.md")) throw unavailable();
+  return tree;
+}
+
+async function retainedDestination(skill: RetainSkill, destination: string): Promise<string | undefined> {
+  try {
+    await lstat(destination);
+    await verifyRetainedTree(skill, destination);
+    return destination;
+  } catch (error) {
+    if (!isFsErrorWithCode(error, "ENOENT")) throw unavailable();
+    return undefined;
+  }
+}
+
+async function writeRetainedEntries(tree: RetainedTree, temporary: string): Promise<void> {
+  for (const entry of tree.entries) {
+    await writePrivate(join(temporary, ...entry.path.split("/")), Buffer.from(entry.contentBase64, "base64"), entry.mode);
+  }
+}
+
+async function publishRetainedTemporary(
+  skill: RetainSkill,
+  temporary: string,
+  destination: string,
+): Promise<boolean> {
+  try {
+    await rename(temporary, destination);
+    return true;
+  } catch (error) {
+    if (!isFsErrorWithCode(error, "EEXIST") && !isFsErrorWithCode(error, "ENOTEMPTY")) throw error;
+    await verifyRetainedTree(skill, destination);
+    return false;
+  }
+}
+
+async function writeRetainedTree(
+  skill: RetainSkill,
+  tree: RetainedTree,
+  parent: string,
+  destination: string,
+): Promise<string> {
+  let temporary: string | undefined;
+  try {
+    temporary = await mkdtemp(join(parent, ".stage-"));
+    await chmod(temporary, 0o700);
+    await writeRetainedEntries(tree, temporary);
+    await verifyRetainedTree(skill, temporary);
+    if (await publishRetainedTemporary(skill, temporary, destination)) temporary = undefined;
+    await verifyRetainedTree(skill, destination);
+    return destination;
+  } catch {
+    throw unavailable();
+  } finally {
+    if (temporary) await rm(temporary, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+export async function retainStagedSkill(skill: RetainSkill, parent: string): Promise<string> {
+  const tree = await verifyRetainedTree(skill, skill.directory);
+  const destination = join(parent, `tree-${sha256Hex(skill.treeDigest)}`);
+  const existing = await retainedDestination(skill, destination);
+  if (existing) return existing;
+  return writeRetainedTree(skill, tree, parent, destination);
 }
 
 type AuthorizedCatalog = { catalog: RemoteSkillCatalog; binding: RemoteTransferBinding };
@@ -202,7 +277,7 @@ async function stagedAlready(destination: string): Promise<boolean> {
 }
 
 async function reuseStaged(destination: string, catalog: RemoteSkillCatalog, options: StageOrganizationSkillsOptions): Promise<StagedOrganizationSkills> {
-  try { await verifyCatalog(destination, catalog, options.now()); await current(options, catalog); return result(destination, catalog); }
+  try { const modes = await verifyCatalog(destination, catalog, options.now()); await current(options, catalog); return result(destination, catalog, modes); }
   catch { throw unavailable(); }
 }
 
@@ -216,8 +291,9 @@ async function stageFresh(scratch: string, destination: string, authorized: Auth
     await verifyCatalog(temporary, catalog, options.now());
     await current(options, catalog);
     if (await publishStaged(temporary, destination, catalog, options)) temporary = undefined;
+    const retainedModes = await verifyCatalog(destination, catalog, options.now());
     await current(options, catalog);
-    return result(destination, catalog);
+    return result(destination, catalog, retainedModes);
   } catch { throw unavailable(); }
   finally {
     // Only the exact mkdtemp child created by this call is eligible for cleanup.

@@ -102,6 +102,7 @@ async function fixture(sourceFiles: Record<string, string> = { "src/app.txt": "o
   const catalog = {
     version: 1,
     binding,
+    catalogRevision: `sha256:${'a'.repeat(64)}`,
     skills: [
       {
         skillId: "review",
