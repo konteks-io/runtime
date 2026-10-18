@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdtemp, mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdtemp, mkdir, open, readFile, readdir, rename, rm, symlink, writeFile, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -18,6 +18,11 @@ import { CoreSignatureVerifier } from "../control/core-signature.js";
 import { NativeInputClient } from "../native/input-client.js";
 import { NativeWorkspaceCheckpointStore } from "../native/workspace-preservation.js";
 import { testGitCommand, testGitTool } from "./native-git-fixture.js";
+
+vi.mock("node:fs/promises", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, link: vi.fn(actual.link) };
+});
 
 interface DeliveryInternals {
   composeCoreDeliveries(): void;
@@ -295,6 +300,103 @@ describe("Supervisor diagnostic history admission", () => {
 });
 
 describe("Supervisor lifecycle capture intake", () => {
+  it("retains the completed pending fact after final-link failure for ordinary intake on restart", async () => {
+    const source = await retainedLifecycle("update-final-link-refused");
+    await rm(source.path);
+    const pending = `${source.path}.pending`;
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    vi.mocked(link).mockImplementation(async (from, to) => {
+      if (String(from) === pending && String(to) === source.path) {
+        throw Object.assign(new Error("simulated final publication link failure"), { code: "ENOSPC" });
+      }
+      return actual.link(from, to);
+    });
+    try {
+      await expect(writeRuntimeFailureCapture(dir, source.capture)).rejects.toMatchObject({ code: "ENOSPC" });
+      await expect(lstat(source.path)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(readFile(pending, "utf8")).resolves.toBe(source.bytes);
+      expect((await lstat(pending)).nlink).toBe(1);
+    } finally {
+      vi.mocked(link).mockImplementation(actual.link);
+    }
+    const { send } = await fixture({ mode: "active" });
+    expect(send.mock.calls).toEqual([["instance", source.body]]);
+    await expect(lstat(pending)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.skipIf(process.platform === "win32")("does not intake parseable producer bytes while their real file durability barrier is held", async () => {
+    const source = await retainedLifecycle("update-in-progress");
+    await rm(source.path);
+    const probe = await open(dir, "r");
+    const prototype = Object.getPrototypeOf(probe);
+    const sync = prototype.sync;
+    await probe.close();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let held = false;
+    vi.spyOn(prototype, "sync").mockImplementation(async function (this: FileHandle) {
+      if (!held && (await this.stat()).isFile()) {
+        held = true;
+        entered.resolve();
+        await release.promise;
+      }
+      await sync.call(this);
+    });
+    const writing = writeRuntimeFailureCapture(dir, source.capture);
+    let internal: DeliveryInternals | undefined;
+    let send: Awaited<ReturnType<typeof fixture>>["send"] | undefined;
+    try {
+      await entered.promise;
+      const names = await readdir(dirname(source.path));
+      expect(names).toHaveLength(1);
+      expect(JSON.parse(await readFile(join(dirname(source.path), names[0]!), "utf8"))).toEqual(source.capture);
+      ({ internal, send } = await fixture({ mode: "active" }));
+      expect(send).not.toHaveBeenCalled();
+      expect((await failureOutbox()).depth).toBe(0);
+    } finally {
+      release.resolve();
+      await writing;
+    }
+    await internal!.runtimeFailureDelivery.flush();
+    expect(send!.mock.calls).toEqual([["instance", source.body]]);
+    await expect(lstat(source.path)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("recovers the exact completed-pending and writing hard links left by interrupted candidate cleanup", async () => {
+    const source = await retainedLifecycle("update-pending-linked");
+    const pending = `${source.path}.pending`;
+    const writing = `${pending}.writing`;
+    await rename(source.path, pending);
+    await link(pending, writing);
+    const { send } = await fixture({ mode: "active" });
+    expect(send.mock.calls).toEqual([["instance", source.body]]);
+    await expect(lstat(pending)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(lstat(writing)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.skipIf(process.platform === "win32")("refuses partial, foreign, linked and substituted pending captures while admitting the valid owned fact", async () => {
+    const owned = await retainedLifecycle("update-pending-owned");
+    await rename(owned.path, `${owned.path}.pending`);
+    const foreign = await retainedLifecycle("update-pending-foreign", "other-tenant");
+    await rename(foreign.path, `${foreign.path}.pending`);
+    const partial = await retainedLifecycle("update-pending-partial");
+    await rename(partial.path, `${partial.path}.pending`);
+    await writeFile(`${partial.path}.pending`, "{", { mode: 0o600 });
+    const substituted = await retainedLifecycle("update-pending-substituted");
+    await rename(substituted.path, `${substituted.path}.pending`);
+    await link(`${substituted.path}.pending`, `${substituted.path}.extra`);
+    await writeFile(`${substituted.path}.pending.writing`, substituted.bytes, { mode: 0o600 });
+    const linked = join(dirname(owned.path), `${"B".repeat(43)}.json.pending`);
+    await symlink(`${foreign.path}.pending`, linked);
+    const { send } = await fixture({ mode: "active" });
+    expect(send.mock.calls).toEqual([["instance", owned.body]]);
+    expect(await readFile(`${foreign.path}.pending`, "utf8")).toBe(foreign.bytes);
+    expect(await readFile(`${partial.path}.pending`, "utf8")).toBe("{");
+    expect((await lstat(linked)).isSymbolicLink()).toBe(true);
+    expect((await lstat(`${substituted.path}.pending`)).nlink).toBe(2);
+    expect(await readFile(`${substituted.path}.pending.writing`, "utf8")).toBe(substituted.bytes);
+  });
+
   it("hands off a private pre-publication capture on restart without a producer retry", async () => {
     const source = await retainedLifecycle("update-before-publication");
     const pending = `${source.path}.pending`;

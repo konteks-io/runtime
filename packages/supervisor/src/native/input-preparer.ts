@@ -31,7 +31,7 @@ import {
   type PreparedSessionInputs,
 } from "../skills/session-inputs.js";
 import { continuedSession, isDirectAssignment } from "../work/continued-session.js";
-import { transientInputFailure, type NativeInputClient } from "./input-client.js";
+import { NativeInputResponseError, transientInputFailure, type NativeInputClient } from "./input-client.js";
 import type { NativeOutputClient } from "./output-client.js";
 import { captureNativeDeliveryOutput } from "./output-capture.js";
 import { NativeOutputSessionHeadStore, type NativeOutputRecord, type NativeOutputStore } from "./output-store.js";
@@ -304,7 +304,7 @@ async function sourceWorkspace(
   const cwd = join(destination, "source");
   const present = await pathExists(destination);
   const folder = { root, rootStat, destination, cwd, expected };
-  const readSource = () => readSourceTree(fetchSource, onFailure);
+  const readSource = () => readSourceTree(fetchSource, onFailure, needsGit ? undefined : "session_context");
   if (present && !needsGit) await refreshSessionWorkspace(folder, readSource, onFailure);
   if (!present) await materializeWorkspace(folder, readSource, needsGit, gitTool);
   return publishedWorkspace(folder, needsGit);
@@ -347,19 +347,19 @@ async function refreshSessionWorkspace(folder: WorkspaceFolder, fetchSource: () 
   await syncDirectory(destination);
 }
 
-async function readSourceTree(fetchSource: () => Promise<FetchedTree>, onFailure?: SourceFailureObserver): Promise<FetchedTree> {
+async function readSourceTree(fetchSource: () => Promise<FetchedTree>, onFailure: SourceFailureObserver | undefined, pathRole: RuntimeFailureFact["pathRole"]): Promise<FetchedTree> {
   try { return await fetchSource(); }
   catch (error) {
     const code = sourceTransferFailureCode(error);
     onFailure?.({ phase: "preparation", stage: "source_transfer_read", code,
-      evidence: { kind: "runtime_exception" }, pathRole: "session_context" });
+      evidence: { kind: "runtime_exception" }, ...(pathRole === undefined ? {} : { pathRole }) });
     throw error;
   }
 }
 
 function sourceTransferFailureCode(error: unknown): string {
-  if (!(error instanceof RemoteInstanceError)) return "local_preparation_failed";
-  return ["response_status_invalid", "temporarily_unavailable"].includes(error.code) ? error.code : "local_preparation_failed";
+  if (error instanceof NativeInputResponseError) return error.fault;
+  return transientInputFailure(error) ? "temporarily_unavailable" : "local_preparation_failed";
 }
 
 /** Only a directly owned filesystem operation can attest an OS errno. */
@@ -643,11 +643,12 @@ function withSessionContext(source: SourceWorkspace, prepared: PreparedSessionIn
   };
 }
 
-function failureFields(error: unknown, fallback: string): { code: string; retryable: boolean; diagnostic?: string } {
+function failureFields(error: unknown, fallback: string): { code: string; retryable: boolean; diagnostic?: string; status?: number } {
   return {
     code: error instanceof RemoteInstanceError ? error.code : fallback,
     retryable: transientInputFailure(error) !== null,
     ...(error instanceof RemoteInstanceError && error.diagnostic ? { diagnostic: error.diagnostic } : {}),
+    ...(error instanceof NativeInputResponseError ? { status: error.status } : {}),
   };
 }
 

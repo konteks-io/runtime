@@ -48,6 +48,21 @@ interface NativeInputClientOptions {
 // envelope; expiry and assignment deadlines remain exact.
 const CORE_HTTP_DATE_UNCERTAINTY_MS = 1_000;
 
+type InputResponseFault = "response_status_invalid" | "response_content_type_invalid" | "response_body_missing";
+
+/** Facts from the response owner, with the existing public refusal unchanged. */
+export class NativeInputResponseError extends RemoteInstanceError {
+  readonly fault: InputResponseFault;
+  readonly status: number;
+
+  constructor(response: Response) {
+    const fault = jsonRefusal(response);
+    super("capability_unavailable", "Required assignment inputs are unavailable or no longer authorized.", { diagnostic: fault });
+    this.fault = fault;
+    this.status = response.status;
+  }
+}
+
 /** Artifact transport has tighter body/redirect/error rules than ordinary control JSON. */
 export class NativeInputClient {
   /** Unfinished workspace retention is independent of successful output. */
@@ -229,7 +244,7 @@ export class NativeInputClient {
     return this.postOnce(assignment, operation, body, "application/json", async (response, signal, held) => {
       if (!response.ok || response.redirected || mediaType(response) !== "application/json" || !response.body) {
         void response.body?.cancel().catch(() => undefined);
-        throw unavailable(jsonRefusal(response));
+        throw new NativeInputResponseError(response);
       }
       held.reader = response.body.getReader();
       const bytes = await readAll(held.reader, signal, maxBytes);
@@ -462,7 +477,7 @@ function refuseTransient(response: Response): void {
 }
 
 /** Why a JSON answer is not acceptable: its status, a missing body, or its content type. */
-function jsonRefusal(response: Response): string {
+function jsonRefusal(response: Response): InputResponseFault {
   if (!response.ok || response.redirected) return "response_status_invalid";
   return response.body ? "response_content_type_invalid" : "response_body_missing";
 }

@@ -56,9 +56,9 @@ export async function writeRuntimeFailureCapture(dataDir: string, value: Runtime
   return target;
 }
 
-/** A published capture has one link; recover only its exact interrupted publication sibling. */
+/** Completed captures and pending handoffs have one link after exact publication recovery. */
 export async function readRuntimeFailureCapture(path: string): Promise<RuntimeFailureCaptureFile | null> {
-  if (!/^[A-Za-z0-9_-]{43}\.json$/.test(basename(path))) throw unavailable();
+  if (!/^[A-Za-z0-9_-]{43}\.json(?:\.pending)?$/.test(basename(path))) throw unavailable();
   const directory = await ownedDirectory(dirname(path));
   if (basename(directory.path) !== CAPTURE_DIRECTORY) throw unavailable();
   const target = join(directory.path, basename(path));
@@ -82,7 +82,7 @@ export async function listRuntimeFailureCaptures(dataDir: string): Promise<strin
   const names = await readdir(directory.path);
   await unchangedDirectory(owner);
   await unchangedDirectory(directory);
-  return names.filter(name => /^[A-Za-z0-9_-]{43}\.json$/.test(name)).sort().slice(0, CAPACITY)
+  return names.filter(name => /^[A-Za-z0-9_-]{43}\.json(?:\.pending)?$/.test(name)).sort().slice(0, CAPACITY)
     .map(name => join(directory.path, name));
 }
 
@@ -139,12 +139,33 @@ async function publishCapture(directory: OwnedDirectory, target: string, bytes: 
 }
 
 async function preparePublication(path: string, bytes: string): Promise<Stats> {
+  const existing = await retainedPublication(path, bytes);
+  if (existing) return existing.identity;
+  // A pending name is visible only after its complete immutable bytes were synced and closed.
+  const writing = `${path}.writing`;
+  let identity: Stats | null = null;
+  try {
+    identity = await writeCandidate(writing, bytes);
+    await link(writing, path).catch(async error => {
+      if (!isFsErrorWithCode(error, "EEXIST")) throw error;
+      if (!(await retainedPublication(path, bytes))) throw unavailable();
+    });
+  } finally {
+    if (identity) await removePending(writing, identity);
+  }
+  await syncDirectory(dirname(path));
+  const prepared = await retainedPublication(path, bytes);
+  if (!prepared) throw unavailable();
+  return prepared.identity;
+}
+
+async function writeCandidate(path: string, bytes: string): Promise<Stats> {
   const file = await open(path, "wx", 0o600).catch(error => {
     if (isFsErrorWithCode(error, "EEXIST")) return null;
     throw error;
   });
   if (!file) {
-    const existing = await readCaptureFile(path, await lstat(path), 1);
+    const existing = await readCaptureFile(path, await lstat(path), 1, true);
     if (existing.bytes !== bytes) throw unavailable();
     return existing.identity;
   }
@@ -153,12 +174,7 @@ async function preparePublication(path: string, bytes: string): Promise<Stats> {
 }
 
 async function pendingPublication(target: string, bytes: string): Promise<boolean> {
-  const path = `${target}.pending`;
-  const identity = await optionalStat(path);
-  if (!identity) return false;
-  const pending = await readCaptureFile(path, identity, 1);
-  if (pending.bytes !== bytes) throw unavailable();
-  return true;
+  return (await retainedPublication(`${target}.pending`, bytes)) !== null;
 }
 
 async function syncDirectory(path: string): Promise<void> {
@@ -169,10 +185,14 @@ async function syncDirectory(path: string): Promise<void> {
 }
 
 async function existingCapture(path: string, expected: string): Promise<boolean> {
+  return (await retainedPublication(path, expected)) !== null;
+}
+
+async function retainedPublication(path: string, expected: string): Promise<RuntimeFailureCaptureFile | null> {
   const existing = await readRuntimeFailureCapture(path);
-  if (!existing) return false;
+  if (!existing) return null;
   if (existing.bytes !== expected) throw unavailable();
-  return true;
+  return existing;
 }
 
 async function optionalStat(path: string): Promise<Stats | null> {
@@ -182,7 +202,7 @@ async function optionalStat(path: string): Promise<Stats | null> {
   });
 }
 
-async function readCaptureFile(path: string, before: Stats, links: number): Promise<RuntimeFailureCaptureFile> {
+async function readCaptureFile(path: string, before: Stats, links: number, sync = false): Promise<RuntimeFailureCaptureFile> {
   if (!privateFile(before, links)) throw unavailable();
   const file = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   try {
@@ -194,14 +214,15 @@ async function readCaptureFile(path: string, before: Stats, links: number): Prom
     if (!unchangedFile(before, after, named, bytesRead, links)) throw unavailable();
     const text = bytes.subarray(0, bytesRead).toString("utf8");
     const capture = CaptureSchema.parse(JSON.parse(text));
-    if (basename(path).replace(/\.pending$/, "") !== captureName(capture)) throw unavailable();
+    if (basename(path).replace(/\.pending(?:\.writing)?$/, "") !== captureName(capture)) throw unavailable();
+    if (sync) await file.sync();
     return { path, capture, bytes: text, identity: named };
   } finally { await file.close(); }
 }
 
 async function recoverPublication(directory: OwnedDirectory, target: string, before: Stats): Promise<void> {
   const published = await readCaptureFile(target, before, 2);
-  const pending = `${target}.pending`;
+  const pending = `${target}.${target.endsWith(".pending") ? "writing" : "pending"}`;
   const sibling = await lstat(pending);
   if (!privateFile(sibling, 2) || !sameVersion(published.identity, sibling)) throw unavailable();
   if (!sameVersion(published.identity, await lstat(target))) throw unavailable();
