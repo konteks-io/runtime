@@ -603,6 +603,20 @@ function stopOperation(f: SessionFixture, delivered: boolean) {
 }
 
 describe("native session dispatch uses genuine execution admission", () => {
+  it("does not send user work to the runner while required Skill load proof is unknown", async () => {
+    const f = await sessionFixture(assignment, undefined, undefined, {}, {}, {
+      catalogRevision: `sha256:${"a".repeat(64)}`,
+      managedSkills: [{ skillId: "11111111-1111-4111-8111-111111111111", version: "1.2.3", skillFile: join(root, "skills", "review", "SKILL.md") }],
+    });
+    try {
+      await f.session.onToRuntime(f.envelope);
+      expect(f.runner.prompt).not.toHaveBeenCalled();
+      expect(f.send).toHaveBeenCalledWith(expect.objectContaining({
+        body: expect.objectContaining({ kind: "acp_error", error: expect.objectContaining({ message: expect.stringContaining("managed_skill_load_proof_missing") }) }),
+      }));
+    } finally { await f.session.close("cancelled"); }
+  });
+
   it("captures genuine SDK protocol evidence through the actual runner prompt boundary", async () => {
     const f = await admittedProtocolFailure(new RequestError(-32042, "private-rpc-message-canary", { detail: "private-rpc-data-canary" }));
     try {
@@ -649,7 +663,7 @@ describe("native session dispatch uses genuine execution admission", () => {
     await f.session.close("cancelled");
   });
 
-  it("reports the admitted owner revision only after the agent reads every required staged Skill", async () => {
+  it("does not mint Skill load evidence from events after refusing an unproved turn before dispatch", async () => {
     const catalogRevision = `sha256:${"a".repeat(64)}`;
     const firstPath = join(root, "skills", "review", "SKILL.md");
     const secondPath = join(root, "skills", "security", "SKILL.md");
@@ -677,9 +691,9 @@ describe("native session dispatch uses genuine execution admission", () => {
       await read("read-review", firstPath);
       expect(onSkillLoadProof).not.toHaveBeenCalled();
       await read("read-security", secondPath);
-      expect(onSkillRead).toHaveBeenCalledTimes(2);
-      expect(onSkillLoadProof).toHaveBeenCalledOnce();
-      expect(onSkillLoadProof).toHaveBeenCalledWith({ agentId: "codex", catalogRevision });
+      expect(f.runner.prompt).not.toHaveBeenCalled();
+      expect(onSkillRead).not.toHaveBeenCalled();
+      expect(onSkillLoadProof).not.toHaveBeenCalled();
     } finally { await f.session.close("cancelled"); }
 
   });

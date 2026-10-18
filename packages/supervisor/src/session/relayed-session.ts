@@ -1226,6 +1226,11 @@ export class RelayedSession {
       if (isGitXcodeLicenseError(error)) throw error;
       throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable.");
     }
+    if (this.skillReadTracker && !this.skillReadTracker.loadedCatalogRevision()) {
+      throw new RemoteInstanceError("capability_unavailable",
+        "managed_skill_load_proof_missing: the agent has not attested the required Skill revision before this turn; user work was not sent.",
+        { diagnostic: "managed_skill_load_proof_missing" });
+    }
   }
 
   /** The staged skills line goes in front of the person's text. */
@@ -2582,11 +2587,20 @@ function concurrentPromptError(id: string): SessionToCoreMessage {
     error: { code: -32600, class: "invalid_params", message: "Another prompt is already running on this session.", retryable: false } };
 }
 
-function classify(error: unknown): AcpJsonRpcError {
-  const message = error instanceof Error ? error.message.slice(0, 1_024) : "request failed";
+function knownSessionRefusal(error: unknown, message: string): AcpJsonRpcError | null {
   if (error && typeof error === "object" && "code" in error && (error as { code: string }).code === "agent_auth_required") {
     return { code: -32000, class: "agent_auth_required", message, retryable: false };
   }
+  if (error instanceof RemoteInstanceError && error.diagnostic === "managed_skill_load_proof_missing") {
+    return { code: -32001, class: "policy_denied", message, retryable: false };
+  }
+  return null;
+}
+
+function classify(error: unknown): AcpJsonRpcError {
+  const message = error instanceof Error ? error.message.slice(0, 1_024) : "request failed";
+  const refusal = knownSessionRefusal(error, message);
+  if (refusal) return refusal;
   // A temporary Core refusal keeps its code and retryability so the Assistant
   // retries the turn instead of failing it.
   if (error instanceof RemoteInstanceError && isTransientExecutionRefusal(error)) {
