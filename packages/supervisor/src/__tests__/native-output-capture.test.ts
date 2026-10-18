@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { computeRemoteDeliveryOutputDigest } from "@konteks/remote-common";
-import { captureNativeDeliveryOutput, checkOutputTreeLimits } from "../native/output-capture.js";
+import { captureNativeDeliveryOutput, checkOutputTreeLimits, staleCheckoutVerdict } from "../native/output-capture.js";
 
 let dir = "";
 let linked = "";
@@ -43,6 +43,47 @@ describe("native delivery output capture", () => {
     ]);
     const { resultDigest: _, ...digestBody } = result;
     expect(result.resultDigest).toBe(computeRemoteDeliveryOutputDigest(digestBody));
+  });
+
+  it("keeps corrections against the previous accepted output across turns", async () => {
+    const { stdout } = await run("git", ["-C", dir, "rev-parse", "HEAD"]);
+    const options = { cwd: dir, gitExecutable: "/usr/bin/git", baselineCommit: stdout.trim(),
+      binding: { workspaceId: "tenant", sessionId: "session", assignmentId: "assignment", attempt: 1, instanceId: "instance" },
+      claimId: "claim", invocationRef: "first", inputSelectionDigest: `sha256:${"a".repeat(64)}`, baseRevision: stdout.trim() };
+    await writeFile(join(dir, "added.txt"), "unwanted change\n");
+    await writeFile(join(dir, "kept.txt"), "changed\n");
+    await unlink(join(dir, "deleted.txt"));
+    const first = await captureNativeDeliveryOutput(options);
+    await unlink(join(dir, "added.txt"));
+    await writeFile(join(dir, "kept.txt"), "before\n");
+    await writeFile(join(dir, "deleted.txt"), "delete me\n");
+    const second = await captureNativeDeliveryOutput({ ...options, invocationRef: "second", previousOutput: first });
+    expect(second.deletions).toEqual(["added.txt"]);
+    expect(second.files.entries.map(entry => [entry.path, Buffer.from(entry.contentBase64, "base64").toString()])).toEqual([
+      ["deleted.txt", "delete me\n"], ["kept.txt", "before\n"],
+    ]);
+    const third = await captureNativeDeliveryOutput({ ...options, invocationRef: "third", previousOutput: second });
+    expect(third.files).toEqual(second.files);
+    expect(third.deletions).toEqual(second.deletions);
+    const accepted = { treeDigest: second.files.treeDigest, files: second.files, deletions: second.deletions };
+    await expect(staleCheckoutVerdict({ ...options, publishedCommit: stdout.trim(), accepted })).resolves.toBe("accepted");
+    await writeFile(join(dir, "kept.txt"), "unaccepted work\n");
+    await expect(staleCheckoutVerdict({ ...options, publishedCommit: stdout.trim(), accepted })).resolves.toBe("unsaved");
+  });
+
+  it("retains previously accepted files when later ignored without capturing new ignored files", async () => {
+    const { stdout } = await run("git", ["-C", dir, "rev-parse", "HEAD"]);
+    const options = { cwd: dir, gitExecutable: "/usr/bin/git", baselineCommit: stdout.trim(),
+      binding: { workspaceId: "tenant", sessionId: "session", assignmentId: "assignment", attempt: 1, instanceId: "instance" },
+      claimId: "claim", invocationRef: "first", inputSelectionDigest: `sha256:${"a".repeat(64)}`, baseRevision: stdout.trim() };
+    await writeFile(join(dir, "accepted.txt"), "accepted\n");
+    const first = await captureNativeDeliveryOutput(options);
+    await writeFile(join(dir, ".git", "info", "exclude"), "accepted.txt\nprivate.txt\n");
+    await writeFile(join(dir, "accepted.txt"), "corrected\n");
+    await writeFile(join(dir, "private.txt"), "never accepted\n");
+    const second = await captureNativeDeliveryOutput({ ...options, invocationRef: "second", previousOutput: first });
+    expect(second.files.entries.map(entry => entry.path)).toEqual(["accepted.txt"]);
+    expect(Buffer.from(second.files.entries[0]!.contentBase64, "base64").toString()).toBe("corrected\n");
   });
 
   it("honors connector exclude rules without suppressing tracked project changes", async () => {
