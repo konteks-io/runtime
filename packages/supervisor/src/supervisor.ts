@@ -466,10 +466,11 @@ export class Supervisor {
   /** Preserve an owned post-activation failure before daemon cleanup releases this state. */
   private recordBootstrapFailure(identity: StoredIdentity): Promise<void> {
     return this.stateMutations.run(async () => {
-      if (this.stopping || this.instanceId !== identity.instanceId || this.workspaceId !== identity.workspaceId) return;
-      const capture = createRuntimeFailureCapture(identity.workspaceId, {
+      const { instanceId, workspaceId } = identity;
+      if (!workspaceId || this.stopping || this.instanceId !== instanceId || this.workspaceId !== workspaceId) return;
+      const capture = createRuntimeFailureCapture(workspaceId, {
         schemaVersion: 1, failureId: randomUUID(), observedAt: new Date(this.clock.coreNow()).toISOString(),
-        instanceId: identity.instanceId, scope: { kind: "runtime" }, phase: "supervisor",
+        instanceId, scope: { kind: "runtime" }, phase: "supervisor",
         stage: "runtime_start", code: "runtime_start_failed", evidence: { kind: "runtime_exception" },
       });
       await writeRuntimeFailureCapture(this.config.SUPERVISOR_DATA_DIR, capture);
