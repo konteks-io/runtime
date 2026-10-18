@@ -25,6 +25,15 @@ const authority = {
 };
 
 describe("managed Skill read observations", () => {
+  it.each([{ offset: 10 }, { limit: 1 }, { start_line: 2, end_line: 3 }, { startLine: 2, endLine: 3 }, { line_start: 2, line_end: 3 }])(
+    "does not count a partial Skill read as completed loading: %j",
+    range => {
+      const tracker = new ManagedSkillReadTracker("/private/work", [skill]);
+      expect(tracker.observe({ sessionUpdate: "tool_call", toolCallId: "partial", kind: "read", status: "completed", rawInput: { path: skill.skillFile, ...range } }, authority, "2026-10-18T00:00:00.000Z")).toBeNull();
+      expect(tracker.allRequiredSkillsLoaded()).toBe(false);
+    },
+  );
+
   it("does not infer a verified read from a display title", () => {
     const tracker = new ManagedSkillReadTracker("/private/work", [skill]);
     const call = { sessionUpdate: "tool_call", toolCallId: "title-only", title: "read_file", status: "completed", rawInput: { path: skill.skillFile } };

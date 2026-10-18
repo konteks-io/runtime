@@ -65,6 +65,17 @@ function requestedInputFile(rawInput: unknown): string | undefined {
   return undefined;
 }
 
+const READ_WINDOW_FIELDS = ["offset", "limit", "start_line", "end_line", "startLine", "endLine", "line_start", "line_end"] as const;
+
+/** A bounded excerpt is not evidence that the agent loaded the complete Skill. */
+function hasReadWindow(rawInput: unknown): boolean {
+  const input = record(rawInput);
+  if (!input) return false;
+  return [input, record(input.arguments), record(input.args)].some(candidate =>
+    candidate !== undefined && READ_WINDOW_FIELDS.some(field => Object.hasOwn(candidate, field)),
+  );
+}
+
 function requestedLocationFile(locations: unknown): string | undefined {
   if (!Array.isArray(locations)) return undefined;
   for (const location of locations) {
@@ -164,7 +175,7 @@ export class ManagedSkillReadTracker {
     authority: SkillReadAuthorityContext | null,
     observedAt: string,
   ): AgentSkillReadObservation | null {
-    if (!authority || !isReadCall(update)) return null;
+    if (!authority || !isReadCall(update) || hasReadWindow(update.rawInput)) return null;
     const file = requestedFile(update);
     if (!file) return null;
     const target = this.targetFor(file);
