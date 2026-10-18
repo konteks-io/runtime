@@ -23,18 +23,26 @@ const oidPattern = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/;
 const unavailable = () => new RemoteInstanceError("capability_unavailable", "Generated delivery output is unavailable or changed during capture.");
 
 /**
- * Package-manager caches are never part of a delivered change: an agent that
- * runs `npm install` inside the worktree would otherwise hand the platform a
+ * Package-manager and internal tool caches are never part of a delivered
+ * change: an agent that runs `npm install` would otherwise hand the platform a
  * tree of tens of thousands of vendored files, far past the contract's
- * 1000-file / 10 MiB envelope. Repository and connector ignore rules remain authoritative for untracked
- * files. Already tracked files are still captured even if later ignored.
+ * 1000-file / 10 MiB envelope. Repository and connector ignore rules remain
+ * authoritative for untracked files. Tracked project files are still captured even if later ignored;
+ * internal tool paths stay at their baseline state in the private index.
  */
-const DEPENDENCY_CACHE_EXCLUSIONS = [
+const TOOL_ARTIFACT_ROOTS = ["graft/.cache", "graft/.graph"] as const;
+const OUTPUT_CACHE_EXCLUSIONS = [
   ":(exclude,glob)**/node_modules/**",
   ":(exclude,glob)**/.venv/**",
   ":(exclude,glob)**/__pycache__/**",
   ":(exclude,glob)**/.pnpm-store/**",
+  ...TOOL_ARTIFACT_ROOTS.map(root => `:(exclude,top,literal)${root}`),
 ];
+
+function isToolArtifactPath(relativePath: string): boolean {
+  // Git already names canonical repository-relative paths on every platform.
+  return TOOL_ARTIFACT_ROOTS.some(root => relativePath === root || relativePath.startsWith(`${root}/`));
+}
 
 /** The captured tree against the transfer contract, before any bytes leave the runtime. */
 export function checkOutputTreeLimits(entries: ReadonlyArray<{ sizeBytes: number }>): void {
@@ -81,7 +89,7 @@ async function captureIndex(executable: string, cwd: string, baselineCommit: str
   await runGit(executable, cwd, ["read-tree", "--reset", baselineCommit], env);
   // A private index captures tracked changes and non-ignored new files.
   // Forcing addition bypasses connector excludes and publishes local tooling.
-  await runGit(executable, cwd, ["add", "--no-renormalize", "-A", "--", ".", ...DEPENDENCY_CACHE_EXCLUSIONS], env);
+  await runGit(executable, cwd, ["add", "--no-renormalize", "-A", "--", ".", ...OUTPUT_CACHE_EXCLUSIONS], env);
   await captureAcceptedPaths(executable, cwd, env, previous);
   const tree = (await runGit(executable, cwd, ["write-tree"], env)).toString("ascii").trim();
   if (!oidPattern.test(tree)) throw unavailable();
@@ -94,6 +102,7 @@ async function captureAcceptedPaths(executable: string, cwd: string, env: NodeJS
   const files = RemoteFileTreeSchema.parse(previous.files);
   const paths: string[] = [];
   for (const entry of files.entries) {
+    if (isToolArtifactPath(entry.path)) continue;
     const stat = await lstat(join(cwd, entry.path)).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT" || error.code === "ENOTDIR") return null;
       throw error;
@@ -200,7 +209,7 @@ async function capturedChanges(gitExecutable: string, root: string, baselineComm
   let deletions = decodePaths(await runGit(gitExecutable, root, ["diff", "--cached", "--diff-filter=D", "--name-only", "-z", "--no-renames", baselineCommit, "--"], env));
   const writes = decodePaths(await runGit(gitExecutable, root, ["diff", "--cached", "--diff-filter=ACMRTUXB", "--name-only", "-z", "--no-renames", baselineCommit, "--"], env));
   const tree = parseTree(await runGit(gitExecutable, root, ["ls-tree", "-rz", second], env));
-  const touched = new Set([...writes, ...deletions, ...(previous?.files.entries.map(entry => entry.path) ?? []), ...(previous?.deletions ?? [])]);
+  const touched = new Set([...writes, ...deletions, ...(previous?.files.entries.map(entry => entry.path) ?? []), ...(previous?.deletions ?? [])].filter(path => !isToolArtifactPath(path)));
   deletions = [...touched].filter(path => !tree.has(path)).sort();
   const selected = [...touched].filter(path => tree.has(path)).sort().map(path => ({ path, item: tree.get(path) }));
   if (selected.some(value => !value.item)) throw unavailable();
