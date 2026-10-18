@@ -190,12 +190,12 @@ export class NativeOutputSessionHeadStore {
   }
 
   /** The output this session's last accepted turn produced here, when this computer still records one. Read-only. */
-  async latestAccepted(): Promise<{ treeDigest: string; deletions: string[] } | null> {
+  async latestAccepted(): Promise<{ treeDigest: string; deletions: string[]; files: RemoteDeliveryResultCandidate["files"] } | null> {
     const head = await this.read();
     if (!head?.latest) return null;
     const record = await this.record({ invocationId: head.latest.invocationId, claimId: head.latest.claimId }).read();
     if (record?.state !== "accepted") return null;
-    return { treeDigest: record.candidate.files.treeDigest, deletions: [...record.candidate.deletions] };
+    return { treeDigest: record.candidate.files.treeDigest, deletions: [...record.candidate.deletions], files: record.candidate.files };
   }
 
   async verifyExpected(expected: ExpectedAcceptance, current: Omit<TurnIdentity, "sessionId">): Promise<void> {

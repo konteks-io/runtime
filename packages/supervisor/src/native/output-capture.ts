@@ -77,14 +77,30 @@ function decodePaths(value: Buffer): string[] {
   return new TextDecoder("utf-8", { fatal: true }).decode(value).split("\0").filter(Boolean).sort();
 }
 
-async function captureIndex(executable: string, cwd: string, baselineCommit: string, env: NodeJS.ProcessEnv): Promise<string> {
+async function captureIndex(executable: string, cwd: string, baselineCommit: string, env: NodeJS.ProcessEnv, previous?: PreviousOutput | null): Promise<string> {
   await runGit(executable, cwd, ["read-tree", "--reset", baselineCommit], env);
   // A private index captures tracked changes and non-ignored new files.
   // Forcing addition bypasses connector excludes and publishes local tooling.
   await runGit(executable, cwd, ["add", "--no-renormalize", "-A", "--", ".", ...DEPENDENCY_CACHE_EXCLUSIONS], env);
+  await captureAcceptedPaths(executable, cwd, env, previous);
   const tree = (await runGit(executable, cwd, ["write-tree"], env)).toString("ascii").trim();
   if (!oidPattern.test(tree)) throw unavailable();
   return tree;
+}
+
+/** Previously accepted paths remain project output even if a later ignore rule hides them. */
+async function captureAcceptedPaths(executable: string, cwd: string, env: NodeJS.ProcessEnv, previous?: PreviousOutput | null): Promise<void> {
+  if (!previous) return;
+  const files = RemoteFileTreeSchema.parse(previous.files);
+  const paths: string[] = [];
+  for (const entry of files.entries) {
+    const stat = await lstat(join(cwd, entry.path)).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT" || error.code === "ENOTDIR") return null;
+      throw error;
+    });
+    if (stat && !stat.isDirectory()) paths.push(entry.path);
+  }
+  if (paths.length) await runGit(executable, cwd, ["--literal-pathspecs", "add", "--no-renormalize", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"], env, paths.join("\0") + "\0");
 }
 
 function parseTree(value: Buffer): Map<string, { oid: string; mode: 0o600 | 0o700 }> {
@@ -138,7 +154,7 @@ export async function captureNativeDeliveryOutput(options: CaptureOptions): Prom
     temporary = await mkdtemp(join(dirname(root), ".output-capture-")); await chmod(temporary, 0o700);
     const temporaryObjects = join(temporary, "objects"); await mkdir(temporaryObjects, { mode: 0o700 });
     const env = { GIT_INDEX_FILE: join(temporary, "index"), GIT_OBJECT_DIRECTORY: temporaryObjects, GIT_ALTERNATE_OBJECT_DIRECTORIES: objectDirectory };
-    const { entries, deletions } = await capturedChanges(options.gitExecutable, root, options.baselineCommit, env);
+    const { entries, deletions } = await capturedChanges(options.gitExecutable, root, options.baselineCommit, env, options.previousOutput);
     const result = deliveryCandidate(options, entries, deletions);
     logger.info({ event: "native.output.capture_completed", correlationId: result.invocationRef, stage: "capture", outcome: "success",
       files: entries.length, bytes: entries.reduce((total, entry) => total + entry.sizeBytes, 0), treeDigest: result.files.treeDigest,
@@ -157,8 +173,10 @@ export async function captureNativeDeliveryOutput(options: CaptureOptions): Prom
 interface CaptureOptions {
   cwd: string; gitExecutable: string; baselineCommit: string; binding: RemoteTransferBinding; claimId: string;
   invocationRef: string; inputSelectionDigest: string; baseRevision: string;
-  logger?: Logger;
+  logger?: Logger; previousOutput?: PreviousOutput | null;
 }
+
+type PreviousOutput = Pick<RemoteDeliveryResultCandidate, "files" | "deletions">;
 
 type CapturedEntry = { path: string; mode: 384 | 448; sizeBytes: number; digest: string; contentBase64: string };
 
@@ -175,14 +193,16 @@ async function commonObjectDirectory(gitExecutable: string, root: string): Promi
 }
 
 /** The files written and deleted since the baseline, captured twice into the private index and required to agree. */
-async function capturedChanges(gitExecutable: string, root: string, baselineCommit: string, env: NodeJS.ProcessEnv): Promise<{ entries: CapturedEntry[]; deletions: string[] }> {
-  const first = await captureIndex(gitExecutable, root, baselineCommit, env);
-  const second = await captureIndex(gitExecutable, root, baselineCommit, env);
+async function capturedChanges(gitExecutable: string, root: string, baselineCommit: string, env: NodeJS.ProcessEnv, previous?: PreviousOutput | null): Promise<{ entries: CapturedEntry[]; deletions: string[] }> {
+  const first = await captureIndex(gitExecutable, root, baselineCommit, env, previous);
+  const second = await captureIndex(gitExecutable, root, baselineCommit, env, previous);
   if (first !== second) throw unavailable();
-  const deletions = decodePaths(await runGit(gitExecutable, root, ["diff", "--cached", "--diff-filter=D", "--name-only", "-z", "--no-renames", baselineCommit, "--"], env));
+  let deletions = decodePaths(await runGit(gitExecutable, root, ["diff", "--cached", "--diff-filter=D", "--name-only", "-z", "--no-renames", baselineCommit, "--"], env));
   const writes = decodePaths(await runGit(gitExecutable, root, ["diff", "--cached", "--diff-filter=ACMRTUXB", "--name-only", "-z", "--no-renames", baselineCommit, "--"], env));
   const tree = parseTree(await runGit(gitExecutable, root, ["ls-tree", "-rz", second], env));
-  const selected = writes.map(path => ({ path, item: tree.get(path) }));
+  const touched = new Set([...writes, ...deletions, ...(previous?.files.entries.map(entry => entry.path) ?? []), ...(previous?.deletions ?? [])]);
+  deletions = [...touched].filter(path => !tree.has(path)).sort();
+  const selected = [...touched].filter(path => tree.has(path)).sort().map(path => ({ path, item: tree.get(path) }));
   if (selected.some(value => !value.item)) throw unavailable();
   const blobs = await readBlobs(gitExecutable, root, env, selected.map(value => value.item!.oid));
   const entries = selected.map((value, index) => {
@@ -229,14 +249,15 @@ export async function staleCheckoutVerdict(options: StaleCheckoutInput): Promise
 }
 
 type StaleCheckoutInput = { cwd: string; gitExecutable: string; baselineCommit: string;
-  publishedCommit: string; accepted?: { treeDigest: string; deletions: readonly string[] } | null };
+  publishedCommit: string; accepted?: { treeDigest: string; deletions: readonly string[]; files?: RemoteDeliveryResultCandidate["files"] } | null };
 
 function assertStaleInput(options: StaleCheckoutInput): void {
   if (!isAbsolute(options.gitExecutable) || !oidPattern.test(options.baselineCommit) || !oidPattern.test(options.publishedCommit)) throw unavailable();
 }
 
 async function verdictOf(options: StaleCheckoutInput, root: string, env: NodeJS.ProcessEnv): Promise<StaleCheckoutVerdict> {
-  const { entries, deletions } = await capturedChanges(options.gitExecutable, root, options.baselineCommit, env);
+  const previous = options.accepted?.files ? { files: options.accepted.files, deletions: [...options.accepted.deletions] } : undefined;
+  const { entries, deletions } = await capturedChanges(options.gitExecutable, root, options.baselineCommit, env, previous);
   if (!entries.length && !deletions.length) return "clean";
   if (sameOutput(options.accepted, entries, deletions)) return "accepted";
   // The private index now holds the checkout exactly as captured.
