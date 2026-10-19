@@ -4,7 +4,18 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { FixedClock, RemoteInstanceError, generateEd25519, ed25519Sign, remoteControlSigningBytes, computeExecutionRevisionControlIntentDigest, computeRemoteExecutionOperationDigest, type RemoteDeliveryAcceptanceReceipt, type RemoteWorkAssignment } from "@konteks/remote-common";
+import {
+  FixedClock,
+  RemoteInstanceError,
+  generateEd25519,
+  ed25519Sign,
+  remoteControlSigningBytes,
+  computeExecutionRevisionControlIntentDigest,
+  computeRemoteExecutionOperationDigest,
+  verifyRemoteExecutionOperationSignature,
+  type RemoteDeliveryAcceptanceReceipt,
+  type RemoteWorkAssignment,
+} from "@konteks/remote-common";
 import { CoreSignatureVerifier } from "../control/core-signature.js";
 import { PermissionAnswerReceiver } from "../control/permission-answer-receiver.js";
 import { SupervisorJournal } from "../state/journal.js";
@@ -18,6 +29,7 @@ import type { TransportManager } from "../transport/relay-transport.js";
 import { RunnerEventBus } from "../../../agent-runner/src/events.js";
 import { SessionManager, InMemorySessionRefStore } from "../../../agent-runner/src/sessions/manager.js";
 import type { BridgeProcess } from "../../../agent-runner/src/bridge/process.js";
+import { WorkOrchestrator } from "../work/orchestrator.js";
 
 let root: string;
 const gates: NativeExecutionGate[] = [];
@@ -484,6 +496,254 @@ it.each(["valid", "core-clock-ahead", "fractional-core-clock", "lost-during-keys
   } else { await expect(receiver.receive(body)).rejects.toThrow(); expect(dispatched).not.toHaveBeenCalled(); }
 });
 
+function permissionOperation(
+  base: Record<string, unknown>,
+  method: "session/request_permission" | "elicitation/create",
+  kind: "result" | "error",
+  selected = false,
+) {
+  const result =
+    method === "session/request_permission"
+      ? {
+          outcome: selected ? { outcome: "selected", optionId: "allow" } : { outcome: "cancelled" },
+        }
+      : { action: "cancel" };
+  const message =
+    kind === "result"
+      ? { kind: "acp_result" as const, method, id: "pending", result }
+      : {
+          kind: "acp_error" as const,
+          method,
+          id: "pending",
+          error: { code: -32000, class: "policy_denied", message: "Declined", retryable: false },
+        };
+  const claims = {
+    ...base,
+    operationId: "answer-operation",
+    permitId: "answer-permit",
+    kind: message.kind,
+    method,
+    requestId: message.id,
+    payloadDigest: computeRemoteExecutionOperationDigest(message),
+    sender: {
+      kind: "core_permission_answer",
+      principal: "core-answer",
+      pendingRef: "pending-ref",
+      requestDigest: "b".repeat(43),
+      responderActorId: "user:default/responder",
+      decisionId: "decision",
+    },
+  };
+  return {
+    claims,
+    operation: {
+      kind: "authorized_operation" as const,
+      operationId: claims.operationId,
+      permit: signed(claims),
+      message,
+    },
+  };
+}
+
+function signedPermissionDelivery(
+  clock: FixedClock,
+  operation: ReturnType<typeof permissionOperation>["operation"],
+) {
+  const control = generateEd25519();
+  const verifier = new CoreSignatureVerifier([
+    {
+      keyId: "release",
+      publicKeyJwk: generateEd25519().publicJwk,
+      coreControlKeys: [{ keyId: "control", publicKeyJwk: control.publicJwk }],
+    },
+  ]);
+  const body = {
+    type: "runtime_permission_answer_delivery",
+    method: "POST",
+    path: { instanceId: "instance" },
+    nodeId: "node",
+    connectionRef: "connection",
+    connectionEpoch: 1,
+    intent: {
+      intentId: "intent",
+      tenantId: "tenant",
+      instanceId: "instance",
+      executionId: "execution",
+      operation,
+    },
+    keyId: "control",
+    nonce: "N".repeat(22),
+    issuedAt: clock.nowIso(),
+    expiresAt: new Date(clock.coreNow() + 30000).toISOString(),
+    signature: "AA",
+  };
+  body.signature = ed25519Sign(control.privateKey, remoteControlSigningBytes(body));
+  return { body, verifier };
+}
+
+async function deliveryAnswerFixture(role: "generator" | "qa") {
+  const f = await deliveryFixture();
+  f.assigned.kind = role === "qa" ? "validation" : "delivery";
+  f.assigned.agentRoute.requiredRole = role;
+  f.claims.deliveryIdentity.requiredRuntimeRole = role;
+  f.claims.deliveryIdentity.routeId = role;
+  const entry = f.journal.assignments.get("assignment:1")!;
+  await f.journal.assignments.put({ ...entry, kind: f.assigned.kind });
+  return f;
+}
+
+it.each([
+  ["generator", "session/request_permission", "result"],
+  ["qa", "session/request_permission", "result"],
+  ["qa", "elicitation/create", "result"],
+  ["qa", "session/request_permission", "error"],
+  ["qa", "elicitation/create", "error"],
+] as const)(
+  "verifies and durably completes a %s Delivery %s %s answer with replay after restart",
+  async (role, method, kind) => {
+    const f = await deliveryAnswerFixture(role),
+      answer = permissionOperation(f.claims, method, kind);
+    await f.journal.pendingRequests.put({
+      acpSessionRef: "acp",
+      id: "pending",
+      method,
+      direction: "issued",
+      openedAt: f.clock.nowIso(),
+      closedAt: null,
+      deadlineAt: new Date(f.clock.coreNow() + 30000).toISOString(),
+      requestDigest: answer.claims.sender.requestDigest,
+    });
+    const { body, verifier } = signedPermissionDelivery(f.clock, answer.operation);
+    f.client.consumeDeliveryExecution.mockResolvedValue({
+      outcome: "admitted",
+      admissionId: "answer-admission",
+      receipt: signed({
+        ...answer.claims,
+        aud: "konteks:delivery-execution-admission",
+        admissionId: "answer-admission",
+        admittedAt: f.clock.nowIso(),
+        checkExpiresAt: new Date(f.clock.coreNow() + 30000).toISOString(),
+      }),
+    });
+    let gate = f.gate;
+    const dispatch = vi.fn();
+    const receiver = new PermissionAnswerReceiver({
+      verifier,
+      core: f.client,
+      coreProducer: "core-answer",
+      now: () => f.clock.coreNow(),
+      captureConnection: () => ({
+        instanceId: "instance",
+        workspaceId: "tenant",
+        runnerIncarnation: "runner",
+        connectionEpoch: 1,
+        leaseExpiresAt: expiresAt,
+        assertCurrent: () => undefined,
+      }),
+      deliver: async (operation, _claims, current) => {
+        current();
+        const admitted = await gate.admit(operation);
+        current();
+        if (await gate.begin(admitted)) {
+          dispatch();
+          await gate.complete(admitted.key);
+        }
+      },
+    });
+    await receiver.receive(body);
+    const reloaded = new SupervisorJournal(root);
+    await reloaded.load();
+    gate = f.makeGate(reloaded);
+    await receiver.receive(body);
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(f.client.consumeDeliveryExecution).toHaveBeenCalledOnce();
+    expect(f.client.consumeExecution).not.toHaveBeenCalled();
+    expect(await terminalOperationDispositions(reloaded, "assignment", 1, "claim")).toContainEqual(
+      expect.objectContaining({
+        operationId: "answer-operation",
+        admissionId: "answer-admission",
+        state: "completed",
+      }),
+    );
+  },
+);
+
+it.each(["wrong-audience", "foreign-assignment", "wrong-producer", "lost-connection"] as const)(
+  "refuses a Delivery answer's %s before a new consumption",
+  async (mode) => {
+    const f = await deliveryAnswerFixture("qa"),
+      answer = permissionOperation(f.claims, "session/request_permission", "result");
+    const changed = {
+      ...answer.claims,
+      ...(mode === "wrong-audience" ? { aud: "konteks:remote-execution-operation" } : {}),
+      ...(mode === "foreign-assignment" ? { assignmentId: "other-assignment" } : {}),
+    };
+    const { body, verifier } = signedPermissionDelivery(f.clock, {
+      ...answer.operation,
+      permit: signed(changed),
+    });
+    const dispatch = vi.fn();
+    const receiver = new PermissionAnswerReceiver({
+      verifier,
+      core: f.client,
+      coreProducer: mode === "wrong-producer" ? "assistant" : "core-answer",
+      now: () => f.clock.coreNow(),
+      captureConnection: () => ({
+        instanceId: "instance",
+        workspaceId: "tenant",
+        runnerIncarnation: "runner",
+        connectionEpoch: 1,
+        leaseExpiresAt: expiresAt,
+        assertCurrent: () => {
+          if (mode === "lost-connection") throw new Error("connection replaced");
+        },
+      }),
+      deliver: async (operation) => {
+        const admitted = await f.gate.admit(operation);
+        if (await f.gate.begin(admitted)) dispatch();
+      },
+    });
+    await expect(receiver.receive(body)).rejects.toThrow();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(f.client.consumeDeliveryExecution).not.toHaveBeenCalled();
+    expect(f.client.consumeExecution).not.toHaveBeenCalled();
+  },
+);
+
+it("refuses a genuinely valid Assistant answer on an owned Delivery assignment without consumption", async () => {
+  const assistant = await fixture(),
+    f = await deliveryAnswerFixture("qa");
+  const answer = permissionOperation(assistant.claims, "session/request_permission", "result");
+  expect(
+    verifyRemoteExecutionOperationSignature({
+      operation: answer.operation,
+      trustedKeys: keys,
+      nowSeconds: Math.floor(f.clock.coreNow() / 1000),
+    }),
+  ).toMatchObject({ aud: "konteks:remote-execution-operation", sender: answer.claims.sender });
+  const { body, verifier } = signedPermissionDelivery(f.clock, answer.operation);
+  const receiver = new PermissionAnswerReceiver({
+    verifier,
+    core: f.client,
+    coreProducer: "core-answer",
+    now: () => f.clock.coreNow(),
+    captureConnection: () => ({
+      instanceId: "instance",
+      workspaceId: "tenant",
+      runnerIncarnation: "runner",
+      connectionEpoch: 1,
+      leaseExpiresAt: expiresAt,
+      assertCurrent: () => undefined,
+    }),
+    deliver: async (operation) => {
+      await f.gate.admit(operation);
+    },
+  });
+  await expect(receiver.receive(body)).rejects.toThrow();
+  expect(f.client.consumeDeliveryExecution).not.toHaveBeenCalled();
+  expect(f.client.consumeExecution).not.toHaveBeenCalled();
+});
+
 async function sessionFixture(work: RemoteWorkAssignment = assignment, acceptDeliveryOutput?: (authority: { claimId: string; invocationRef: string }) => Promise<RemoteDeliveryAcceptanceReceipt>,
   logger?: { warn: (...args: unknown[]) => void; info: (...args: unknown[]) => void; error: (...args: unknown[]) => void; debug: (...args: unknown[]) => void },
   authority: Record<string, unknown> = {}, deps: Partial<RelayedSessionDeps> = {}) {
@@ -522,6 +782,121 @@ const deliveryTurn: RemoteWorkAssignment = { ...assignment, kind: "delivery", ta
     repositoryId: "https://git.example.com/acme/store", modelBinding: { canonicalProviderId: "openai", canonicalModelId: "model-a" },
     turn: { invocationId: "invocation", dispatchGeneration: 0 } } };
 type SessionFixture = Awaited<ReturnType<typeof sessionFixture>>;
+
+it.each([
+  ["session/request_permission", true],
+  ["elicitation/create", true],
+  ["session/request_permission", false],
+] as const)(
+  "a QA %s answer is completed only after the actual runner reports delivered=%s",
+  async (method, delivered) => {
+    const broker = new PermissionBroker({
+      clock: new FixedClock(Date.parse("2026-09-10T00:00:00Z")),
+      deadlineSeconds: () => 60,
+      onTimeout: async () => undefined,
+    });
+    const work: RemoteWorkAssignment = {
+      ...deliveryTurn,
+      kind: "validation",
+      agentRoute: { ...deliveryTurn.agentRoute, requiredRole: "qa" },
+    };
+    const f = await sessionFixture(work, undefined, undefined, {}, { broker });
+    const currentOwner = { channelOwners: new Map([["session:session", f.session]]) };
+    if (!("deliveryIdentity" in f.claims) || !("consumeDeliveryExecution" in f.client))
+      throw new Error("Delivery fixture is required");
+    f.claims.deliveryIdentity.requiredRuntimeRole = "qa";
+    f.claims.deliveryIdentity.routeId = "qa";
+    const answer = permissionOperation(f.claims, method, "result", true),
+      { body, verifier } = signedPermissionDelivery(f.clock, answer.operation);
+    const pending = broker.defer({
+      acpSessionRef: "acp",
+      requestId: "pending",
+      assignmentId: "assignment",
+      attempt: 1,
+      agentId: "codex",
+      sanitized:
+        method === "session/request_permission"
+          ? {
+              kind: "permission",
+              requestDigest: "b".repeat(43),
+              params: {
+                title: "Review tool",
+                options: [
+                  { optionId: "allow", name: "Allow once", kind: "allow_once" },
+                  { optionId: "reject", name: "Reject", kind: "reject_once" },
+                ],
+              },
+            }
+          : {
+              kind: "elicitation",
+              requestDigest: "b".repeat(43),
+              isSignIn: false,
+              params: { message: "Review input", requestedSchema: {} },
+            },
+    });
+    await f.journal.pendingRequests.put({
+      acpSessionRef: "acp",
+      id: pending.requestId,
+      method,
+      direction: "issued",
+      openedAt: pending.raisedAt,
+      closedAt: null,
+      deadlineAt: pending.deadlineAt,
+      requestDigest: pending.sanitized.requestDigest,
+    });
+    f.runner.answer.mockResolvedValue({ delivered });
+    f.client.consumeDeliveryExecution.mockResolvedValue({
+      outcome: "admitted",
+      admissionId: "answer-admission",
+      receipt: signed({
+        ...answer.claims,
+        aud: "konteks:delivery-execution-admission",
+        admissionId: "answer-admission",
+        admittedAt: f.clock.nowIso(),
+        checkExpiresAt: new Date(f.clock.coreNow() + 30000).toISOString(),
+      }),
+    });
+    const receiver = new PermissionAnswerReceiver({
+      verifier,
+      core: f.client,
+      coreProducer: "core-answer",
+      now: () => f.clock.coreNow(),
+      captureConnection: () => ({
+        instanceId: "instance",
+        workspaceId: "tenant",
+        runnerIncarnation: "runner",
+        connectionEpoch: 1,
+        leaseExpiresAt: expiresAt,
+        assertCurrent: () => undefined,
+      }),
+      deliver: (operation, claims, current) =>
+        WorkOrchestrator.prototype.onPermissionAnswer.call(
+          currentOwner as never,
+          operation,
+          claims,
+          current,
+        ),
+    });
+    const authorizationState = () =>
+      f.journal.pendingRequests.get("acp:issued:pending")?.authorization?.state;
+    if (delivered) {
+      await receiver.receive(body);
+      await receiver.receive(body);
+      expect(authorizationState()).toBe("completed");
+    } else {
+      await expect(receiver.receive(body)).rejects.toMatchObject({ code: "operation_interrupted" });
+      expect(authorizationState()).toBe("dispatch_started");
+    }
+    const expectedAnswer =
+      method === "session/request_permission"
+        ? { outcome: { outcome: "selected", optionId: "allow" } }
+        : { action: "cancel" };
+    expect(f.runner.answer).toHaveBeenCalledExactlyOnceWith("acp", "pending", expectedAnswer);
+    expect(f.client.consumeDeliveryExecution).toHaveBeenCalledOnce();
+    expect(f.client.consumeExecution).not.toHaveBeenCalled();
+    broker.cancelSession("acp");
+  },
+);
 
 async function admittedProtocolFailure(failure: Error) {
   const onRuntimeFailure = vi.fn((_fact: unknown, _context: unknown) => undefined);

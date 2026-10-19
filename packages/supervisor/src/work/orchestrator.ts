@@ -4,6 +4,7 @@ import {
   allEqual,
   type RemoteAuthorizedOperation,
   type RemoteExecutionOperationPermitClaims,
+  type RemoteDeliveryOperationPermitClaims,
   ClaimResultSchema,
   RemoteWorkAssignmentSchema,
   ReportAckSchema,
@@ -1901,7 +1902,7 @@ export class WorkOrchestrator {
     this.logger.warn({ channelId }, "session frame for an unknown channel");
   }
 
-  async onPermissionAnswer(operation: RemoteAuthorizedOperation, claims: RemoteExecutionOperationPermitClaims, assertCurrent: () => void): Promise<void> {
+  async onPermissionAnswer(operation: RemoteAuthorizedOperation, claims: RemoteExecutionOperationPermitClaims | RemoteDeliveryOperationPermitClaims, assertCurrent: () => void): Promise<void> {
     assertCurrent();
     const owner = this.channelOwners.get(claims.channelId);
     if (!owner || operation.message.kind === "acp" || claims.sender.kind !== "core_permission_answer" ||

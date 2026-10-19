@@ -148,6 +148,83 @@ describe("D20c claim-bound bootstrap failure history", () => {
     expect(f.sent.filter(message => "reportId" in (message.body as object))).toEqual([]);
   });
 
+  it.each(["acp_session_bootstrap", "readiness"] as const)(
+    "retains a static refusal within its original %s stage",
+    async (stage) => {
+      const f = await fixture();
+      const original = new RemoteInstanceError("recovery_required", privateDetail, {
+        diagnostic: "local_execution_unprovable",
+      });
+      if (stage === "acp_session_bootstrap")
+        vi.mocked(f.runner.createSession).mockRejectedValueOnce(original);
+      else f.ready.mockRejectedValueOnce(original);
+      await expect(f.session().bootstrap()).rejects.toBe(original);
+      await Promise.all(f.captures);
+      const failures = await retainedFailures();
+      expect(failures).toHaveLength(1);
+      assertSafeFact(failures[0], `${stage}_local_execution_unprovable`, "recovery_required");
+      expect(failures[0].retryable).toBe(false);
+      expect(f.reporter).toHaveBeenCalledOnce();
+      expect(f.onUsage).not.toHaveBeenCalled();
+    },
+  );
+
+  it("retains the actual legacy Codex refusal beneath the fallback bootstrap parent", async () => {
+    const f = await fixture();
+    const inspect = vi.fn(async () => false);
+    const session = f.session({
+      continueReference: "legacy-reference",
+      assertLegacyCodexThreadUnloaded: inspect,
+    });
+    await expect(session.bootstrap()).rejects.toMatchObject({
+      code: "recovery_required",
+      diagnostic: "legacy_mcp_thread_loaded_or_unverified",
+    });
+    await Promise.all(f.captures);
+    const failures = await retainedFailures();
+    expect(failures).toHaveLength(1);
+    assertSafeFact(
+      failures[0],
+      "session_bootstrap_legacy_mcp_thread_loaded_or_unverified",
+      "recovery_required",
+    );
+    expect(inspect).toHaveBeenCalledExactlyOnceWith("legacy-reference");
+    expect(f.runner.createSession).not.toHaveBeenCalled();
+    expect(f.ready).not.toHaveBeenCalled();
+    expect(f.reporter).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { label: "an identifier-shaped private value", diagnostic: "private_token_canary" },
+    { label: "private exception detail", diagnostic: privateDetail },
+    { label: "an oversized identifier", diagnostic: "x".repeat(128) },
+  ])("keeps $label out of durable history", async ({ diagnostic }) => {
+    const f = await fixture();
+    const original = new RemoteInstanceError("recovery_required", privateDetail, { diagnostic });
+    vi.mocked(f.runner.createSession).mockRejectedValueOnce(original);
+    await expect(f.session().bootstrap()).rejects.toBe(original);
+    await Promise.all(f.captures);
+    const failures = await retainedFailures();
+    expect(failures).toHaveLength(1);
+    assertSafeFact(failures[0], "acp_session_bootstrap", "recovery_required");
+    expect(failures[0].evidence).toEqual({ kind: "runtime_exception" });
+    expect(JSON.stringify(failures)).not.toContain(diagnostic);
+  });
+
+  it("does not trust an arbitrary error carrying a known diagnostic spelling", async () => {
+    const f = await fixture();
+    const original = Object.assign(new Error(privateDetail), {
+      diagnostic: "local_execution_unprovable",
+    });
+    vi.mocked(f.runner.createSession).mockRejectedValueOnce(original);
+    await expect(f.session().bootstrap()).rejects.toBe(original);
+    await Promise.all(f.captures);
+    const failures = await retainedFailures();
+    expect(failures).toHaveLength(1);
+    assertSafeFact(failures[0], "acp_session_bootstrap", "session_bootstrap_failed");
+    expect(JSON.stringify(failures)).not.toContain("local_execution_unprovable");
+  });
+
   it("does not infer a provider code or copy fields from an arbitrary thrown error", async () => {
     const f = await fixture();
     const original = Object.assign(new Error(privateDetail), { name: "private-d20c-name", code: -32603, cause: { args: privateDetail } });
@@ -226,78 +303,187 @@ describe("D20c claim-bound bootstrap failure history", () => {
     expect(await retainedFailures()).toEqual([]);
   });
 
-  it("replays the same durable fact after an offline send without creating another observation", async () => {
+  it("replays the same durable refusal substage after an offline send without creating another observation", async () => {
     const f = await fixture();
-    const original = new Error(privateDetail);
+    const original = new RemoteInstanceError("recovery_required", privateDetail, {
+      diagnostic: "local_execution_unprovable",
+    });
     vi.mocked(f.runner.createSession).mockRejectedValueOnce(original);
     await expect(f.session().bootstrap()).rejects.toBe(original);
     await Promise.all(f.captures);
     const captured = await retainedFailures();
     expect(captured).toHaveLength(1);
+    assertSafeFact(
+      captured[0],
+      "acp_session_bootstrap_local_execution_unprovable",
+      "recovery_required",
+    );
     const sent: RuntimeFailureObservation[] = [];
     const send = vi.fn(async (_instanceId: string, body: unknown) => {
       const observation = RuntimeFailureObservationSchema.parse(body);
       sent.push(observation);
       if (sent.length === 1) throw new Error(privateDetail);
-      return { schemaVersion: 1 as const, instanceId: observation.instanceId, failureId: observation.failureId,
-        failureDigest: jcsDigest(observation as unknown as JsonValue), status: "duplicate" as const };
+      return {
+        schemaVersion: 1 as const,
+        instanceId: observation.instanceId,
+        failureId: observation.failureId,
+        failureDigest: jcsDigest(observation as unknown as JsonValue),
+        status: "duplicate" as const,
+      };
     });
-    const makeDelivery = () => new RuntimeFailureDelivery({ dataDir: dir, core: { submitRuntimeFailure: send },
-      instanceId: () => assignment.instanceId, clock: f.clock, coreContractVersion: () => "7.12", canSend: () => true });
+    const makeDelivery = () =>
+      new RuntimeFailureDelivery({
+        dataDir: dir,
+        core: { submitRuntimeFailure: send },
+        instanceId: () => assignment.instanceId,
+        clock: f.clock,
+        coreContractVersion: () => "7.12",
+        canSend: () => true,
+      });
     const first = makeDelivery();
-    await first.flush(); first.stop();
+    await first.flush();
+    first.stop();
     expect(await retainedFailures()).toEqual(captured);
     f.clock.advance(60_000);
     const restarted = makeDelivery();
-    await restarted.flush(); restarted.stop();
+    await restarted.flush();
+    restarted.stop();
     expect(sent).toEqual([captured[0], captured[0]]);
     expect(await retainedFailures()).toEqual([]);
     expect(f.reporter).toHaveBeenCalledOnce();
   });
 
-  it("keeps the ordinary dispatch failure result while retaining exactly one bootstrap fact", async () => {
-    const f = await fixture(false);
-    const original = new RemoteInstanceError("recovery_required", privateDetail);
-    vi.mocked(f.runner.createSession).mockRejectedValueOnce(original);
-    const lease = new LeaseState(f.clock);
-    lease.set({ lease: "fixture-lease", mode: "active", workspaceId: assignment.workspaceId, issuedAt: f.clock.nowIso(),
-      expiresAt: assignment.expiresAt, drainDeadline: null });
-    const outbox = new DurableOutbox(dir); await outbox.load();
-    const work = new WorkOrchestrator({
-      clock: f.clock, journal: f.supervisor.journal, outbox, transport: f.transport, lease,
-      instanceId: () => assignment.instanceId, runnerIncarnation: () => "runner", assertOwned: () => undefined,
-      workspaceId: () => assignment.workspaceId,
-      agents: () => [{ agentId: "codex", displayName: "Codex", connectionState: "ready", authMode: "agent_local_subscription",
-        accountScope: "personal", readiness: "ready", tokenUsageObservable: true,
-        acpCapabilities: { sessionResume: true, forkSession: false, structuredOutputShim: true, toolControl: "approve" } }],
-      roleBindings: () => [{ role: "assistant", agentPreference: ["codex"] }], advertisedRoles: () => ["assistant"],
-      acceptedKinds: () => ["assistant_execution"], instanceEvidencePolicy: () => "structured_only", draining: () => false,
-      reconciliationComplete: () => true, recoveryAuthority: () => "accepted-recovery", reportDeliveryAllowed: () => true,
-      headroom: () => 2, maxPullItems: 1, runners: new Map([["codex", f.runner]]), onUsage: f.onUsage,
-      sessionDeps: (target, runner) => ({ ...f.deps, runner,
-        registerReady: createNativeReadyRegistrar({ clock: f.clock, journal: f.supervisor.journal, instanceId: target.instanceId,
-          workspaceId: target.workspaceId, runnerIncarnation: "runner", assertActive: () => undefined,
-          client: { registerExecutionReady: async (_instanceId, request) => ({ ...request, workspaceId: target.workspaceId,
-            instanceId: target.instanceId, sessionId: "session", channelId: "session:session", readyRevision: 1, registeredAt: f.clock.nowIso() }) } }),
-      }),
-    });
-    cleanups.push(() => work.drainSessions("drain"));
-    await work.onAssignmentMessage({ assignments: [assignment] });
-    const claim = f.supervisor.journal.assignments.get("asg:1")!;
-    expect(claim).toMatchObject({ assignmentId: "asg", state: "claimed" });
-    await work.onAssignmentMessage({ assignmentId: "asg", attempt: 1, claimId: claim.claimId, outcome: "claimed" });
-    const state = work as unknown as { bootstrapping: Map<string, Promise<void>> };
-    await vi.waitFor(() => expect(state.bootstrapping.has("asg:1")).toBe(false));
-    await Promise.all(f.captures);
-    const reports = f.sent.map(message => message.body).filter(body => "reportId" in (body as object));
-    expect(reports).toEqual([expect.objectContaining({ assignmentId: "asg", claimId: claim.claimId,
-      result: expect.objectContaining({ class: "interrupted", reason: "not_resumable" }) })]);
-    const failures = await retainedFailures();
-    expect(failures).toHaveLength(1);
-    expect(failures[0].scope).toEqual({ kind: "assignment", assignmentId: "asg", attempt: 1, claimId: claim.claimId });
-    expect(failures[0]).toMatchObject({ stage: "acp_session_bootstrap", code: "recovery_required" });
-    expect(f.reporter).toHaveBeenCalledOnce();
-    expect(f.onUsage).not.toHaveBeenCalled();
-    expect(JSON.stringify(reports)).not.toContain("private-d20c");
-  });
+  it.each([
+    { diagnostic: undefined, reason: "not_resumable", stage: "acp_session_bootstrap" },
+    {
+      diagnostic: "local_execution_unprovable",
+      reason: "not_resumable",
+      stage: "acp_session_bootstrap_local_execution_unprovable",
+    },
+    {
+      diagnostic: "agent_session_lost",
+      reason: "agent_session_lost",
+      stage: "acp_session_bootstrap_agent_session_lost",
+    },
+  ] as const)(
+    "keeps the ordinary $reason result for $diagnostic while retaining exactly one bootstrap fact",
+    async ({ diagnostic, reason, stage }) => {
+      const f = await fixture(false);
+      const original = new RemoteInstanceError(
+        "recovery_required",
+        privateDetail,
+        diagnostic === undefined ? {} : { diagnostic },
+      );
+      vi.mocked(f.runner.createSession).mockRejectedValueOnce(original);
+      const lease = new LeaseState(f.clock);
+      lease.set({
+        lease: "fixture-lease",
+        mode: "active",
+        workspaceId: assignment.workspaceId,
+        issuedAt: f.clock.nowIso(),
+        expiresAt: assignment.expiresAt,
+        drainDeadline: null,
+      });
+      const outbox = new DurableOutbox(dir);
+      await outbox.load();
+      const work = new WorkOrchestrator({
+        clock: f.clock,
+        journal: f.supervisor.journal,
+        outbox,
+        transport: f.transport,
+        lease,
+        instanceId: () => assignment.instanceId,
+        runnerIncarnation: () => "runner",
+        assertOwned: () => undefined,
+        workspaceId: () => assignment.workspaceId,
+        agents: () => [
+          {
+            agentId: "codex",
+            displayName: "Codex",
+            connectionState: "ready",
+            authMode: "agent_local_subscription",
+            accountScope: "personal",
+            readiness: "ready",
+            tokenUsageObservable: true,
+            acpCapabilities: {
+              sessionResume: true,
+              forkSession: false,
+              structuredOutputShim: true,
+              toolControl: "approve",
+            },
+          },
+        ],
+        roleBindings: () => [{ role: "assistant", agentPreference: ["codex"] }],
+        advertisedRoles: () => ["assistant"],
+        acceptedKinds: () => ["assistant_execution"],
+        instanceEvidencePolicy: () => "structured_only",
+        draining: () => false,
+        reconciliationComplete: () => true,
+        recoveryAuthority: () => "accepted-recovery",
+        reportDeliveryAllowed: () => true,
+        headroom: () => 2,
+        maxPullItems: 1,
+        runners: new Map([["codex", f.runner]]),
+        onUsage: f.onUsage,
+        sessionDeps: (target, runner) => ({
+          ...f.deps,
+          runner,
+          registerReady: createNativeReadyRegistrar({
+            clock: f.clock,
+            journal: f.supervisor.journal,
+            instanceId: target.instanceId,
+            workspaceId: target.workspaceId,
+            runnerIncarnation: "runner",
+            assertActive: () => undefined,
+            client: {
+              registerExecutionReady: async (_instanceId, request) => ({
+                ...request,
+                workspaceId: target.workspaceId,
+                instanceId: target.instanceId,
+                sessionId: "session",
+                channelId: "session:session",
+                readyRevision: 1,
+                registeredAt: f.clock.nowIso(),
+              }),
+            },
+          }),
+        }),
+      });
+      cleanups.push(() => work.drainSessions("drain"));
+      await work.onAssignmentMessage({ assignments: [assignment] });
+      const claim = f.supervisor.journal.assignments.get("asg:1")!;
+      expect(claim).toMatchObject({ assignmentId: "asg", state: "claimed" });
+      await work.onAssignmentMessage({
+        assignmentId: "asg",
+        attempt: 1,
+        claimId: claim.claimId,
+        outcome: "claimed",
+      });
+      const state = work as unknown as { bootstrapping: Map<string, Promise<void>> };
+      await vi.waitFor(() => expect(state.bootstrapping.has("asg:1")).toBe(false));
+      await Promise.all(f.captures);
+      const reports = f.sent
+        .map((message) => message.body)
+        .filter((body) => "reportId" in (body as object));
+      expect(reports).toEqual([
+        expect.objectContaining({
+          assignmentId: "asg",
+          claimId: claim.claimId,
+          result: expect.objectContaining({ class: "interrupted", reason }),
+        }),
+      ]);
+      const failures = await retainedFailures();
+      expect(failures).toHaveLength(1);
+      expect(failures[0].scope).toEqual({
+        kind: "assignment",
+        assignmentId: "asg",
+        attempt: 1,
+        claimId: claim.claimId,
+      });
+      expect(failures[0]).toMatchObject({ stage, code: "recovery_required" });
+      expect(f.reporter).toHaveBeenCalledOnce();
+      expect(f.onUsage).not.toHaveBeenCalled();
+      expect(JSON.stringify(reports)).not.toContain("private-d20c");
+    },
+  );
 });
