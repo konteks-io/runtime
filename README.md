@@ -69,6 +69,13 @@ checksums, and unpacks it under `~/.graft` with its own Node. Its usage
 statistics are off, and its files stay out of your commits through
 `.git/info/exclude`.
 
+Native deliveries also exclude repository-root `graft/.cache/` and
+`graft/.graph/` before calculating the output's identity, even when local
+Graft setup is unavailable. Project Graft documents and configuration remain
+eligible. Private recovery snapshots preserve the complete workspace,
+including ignored files and Git state; they do not turn those files into a
+delivered change.
+
 ### Install from the Konteks app
 
 Create a runtime in the Konteks app (Runtimes, Connect). On Windows, choose
