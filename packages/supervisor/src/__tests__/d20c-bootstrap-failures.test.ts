@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -70,6 +70,7 @@ async function fixture(seedClaim = true) {
   const owner = supervisor as unknown as FailureOwner;
   Object.assign(owner, { instanceId: assignment.instanceId, workspaceId: assignment.workspaceId, nativeOwnership: { assertOwned: vi.fn() } });
   vi.spyOn(supervisor.clock, "coreNow").mockReturnValue(now);
+  await mkdir(join(dir, "journal"), { recursive: true, mode: 0o700 });
   await supervisor.journal.load();
   if (seedClaim) await supervisor.journal.assignments.put({
     assignmentId: assignment.id, attempt: 1, claimId: "claim-one", placementId: assignment.placementId,
