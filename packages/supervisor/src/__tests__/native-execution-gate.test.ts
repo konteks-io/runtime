@@ -1,5 +1,5 @@
 import { generateKeyPairSync, sign } from "node:crypto";
-import { RequestError } from "@agentclientprotocol/sdk";
+import { RequestError, type RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -783,6 +783,188 @@ const deliveryTurn: RemoteWorkAssignment = { ...assignment, kind: "delivery", ta
     turn: { invocationId: "invocation", dispatchGeneration: 0 } } };
 type SessionFixture = Awaited<ReturnType<typeof sessionFixture>>;
 
+async function qaAnswerFixture(
+  method: "session/request_permission" | "elicitation/create",
+  delivered: boolean,
+  isCurrent: () => boolean,
+  capture: boolean,
+) {
+  const broker = new PermissionBroker({
+    clock: new FixedClock(Date.parse("2026-09-10T00:00:00Z")),
+    deadlineSeconds: () => 60,
+    onTimeout: async () => undefined,
+  });
+  const work: RemoteWorkAssignment = {
+    ...deliveryTurn,
+    kind: "validation",
+    agentRoute: {
+      ...deliveryTurn.agentRoute,
+      requiredRole: "qa",
+      ...(capture ? { mcpCapabilityTokenRef: "capability" } : {}),
+    },
+  };
+  const f = await sessionFixture(
+    work,
+    undefined,
+    undefined,
+    {},
+    {
+      broker,
+      ...(capture
+        ? {
+            redeemCapabilityToken: async () => ({
+              mcpServer: {
+                name: "konteks-platform",
+                url: "https://mcp.example/mcp",
+                headers: [{ name: "authorization", value: "Bearer fixture" }],
+              },
+              expiresAt,
+            }),
+          }
+        : {}),
+    },
+  );
+  const currentOwner = { channelOwners: new Map([["session:session", f.session]]) };
+  if (!("deliveryIdentity" in f.claims) || !("consumeDeliveryExecution" in f.client))
+    throw new Error("Delivery fixture is required");
+  f.claims.deliveryIdentity.requiredRuntimeRole = "qa";
+  f.claims.deliveryIdentity.routeId = "qa";
+  f.envelope.permit = signed(f.claims);
+  if (capture) await f.session.onToRuntime(f.envelope);
+  const answer = permissionOperation(f.claims, method, "result", true),
+    { body, verifier } = signedPermissionDelivery(f.clock, answer.operation);
+  const pending = broker.defer({
+    acpSessionRef: "acp",
+    requestId: "pending",
+    assignmentId: "assignment",
+    attempt: 1,
+    agentId: "codex",
+    sanitized:
+      method === "session/request_permission"
+        ? {
+            kind: "permission",
+            requestDigest: "b".repeat(43),
+            params: {
+              title: "Review tool",
+              options: [
+                { optionId: "allow", name: "Allow once", kind: "allow_once" },
+                { optionId: "reject", name: "Reject", kind: "reject_once" },
+              ],
+            },
+          }
+        : {
+            kind: "elicitation",
+            requestDigest: "b".repeat(43),
+            isSignIn: false,
+            params: { message: "Review input", requestedSchema: {} },
+          },
+  });
+  await f.journal.pendingRequests.put({
+    acpSessionRef: "acp",
+    id: pending.requestId,
+    method,
+    direction: "issued",
+    openedAt: pending.raisedAt,
+    closedAt: null,
+    deadlineAt: pending.deadlineAt,
+    requestDigest: pending.sanitized.requestDigest,
+  });
+  f.runner.answer.mockResolvedValue({ delivered });
+  f.client.consumeDeliveryExecution.mockResolvedValue({
+    outcome: "admitted",
+    admissionId: "answer-admission",
+    receipt: signed({
+      ...answer.claims,
+      aud: "konteks:delivery-execution-admission",
+      admissionId: "answer-admission",
+      admittedAt: f.clock.nowIso(),
+      checkExpiresAt: new Date(f.clock.coreNow() + 30000).toISOString(),
+    }),
+  });
+  const receiver = new PermissionAnswerReceiver({
+    verifier,
+    core: f.client,
+    coreProducer: "core-answer",
+    now: () => f.clock.coreNow(),
+    captureConnection: () => ({
+      instanceId: "instance",
+      workspaceId: "tenant",
+      runnerIncarnation: "runner",
+      connectionEpoch: 1,
+      leaseExpiresAt: expiresAt,
+      assertCurrent: () => {
+        if (!isCurrent())
+          throw new RemoteInstanceError("execution_fenced", "Captured answer owner changed.");
+      },
+    }),
+    deliver: (operation, claims, current) =>
+      WorkOrchestrator.prototype.onPermissionAnswer.call(
+        currentOwner as never,
+        operation,
+        claims,
+        current,
+      ),
+  });
+  const authorizationState = () =>
+    f.journal.pendingRequests.get("acp:issued:pending")?.authorization?.state;
+  return {
+    f,
+    broker,
+    body,
+    receiver,
+    authorizationState,
+    consumeDeliveryExecution: f.client.consumeDeliveryExecution,
+  };
+}
+
+/** Pause the real capture journal write after its actual Codex call and hash were resolved. */
+async function coordinationCaptureBarrier(f: SessionFixture) {
+  const tool = "platform__coordination__send";
+  const args = {
+    target: { kind: "ticket", id: "TKT-2" },
+    kind: "question",
+    body: "Which interface?",
+  };
+  await f.session.onRunnerEvent({
+    kind: "session_update",
+    acpSessionRef: "acp",
+    params: {
+      sessionId: "acp",
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId: "provider-call",
+        rawInput: { server: "konteks-platform", tool, arguments: args },
+        _meta: { is_mcp_tool_call: true },
+      },
+    },
+  } as never);
+  const request: RequestPermissionRequest = {
+    sessionId: "acp",
+    toolCall: { toolCallId: "provider-call", kind: "other" },
+    options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+    _meta: { is_mcp_tool_approval: true },
+  };
+  (
+    f.session as unknown as { pendingToolPermissions: Map<string, RequestPermissionRequest> }
+  ).pendingToolPermissions.set("pending", request);
+  let enter!: () => void, release!: () => void;
+  const entered = new Promise<void>((resolve) => {
+    enter = resolve;
+  });
+  const paused = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const original = f.journal.coordinationInvocations.update.bind(f.journal.coordinationInvocations);
+  const write = vi
+    .spyOn(f.journal.coordinationInvocations, "update")
+    .mockImplementationOnce(async (...args) => {
+      enter();
+      await paused;
+      return original(...args);
+    });
+  return { entered, release, write };
+}
+
 it.each([
   ["session/request_permission", true],
   ["elicitation/create", true],
@@ -790,95 +972,8 @@ it.each([
 ] as const)(
   "a QA %s answer is completed only after the actual runner reports delivered=%s",
   async (method, delivered) => {
-    const broker = new PermissionBroker({
-      clock: new FixedClock(Date.parse("2026-09-10T00:00:00Z")),
-      deadlineSeconds: () => 60,
-      onTimeout: async () => undefined,
-    });
-    const work: RemoteWorkAssignment = {
-      ...deliveryTurn,
-      kind: "validation",
-      agentRoute: { ...deliveryTurn.agentRoute, requiredRole: "qa" },
-    };
-    const f = await sessionFixture(work, undefined, undefined, {}, { broker });
-    const currentOwner = { channelOwners: new Map([["session:session", f.session]]) };
-    if (!("deliveryIdentity" in f.claims) || !("consumeDeliveryExecution" in f.client))
-      throw new Error("Delivery fixture is required");
-    f.claims.deliveryIdentity.requiredRuntimeRole = "qa";
-    f.claims.deliveryIdentity.routeId = "qa";
-    const answer = permissionOperation(f.claims, method, "result", true),
-      { body, verifier } = signedPermissionDelivery(f.clock, answer.operation);
-    const pending = broker.defer({
-      acpSessionRef: "acp",
-      requestId: "pending",
-      assignmentId: "assignment",
-      attempt: 1,
-      agentId: "codex",
-      sanitized:
-        method === "session/request_permission"
-          ? {
-              kind: "permission",
-              requestDigest: "b".repeat(43),
-              params: {
-                title: "Review tool",
-                options: [
-                  { optionId: "allow", name: "Allow once", kind: "allow_once" },
-                  { optionId: "reject", name: "Reject", kind: "reject_once" },
-                ],
-              },
-            }
-          : {
-              kind: "elicitation",
-              requestDigest: "b".repeat(43),
-              isSignIn: false,
-              params: { message: "Review input", requestedSchema: {} },
-            },
-    });
-    await f.journal.pendingRequests.put({
-      acpSessionRef: "acp",
-      id: pending.requestId,
-      method,
-      direction: "issued",
-      openedAt: pending.raisedAt,
-      closedAt: null,
-      deadlineAt: pending.deadlineAt,
-      requestDigest: pending.sanitized.requestDigest,
-    });
-    f.runner.answer.mockResolvedValue({ delivered });
-    f.client.consumeDeliveryExecution.mockResolvedValue({
-      outcome: "admitted",
-      admissionId: "answer-admission",
-      receipt: signed({
-        ...answer.claims,
-        aud: "konteks:delivery-execution-admission",
-        admissionId: "answer-admission",
-        admittedAt: f.clock.nowIso(),
-        checkExpiresAt: new Date(f.clock.coreNow() + 30000).toISOString(),
-      }),
-    });
-    const receiver = new PermissionAnswerReceiver({
-      verifier,
-      core: f.client,
-      coreProducer: "core-answer",
-      now: () => f.clock.coreNow(),
-      captureConnection: () => ({
-        instanceId: "instance",
-        workspaceId: "tenant",
-        runnerIncarnation: "runner",
-        connectionEpoch: 1,
-        leaseExpiresAt: expiresAt,
-        assertCurrent: () => undefined,
-      }),
-      deliver: (operation, claims, current) =>
-        WorkOrchestrator.prototype.onPermissionAnswer.call(
-          currentOwner as never,
-          operation,
-          claims,
-          current,
-        ),
-    });
-    const authorizationState = () =>
-      f.journal.pendingRequests.get("acp:issued:pending")?.authorization?.state;
+    const { f, broker, body, receiver, authorizationState, consumeDeliveryExecution } =
+      await qaAnswerFixture(method, delivered, () => true, false);
     if (delivered) {
       await receiver.receive(body);
       await receiver.receive(body);
@@ -892,9 +987,47 @@ it.each([
         ? { outcome: { outcome: "selected", optionId: "allow" } }
         : { action: "cancel" };
     expect(f.runner.answer).toHaveBeenCalledExactlyOnceWith("acp", "pending", expectedAnswer);
-    expect(f.client.consumeDeliveryExecution).toHaveBeenCalledOnce();
+    expect(consumeDeliveryExecution).toHaveBeenCalledOnce();
     expect(f.client.consumeExecution).not.toHaveBeenCalled();
     broker.cancelSession("acp");
+  },
+);
+
+it.each(["connection", "permit_expiry"] as const)(
+  "rechecks the current %s fence after genuine coordination capture and before the QA runner answer",
+  async (mode) => {
+    let current = true;
+    const { f, broker, body, receiver, authorizationState, consumeDeliveryExecution } =
+      await qaAnswerFixture("session/request_permission", true, () => current, true);
+    const barrier = await coordinationCaptureBarrier(f);
+    const delivery = receiver.receive(body);
+    void delivery.catch(() => undefined);
+    try {
+      await barrier.entered;
+      if (mode === "connection") current = false;
+      else f.advance(31_000);
+      barrier.release();
+      await expect(delivery).rejects.toMatchObject({
+        code: mode === "connection" ? "execution_fenced" : "permission_denied",
+      });
+      expect(barrier.write).toHaveBeenCalledOnce();
+      expect(f.journal.coordinationInvocations.all()).toEqual([
+        expect.objectContaining({
+          operationId: "operation",
+          toolCallId: "provider-call",
+          state: "captured",
+        }),
+      ]);
+      expect(f.runner.answer).not.toHaveBeenCalled();
+      expect(authorizationState()).toBe("dispatch_started");
+      expect(consumeDeliveryExecution).toHaveBeenCalledTimes(2);
+      expect(f.client.consumeExecution).not.toHaveBeenCalled();
+    } finally {
+      barrier.release();
+      barrier.write.mockRestore();
+      broker.cancelSession("acp");
+      await f.session.close("cancelled");
+    }
   },
 );
 

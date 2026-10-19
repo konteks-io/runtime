@@ -1320,7 +1320,7 @@ export class RelayedSession {
     const begun = await this.beginAuthorized(context.gate, context.operation, assertDeliveryCurrent, onWait);
     if (!begun.started) return;
     // Do not convert a bridge transport exception into proof of completion.
-    return this.dispatchAuthorized(context, begun.params);
+    return this.dispatchAuthorized(context, begun.params, assertDeliveryCurrent);
   }
 
   /** A Core-permitted stop while this session's prompt is admitted and not yet started. */
@@ -1398,10 +1398,10 @@ export class RelayedSession {
     }
   }
 
-  private async dispatchAuthorized(context: { gate: NativeExecutionGate; operation: AuthorizedOperation; ref: string }, params: unknown,
+  private async dispatchAuthorized(context: { gate: NativeExecutionGate; operation: AuthorizedOperation; ref: string }, params: unknown, assertDeliveryCurrent: () => void,
   ): Promise<void> {
     const message = context.operation.envelope.message;
-    if (message.kind !== "acp") return this.answerAuthorized(context, message);
+    if (message.kind !== "acp") return this.answerAuthorized(context, message, assertDeliveryCurrent);
     if (message.method === "session/prompt") return this.promptAuthorized(context, message.id, params as PromptParams);
     if (message.method === "session/set_mode") return void (await this.deps.runner.setMode(context.ref, message.id, params));
     if (message.method === "session/set_config_option") return void (await this.deps.runner.setConfigOption(context.ref, message.id, params));
@@ -1443,11 +1443,12 @@ export class RelayedSession {
     await gate.complete(operation.key);
   }
 
-  private async answerAuthorized({ gate, operation, ref }: { gate: NativeExecutionGate; operation: AuthorizedOperation; ref: string }, message: Exclude<AuthorizedMessage, { kind: "acp" }>): Promise<void> {
+  private async answerAuthorized({ gate, operation, ref }: { gate: NativeExecutionGate; operation: AuthorizedOperation; ref: string }, message: Exclude<AuthorizedMessage, { kind: "acp" }>, assertDeliveryCurrent: () => void): Promise<void> {
     const answer = issuedAnswer(message, message.method);
     const verdict = this.deps.broker.answer(ref, message.id, answer);
     if (!verdict.ok) throw new RemoteInstanceError("operation_conflict", "The pending human answer is no longer admissible.");
     await this.capturePermissionInvocation(message.id, answer);
+    assertDeliveryCurrent();
     this.notePermissionAnswer(message.id, answer);
     const delivered = await this.deps.runner.answer(ref, message.id, answer);
     if (!delivered.delivered) throw new RemoteInstanceError("operation_interrupted", "Answer delivery is unproven.");
