@@ -107,7 +107,7 @@ async function fixture(seedClaim = true) {
     policy: new EvaluatorPolicyResponder(null, () => true),
     broker: new PermissionBroker({ clock, deadlineSeconds: () => 60, onTimeout: async () => undefined }),
     instanceId: assignment.instanceId, workspaceRoot: dir,
-    redeemCapabilityToken: async () => ({ mcpServer: { name: "konteks", url: "https://mcp.example", headers: [] }, expiresAt: assignment.expiresAt }),
+    redeemCapabilityToken: async () => ({ mcpServer: { name: "konteks", url: "https://mcp.example", headers: [{ name: "authorization", value: "Bearer cap-token" }] }, expiresAt: assignment.expiresAt }),
     prepareInputs: async target => ({ binding: { workspaceId: target.workspaceId, sessionId: "session", assignmentId: target.id,
       instanceId: target.instanceId, attempt: target.attempt }, cwd: dir, skillInstructions: "", beforePrompt: async () => undefined }),
     registerReady: ready, onRuntimeFailure: reporter,
