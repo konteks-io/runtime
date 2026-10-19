@@ -36,7 +36,6 @@ const OUTPUT_CACHE_EXCLUSIONS = [
   ":(exclude,glob)**/.venv/**",
   ":(exclude,glob)**/__pycache__/**",
   ":(exclude,glob)**/.pnpm-store/**",
-  ...TOOL_ARTIFACT_ROOTS.map(root => `:(exclude,top,literal)${root}`),
 ];
 
 function isToolArtifactPath(relativePath: string): boolean {
@@ -87,9 +86,13 @@ function decodePaths(value: Buffer): string[] {
 
 async function captureIndex(executable: string, cwd: string, baselineCommit: string, env: NodeJS.ProcessEnv, previous?: PreviousOutput | null): Promise<string> {
   await runGit(executable, cwd, ["read-tree", "--reset", baselineCommit], env);
-  // A private index captures tracked changes and non-ignored new files.
-  // Forcing addition bypasses connector excludes and publishes local tooling.
-  await runGit(executable, cwd, ["add", "--no-renormalize", "-A", "--", ".", ...OUTPUT_CACHE_EXCLUSIONS], env);
+  // Enumerate eligible names before reading their bytes. Naming an ignored
+  // parent in an `add` exclusion makes Git refuse otherwise valid changes.
+  const paths = decodePaths(await runGit(executable, cwd,
+    ["ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", ".", ...OUTPUT_CACHE_EXCLUSIONS], env))
+    .filter(path => !isToolArtifactPath(path));
+  if (paths.length) await runGit(executable, cwd,
+    ["--literal-pathspecs", "add", "--no-renormalize", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"], env, paths.join("\0") + "\0");
   await captureAcceptedPaths(executable, cwd, env, previous);
   const tree = (await runGit(executable, cwd, ["write-tree"], env)).toString("ascii").trim();
   if (!oidPattern.test(tree)) throw unavailable();
