@@ -1,9 +1,23 @@
 import { z } from "zod";
 import { DELIVERY_TURN_RENEWAL_CAPABILITY } from "./delivery-turn-renewal.js";
 import { DIRECT_TURN_RENEWAL_CAPABILITY } from "./direct-turn-renewal.js";
-import { ConnectedAgentViewSchema, REMOTE_CORE_CONTRACT_CAPABILITY, REMOTE_WORKSPACE_CHECKPOINT_CAPABILITY, REMOTE_WORKSPACE_CHUNK_CAPABILITY,
-  REMOTE_DIRECT_MODEL_FALLBACK_CAPABILITY, REMOTE_PERMISSION_ANSWER_CAPABILITY,
-  REMOTE_AGENT_LOGIN_BROWSER_CAPABILITY, REMOTE_AGENT_LOGIN_CAPABILITY, REMOTE_CANCELLATION_DELIVERY_CAPABILITY, REMOTE_EXECUTION_PERMITS_CAPABILITY, REMOTE_DELIVERY_PERMITS_CAPABILITY, REMOTE_PREVIEW_APP_CREDENTIALS_CAPABILITY, REMOTE_PREVIEW_CAPABILITY, REMOTE_SESSION_LABEL_CAPABILITY, type ConnectedAgentView,
+import {
+  ConnectedAgentViewSchema,
+  REMOTE_CORE_CONTRACT_CAPABILITY,
+  REMOTE_WORKSPACE_CHECKPOINT_CAPABILITY,
+  REMOTE_WORKSPACE_CHUNK_CAPABILITY,
+  REMOTE_DIRECT_MODEL_FALLBACK_CAPABILITY,
+  REMOTE_PERMISSION_ANSWER_CAPABILITY,
+  REMOTE_DELIVERY_PERMISSION_ANSWER_CAPABILITY,
+  REMOTE_AGENT_LOGIN_BROWSER_CAPABILITY,
+  REMOTE_AGENT_LOGIN_CAPABILITY,
+  REMOTE_CANCELLATION_DELIVERY_CAPABILITY,
+  REMOTE_EXECUTION_PERMITS_CAPABILITY,
+  REMOTE_DELIVERY_PERMITS_CAPABILITY,
+  REMOTE_PREVIEW_APP_CREDENTIALS_CAPABILITY,
+  REMOTE_PREVIEW_CAPABILITY,
+  REMOTE_SESSION_LABEL_CAPABILITY,
+  type ConnectedAgentView,
 } from "@konteks/remote-common";
 import { hostPressureRatio, UtilizationSignalsSchema, type SignalSampler } from "@konteks/remote-sysmon";
 import type { InventorySnapshot } from "../inventory/snapshot.js";
@@ -99,11 +113,17 @@ export class NativeInventoryCollector {
     this.now = options.now ?? (() => new Date());
   }
 
-  agents(): ConnectedAgentView[] { return structuredClone([...this.cached.values()]); }
+  agents(): ConnectedAgentView[] {
+    return structuredClone([...this.cached.values()]);
+  }
 
   updateAgent(value: ConnectedAgentView): void {
     const parsed = ConnectedAgentViewSchema.safeParse(value);
-    if (parsed.success && this.options.runners.has(parsed.data.agentId) && parsed.data.authMode === "agent_local_subscription") {
+    if (
+      parsed.success &&
+      this.options.runners.has(parsed.data.agentId) &&
+      parsed.data.authMode === "agent_local_subscription"
+    ) {
       this.cached.set(parsed.data.agentId, parsed.data);
     }
   }
@@ -113,8 +133,13 @@ export class NativeInventoryCollector {
     const gitVersion = await settledProbe(this.options.gitVersion?.());
     const claudeExecutable = await settledProbe(this.options.claudeExecutable?.());
     const [signals, results] = await Promise.all([
-      this.options.sampler.sample(this.now).then(value => UtilizationSignalsSchema.safeParse(value)).catch(() => null),
-      Promise.all([...this.options.runners].map(([agentId, runner]) => runnerReadiness(agentId, runner))),
+      this.options.sampler
+        .sample(this.now)
+        .then((value) => UtilizationSignalsSchema.safeParse(value))
+        .catch(() => null),
+      Promise.all(
+        [...this.options.runners].map(([agentId, runner]) => runnerReadiness(agentId, runner)),
+      ),
     ]);
     const tally = this.tally(results);
     this.cached.clear();
@@ -123,7 +148,15 @@ export class NativeInventoryCollector {
     const capabilities = this.capabilities(tally.agents, gitVersion, claudeExecutable);
     const reported = await this.decorated(tally.agents);
     return {
-      components: [{ kind: "agent_runner", version: this.options.bundleVersion, healthStatus: runnerHealth(tally.healthyRunners, results.length), capabilities, lastProbeAt: at }],
+      components: [
+        {
+          kind: "agent_runner",
+          version: this.options.bundleVersion,
+          healthStatus: runnerHealth(tally.healthyRunners, results.length),
+          capabilities,
+          lastProbeAt: at,
+        },
+      ],
       agents: reported,
       hostPressure: metrics ? hostPressureRatio(metrics) : 1,
       activeSessions: tally.activeSessions,
@@ -134,8 +167,15 @@ export class NativeInventoryCollector {
   }
 
   /** Runner totals and the agents to report: each ready runner's view, else its last view marked unavailable. */
-  private tally(results: ReadonlyArray<{ agentId: string; readiness: z.infer<typeof readinessSchema> | null }>) {
-    const tally = { healthyRunners: 0, activeSessions: 0, activeTurns: 0, agents: [] as ConnectedAgentView[] };
+  private tally(
+    results: ReadonlyArray<{ agentId: string; readiness: z.infer<typeof readinessSchema> | null }>,
+  ) {
+    const tally = {
+      healthyRunners: 0,
+      activeSessions: 0,
+      activeTurns: 0,
+      agents: [] as ConnectedAgentView[],
+    };
     for (const { agentId, readiness } of results) {
       if (readiness) {
         tally.healthyRunners += 1;
@@ -145,7 +185,8 @@ export class NativeInventoryCollector {
         continue;
       }
       const cached = this.cached.get(agentId);
-      if (cached) tally.agents.push({ ...cached, readiness: "unavailable", connectionState: "unavailable" });
+      if (cached)
+        tally.agents.push({ ...cached, readiness: "unavailable", connectionState: "unavailable" });
     }
     return tally;
   }
@@ -155,9 +196,19 @@ export class NativeInventoryCollector {
     return this.options.decorateAgents(structuredClone(agents)).catch(() => agents);
   }
 
-  private capabilities(agents: readonly ConnectedAgentView[], gitVersion: string | null, claudeExecutable: string | null): string[] {
-    const ready = agents.filter(agent => agent.readiness === "ready" && agent.connectionState === "ready");
-    const capabilities = this.withAdditional([...ready.map(agent => `agent:${agent.agentId}`), ...this.permitCapabilities(ready.length > 0), ...this.deliveryChannelCapabilities()]);
+  private capabilities(
+    agents: readonly ConnectedAgentView[],
+    gitVersion: string | null,
+    claudeExecutable: string | null,
+  ): string[] {
+    const ready = agents.filter(
+      (agent) => agent.readiness === "ready" && agent.connectionState === "ready",
+    );
+    const capabilities = this.withAdditional([
+      ...ready.map((agent) => `agent:${agent.agentId}`),
+      ...this.permitCapabilities(ready.length > 0),
+      ...this.deliveryChannelCapabilities(),
+    ]);
     // The onboard role is git on THIS machine, not a signed-in agent: the
     // capabilities are advertised whenever git answers, and withheld the moment
     // it does not.
@@ -173,40 +224,59 @@ export class NativeInventoryCollector {
     // fields (pay-per-use turns, the download state, a credential's reason)
     // from it.
     capabilities.push(REMOTE_CORE_CONTRACT_CAPABILITY);
-    if (this.options.workspaceRecoveryReady?.()) capabilities.push(REMOTE_WORKSPACE_CHECKPOINT_CAPABILITY, REMOTE_WORKSPACE_CHUNK_CAPABILITY);
+    if (this.options.workspaceRecoveryReady?.())
+      capabilities.push(REMOTE_WORKSPACE_CHECKPOINT_CAPABILITY, REMOTE_WORKSPACE_CHUNK_CAPABILITY);
     // This build's preview takes the app's own cookies and Authorization (D46).
-    if (this.options.previewReady?.()) capabilities.push(REMOTE_PREVIEW_CAPABILITY, REMOTE_PREVIEW_APP_CREDENTIALS_CAPABILITY);
+    if (this.options.previewReady?.())
+      capabilities.push(REMOTE_PREVIEW_CAPABILITY, REMOTE_PREVIEW_APP_CREDENTIALS_CAPABILITY);
     return capabilities;
   }
 
   private coordinationCapabilities(agents: readonly ConnectedAgentView[]): string[] {
     if (!this.options.coordinationInvocationsReady?.()) return [];
-    return agents.filter(agent => coordinationInvocationAgent(agent.agentId)).map(agent => `coordination-invocations-v1:${agent.agentId}`);
+    return agents
+      .filter((agent) => coordinationInvocationAgent(agent.agentId))
+      .map((agent) => `coordination-invocations-v1:${agent.agentId}`);
   }
 
   /** Signed execution and delivery permits, only while some agent is ready to use them. */
   private permitCapabilities(anyReady: boolean): string[] {
     const permits: string[] = [];
-    if (anyReady && this.options.executionPermitsReady?.()) permits.push(REMOTE_EXECUTION_PERMITS_CAPABILITY, REMOTE_DIRECT_MODEL_FALLBACK_CAPABILITY, DIRECT_TURN_RENEWAL_CAPABILITY, ...this.answerCapabilities());
-    if (anyReady && this.options.deliveryExecutionPermitsReady?.()) permits.push(REMOTE_DELIVERY_PERMITS_CAPABILITY, DELIVERY_TURN_RENEWAL_CAPABILITY);
+    if (anyReady && this.options.executionPermitsReady?.())
+      permits.push(
+        REMOTE_EXECUTION_PERMITS_CAPABILITY,
+        REMOTE_DIRECT_MODEL_FALLBACK_CAPABILITY,
+        DIRECT_TURN_RENEWAL_CAPABILITY,
+        ...this.answerCapabilities(REMOTE_PERMISSION_ANSWER_CAPABILITY),
+      );
+    if (anyReady && this.options.deliveryExecutionPermitsReady?.())
+      permits.push(
+        REMOTE_DELIVERY_PERMITS_CAPABILITY,
+        DELIVERY_TURN_RENEWAL_CAPABILITY,
+        ...this.answerCapabilities(REMOTE_DELIVERY_PERMISSION_ANSWER_CAPABILITY),
+      );
     return permits;
   }
 
   /** A turn may ask the person only where their answer can come back. */
-  private answerCapabilities(): string[] {
-    return this.options.permissionAnswersReady?.() ? [REMOTE_PERMISSION_ANSWER_CAPABILITY] : [];
+  private answerCapabilities(capability: string): string[] {
+    return this.options.permissionAnswersReady?.() ? [capability] : [];
   }
 
   /** Cancellation delivery and site-started logins, whatever the agents' readiness. */
   private deliveryChannelCapabilities(): string[] {
     const channels: string[] = [];
-    if (this.options.cancellationDeliveryReady?.()) channels.push(REMOTE_CANCELLATION_DELIVERY_CAPABILITY);
+    if (this.options.cancellationDeliveryReady?.())
+      channels.push(REMOTE_CANCELLATION_DELIVERY_CAPABILITY);
     if (this.options.agentLoginReady?.()) channels.push(REMOTE_AGENT_LOGIN_CAPABILITY);
-    if (this.options.agentLoginBrowserReady?.()) channels.push(REMOTE_AGENT_LOGIN_BROWSER_CAPABILITY);
+    if (this.options.agentLoginBrowserReady?.())
+      channels.push(REMOTE_AGENT_LOGIN_BROWSER_CAPABILITY);
     return channels;
   }
 
   private withAdditional(capabilities: string[]): string[] {
-    for (const capability of this.options.additionalCapabilities?.() ?? []) if (!capabilities.includes(capability)) capabilities.push(capability);
+    for (const capability of this.options.additionalCapabilities?.() ?? [])
+      if (!capabilities.includes(capability)) capabilities.push(capability);
     return capabilities;
-  }}
+  }
+}

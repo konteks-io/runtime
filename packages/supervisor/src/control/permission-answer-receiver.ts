@@ -1,32 +1,68 @@
-import { RemoteInstanceError, RuntimePermissionAnswerDeliveryRequestSchema, runtimePermissionAnswerMatches,
-  verifyRemoteExecutionOperationSignature, type RemoteAuthorizedOperation, type RemoteExecutionOperationPermitClaims,
-  type RuntimePermissionAnswerDeliveryRequest } from "@konteks/remote-common";
+import {
+  RemoteInstanceError,
+  RuntimePermissionAnswerDeliveryRequestSchema,
+  runtimePermissionAnswerMatches,
+  verifyRemoteExecutionOperationSignature,
+  verifyRemoteDeliveryOperationSignature,
+  type RemoteAuthorizedOperation,
+  type RemoteExecutionOperationPermitClaims,
+  type RemoteDeliveryOperationPermitClaims,
+  type RuntimePermissionAnswerDeliveryRequest,
+} from "@konteks/remote-common";
 import { CORE_DELIVERY_CLOCK_SKEW_MS, deliveryStaleReason } from "./delivery-scope.js";
 import type { CoreSignatureVerifier } from "./core-signature.js";
 import type { CapturedCancellationConnection } from "./cancellation-receiver.js";
 import type { CoreClient } from "../core/client.js";
 
+type PermissionAnswerClaims =
+  RemoteExecutionOperationPermitClaims | RemoteDeliveryOperationPermitClaims;
+
+/** The untrusted audience only selects its fixed verifier; each verifier independently
+ * checks the signature, exact audience, typed claims and complete answer body. */
+function answerVerifier(operation: RemoteAuthorizedOperation) {
+  const { aud } = JSON.parse(
+    Buffer.from(operation.permit.split(".")[1] ?? "", "base64url").toString("utf8"),
+  ) as { aud?: unknown };
+  if (aud === "konteks:delivery-execution-operation") return verifyRemoteDeliveryOperationSignature;
+  if (aud === "konteks:remote-execution-operation") return verifyRemoteExecutionOperationSignature;
+  throw new RemoteInstanceError(
+    "permission_denied",
+    "A supported permission answer permit is required.",
+  );
+}
+
 /** Verifies the envelope independently of Relay. The accepting session owner
  * must run the supplied guard around its asynchronous admission and before ACP.
  * Durable deduplication/disposition belongs to its existing execution gate. */
 export class PermissionAnswerReceiver {
-  constructor(private readonly deps: {
-    verifier: Pick<CoreSignatureVerifier, "verifyPermissionAnswerDelivery">;
-    core: Pick<CoreClient, "executionSigningKeys">;
-    coreProducer: string;
-    captureConnection: () => CapturedCancellationConnection | null;
-    now: () => number;
-    deliver: (operation: RemoteAuthorizedOperation, claims: RemoteExecutionOperationPermitClaims, assertCurrent: () => void) => Promise<void>;
-  }) {}
+  constructor(
+    private readonly deps: {
+      verifier: Pick<CoreSignatureVerifier, "verifyPermissionAnswerDelivery">;
+      core: Pick<CoreClient, "executionSigningKeys">;
+      coreProducer: string;
+      captureConnection: () => CapturedCancellationConnection | null;
+      now: () => number;
+      deliver: (
+        operation: RemoteAuthorizedOperation,
+        claims: PermissionAnswerClaims,
+        assertCurrent: () => void,
+      ) => Promise<void>;
+    },
+  ) {}
 
   async receive(raw: unknown): Promise<void> {
     const parsed = RuntimePermissionAnswerDeliveryRequestSchema.safeParse(raw);
     // Which check refused is said, so a refusal can be told apart from the log alone (10-15).
-    const denied = (reason: string) => new RemoteInstanceError("permission_denied", `Current Core permission answer authority is required (${reason})`);
+    const denied = (reason: string) =>
+      new RemoteInstanceError(
+        "permission_denied",
+        `Current Core permission answer authority is required (${reason})`,
+      );
     if (!parsed.success) throw denied("request");
     if (!this.deps.coreProducer) throw denied("producer");
     if (!this.deps.verifier.verifyPermissionAnswerDelivery(parsed.data)) throw denied("signature");
-    const request = parsed.data, scope = this.deps.captureConnection();
+    const request = parsed.data,
+      scope = this.deps.captureConnection();
     if (!scope) throw denied("connection");
     const assertConnection = () => {
       scope.assertCurrent();
@@ -40,7 +76,10 @@ export class PermissionAnswerReceiver {
     const keys = await this.deps.core.executionSigningKeys();
     assertConnection();
     const claims = this.verifiedClaims(request, keys, scope, () => denied("permit"));
-    const assertCurrent = () => { assertConnection(); if (claims.exp * 1000 <= this.deps.now()) throw denied("permit_expired"); };
+    const assertCurrent = () => {
+      assertConnection();
+      if (claims.exp * 1000 <= this.deps.now()) throw denied("permit_expired");
+    };
     assertCurrent();
     await this.deps.deliver(request.intent.operation, claims, assertCurrent);
     assertCurrent();
@@ -52,12 +91,22 @@ export class PermissionAnswerReceiver {
     keys: Awaited<ReturnType<CoreClient["executionSigningKeys"]>>,
     scope: CapturedCancellationConnection,
     denied: () => RemoteInstanceError,
-  ): RemoteExecutionOperationPermitClaims {
+  ): PermissionAnswerClaims {
     try {
-      const claims = verifyRemoteExecutionOperationSignature({ operation: request.intent.operation, trustedKeys: keys, nowSeconds: Math.floor(this.deps.now() / 1000) });
-      if (!runtimePermissionAnswerMatches(claims, request.intent, this.deps.coreProducer) ||
-        claims.runnerIncarnation !== scope.runnerIncarnation || Date.parse(request.expiresAt) > claims.exp * 1000) throw denied();
+      const claims = answerVerifier(request.intent.operation)({
+        operation: request.intent.operation,
+        trustedKeys: keys,
+        nowSeconds: Math.floor(this.deps.now() / 1000),
+      });
+      if (
+        !runtimePermissionAnswerMatches(claims, request.intent, this.deps.coreProducer) ||
+        claims.runnerIncarnation !== scope.runnerIncarnation ||
+        Date.parse(request.expiresAt) > claims.exp * 1000
+      )
+        throw denied();
       return claims;
-    } catch { throw denied(); }
+    } catch {
+      throw denied();
+    }
   }
 }

@@ -121,6 +121,42 @@ describe("native host inventory", () => {
     expect(await collect(true)).not.toContain("permission-answer-delivery.v1");
   });
 
+  it.each([
+    { delivery: true, assistant: false, trusted: true, ready: true, advertised: true },
+    { delivery: false, assistant: true, trusted: true, ready: true, advertised: false },
+    { delivery: true, assistant: true, trusted: false, ready: true, advertised: false },
+    { delivery: true, assistant: true, trusted: true, ready: false, advertised: false },
+  ])(
+    "advertises the distinct delivery answer protocol only under its own live composition: %j",
+    async (mode) => {
+      const inventory = new NativeInventoryCollector({
+        runners: new Map([
+          [
+            "codex",
+            {
+              readiness: async () => ({
+                agent: {
+                  ...agent,
+                  readiness: mode.ready ? ("ready" as const) : ("not_configured" as const),
+                },
+                utilization: { activeSessions: 0, activeTurns: 0 },
+              }),
+            },
+          ],
+        ]),
+        sampler: { sample: async () => signals },
+        bundleVersion: "1.0.0",
+        now: () => new Date(signals.observedAt),
+        executionPermitsReady: () => mode.assistant,
+        deliveryExecutionPermitsReady: () => mode.delivery,
+        permissionAnswersReady: () => mode.trusted,
+      });
+      const capabilities = (await inventory.collect()).components[0]?.capabilities;
+      expect(capabilities?.includes("delivery-permission-answer.v1")).toBe(mode.advertised);
+      if (!mode.assistant) expect(capabilities).not.toContain("permission-answer-delivery.v1");
+    },
+  );
+
   it("reports only the actual in-process runner and host pressure, never appliance components", async () => {
     const f = fixture();
     const snapshot = await f.inventory.collect();
