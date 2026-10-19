@@ -239,6 +239,8 @@ export class RelayedSession {
   private recoveryStopping = false;
   private recoveryStopTask: Promise<void> | null = null;
   private creationReturned = false;
+  /** In-process stage correlation only; recovered stages never become terminal history. */
+  private bootstrapFailure: { stage: string; error: unknown } | null = null;
   private readonly activities = new Set<Promise<unknown>>();
   private closeTask: Promise<void> | null = null;
   /**
@@ -351,10 +353,24 @@ export class RelayedSession {
     return this.track(async () => {
       try { return await this.bootstrapImpl(); }
       catch (error) {
+        this.reportBootstrapFailure(error);
         await this.closeMcpFacade();
         throw error;
       }
     });
+  }
+
+  /** Capture one terminal fact before disposal, without waiting for diagnostic delivery. */
+  private reportBootstrapFailure(error: unknown): void {
+    const failed = this.bootstrapFailure;
+    this.bootstrapFailure = null;
+    const stage = failed !== null && failed.error === error ? failed.stage : "session_bootstrap";
+    const safeError = error instanceof RemoteInstanceError
+      ? { code: error.code, retryable: error.retryable }
+      : { code: "session_bootstrap_failed", retryable: false };
+    reportRuntimeFailure(this.deps.onRuntimeFailure, {
+      phase: "launch", stage, ...safeError, evidence: { kind: "runtime_exception" },
+    }, { assignmentId: this.assignment.id, attempt: this.assignment.attempt });
   }
 
   private track<T>(operation: () => Promise<T>): Promise<T> {
@@ -374,11 +390,13 @@ export class RelayedSession {
     const startedAt = Date.now();
     try {
       const result = await operation();
+      this.bootstrapFailure = null;
       // One line per finished stage, so a slow bootstrap says where.
       this.logger.info({ event: "native.bootstrap.stage", assignmentId: this.assignment.id, attempt: this.assignment.attempt,
         stage, durationMs: Date.now() - startedAt }, "native session bootstrap stage finished");
       return result;
     } catch (error) {
+      this.bootstrapFailure = { stage, error };
       this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, stage, ...stageFailure(error) },
         "native session bootstrap stage failed");
       throw error;
