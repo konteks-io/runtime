@@ -1,3 +1,4 @@
+import { dispatchFailureOutcome } from "./dispatch-failure-outcome.js";
 import { randomUUID } from "node:crypto";
 import {
   RemoteInstanceError,
@@ -45,7 +46,6 @@ import type { TransportManager } from "../transport/relay-transport.js";
 import { RecoveryAuthority } from "../transport/recovery-authority.js";
 import type { RunnerPort } from "../runner-port.js";
 import { RelayedSession, type RelayedSessionDeps, type SessionClosedReason } from "../session/relayed-session.js";
-import { transientInputFailure } from "../native/input-client.js";
 import type { PendingHumanRequest } from "../session/permissions.js";
 import { intersectEvidencePolicy } from "./evidence.js";
 import { ReportSender } from "./report-sender.js";
@@ -100,6 +100,8 @@ interface OrchestratorDeps {
    */
   roleCapabilityInputs?: () => RoleCapabilityInputs;
   acceptedKinds: () => RemoteWorkKind[];
+  /** Signed Core wire support; an absent version never admits a new terminal reason. */
+  coreContractVersion?: () => string | undefined;
   instanceEvidencePolicy: () => "structured_only" | "selected_artifacts";
   draining: () => boolean;
   reconciliationComplete: () => boolean;
@@ -787,7 +789,7 @@ export class WorkOrchestrator {
     }
     // Preserve recovery semantics without copying a native exception into the
     // public report. An ownership refusal is not an agent execution failure.
-    const outcome = dispatchFailureOutcome(error);
+    const outcome = dispatchFailureOutcome(error, this.deps.coreContractVersion?.());
     await this.reports.submit({ assignmentId: assignment.id, attempt: assignment.attempt, claimId: entry.claimId, draft: { terminal: true, result: { ...outcome, terminalResultHash: jcsDigest(outcome) } } });
   }
 
@@ -2592,16 +2594,6 @@ function claimableState(entry: JournalEntry): boolean {
 /** The row is still the dispatched claim's, at its recovery epoch, without a terminal report. */
 function sameDispatchOwner(current: JournalEntry | undefined, entry: JournalEntry): current is JournalEntry {
   return current !== undefined && current.claimId === entry.claimId && current.recoveryEpoch === entry.recoveryEpoch && current.reports.terminalSequence === undefined;
-}
-
-/** An ownership refusal interrupts the attempt; anything else is a failed dispatch (agent sign-in named as such). */
-function dispatchFailureOutcome(error: unknown): { class: "interrupted"; reason: "agent_session_lost" | "not_resumable" | "lease_lost" } | { class: "failed"; reason: "agent_auth_required" | "internal" } {
-  if (error instanceof RemoteInstanceError && error.code === "recovery_required") {
-    return { class: "interrupted", reason: error.diagnostic === "agent_session_lost" ? "agent_session_lost" : "not_resumable" };
-  }
-  // A transient Core failure is never the agent's: Core issues a successor (D132).
-  if (transientInputFailure(error)) return { class: "interrupted", reason: "lease_lost" };
-  return { class: "failed", reason: error instanceof RemoteInstanceError && error.code === "agent_auth_required" ? "agent_auth_required" : "internal" };
 }
 
 /** Bounded identifiers only, never message text (a RemoteInstanceError message can embed bridge output). */

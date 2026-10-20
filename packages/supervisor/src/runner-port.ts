@@ -25,6 +25,8 @@ export interface RunnerSessionInput {
   /** Absolute outer readiness deadline; every nested native retry clips to it. */
   readinessDeadlineAt: string;
   cwd: string;
+  /** Set only by authorized repository preparation; never inferred from a path. */
+  managedRepository?: true;
   /** Local input-preparation authority, never read from model tool arguments. */
   readOnlyRoots?: readonly string[];
   mcpServers: Array<{ type: "http" | "sse"; name: string; url: string; headers: Array<{ name: string; value: string }> }>;

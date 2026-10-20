@@ -7,6 +7,8 @@ import { stageOrganizationSkills, type StageOrganizationSkillsOptions, type Stag
 export interface PreparedSessionInputs {
   binding: RemoteTransferBinding;
   cwd: string;
+  /** Set only by authorized repository preparation; never inferred from a path. */
+  managedRepository?: true;
   /** Verified selected organization-skill directories; read authority only, local to this session. */
   readOnlyRoots?: readonly string[];
   skillInstructions: string;

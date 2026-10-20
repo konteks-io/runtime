@@ -7,7 +7,7 @@ import { konteksPrefixedName } from "./konteks-session-prefix.mjs";
 // MCP server off, and shows a direct session's own title behind the
 // [konteks] prefix.
 export const codexAcpLiveUserPatch = {
-  id: "konteks-codex-acp-live-user-v11",
+  id: "konteks-codex-acp-live-user-v12",
   package: "@agentclientprotocol/codex-acp",
   version: "1.10.0",
   upstreamSha256: "4602784c5896fbf05a7d89b09655bacc768d0bf281e0d03a10333ff81da45268",
@@ -75,6 +75,12 @@ export function konteksAdmittedMcpServerNames(meta) {
   return [...names];
 }
 
+export function konteksRepositoryConfig(config, meta) {
+  const policy = meta?.konteksRepository;
+  if (policy?.version !== 1 || policy.managed !== true) return config;
+  return { ...config, "shell_environment_policy.set.HUSKY": "0" };
+}
+
 export function patchCodexAcpLiveUsers(source, version) {
   if (
     version !== codexAcpLiveUserPatch.version ||
@@ -109,7 +115,7 @@ function createReasoningEffortConfigOption`,
   );
   replaceOnce(
     "var CodexEventHandler = class _CodexEventHandler {",
-    `${missingCodexToolTerminals.toString()}\n${reconcileCodexToolTerminals.toString()}\n${konteksCodexMcpServers.toString()}\n${konteksAdmittedMcpServerNames.toString()}\n${konteksPrefixedName.toString()}\nvar CodexEventHandler = class _CodexEventHandler {`,
+    `${konteksRepositoryConfig.toString()}\n${missingCodexToolTerminals.toString()}\n${reconcileCodexToolTerminals.toString()}\n${konteksCodexMcpServers.toString()}\n${konteksAdmittedMcpServerNames.toString()}\n${konteksPrefixedName.toString()}\nvar CodexEventHandler = class _CodexEventHandler {`,
   );
   replaceOnce(
     "      config: await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers),\n      modelProvider: this.getModelProvider(),",
@@ -311,6 +317,12 @@ function createReasoningEffortConfigOption`,
     "    const title = extractTitle(turnResult.turn);\n    if (!title) return;",
     "    const title = extractTitle(turnResult.turn);\n    if (this.konteksPrefix) return title;\n    if (!title) return;",
   );
+  const resumedConfig = "config: await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers ?? []),";
+  if (source.split(resumedConfig).length !== 3) throw new Error("Codex repository policy resume anchors changed");
+  source = source.replaceAll(resumedConfig,
+    "config: konteksRepositoryConfig(await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers ?? []), request._meta),");
+  replaceOnce("config: await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers, konteksAdmittedMcpServerNames(request._meta)),",
+    "config: konteksRepositoryConfig(await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers, konteksAdmittedMcpServerNames(request._meta)), request._meta),");
   return {
     source,
     provenance: {

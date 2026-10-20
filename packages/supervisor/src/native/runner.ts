@@ -40,6 +40,7 @@ const inputSchema = z.object({
   sessionLabel: RemoteSessionLabelSchema.optional(),
   agentTitled: z.literal(true).optional(),
   directAccountConnectors: z.literal(true).optional(),
+  managedRepository: z.literal(true).optional(),
   browser: z.object({
     proxyUrl: z.string().regex(/^http:\/\/127\.0\.0\.1:\d{1,5}$/),
     outputDir: z.string().min(1).refine(isAbsolute),
@@ -251,7 +252,7 @@ export class NativeRunner implements RunnerPort {
     const { context, readinessDeadlineAt, cwd, readOnlyRoots, sessionConfig,
       modelSelectionPolicy,
       modelSelection,
-      acpSessionRef, freshProviderSessionOnRestore, freshSessionWhenRestoreLost, sessionLabel, agentTitled, directAccountConnectors, browser, integration,
+      acpSessionRef, freshProviderSessionOnRestore, freshSessionWhenRestoreLost, sessionLabel, agentTitled, directAccountConnectors, managedRepository, browser, integration,
     } = data;
     // The session's browser is a stdio MCP server the agent launches (its own
     // package's, or the connector's for an agent without one); composed here,
@@ -266,6 +267,7 @@ export class NativeRunner implements RunnerPort {
         acpSessionRef, freshProviderSessionOnRestore, freshSessionWhenRestoreLost, sessionLabel,
       }),
       ...(agentTitled ? { agentTitled } : {}),
+      ...(managedRepository ? { managedRepository } : {}),
       ...withoutUndefined({ integration, directAccountConnectors }),
       lifecycle: this.sessionLifecycle(lifecycle),
     };

@@ -1154,6 +1154,7 @@ export class Supervisor {
       roleCapabilityInputs: () => this.roleCapabilityInputs(),
       // `direct` from a 7.1 Core, `integration` from a 7.3 Core and only while
       // the integration carrier is composed (work/accepted-kinds.ts).
+      coreContractVersion: () => this.coreContractVersion,
       acceptedKinds: () => acceptedWorkKinds(this.coreContractVersion).filter(kind => kind !== "integration" || this.integrationCarrier !== undefined),
       instanceEvidencePolicy: () => this.configuration.evidenceUpload,
       draining: () => this.draining || this.onUpdateProbation,

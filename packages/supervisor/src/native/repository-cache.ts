@@ -1,9 +1,10 @@
+import { migrateRepositoryWorkspace } from "./repository-isolation-migration.js";
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { constants, type Stats } from "node:fs";
 import { chmod, lstat, mkdir, open, readFile, realpath, rename, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, parse, resolve } from "node:path";
-import { RemoteInstanceError, canonicalize, createLogger, sha256Hex } from "@konteks/remote-common";
+import { RemoteInstanceError, canonicalize, createLogger, sha256Hex, type JsonValue } from "@konteks/remote-common";
 import { verifyNativeGitTool, type NativeGitTool } from "./git-workspace.js";
 import { staleCheckoutVerdict } from "./output-capture.js";
 
@@ -103,7 +104,7 @@ async function writePrivate(path: string, value: string): Promise<void> {
   }
 }
 
-async function readJson(path: string): Promise<unknown> {
+async function readJson(path: string): Promise<JsonValue> {
   const before = await lstat(path);
   if (!privateJsonFile(before)) throw unavailable();
   const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
@@ -316,6 +317,7 @@ async function exists(path: string): Promise<boolean> {
 /** One worktree's preparation: its paths, the receipt it must carry, and the steps that make or repair it. */
 class WorktreePreparation {
   private readonly gitDir: string;
+  private readonly cacheGitDir: string;
   private readonly cwd: string;
   private readonly intent: string;
   private readonly receiptPath: string;
@@ -335,13 +337,14 @@ class WorktreePreparation {
     const { root, agentRoot, repositoryId, worktreeId, input } = setup;
     const repositoryDigest = `sha256:${sha256Hex(canonicalize({ repositoryId }))}`;
     const worktreeDigest = sha256Hex(canonicalize({ repositoryDigest, worktreeId }));
-    this.gitDir = join(root, repositoryDigest.slice(7) + ".git");
+    this.cacheGitDir = join(root, repositoryDigest.slice(7) + ".git");
     this.cwd = join(agentRoot, "worktree-" + worktreeDigest);
     this.intent = join(agentRoot, `.worktree-${worktreeDigest}${INTENT_SUFFIX}`);
     // The same durable worktree identity can exist under different agent
     // boundaries. Include the verified agent root in the connector-owned
     // receipt name so those worktrees never contend for one receipt.
     const receiptDigest = sha256Hex(canonicalize({ worktreeDigest, agentRoot }));
+    this.gitDir = join(root, `.workspace-${receiptDigest}.git`);
     this.receiptPath = join(root, `.worktree-${receiptDigest}${RECEIPT_SUFFIX}`);
     this.legacyReceiptPath = join(this.cwd, LEGACY_RECEIPT_FILE);
     this.expected = {
@@ -356,7 +359,12 @@ class WorktreePreparation {
 
   async prepare(): Promise<NativeRepositoryWorktree> {
     const verify = (receiptExpected?: WorktreeReceipt) => this.verify(receiptExpected);
+    await this.promoteLegacyReceiptIfPresent();
     const current = await this.currentReceipt();
+    if (current && (this.isSharedReceipt(current) || await exists(`${this.receiptPath}.isolation-migration.json`))) {
+      await withRepositoryLock(this.setup.root, this.expected.repositoryDigest, () => this.isolateSharedWorktree());
+      return this.prepare();
+    }
     if (current && sameReceipt(current, this.expected)) {
       await this.verify();
       return { cwd: this.cwd, baselineCommit: this.setup.input.revision, verify };
@@ -368,6 +376,31 @@ class WorktreePreparation {
     await withRepositoryLock(this.setup.root, this.expected.repositoryDigest, () => this.prepareLocked());
     await this.verify();
     return { cwd: this.cwd, baselineCommit: this.setup.input.revision, verify };
+  }
+
+  private async promoteLegacyReceiptIfPresent(): Promise<void> {
+    if (!(await exists(this.legacyReceiptPath))) return;
+    await withRepositoryLock(this.setup.root, this.expected.repositoryDigest, async () => {
+      if (await exists(this.legacyReceiptPath)) await this.migrateLegacyReceipt();
+    });
+  }
+
+  private isSharedReceipt(current: WorktreeReceipt): boolean {
+    return sameReceipt(current, { ...this.expected, baselineCommit: current.baselineCommit,
+      commonDirectoryDigest: `sha256:${sha256Hex(canonicalize({ path: this.cacheGitDir }))}` });
+  }
+
+  /** Complete this checkout's metadata switch before any agent can resume it. */
+  private async isolateSharedWorktree(): Promise<void> {
+    const current = await this.currentReceipt();
+    if (!current) throw unavailable();
+    const after = { ...this.expected, baselineCommit: current.baselineCommit };
+    const before = { ...after, commonDirectoryDigest: `sha256:${sha256Hex(canonicalize({ path: this.cacheGitDir }))}` };
+    if (!sameReceipt(current, before) && !sameReceipt(current, after)) throw unavailable();
+    await migrateRepositoryWorkspace({ source: this.cacheGitDir, target: this.gitDir, cwd: this.cwd,
+      receiptPath: this.receiptPath, before, after, git: args => this.git(args),
+      verifyRepository: path => this.verifyRepository(path), readRecord: readJson,
+      writeExclusive, writePrivate, exists });
   }
 
   private git(args: string[], timeout = 30_000): Promise<string> {
@@ -396,12 +429,12 @@ class WorktreePreparation {
         current.commonDirectoryDigest !== expected.commonDirectoryDigest) throw unavailable();
   }
 
-  private async verifyRepository(): Promise<void> {
-    await privateDirectory(this.gitDir);
-    await privateDirectory(join(this.gitDir, "hooks-disabled"));
-    if ((await readFile(join(this.gitDir, "config"), "utf8")) !== REPOSITORY_CONFIG)
-      throw unavailable();
-    if ((await this.git(["--git-dir", this.gitDir, "remote"])).trim() !== "") throw unavailable();
+  private async verifyRepository(gitDir = this.gitDir): Promise<void> {
+    await privateDirectory(gitDir);
+    await privateDirectory(join(gitDir, "hooks-disabled"));
+    if ((await readFile(join(gitDir, "config"), "utf8")) !== REPOSITORY_CONFIG)
+      throw new RemoteInstanceError("capability_unavailable", "Private Git configuration violates workspace policy.", { diagnostic: "workspace_policy_invalid" });
+    if ((await this.git(["--git-dir", gitDir, "remote"])).trim() !== "") throw unavailable();
   }
 
   private async verify(receiptExpected = this.expected): Promise<void> {
@@ -427,9 +460,9 @@ class WorktreePreparation {
     const current = await this.currentReceipt();
     if (current && sameReceipt(current, this.expected)) return;
     const stale = this.staleOrResettable(current);
+    if (await exists(this.legacyReceiptPath)) throw unavailable();
     await this.ensureRepository();
     await this.verifyRepository();
-    if (await exists(this.legacyReceiptPath)) return this.migrateLegacyReceipt();
     await this.ensureRevision();
     if (stale) await this.retireStaleCheckout(stale);
     if ((await exists(this.receiptPath)) && (await exists(this.cwd)) && !(await exists(this.legacyReceiptPath))) return this.resetWorktree();
@@ -488,14 +521,20 @@ class WorktreePreparation {
   }
 
   private async ensureRepository(): Promise<void> {
-    if (await exists(this.gitDir)) return;
-    const temporary = `${this.gitDir}.new-${randomUUID()}`;
+    await this.initializeRepository(this.cacheGitDir);
+    await this.verifyRepository(this.cacheGitDir);
+    await this.initializeRepository(this.gitDir);
+  }
+
+  private async initializeRepository(gitDir: string): Promise<void> {
+    if (await exists(gitDir)) return;
+    const temporary = `${gitDir}.new-${randomUUID()}`;
     try {
       await this.git(["init", "--bare", "--object-format=sha1", "--template=", temporary]);
       await chmod(temporary, 0o700);
       await mkdir(join(temporary, "hooks-disabled"), { mode: 0o700 });
       await writePrivate(join(temporary, "config"), REPOSITORY_CONFIG);
-      await rename(temporary, this.gitDir);
+      await rename(temporary, gitDir);
     } finally {
       await rm(temporary, { recursive: true, force: true });
     }
@@ -509,22 +548,35 @@ class WorktreePreparation {
   private async migrateLegacyReceipt(): Promise<void> {
     const raw = (await readJson(this.legacyReceiptPath)) as Partial<WorktreeReceipt>;
     if (!legacyReceiptMatches(raw, this.expected)) throw unavailable();
-    if ((await realpath(await this.commonDirectory())) !== (await realpath(this.gitDir))) throw unavailable();
+    const common = await realpath(await this.commonDirectory());
+    if (common !== this.cacheGitDir && common !== this.gitDir) throw unavailable();
+    await this.verifyRepository(common);
+    const promoted = { ...this.expected, commonDirectoryDigest: `sha256:${sha256Hex(canonicalize({ path: common }))}` };
     if (await exists(this.receiptPath)) {
-      if (!sameReceipt(receipt(await readJson(this.receiptPath)), this.expected)) throw unavailable();
-    } else await writeExclusive(this.receiptPath, this.expected);
+      if (!sameReceipt(receipt(await readJson(this.receiptPath)), promoted)) throw unavailable();
+    } else await writeExclusive(this.receiptPath, promoted);
     await rm(this.legacyReceiptPath, { force: true });
   }
 
   /** Existing objects are the fast path. Fetch exactly once under the repository lock. */
   private async ensureRevision(): Promise<void> {
+    await this.ensureCachedRevision();
+    const revision = this.setup.input.revision;
+    // A local fetch copies objects without alternates or hardlinks. Mutable
+    // metadata and object lifetime belong to this session's private store.
+    await this.git(["--git-dir", this.gitDir, "fetch", "--no-tags", "--no-write-fetch-head",
+      this.cacheGitDir, `+${revision}:refs/konteks/fetched/${revision}`]);
+    await this.verifyRepository();
+  }
+
+  private async ensureCachedRevision(): Promise<void> {
     const revision = this.setup.input.revision;
     try {
-      await this.git(["--git-dir", this.gitDir, "cat-file", "-e", `${revision}^{commit}`]);
+      await this.git(["--git-dir", this.cacheGitDir, "cat-file", "-e", `${revision}^{commit}`]);
     } catch {
       const haveRevisions = (await this.git([
         "--git-dir",
-        this.gitDir,
+        this.cacheGitDir,
         "for-each-ref",
         "--format=%(objectname)",
         "refs/konteks/fetched",
@@ -532,9 +584,9 @@ class WorktreePreparation {
         .split(/\r?\n/u)
         .filter((value) => COMMIT.test(value))
         .slice(0, 64);
-      await this.setup.fetchRevision({ gitDir: this.gitDir, revision, haveRevisions });
-      await this.verifyRepository();
-      await this.git(["--git-dir", this.gitDir, "cat-file", "-e", `${revision}^{commit}`]);
+      await this.setup.fetchRevision({ gitDir: this.cacheGitDir, revision, haveRevisions });
+      await this.verifyRepository(this.cacheGitDir);
+      await this.git(["--git-dir", this.cacheGitDir, "cat-file", "-e", `${revision}^{commit}`]);
     }
   }
 
@@ -562,10 +614,30 @@ class WorktreePreparation {
    * first; if any step fails, the intent stays behind so a restart can tell
    * it from a completed agent worktree.
    */
+  private async preserveLegacyIntent(previous: WorktreeReceipt): Promise<boolean> {
+    const legacy = { ...this.expected,
+      commonDirectoryDigest: `sha256:${sha256Hex(canonicalize({ path: this.cacheGitDir }))}` };
+    if (!sameReceipt(previous, legacy)) return false;
+    // An old incomplete preparation is retained, never treated as disposable
+    // merely because its store layout differs. Completed receipts refuse here.
+    if (await exists(this.receiptPath) || await exists(this.legacyReceiptPath)) throw unavailable();
+    if (await exists(this.cwd)) {
+      const kept = `${this.cwd}.kept-preparation-${randomUUID()}`;
+      if (await exists(join(this.cwd, ".git")))
+        await this.git(["--git-dir", this.cacheGitDir, "worktree", "move", this.cwd, kept]);
+      else await rename(this.cwd, kept);
+    }
+    await rm(this.intent);
+    return true;
+  }
+
   private async addWorktree(): Promise<void> {
     if (await exists(this.intent)) {
       const previous = receipt(await readJson(this.intent));
-      if (!sameReceipt(previous, this.expected)) throw unavailable();
+      if (!sameReceipt(previous, this.expected)) {
+        if (!(await this.preserveLegacyIntent(previous))) throw unavailable();
+        return this.addWorktree();
+      }
       await this.git(["--git-dir", this.gitDir, "worktree", "remove", "--force", this.cwd]).catch(
         () => undefined,
       );

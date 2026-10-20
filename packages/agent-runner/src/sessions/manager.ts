@@ -49,6 +49,8 @@ interface CreateSessionArgs {
   /** Absolute outer readiness deadline supplied by the claim owner. */
   readinessDeadlineAt?: string;
   cwd: string;
+  /** Set only by authorized repository preparation; never inferred from a path. */
+  managedRepository?: true;
   readOnlyRoots?: readonly string[];
   mcpServers: McpServer[];
   /** ACP session-config selections from the assignment (`agentRoute.sessionConfig`). */
@@ -446,17 +448,20 @@ export class SessionManager {
   }
 
   /** `_meta` for `session/load` and `session/resume`: the agent's own (a persisted tool filter is overridden there). */
-  private reopenMeta(args?: Pick<CreateSessionArgs, "agentTitled" | "directAccountConnectors">): { _meta?: Record<string, unknown> } {
+  private reopenMeta(args?: Pick<CreateSessionArgs, "agentTitled" | "directAccountConnectors" | "managedRepository">): { _meta?: Record<string, unknown> } {
     // A reopened direct session the agent has not titled yet still gets the prefix when it does.
     const naming = args?.agentTitled ? { konteksSession: konteksAgentTitledMetadata().konteksSession } : {};
-    const meta = { ...naming, ...this.options.sessionMeta, ...runtimeConnectorMeta(args?.directAccountConnectors) };
+    const meta = { ...naming, ...this.options.sessionMeta, ...runtimeConnectorMeta(args?.directAccountConnectors),
+      ...(args?.managedRepository ? { konteksRepository: { version: 1, managed: true } } : {}) };
     return Object.keys(meta).length ? { _meta: meta } : {};
   }
 
   private newSessionMeta(args: CreateSessionArgs, acpSessionRef: string): Record<string, unknown> {
     const naming = args.agentTitled ? konteksAgentTitledMetadata(args.context.agentId)
       : konteksSessionMetadata(konteksCodingSessionTitle(args.sessionLabel, acpSessionRef.slice(-8)), args.context.agentId);
-    const meta = { ...naming, ...this.options.sessionMeta, ...runtimeConnectorMeta(args.directAccountConnectors), ...(args.integration ? konteksIntegrationMeta(args.integration) : {}) };
+    const meta = { ...naming, ...this.options.sessionMeta, ...runtimeConnectorMeta(args.directAccountConnectors),
+      ...(args.managedRepository ? { konteksRepository: { version: 1, managed: true } } : {}),
+      ...(args.integration ? konteksIntegrationMeta(args.integration) : {}) };
     const locked = args.integration ? withIntegrationToolLock(meta) : meta;
     return args.integration?.utility ? withUtilityTurnOptions(locked) : locked;
   }
