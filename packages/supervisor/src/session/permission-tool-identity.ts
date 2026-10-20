@@ -20,6 +20,14 @@ export type PermissionToolIdentity =
   | { kind: "native"; tool: string }
   | { kind: "unidentified"; mcp: boolean };
 
+/** A host adapter's retained provider announcement, never a permission title. */
+export interface ObservedMcpInvocation {
+  toolCallId: string;
+  server: string;
+  tool: string;
+  arguments: unknown;
+}
+
 
 const MAX_NAME = 256;
 const nonEmpty = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= MAX_NAME;

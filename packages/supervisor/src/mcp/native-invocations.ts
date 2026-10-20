@@ -1,33 +1,47 @@
 import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
-import { CoordinationAgentToolNames, NativeCoordinationInvocationSchema, RemoteInstanceError, coordinationPayloadHash, plainRecord, type NativeCoordinationInvocation } from "@konteks/remote-common";
+import { CoordinationAgentToolNames, NativeCoordinationInvocationSchema, RemoteInstanceError, coordinationPayloadHash, plainRecord, type ConnectedAgentView, type NativeCoordinationInvocation } from "@konteks/remote-common";
 import type { SupervisorJournal } from "../state/journal.js";
 import { coordinationInvocationKey } from "../state/coordination-invocation.js";
 import { permissionToolIdentity, type McpToolCallLedger } from "../session/permission-tool-identity.js";
-import type { PermissionToolIdentity } from "../session/permission-tool-identity.js";
+import type { ObservedMcpInvocation, PermissionToolIdentity } from "../session/permission-tool-identity.js";
 
 type InvocationContext = Omit<NativeCoordinationInvocation, "version" | "toolCallId" | "tool" | "payloadHash">;
 const MAX_RETAINED_CALLS = 8_000;
-const CAPTURE_AGENTS = new Set(["claude-code", "codex"]);
+const CAPTURE_AGENTS = new Set(["claude-code", "codex", "dsh"]);
+const QUALIFIED_HOST_VERSIONS: Readonly<Record<string, ReadonlySet<string>>> = { dsh: new Set(["0.1.7-rc.2"]) };
 const TOOLS: ReadonlySet<string> = new Set(CoordinationAgentToolNames);
 
 export function coordinationInvocationAgent(agentId: string): boolean { return CAPTURE_AGENTS.has(agentId); }
+export function coordinationInvocationReady(agent: Pick<ConnectedAgentView, 'agentId' | 'hostAgentVersion'>): boolean {
+  const versions = QUALIFIED_HOST_VERSIONS[agent.agentId];
+  return coordinationInvocationAgent(agent.agentId) && (!versions || versions.has(agent.hostAgentVersion ?? ""));
+}
 export function coordinationInvocationTool(tool: string): boolean { return TOOLS.has(tool); }
 function unavailable(): RemoteInstanceError { return new RemoteInstanceError("operation_conflict", "A unique captured native coordination invocation is required."); }
 function capturedTool(identity: PermissionToolIdentity, servers: ReadonlySet<string>): identity is Extract<PermissionToolIdentity, { kind: "mcp" }> {
   return identity.kind === "mcp" && servers.has(identity.server) && coordinationInvocationTool(identity.tool);
 }
 
+function permissionCapture(request: RequestPermissionRequest, agentId: string, servers: ReadonlySet<string>,
+  ledger: McpToolCallLedger | undefined, observed: ObservedMcpInvocation | undefined): { identity: PermissionToolIdentity; arguments: unknown } {
+  if (observed) {
+    if (agentId !== "dsh" || observed.toolCallId !== request.toolCall.toolCallId) throw unavailable();
+    return { identity: { kind: "mcp", server: observed.server, tool: observed.tool }, arguments: observed.arguments };
+  }
+  return { identity: permissionToolIdentity(request, agentId, { sessionServers: servers, ...(ledger ? { ledger } : {}) }),
+    arguments: agentId === "codex" ? ledger?.arguments(request.toolCall.toolCallId) : request.toolCall.rawInput };
+}
+
 /** Captures the provider's stable call before allow_once; HTTP never creates identity. */
 export class NativeCoordinationInvocations {
   constructor(private readonly journal: SupervisorJournal, private readonly context: () => InvocationContext | null, private readonly now: () => Date = () => new Date()) {}
 
-  async capture(request: RequestPermissionRequest, agentId: string, servers: ReadonlySet<string>, ledger?: McpToolCallLedger): Promise<void> {
+  async capture(request: RequestPermissionRequest, agentId: string, servers: ReadonlySet<string>, ledger?: McpToolCallLedger, observed?: ObservedMcpInvocation): Promise<void> {
     if (!coordinationInvocationAgent(agentId)) return;
-    const identity = permissionToolIdentity(request, agentId, { sessionServers: servers, ...(ledger ? { ledger } : {}) });
+    const { identity, arguments: args } = permissionCapture(request, agentId, servers, ledger, observed);
     if (!capturedTool(identity, servers)) return;
     const context = this.context();
     if (!context || context.acpSessionRef !== request.sessionId) throw unavailable();
-    const args = agentId === "codex" ? ledger?.arguments(request.toolCall.toolCallId) : request.toolCall.rawInput;
     const invocation = NativeCoordinationInvocationSchema.parse({ version: 1, ...context, toolCallId: request.toolCall.toolCallId, tool: identity.tool, payloadHash: await coordinationPayloadHash(args) });
     await this.retain(invocation);
   }

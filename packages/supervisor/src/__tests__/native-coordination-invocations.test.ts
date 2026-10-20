@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { SupervisorJournal } from "../state/journal.js";
 import { McpToolCallLedger } from "../session/permission-tool-identity.js";
 import { NativeCoordinationInvocations } from "../mcp/native-invocations.js";
+import { DshToolGovernance } from "../session/dsh-tool-governance.js";
+import { dshCoordinationArguments, dshCoordinationCall, dshCoordinationPermission, dshCoordinationResult } from "./fixtures/dsh-acp-coordination.js";
 
 const directories: string[] = [];
 afterEach(async () => { await Promise.all(directories.splice(0).map(dir => rm(dir, { recursive: true, force: true }))); });
@@ -23,6 +25,28 @@ async function fixture() {
 }
 
 describe("trusted native coordination invocation capture", () => {
+  it("journals the DSH adapter's committed call and reuses its existing durable replay and terminal ownership", async () => {
+    const { dir, invocations } = await fixture();
+    const governance = new DshToolGovernance();
+    governance.observe(dshCoordinationCall);
+    const options = { browserTools: false, servers };
+    const request = { ...dshCoordinationPermission, toolCall: { toolCallId: "dsh-call-1", title: "a misleading approval display title", rawInput: { body: "forged" } } } as RequestPermissionRequest;
+    const decision = governance.decide(request, "/work", options);
+    expect(decision.kind).toBe("allow");
+    if (decision.kind !== "allow") throw new Error("fixture DSH call was refused");
+    await invocations.capture(request, "dsh", servers, undefined, decision.coordinationInvocation);
+    const first = await invocations.resolve(tool, dshCoordinationArguments);
+    expect(first).toMatchObject({ ...context, toolCallId: "dsh-call-1", tool });
+    await invocations.capture(request, "dsh", servers, undefined, decision.coordinationInvocation);
+    const restored = new SupervisorJournal(dir); await restored.load();
+    const resumed = new NativeCoordinationInvocations(restored, () => context);
+    expect(await resumed.resolve(tool, dshCoordinationArguments)).toEqual(first);
+    await expect(resumed.resolve(tool, { body: "forged" })).rejects.toThrow();
+    await resumed.observe(dshCoordinationResult);
+    await expect(resumed.resolve(tool, dshCoordinationArguments)).rejects.toThrow();
+    expect(restored.coordinationInvocations.all()).toHaveLength(1);
+  });
+
   it("persists the provider call identity before forwarding and recovers it without storing message content", async () => {
     const { dir, invocations } = await fixture();
     await invocations.capture(permission(), "claude-code", servers);

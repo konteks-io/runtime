@@ -14,6 +14,21 @@ function fixture(executionPermitsReady?: () => boolean, cancellationDeliveryRead
 }
 
 describe("native host inventory", () => {
+  it.each([
+    { hostAgentVersion: "0.1.7-rc.2", expected: true },
+    { hostAgentVersion: "0.1.5-rc.3", expected: false },
+    { hostAgentVersion: undefined, expected: false },
+  ])("advertises DSH capture only for the qualified provider event contract: $hostAgentVersion", async ({ hostAgentVersion, expected }) => {
+    const dsh = { ...agent, agentId: "dsh", displayName: "DeepSeek Harness", ...(hostAgentVersion ? { hostAgentVersion } : {}) };
+    const readiness = vi.fn(async () => ({ agent: dsh, utilization: { activeSessions: 0, activeTurns: 0 } }));
+    let owned = true;
+    const inventory = new NativeInventoryCollector({ runners: new Map([["dsh", { readiness }]]),
+      sampler: { sample: async () => signals }, bundleVersion: "1.0.0", coordinationInvocationsReady: () => owned });
+    expect((await inventory.collect()).components[0]?.capabilities?.includes("coordination-invocations-v1:dsh")).toBe(expected);
+    owned = false;
+    expect((await inventory.collect()).components[0]?.capabilities).not.toContain("coordination-invocations-v1:dsh");
+  });
+
   it("advertises coordination invocation capture only for its supported ready adapters with live ownership", async () => {
     const readiness = vi.fn(async () => ({ agent, utilization: { activeSessions: 0, activeTurns: 0 } }));
     let owned = true;
