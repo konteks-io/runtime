@@ -63,7 +63,7 @@ import {
 } from "../native/direct-model-selection.js";
 import { continuedSession, isDirectAssignment, isNativeTurn } from "../work/continued-session.js";
 import { hostToolGovernance, type HostToolBypass, type HostToolGovernance } from "./host-tool-governance.js";
-import { McpToolCallLedger } from "./permission-tool-identity.js";
+import { McpToolCallLedger, type ObservedMcpInvocation } from "./permission-tool-identity.js";
 import { FolderAccessCue, type FolderAccessCueOptions } from "./folder-access-cue.js";
 import { heldChunk, StreamedPathHold } from "./path-hold.js";
 import { antigravityKonteksToolsLine, antigravityResultToolReference } from "./antigravity-prompt.js";
@@ -1860,7 +1860,9 @@ export class RelayedSession {
       this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: request.toolCall.toolCallId, reason: verdict.reason.slice(0, 512) },
         `${governance.agentName} tool call refused by policy`);
     }
-    await this.answerPermission(ref, requestId, optionId === undefined ? cancelledPermission() : selectedOption(optionId));
+    this.pendingToolPermissions.set(requestId, request);
+    await this.answerPermission(ref, requestId, optionId === undefined ? cancelledPermission() : selectedOption(optionId),
+      verdict.kind === "allow" ? verdict.coordinationInvocation : undefined);
   }
 
   private permissionContext(): Parameters<PolicyResponder["evaluatePermission"]>[1] {
@@ -1932,8 +1934,8 @@ export class RelayedSession {
   }
 
   /** Answer a permission request, telling a host agent's governance what was decided (Antigravity pairs its own reports with it). */
-  private async answerPermission(ref: string, requestId: string, response: { outcome: { outcome: string; optionId?: string } }): Promise<void> {
-    try { await this.capturePermissionInvocation(requestId, response); }
+  private async answerPermission(ref: string, requestId: string, response: { outcome: { outcome: string; optionId?: string } }, observed?: ObservedMcpInvocation): Promise<void> {
+    try { await this.capturePermissionInvocation(requestId, response, observed); }
     catch {
       this.logger.warn({ event: "coordination.invocation_capture_failed", assignmentId: this.assignment.id, attempt: this.assignment.attempt }, "native coordination call refused before provider dispatch");
       response = cancelledPermission();
@@ -1942,7 +1944,7 @@ export class RelayedSession {
     await this.deps.runner.answer(ref, requestId, response);
   }
 
-  private async capturePermissionInvocation(requestId: string, response: unknown): Promise<void> {
+  private async capturePermissionInvocation(requestId: string, response: unknown, observed?: ObservedMcpInvocation): Promise<void> {
     const request = this.pendingToolPermissions.get(requestId);
     this.pendingToolPermissions.delete(requestId);
     if (!request) return;
@@ -1950,7 +1952,7 @@ export class RelayedSession {
     if (answer.outcome?.outcome !== "selected") return;
     const option = request.options.find(candidate => candidate.optionId === answer.outcome?.optionId);
     if (option?.kind !== "allow_once") return;
-    await this.coordinationCalls.capture(request, this.assignment.agentRoute.agentId, this.platformServers, this.mcpCalls ?? undefined);
+    await this.coordinationCalls.capture(request, this.assignment.agentRoute.agentId, this.platformServers, this.mcpCalls ?? undefined, observed);
   }
 
   private notePermissionAnswer(requestId: string, response: unknown): void {

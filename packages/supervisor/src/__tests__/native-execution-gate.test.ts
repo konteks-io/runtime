@@ -26,6 +26,7 @@ import { PermissionBroker } from "../session/permissions.js";
 import { EvaluatorPolicyResponder } from "../session/policy-responder.js";
 import type { RunnerPort } from "../runner-port.js";
 import type { TransportManager } from "../transport/relay-transport.js";
+import { dshCoordinationArguments, dshCoordinationCall, dshCoordinationPermission } from "./fixtures/dsh-acp-coordination.js";
 import { RunnerEventBus } from "../../../agent-runner/src/events.js";
 import { SessionManager, InMemorySessionRefStore } from "../../../agent-runner/src/sessions/manager.js";
 import type { BridgeProcess } from "../../../agent-runner/src/bridge/process.js";
@@ -47,12 +48,12 @@ const expiresAt = "2026-09-10T01:00:00Z";
 const assignment: RemoteWorkAssignment = { id: "assignment", attempt: 1, workspaceId: "tenant", instanceId: "instance", placementId: "placement", kind: "assistant_execution", taskId: "turn", correlationId: "correlation", expiresAt, requiredCapabilities: [], agentRoute: { agentId: "codex", requiredRole: "assistant" }, source: { kind: "conversation", portability: "portable_before_claim", sessionId: "session", turnRef: "turn" }, policy: { maxDurationSeconds: 60, maxArtifactBytes: 1, evidenceUpload: "structured_only", allowedArtifactKinds: [], recoveryMode: "report_interrupted", latestResumeAt: expiresAt, permissionResponderDeadlineSeconds: 60, humanDeferralAllowed: false } };
 const message = { kind: "acp", method: "session/prompt", id: "request", params: { sessionId: "acp", prompt: [{ type: "text", text: "hello" }] } };
 
-async function fixture() {
+async function fixture(agentId = "codex") {
   const clock = new FixedClock(Date.parse("2026-09-10T00:00:00Z"));
   const journal = new SupervisorJournal(root); await journal.load();
   const ready = { workspaceId: "tenant", instanceId: "instance", sessionId: "session", channelId: "session:session", assignmentId: "assignment", attempt: 1,
-    claimId: "claim", recoveryEpoch: 0, runnerIncarnation: "runner", agentId: "codex", acpSessionRef: "acp", readyRevision: 1, registeredAt: clock.nowIso() };
-  await journal.assignments.put({ assignmentId: "assignment", attempt: 1, claimId: "claim", kind: "assistant_execution", placementId: "placement", workspaceId: "tenant", agentId: "codex", state: "running", recoveryEpoch: 0, executionReady: ready,
+    claimId: "claim", recoveryEpoch: 0, runnerIncarnation: "runner", agentId, acpSessionRef: "acp", readyRevision: 1, registeredAt: clock.nowIso() };
+  await journal.assignments.put({ assignmentId: "assignment", attempt: 1, claimId: "claim", kind: "assistant_execution", placementId: "placement", workspaceId: "tenant", agentId, state: "running", recoveryEpoch: 0, executionReady: ready,
     reports: { nextSequence: 1, durableWatermark: 0 }, evidenceUpload: "structured_only", expiresAt, latestResumeAt: expiresAt, updatedAt: clock.nowIso() });
   const { registeredAt: _time, ...binding } = ready;
   const authority = { ...binding, executionId: "execution", delegationRef: "delegation", turnRef: "turn", principal: "assistant",
@@ -74,17 +75,17 @@ async function fixture() {
   let monotonic = 0;
   const assertOwned = vi.fn();
   const onAuthorityLost = vi.fn(async () => undefined);
-  const makeGate = (overrides: Record<string, unknown> = {}) => { const gate = new NativeExecutionGate({ assignment, journal, clock, runnerIncarnation: "runner", client,
+  const makeGate = (overrides: Record<string, unknown> = {}) => { const gate = new NativeExecutionGate({ assignment: { ...assignment, agentRoute: { ...assignment.agentRoute, agentId } }, journal, clock, runnerIncarnation: "runner", client,
     assertOwned, onAuthorityLost, currentRevisionFenceConnection: () => ({ connectionRef: "connection", connectionEpoch: 2 }), monotonicNow: () => monotonic, ...overrides } as never); gates.push(gate); return gate; };
   return { journal, clock, ready, claims, client, envelope, gate: makeGate(), makeGate, onAuthorityLost, assertOwned,
     monotonicNow: () => monotonic,
     advance: (milliseconds: number) => { monotonic += milliseconds; clock.advance(milliseconds); } };
 }
 
-async function deliveryFixture() {
-  const f = await fixture();
+async function deliveryFixture(agentId = "codex") {
+  const f = await fixture(agentId);
   const assigned: RemoteWorkAssignment = { ...assignment, kind: "delivery", taskId: "task", correlationId: "invocation",
-    agentRoute: { agentId: "codex", requiredRole: "generator", sessionConfig: { model: "model-a" } },
+    agentRoute: { agentId, requiredRole: "generator", sessionConfig: { model: "model-a" } },
     source: { kind: "harness_delivery", portability: "instance_bound", ownerInstanceId: "instance", executionSessionId: "session",
       repositoryId: "https://git.example.com/acme/store", modelBinding: { canonicalProviderId: "openai", canonicalModelId: "model-a" },
       turn: { invocationId: "invocation", dispatchGeneration: 0 } } };
@@ -98,7 +99,7 @@ async function deliveryFixture() {
       repositoryId: "https://git.example.com/acme/store",
       routeId: "executor", routeManifestHash: "a".repeat(64), invocationId: "invocation", dispatchGeneration: 0,
       publicSessionId: "public", executionSessionId: "session", instanceId: "instance", requiredRuntimeRole: "generator",
-      agentId: "codex", modelBinding: { selectedValue: "model-a", canonicalProviderId: "openai", canonicalModelId: "model-a" } },
+      agentId, modelBinding: { selectedValue: "model-a", canonicalProviderId: "openai", canonicalModelId: "model-a" } },
     modelSelection: { mappingId: "mapping", mappingRevision: 1, mappingDigest: "m".repeat(43), snapshotId: "snapshot",
       snapshotRevision: 1, snapshotDigest: "s".repeat(43), configId: "model", selectedValue: "model-a",
       canonicalIdentity: { canonicalProviderId: "openai", canonicalModelId: "model-a" } } };
@@ -747,7 +748,7 @@ it("refuses a genuinely valid Assistant answer on an owned Delivery assignment w
 async function sessionFixture(work: RemoteWorkAssignment = assignment, acceptDeliveryOutput?: (authority: { claimId: string; invocationRef: string }) => Promise<RemoteDeliveryAcceptanceReceipt>,
   logger?: { warn: (...args: unknown[]) => void; info: (...args: unknown[]) => void; error: (...args: unknown[]) => void; debug: (...args: unknown[]) => void },
   authority: Record<string, unknown> = {}, deps: Partial<RelayedSessionDeps> = {}) {
-  const f = work.source.kind === "harness_delivery" ? await deliveryFixture() : await fixture();
+  const f = work.source.kind === "harness_delivery" ? await deliveryFixture(work.agentRoute.agentId) : await fixture(work.agentRoute.agentId);
   const entry = f.journal.assignments.get(`${work.id}:${work.attempt}`)!;
   await f.journal.assignments.put({ ...entry, kind: work.kind });
   const runner = { createSession: vi.fn(async () => ({ acpSessionRef: "acp", resumed: false, capabilities: { forkSession: false, sessionResume: false } })),
@@ -782,6 +783,58 @@ const deliveryTurn: RemoteWorkAssignment = { ...assignment, kind: "delivery", ta
     repositoryId: "https://git.example.com/acme/store", modelBinding: { canonicalProviderId: "openai", canonicalModelId: "model-a" },
     turn: { invocationId: "invocation", dispatchGeneration: 0 } } };
 type SessionFixture = Awaited<ReturnType<typeof sessionFixture>>;
+
+describe("DeepSeek coordination under native delivery authority", () => {
+  const work: RemoteWorkAssignment = { ...deliveryTurn,
+    agentRoute: { ...deliveryTurn.agentRoute, agentId: "dsh", mcpCapabilityTokenRef: "platform-capability" } };
+  const capability = async () => ({ mcpServer: { name: "konteks-platform", url: "https://mcp.example",
+    headers: [{ name: "authorization", value: "Bearer fixture-capability" }] }, expiresAt });
+
+  async function announceAndAsk(f: SessionFixture) {
+    await f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp",
+      params: { sessionId: "acp", update: dshCoordinationCall } });
+    await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp",
+      requestId: "dsh-approval", params: dshCoordinationPermission as RequestPermissionRequest });
+  }
+
+  it("persists the committed DSH call before its governed fast-allow reaches the provider", async () => {
+    const f = await sessionFixture(work, undefined, undefined, {}, { redeemCapabilityToken: capability });
+    const atAnswer: unknown[] = [];
+    vi.mocked(f.runner.answer).mockImplementation(async () => {
+      atAnswer.push(f.journal.coordinationInvocations.all());
+      return { delivered: true };
+    });
+    try {
+      await f.session.onToRuntime(f.envelope);
+      await announceAndAsk(f);
+      expect(f.runner.answer).toHaveBeenCalledWith("acp", "dsh-approval", { outcome: { outcome: "selected", optionId: "allow-once" } });
+      expect(atAnswer).toEqual([[expect.objectContaining({ version: 1, workspaceId: "tenant",
+        assignmentId: "assignment", attempt: 1, acpSessionRef: "acp", operationId: "operation",
+        toolCallId: "dsh-call-1", tool: "platform__coordination__send", state: "captured" })]]);
+      expect(JSON.stringify(f.journal.coordinationInvocations.all())).not.toContain(dshCoordinationArguments.body);
+    } finally { await f.session.close("cancelled"); }
+  });
+
+  it("does not allow a DSH coordination effect before its current signed prompt is dispatching", async () => {
+    const f = await sessionFixture(work, undefined, undefined, {}, { redeemCapabilityToken: capability });
+    try {
+      await announceAndAsk(f);
+      expect(f.runner.answer).toHaveBeenCalledWith("acp", "dsh-approval", { outcome: { outcome: "cancelled" } });
+      expect(f.journal.coordinationInvocations.all()).toEqual([]);
+    } finally { await f.session.close("cancelled"); }
+  });
+
+  it("cancels the DSH approval if the durable capture write fails", async () => {
+    const f = await sessionFixture(work, undefined, undefined, {}, { redeemCapabilityToken: capability });
+    try {
+      await f.session.onToRuntime(f.envelope);
+      vi.spyOn(f.journal.coordinationInvocations, "update").mockRejectedValueOnce(new Error("fixture capture persistence failed"));
+      await announceAndAsk(f);
+      expect(f.runner.answer).toHaveBeenCalledWith("acp", "dsh-approval", { outcome: { outcome: "cancelled" } });
+      expect(f.journal.coordinationInvocations.all()).toEqual([]);
+    } finally { await f.session.close("cancelled"); }
+  });
+});
 
 async function qaAnswerFixture(
   method: "session/request_permission" | "elicitation/create",

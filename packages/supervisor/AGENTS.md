@@ -57,11 +57,14 @@ QA browser, structured results, updates and doctor/support.
   and checks instance, failure ID and digest before acknowledging a receipt.
   Diagnostics never settle work, meter usage or delay an operation or stop.
   Never include raw logs, provider text, private paths or inferred causes.
-- **Coordination calls.** Claude Code and Codex capture their provider tool-call
-  identity from ACP approval before `allow_once`; the native journal retains
+- **Coordination calls.** Claude Code and Codex use their structured ACP tool
+  identity; qualified DeepSeek Harness uses its committed call ledger and the
+  exact session-installed MCP name mapping. Both ordinary policy and host
+  fast-allow paths capture before `allow_once`; the native journal retains
   only its bound operation identity and payload hash. The platform facade
   requires one matching capture and supplies Core's invocation header itself.
-  Missing or ambiguous capture fails closed. Other adapters do not advertise
+  Missing, changed or ambiguous capture fails closed. DSH advertises capture
+  only for the verified provider version; other adapters do not advertise
   `coordination-invocations-v1:<agentId>`. A structured wait is only a request;
   Harness owns blocker validation and publishing its durable checkpoint.
 - **Direct work** (`work/continued-session.ts`, `isDirectAssignment`): no

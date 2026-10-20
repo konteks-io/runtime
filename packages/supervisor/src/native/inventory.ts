@@ -23,7 +23,7 @@ import { hostPressureRatio, UtilizationSignalsSchema, type SignalSampler } from 
 import type { InventorySnapshot } from "../inventory/snapshot.js";
 import type { RunnerPort } from "../runner-port.js";
 import { onboardCapabilities } from "../inventory/roles.js";
-import { coordinationInvocationAgent } from "../mcp/native-invocations.js";
+import { coordinationInvocationReady } from "../mcp/native-invocations.js";
 
 const readinessSchema = z.object({
   agent: ConnectedAgentViewSchema,
@@ -235,7 +235,7 @@ export class NativeInventoryCollector {
   private coordinationCapabilities(agents: readonly ConnectedAgentView[]): string[] {
     if (!this.options.coordinationInvocationsReady?.()) return [];
     return agents
-      .filter((agent) => coordinationInvocationAgent(agent.agentId))
+      .filter(coordinationInvocationReady)
       .map((agent) => `coordination-invocations-v1:${agent.agentId}`);
   }
 
