@@ -2,6 +2,7 @@ import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import { AntigravityToolGovernance } from "./antigravity-tool-governance.js";
 import { DshToolGovernance } from "./dsh-tool-governance.js";
 import { OpenCodeToolGovernance } from "./opencode-tool-governance.js";
+import type { ObservedMcpInvocation } from "./permission-tool-identity.js";
 
 /**
  * Tool governance for an agent used from the person's own installation
@@ -14,7 +15,7 @@ import { OpenCodeToolGovernance } from "./opencode-tool-governance.js";
  * quarantines the agent on this connector).
  */
 export type HostPermissionDecision =
-  | { kind: "allow" }
+  | { kind: "allow"; coordinationInvocation?: ObservedMcpInvocation }
   | { kind: "deny"; reason: string }
   | { kind: "evaluate"; request: RequestPermissionRequest };
 
@@ -66,6 +67,6 @@ export function hostToolGovernance(agentId: string): HostToolGovernance | null {
     bypassDiagnostic: "dsh_tool_governance_bypassed",
     quarantineMessage: "DeepSeek Harness ran a tool without asking Konteks first. Update or reinstall DeepSeek Harness, then restart the connector.",
     observe: update => dsh.observe(update),
-    decide: (request, context) => dsh.decide(request, context.cwd, { browserTools: context.browserTools === true }),
+    decide: (request, context) => dsh.decide(request, context.cwd, { browserTools: context.browserTools === true, servers: context.servers }),
   };
 }

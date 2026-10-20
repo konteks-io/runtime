@@ -64,7 +64,7 @@ import {
 } from "../native/direct-model-selection.js";
 import { continuedSession, isDirectAssignment, isNativeTurn } from "../work/continued-session.js";
 import { hostToolGovernance, type HostToolBypass, type HostToolGovernance } from "./host-tool-governance.js";
-import { McpToolCallLedger } from "./permission-tool-identity.js";
+import { McpToolCallLedger, type ObservedMcpInvocation } from "./permission-tool-identity.js";
 import { FolderAccessCue, type FolderAccessCueOptions } from "./folder-access-cue.js";
 import { heldChunk, StreamedPathHold } from "./path-hold.js";
 import { antigravityKonteksToolsLine, antigravityResultToolReference } from "./antigravity-prompt.js";
@@ -247,6 +247,8 @@ export class RelayedSession {
   private recoveryStopping = false;
   private recoveryStopTask: Promise<void> | null = null;
   private creationReturned = false;
+  /** In-process stage correlation only; recovered stages never become terminal history. */
+  private bootstrapFailure: { stage: string; error: unknown } | null = null;
   private readonly activities = new Set<Promise<unknown>>();
   private closeTask: Promise<void> | null = null;
   /**
@@ -361,10 +363,31 @@ export class RelayedSession {
     return this.track(async () => {
       try { return await this.bootstrapImpl(); }
       catch (error) {
+        this.reportBootstrapFailure(error);
         await this.closeMcpFacade();
         throw error;
       }
     });
+  }
+
+  /** Capture one terminal fact before disposal, without waiting for diagnostic delivery. */
+  private reportBootstrapFailure(error: unknown): void {
+    const failed = this.bootstrapFailure;
+    this.bootstrapFailure = null;
+    const stage = failed !== null && failed.error === error ? failed.stage : "session_bootstrap";
+    const safeError = error instanceof RemoteInstanceError
+      ? { code: error.code, retryable: error.retryable }
+      : { code: "session_bootstrap_failed", retryable: false };
+    reportRuntimeFailure(
+      this.deps.onRuntimeFailure,
+      {
+        phase: "launch",
+        stage: bootstrapFailureStage(stage, error),
+        ...safeError,
+        evidence: { kind: "runtime_exception" },
+      },
+      { assignmentId: this.assignment.id, attempt: this.assignment.attempt },
+    );
   }
 
   private track<T>(operation: () => Promise<T>): Promise<T> {
@@ -384,11 +407,13 @@ export class RelayedSession {
     const startedAt = Date.now();
     try {
       const result = await operation();
+      this.bootstrapFailure = null;
       // One line per finished stage, so a slow bootstrap says where.
       this.logger.info({ event: "native.bootstrap.stage", assignmentId: this.assignment.id, attempt: this.assignment.attempt,
         stage, durationMs: Date.now() - startedAt }, "native session bootstrap stage finished");
       return result;
     } catch (error) {
+      this.bootstrapFailure = { stage, error };
       this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, stage, ...stageFailure(error) },
         "native session bootstrap stage failed");
       throw error;
@@ -1324,7 +1349,7 @@ export class RelayedSession {
     const begun = await this.beginAuthorized(context.gate, context.operation, assertDeliveryCurrent, onWait);
     if (!begun.started) return;
     // Do not convert a bridge transport exception into proof of completion.
-    return this.dispatchAuthorized(context, begun.params);
+    return this.dispatchAuthorized(context, begun.params, assertDeliveryCurrent);
   }
 
   /** A Core-permitted stop while this session's prompt is admitted and not yet started. */
@@ -1402,10 +1427,10 @@ export class RelayedSession {
     }
   }
 
-  private async dispatchAuthorized(context: { gate: NativeExecutionGate; operation: AuthorizedOperation; ref: string }, params: unknown,
+  private async dispatchAuthorized(context: { gate: NativeExecutionGate; operation: AuthorizedOperation; ref: string }, params: unknown, assertDeliveryCurrent: () => void,
   ): Promise<void> {
     const message = context.operation.envelope.message;
-    if (message.kind !== "acp") return this.answerAuthorized(context, message);
+    if (message.kind !== "acp") return this.answerAuthorized(context, message, assertDeliveryCurrent);
     if (message.method === "session/prompt") return this.promptAuthorized(context, message.id, params as PromptParams);
     if (message.method === "session/set_mode") return void (await this.deps.runner.setMode(context.ref, message.id, params));
     if (message.method === "session/set_config_option") return void (await this.deps.runner.setConfigOption(context.ref, message.id, params));
@@ -1447,11 +1472,12 @@ export class RelayedSession {
     await gate.complete(operation.key);
   }
 
-  private async answerAuthorized({ gate, operation, ref }: { gate: NativeExecutionGate; operation: AuthorizedOperation; ref: string }, message: Exclude<AuthorizedMessage, { kind: "acp" }>): Promise<void> {
+  private async answerAuthorized({ gate, operation, ref }: { gate: NativeExecutionGate; operation: AuthorizedOperation; ref: string }, message: Exclude<AuthorizedMessage, { kind: "acp" }>, assertDeliveryCurrent: () => void): Promise<void> {
     const answer = issuedAnswer(message, message.method);
     const verdict = this.deps.broker.answer(ref, message.id, answer);
     if (!verdict.ok) throw new RemoteInstanceError("operation_conflict", "The pending human answer is no longer admissible.");
     await this.capturePermissionInvocation(message.id, answer);
+    assertDeliveryCurrent();
     this.notePermissionAnswer(message.id, answer);
     const delivered = await this.deps.runner.answer(ref, message.id, answer);
     if (!delivered.delivered) throw new RemoteInstanceError("operation_interrupted", "Answer delivery is unproven.");
@@ -1932,7 +1958,9 @@ export class RelayedSession {
       this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: request.toolCall.toolCallId, reason: verdict.reason.slice(0, 512) },
         `${governance.agentName} tool call refused by policy`);
     }
-    await this.answerPermission(ref, requestId, optionId === undefined ? cancelledPermission() : selectedOption(optionId));
+    this.pendingToolPermissions.set(requestId, request);
+    await this.answerPermission(ref, requestId, optionId === undefined ? cancelledPermission() : selectedOption(optionId),
+      verdict.kind === "allow" ? verdict.coordinationInvocation : undefined);
   }
 
   private permissionContext(): Parameters<PolicyResponder["evaluatePermission"]>[1] {
@@ -2004,8 +2032,8 @@ export class RelayedSession {
   }
 
   /** Answer a permission request, telling a host agent's governance what was decided (Antigravity pairs its own reports with it). */
-  private async answerPermission(ref: string, requestId: string, response: { outcome: { outcome: string; optionId?: string } }): Promise<void> {
-    try { await this.capturePermissionInvocation(requestId, response); }
+  private async answerPermission(ref: string, requestId: string, response: { outcome: { outcome: string; optionId?: string } }, observed?: ObservedMcpInvocation): Promise<void> {
+    try { await this.capturePermissionInvocation(requestId, response, observed); }
     catch {
       this.logger.warn({ event: "coordination.invocation_capture_failed", assignmentId: this.assignment.id, attempt: this.assignment.attempt }, "native coordination call refused before provider dispatch");
       response = cancelledPermission();
@@ -2014,7 +2042,7 @@ export class RelayedSession {
     await this.deps.runner.answer(ref, requestId, response);
   }
 
-  private async capturePermissionInvocation(requestId: string, response: unknown): Promise<void> {
+  private async capturePermissionInvocation(requestId: string, response: unknown, observed?: ObservedMcpInvocation): Promise<void> {
     const request = this.pendingToolPermissions.get(requestId);
     this.pendingToolPermissions.delete(requestId);
     if (!request) return;
@@ -2022,7 +2050,7 @@ export class RelayedSession {
     if (answer.outcome?.outcome !== "selected") return;
     const option = request.options.find(candidate => candidate.optionId === answer.outcome?.optionId);
     if (option?.kind !== "allow_once") return;
-    await this.coordinationCalls.capture(request, this.assignment.agentRoute.agentId, this.platformServers, this.mcpCalls ?? undefined);
+    await this.coordinationCalls.capture(request, this.assignment.agentRoute.agentId, this.platformServers, this.mcpCalls ?? undefined, observed);
   }
 
   private notePermissionAnswer(requestId: string, response: unknown): void {
@@ -2566,6 +2594,21 @@ function sessionClosed(): RemoteInstanceError {
  * into logs: the stable code and retryability, and for an unknown error its
  * class and, for an agent's JSON-RPC refusal, its numeric code.
  */
+/** Static local bootstrap guards only: arbitrary diagnostics are private. */
+const BOOTSTRAP_FAILURE_ORIGINS = new Set([
+  "local_execution_unprovable", "mcp_transport_reference_mismatch", "legacy_mcp_thread_loaded_or_unverified",
+  "session_generation_fenced", "agent_session_lost", "transfer_admissions_unrelated", "transfer_starts_mismatch",
+  "transfer_successor_exists", "transfer_predecessor_missing", "transfer_predecessor_not_continuable",
+  "transfer_reference_moved", "transfer_before_completion", "predecessor_recovery_unqualified", "unfinished_continuation_stop_unconfirmed",
+]);
+
+/** Retain the original boundary and a known typed origin without copying error text. */
+function bootstrapFailureStage(parent: string, error: unknown): string {
+  if (!(error instanceof RemoteInstanceError)) return parent;
+  return error.diagnostic !== undefined && BOOTSTRAP_FAILURE_ORIGINS.has(error.diagnostic)
+    ? `${parent}_${error.diagnostic}` : parent;
+}
+
 function stageFailure(error: unknown): Record<string, unknown> {
   if (error instanceof RemoteInstanceError) return { code: error.code, retryable: error.retryable, ...(error.diagnostic ? { diagnostic: error.diagnostic } : {}) };
   const rpcCode = (error as { code?: unknown } | null)?.code;

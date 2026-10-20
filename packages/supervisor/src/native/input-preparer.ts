@@ -580,6 +580,7 @@ class DeliveryOutput {
       cwd: source.cwd,
       gitExecutable: this.delivery.git.executable,
       baselineCommit: source.baselineCommit!,
+      previousOutput: await mutate(() => this.delivery.outputHead.latestAccepted()),
       binding: inputs.selection.binding,
       claimId: inputs.claimId,
       invocationRef: authority.invocationRef,

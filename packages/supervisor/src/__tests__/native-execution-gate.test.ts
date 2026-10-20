@@ -1,10 +1,21 @@
 import { generateKeyPairSync, sign } from "node:crypto";
-import { RequestError } from "@agentclientprotocol/sdk";
+import { RequestError, type RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { FixedClock, RemoteInstanceError, generateEd25519, ed25519Sign, remoteControlSigningBytes, computeExecutionRevisionControlIntentDigest, computeRemoteExecutionOperationDigest, type RemoteDeliveryAcceptanceReceipt, type RemoteWorkAssignment } from "@konteks/remote-common";
+import {
+  FixedClock,
+  RemoteInstanceError,
+  generateEd25519,
+  ed25519Sign,
+  remoteControlSigningBytes,
+  computeExecutionRevisionControlIntentDigest,
+  computeRemoteExecutionOperationDigest,
+  verifyRemoteExecutionOperationSignature,
+  type RemoteDeliveryAcceptanceReceipt,
+  type RemoteWorkAssignment,
+} from "@konteks/remote-common";
 import { CoreSignatureVerifier } from "../control/core-signature.js";
 import { PermissionAnswerReceiver } from "../control/permission-answer-receiver.js";
 import { SupervisorJournal } from "../state/journal.js";
@@ -15,9 +26,11 @@ import { PermissionBroker } from "../session/permissions.js";
 import { EvaluatorPolicyResponder } from "../session/policy-responder.js";
 import type { RunnerPort } from "../runner-port.js";
 import type { TransportManager } from "../transport/relay-transport.js";
+import { dshCoordinationArguments, dshCoordinationCall, dshCoordinationPermission } from "./fixtures/dsh-acp-coordination.js";
 import { RunnerEventBus } from "../../../agent-runner/src/events.js";
 import { SessionManager, InMemorySessionRefStore } from "../../../agent-runner/src/sessions/manager.js";
 import type { BridgeProcess } from "../../../agent-runner/src/bridge/process.js";
+import { WorkOrchestrator } from "../work/orchestrator.js";
 
 let root: string;
 const gates: NativeExecutionGate[] = [];
@@ -35,12 +48,12 @@ const expiresAt = "2026-09-10T01:00:00Z";
 const assignment: RemoteWorkAssignment = { id: "assignment", attempt: 1, workspaceId: "tenant", instanceId: "instance", placementId: "placement", kind: "assistant_execution", taskId: "turn", correlationId: "correlation", expiresAt, requiredCapabilities: [], agentRoute: { agentId: "codex", requiredRole: "assistant" }, source: { kind: "conversation", portability: "portable_before_claim", sessionId: "session", turnRef: "turn" }, policy: { maxDurationSeconds: 60, maxArtifactBytes: 1, evidenceUpload: "structured_only", allowedArtifactKinds: [], recoveryMode: "report_interrupted", latestResumeAt: expiresAt, permissionResponderDeadlineSeconds: 60, humanDeferralAllowed: false } };
 const message = { kind: "acp", method: "session/prompt", id: "request", params: { sessionId: "acp", prompt: [{ type: "text", text: "hello" }] } };
 
-async function fixture() {
+async function fixture(agentId = "codex") {
   const clock = new FixedClock(Date.parse("2026-09-10T00:00:00Z"));
   const journal = new SupervisorJournal(root); await journal.load();
   const ready = { workspaceId: "tenant", instanceId: "instance", sessionId: "session", channelId: "session:session", assignmentId: "assignment", attempt: 1,
-    claimId: "claim", recoveryEpoch: 0, runnerIncarnation: "runner", agentId: "codex", acpSessionRef: "acp", readyRevision: 1, registeredAt: clock.nowIso() };
-  await journal.assignments.put({ assignmentId: "assignment", attempt: 1, claimId: "claim", kind: "assistant_execution", placementId: "placement", workspaceId: "tenant", agentId: "codex", state: "running", recoveryEpoch: 0, executionReady: ready,
+    claimId: "claim", recoveryEpoch: 0, runnerIncarnation: "runner", agentId, acpSessionRef: "acp", readyRevision: 1, registeredAt: clock.nowIso() };
+  await journal.assignments.put({ assignmentId: "assignment", attempt: 1, claimId: "claim", kind: "assistant_execution", placementId: "placement", workspaceId: "tenant", agentId, state: "running", recoveryEpoch: 0, executionReady: ready,
     reports: { nextSequence: 1, durableWatermark: 0 }, evidenceUpload: "structured_only", expiresAt, latestResumeAt: expiresAt, updatedAt: clock.nowIso() });
   const { registeredAt: _time, ...binding } = ready;
   const authority = { ...binding, executionId: "execution", delegationRef: "delegation", turnRef: "turn", principal: "assistant",
@@ -62,17 +75,17 @@ async function fixture() {
   let monotonic = 0;
   const assertOwned = vi.fn();
   const onAuthorityLost = vi.fn(async () => undefined);
-  const makeGate = (overrides: Record<string, unknown> = {}) => { const gate = new NativeExecutionGate({ assignment, journal, clock, runnerIncarnation: "runner", client,
+  const makeGate = (overrides: Record<string, unknown> = {}) => { const gate = new NativeExecutionGate({ assignment: { ...assignment, agentRoute: { ...assignment.agentRoute, agentId } }, journal, clock, runnerIncarnation: "runner", client,
     assertOwned, onAuthorityLost, currentRevisionFenceConnection: () => ({ connectionRef: "connection", connectionEpoch: 2 }), monotonicNow: () => monotonic, ...overrides } as never); gates.push(gate); return gate; };
   return { journal, clock, ready, claims, client, envelope, gate: makeGate(), makeGate, onAuthorityLost, assertOwned,
     monotonicNow: () => monotonic,
     advance: (milliseconds: number) => { monotonic += milliseconds; clock.advance(milliseconds); } };
 }
 
-async function deliveryFixture() {
-  const f = await fixture();
+async function deliveryFixture(agentId = "codex") {
+  const f = await fixture(agentId);
   const assigned: RemoteWorkAssignment = { ...assignment, kind: "delivery", taskId: "task", correlationId: "invocation",
-    agentRoute: { agentId: "codex", requiredRole: "generator", sessionConfig: { model: "model-a" } },
+    agentRoute: { agentId, requiredRole: "generator", sessionConfig: { model: "model-a" } },
     source: { kind: "harness_delivery", portability: "instance_bound", ownerInstanceId: "instance", executionSessionId: "session",
       repositoryId: "https://git.example.com/acme/store", modelBinding: { canonicalProviderId: "openai", canonicalModelId: "model-a" },
       turn: { invocationId: "invocation", dispatchGeneration: 0 } } };
@@ -86,7 +99,7 @@ async function deliveryFixture() {
       repositoryId: "https://git.example.com/acme/store",
       routeId: "executor", routeManifestHash: "a".repeat(64), invocationId: "invocation", dispatchGeneration: 0,
       publicSessionId: "public", executionSessionId: "session", instanceId: "instance", requiredRuntimeRole: "generator",
-      agentId: "codex", modelBinding: { selectedValue: "model-a", canonicalProviderId: "openai", canonicalModelId: "model-a" } },
+      agentId, modelBinding: { selectedValue: "model-a", canonicalProviderId: "openai", canonicalModelId: "model-a" } },
     modelSelection: { mappingId: "mapping", mappingRevision: 1, mappingDigest: "m".repeat(43), snapshotId: "snapshot",
       snapshotRevision: 1, snapshotDigest: "s".repeat(43), configId: "model", selectedValue: "model-a",
       canonicalIdentity: { canonicalProviderId: "openai", canonicalModelId: "model-a" } } };
@@ -499,6 +512,254 @@ it.each(["valid", "core-clock-ahead", "fractional-core-clock", "lost-during-keys
   } else { await expect(receiver.receive(body)).rejects.toThrow(); expect(dispatched).not.toHaveBeenCalled(); }
 });
 
+function permissionOperation(
+  base: Record<string, unknown>,
+  method: "session/request_permission" | "elicitation/create",
+  kind: "result" | "error",
+  selected = false,
+) {
+  const result =
+    method === "session/request_permission"
+      ? {
+          outcome: selected ? { outcome: "selected", optionId: "allow" } : { outcome: "cancelled" },
+        }
+      : { action: "cancel" };
+  const message =
+    kind === "result"
+      ? { kind: "acp_result" as const, method, id: "pending", result }
+      : {
+          kind: "acp_error" as const,
+          method,
+          id: "pending",
+          error: { code: -32000, class: "policy_denied", message: "Declined", retryable: false },
+        };
+  const claims = {
+    ...base,
+    operationId: "answer-operation",
+    permitId: "answer-permit",
+    kind: message.kind,
+    method,
+    requestId: message.id,
+    payloadDigest: computeRemoteExecutionOperationDigest(message),
+    sender: {
+      kind: "core_permission_answer",
+      principal: "core-answer",
+      pendingRef: "pending-ref",
+      requestDigest: "b".repeat(43),
+      responderActorId: "user:default/responder",
+      decisionId: "decision",
+    },
+  };
+  return {
+    claims,
+    operation: {
+      kind: "authorized_operation" as const,
+      operationId: claims.operationId,
+      permit: signed(claims),
+      message,
+    },
+  };
+}
+
+function signedPermissionDelivery(
+  clock: FixedClock,
+  operation: ReturnType<typeof permissionOperation>["operation"],
+) {
+  const control = generateEd25519();
+  const verifier = new CoreSignatureVerifier([
+    {
+      keyId: "release",
+      publicKeyJwk: generateEd25519().publicJwk,
+      coreControlKeys: [{ keyId: "control", publicKeyJwk: control.publicJwk }],
+    },
+  ]);
+  const body = {
+    type: "runtime_permission_answer_delivery",
+    method: "POST",
+    path: { instanceId: "instance" },
+    nodeId: "node",
+    connectionRef: "connection",
+    connectionEpoch: 1,
+    intent: {
+      intentId: "intent",
+      tenantId: "tenant",
+      instanceId: "instance",
+      executionId: "execution",
+      operation,
+    },
+    keyId: "control",
+    nonce: "N".repeat(22),
+    issuedAt: clock.nowIso(),
+    expiresAt: new Date(clock.coreNow() + 30000).toISOString(),
+    signature: "AA",
+  };
+  body.signature = ed25519Sign(control.privateKey, remoteControlSigningBytes(body));
+  return { body, verifier };
+}
+
+async function deliveryAnswerFixture(role: "generator" | "qa") {
+  const f = await deliveryFixture();
+  f.assigned.kind = role === "qa" ? "validation" : "delivery";
+  f.assigned.agentRoute.requiredRole = role;
+  f.claims.deliveryIdentity.requiredRuntimeRole = role;
+  f.claims.deliveryIdentity.routeId = role;
+  const entry = f.journal.assignments.get("assignment:1")!;
+  await f.journal.assignments.put({ ...entry, kind: f.assigned.kind });
+  return f;
+}
+
+it.each([
+  ["generator", "session/request_permission", "result"],
+  ["qa", "session/request_permission", "result"],
+  ["qa", "elicitation/create", "result"],
+  ["qa", "session/request_permission", "error"],
+  ["qa", "elicitation/create", "error"],
+] as const)(
+  "verifies and durably completes a %s Delivery %s %s answer with replay after restart",
+  async (role, method, kind) => {
+    const f = await deliveryAnswerFixture(role),
+      answer = permissionOperation(f.claims, method, kind);
+    await f.journal.pendingRequests.put({
+      acpSessionRef: "acp",
+      id: "pending",
+      method,
+      direction: "issued",
+      openedAt: f.clock.nowIso(),
+      closedAt: null,
+      deadlineAt: new Date(f.clock.coreNow() + 30000).toISOString(),
+      requestDigest: answer.claims.sender.requestDigest,
+    });
+    const { body, verifier } = signedPermissionDelivery(f.clock, answer.operation);
+    f.client.consumeDeliveryExecution.mockResolvedValue({
+      outcome: "admitted",
+      admissionId: "answer-admission",
+      receipt: signed({
+        ...answer.claims,
+        aud: "konteks:delivery-execution-admission",
+        admissionId: "answer-admission",
+        admittedAt: f.clock.nowIso(),
+        checkExpiresAt: new Date(f.clock.coreNow() + 30000).toISOString(),
+      }),
+    });
+    let gate = f.gate;
+    const dispatch = vi.fn();
+    const receiver = new PermissionAnswerReceiver({
+      verifier,
+      core: f.client,
+      coreProducer: "core-answer",
+      now: () => f.clock.coreNow(),
+      captureConnection: () => ({
+        instanceId: "instance",
+        workspaceId: "tenant",
+        runnerIncarnation: "runner",
+        connectionEpoch: 1,
+        leaseExpiresAt: expiresAt,
+        assertCurrent: () => undefined,
+      }),
+      deliver: async (operation, _claims, current) => {
+        current();
+        const admitted = await gate.admit(operation);
+        current();
+        if (await gate.begin(admitted)) {
+          dispatch();
+          await gate.complete(admitted.key);
+        }
+      },
+    });
+    await receiver.receive(body);
+    const reloaded = new SupervisorJournal(root);
+    await reloaded.load();
+    gate = f.makeGate(reloaded);
+    await receiver.receive(body);
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(f.client.consumeDeliveryExecution).toHaveBeenCalledOnce();
+    expect(f.client.consumeExecution).not.toHaveBeenCalled();
+    expect(await terminalOperationDispositions(reloaded, "assignment", 1, "claim")).toContainEqual(
+      expect.objectContaining({
+        operationId: "answer-operation",
+        admissionId: "answer-admission",
+        state: "completed",
+      }),
+    );
+  },
+);
+
+it.each(["wrong-audience", "foreign-assignment", "wrong-producer", "lost-connection"] as const)(
+  "refuses a Delivery answer's %s before a new consumption",
+  async (mode) => {
+    const f = await deliveryAnswerFixture("qa"),
+      answer = permissionOperation(f.claims, "session/request_permission", "result");
+    const changed = {
+      ...answer.claims,
+      ...(mode === "wrong-audience" ? { aud: "konteks:remote-execution-operation" } : {}),
+      ...(mode === "foreign-assignment" ? { assignmentId: "other-assignment" } : {}),
+    };
+    const { body, verifier } = signedPermissionDelivery(f.clock, {
+      ...answer.operation,
+      permit: signed(changed),
+    });
+    const dispatch = vi.fn();
+    const receiver = new PermissionAnswerReceiver({
+      verifier,
+      core: f.client,
+      coreProducer: mode === "wrong-producer" ? "assistant" : "core-answer",
+      now: () => f.clock.coreNow(),
+      captureConnection: () => ({
+        instanceId: "instance",
+        workspaceId: "tenant",
+        runnerIncarnation: "runner",
+        connectionEpoch: 1,
+        leaseExpiresAt: expiresAt,
+        assertCurrent: () => {
+          if (mode === "lost-connection") throw new Error("connection replaced");
+        },
+      }),
+      deliver: async (operation) => {
+        const admitted = await f.gate.admit(operation);
+        if (await f.gate.begin(admitted)) dispatch();
+      },
+    });
+    await expect(receiver.receive(body)).rejects.toThrow();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(f.client.consumeDeliveryExecution).not.toHaveBeenCalled();
+    expect(f.client.consumeExecution).not.toHaveBeenCalled();
+  },
+);
+
+it("refuses a genuinely valid Assistant answer on an owned Delivery assignment without consumption", async () => {
+  const assistant = await fixture(),
+    f = await deliveryAnswerFixture("qa");
+  const answer = permissionOperation(assistant.claims, "session/request_permission", "result");
+  expect(
+    verifyRemoteExecutionOperationSignature({
+      operation: answer.operation,
+      trustedKeys: keys,
+      nowSeconds: Math.floor(f.clock.coreNow() / 1000),
+    }),
+  ).toMatchObject({ aud: "konteks:remote-execution-operation", sender: answer.claims.sender });
+  const { body, verifier } = signedPermissionDelivery(f.clock, answer.operation);
+  const receiver = new PermissionAnswerReceiver({
+    verifier,
+    core: f.client,
+    coreProducer: "core-answer",
+    now: () => f.clock.coreNow(),
+    captureConnection: () => ({
+      instanceId: "instance",
+      workspaceId: "tenant",
+      runnerIncarnation: "runner",
+      connectionEpoch: 1,
+      leaseExpiresAt: expiresAt,
+      assertCurrent: () => undefined,
+    }),
+    deliver: async (operation) => {
+      await f.gate.admit(operation);
+    },
+  });
+  await expect(receiver.receive(body)).rejects.toThrow();
+  expect(f.client.consumeDeliveryExecution).not.toHaveBeenCalled();
+  expect(f.client.consumeExecution).not.toHaveBeenCalled();
+});
+
 interface SkillFixtureProof {
     catalogRevision: string;
     managedSkills: readonly { skillId: string; version: string; skillFile: string }[];
@@ -517,7 +778,7 @@ async function sessionFixture(work: RemoteWorkAssignment = assignment, acceptDel
   logger?: { warn: (...args: unknown[]) => void; info: (...args: unknown[]) => void; error: (...args: unknown[]) => void; debug: (...args: unknown[]) => void },
   authority: Record<string, unknown> = {}, deps: Partial<RelayedSessionDeps> = {}, skillProof?: SkillFixtureProof) {
 
-  const f = work.source.kind === "harness_delivery" ? await deliveryFixture() : await fixture();
+  const f = work.source.kind === "harness_delivery" ? await deliveryFixture(work.agentRoute.agentId) : await fixture(work.agentRoute.agentId);
   const entry = f.journal.assignments.get(`${work.id}:${work.attempt}`)!;
   await f.journal.assignments.put({ ...entry, kind: work.kind });
   const runner = { createSession: vi.fn(async () => ({ acpSessionRef: "acp", resumed: false, capabilities: { forkSession: false, sessionResume: false } })),
@@ -556,6 +817,306 @@ const deliveryTurn: RemoteWorkAssignment = { ...assignment, kind: "delivery", ta
     repositoryId: "https://git.example.com/acme/store", modelBinding: { canonicalProviderId: "openai", canonicalModelId: "model-a" },
     turn: { invocationId: "invocation", dispatchGeneration: 0 } } };
 type SessionFixture = Awaited<ReturnType<typeof sessionFixture>>;
+
+describe("DeepSeek coordination under native delivery authority", () => {
+  const work: RemoteWorkAssignment = { ...deliveryTurn,
+    agentRoute: { ...deliveryTurn.agentRoute, agentId: "dsh", mcpCapabilityTokenRef: "platform-capability" } };
+  const capability = async () => ({ mcpServer: { name: "konteks-platform", url: "https://mcp.example",
+    headers: [{ name: "authorization", value: "Bearer fixture-capability" }] }, expiresAt });
+
+  async function announceAndAsk(f: SessionFixture) {
+    await f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp",
+      params: { sessionId: "acp", update: dshCoordinationCall } });
+    await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp",
+      requestId: "dsh-approval", params: dshCoordinationPermission as RequestPermissionRequest });
+  }
+
+  it("persists the committed DSH call before its governed fast-allow reaches the provider", async () => {
+    const f = await sessionFixture(work, undefined, undefined, {}, { redeemCapabilityToken: capability });
+    const atAnswer: unknown[] = [];
+    vi.mocked(f.runner.answer).mockImplementation(async () => {
+      atAnswer.push(f.journal.coordinationInvocations.all());
+      return { delivered: true };
+    });
+    try {
+      await f.session.onToRuntime(f.envelope);
+      await announceAndAsk(f);
+      expect(f.runner.answer).toHaveBeenCalledWith("acp", "dsh-approval", { outcome: { outcome: "selected", optionId: "allow-once" } });
+      expect(atAnswer).toEqual([[expect.objectContaining({ version: 1, workspaceId: "tenant",
+        assignmentId: "assignment", attempt: 1, acpSessionRef: "acp", operationId: "operation",
+        toolCallId: "dsh-call-1", tool: "platform__coordination__send", state: "captured" })]]);
+      expect(JSON.stringify(f.journal.coordinationInvocations.all())).not.toContain(dshCoordinationArguments.body);
+    } finally { await f.session.close("cancelled"); }
+  });
+
+  it("does not allow a DSH coordination effect before its current signed prompt is dispatching", async () => {
+    const f = await sessionFixture(work, undefined, undefined, {}, { redeemCapabilityToken: capability });
+    try {
+      await announceAndAsk(f);
+      expect(f.runner.answer).toHaveBeenCalledWith("acp", "dsh-approval", { outcome: { outcome: "cancelled" } });
+      expect(f.journal.coordinationInvocations.all()).toEqual([]);
+    } finally { await f.session.close("cancelled"); }
+  });
+
+  it("cancels the DSH approval if the durable capture write fails", async () => {
+    const f = await sessionFixture(work, undefined, undefined, {}, { redeemCapabilityToken: capability });
+    try {
+      await f.session.onToRuntime(f.envelope);
+      vi.spyOn(f.journal.coordinationInvocations, "update").mockRejectedValueOnce(new Error("fixture capture persistence failed"));
+      await announceAndAsk(f);
+      expect(f.runner.answer).toHaveBeenCalledWith("acp", "dsh-approval", { outcome: { outcome: "cancelled" } });
+      expect(f.journal.coordinationInvocations.all()).toEqual([]);
+    } finally { await f.session.close("cancelled"); }
+  });
+});
+
+async function qaAnswerFixture(
+  method: "session/request_permission" | "elicitation/create",
+  delivered: boolean,
+  isCurrent: () => boolean,
+  capture: boolean,
+) {
+  const broker = new PermissionBroker({
+    clock: new FixedClock(Date.parse("2026-09-10T00:00:00Z")),
+    deadlineSeconds: () => 60,
+    onTimeout: async () => undefined,
+  });
+  const work: RemoteWorkAssignment = {
+    ...deliveryTurn,
+    kind: "validation",
+    agentRoute: {
+      ...deliveryTurn.agentRoute,
+      requiredRole: "qa",
+      ...(capture ? { mcpCapabilityTokenRef: "capability" } : {}),
+    },
+  };
+  const f = await sessionFixture(
+    work,
+    undefined,
+    undefined,
+    {},
+    {
+      broker,
+      ...(capture
+        ? {
+            redeemCapabilityToken: async () => ({
+              mcpServer: {
+                name: "konteks-platform",
+                url: "https://mcp.example/mcp",
+                headers: [{ name: "authorization", value: "Bearer fixture" }],
+              },
+              expiresAt,
+            }),
+          }
+        : {}),
+    },
+  );
+  const currentOwner = { channelOwners: new Map([["session:session", f.session]]) };
+  if (!("deliveryIdentity" in f.claims) || !("consumeDeliveryExecution" in f.client))
+    throw new Error("Delivery fixture is required");
+  f.claims.deliveryIdentity.requiredRuntimeRole = "qa";
+  f.claims.deliveryIdentity.routeId = "qa";
+  f.envelope.permit = signed(f.claims);
+  if (capture) await f.session.onToRuntime(f.envelope);
+  const answer = permissionOperation(f.claims, method, "result", true),
+    { body, verifier } = signedPermissionDelivery(f.clock, answer.operation);
+  const pending = broker.defer({
+    acpSessionRef: "acp",
+    requestId: "pending",
+    assignmentId: "assignment",
+    attempt: 1,
+    agentId: "codex",
+    sanitized:
+      method === "session/request_permission"
+        ? {
+            kind: "permission",
+            requestDigest: "b".repeat(43),
+            params: {
+              title: "Review tool",
+              options: [
+                { optionId: "allow", name: "Allow once", kind: "allow_once" },
+                { optionId: "reject", name: "Reject", kind: "reject_once" },
+              ],
+            },
+          }
+        : {
+            kind: "elicitation",
+            requestDigest: "b".repeat(43),
+            isSignIn: false,
+            params: { message: "Review input", requestedSchema: {} },
+          },
+  });
+  await f.journal.pendingRequests.put({
+    acpSessionRef: "acp",
+    id: pending.requestId,
+    method,
+    direction: "issued",
+    openedAt: pending.raisedAt,
+    closedAt: null,
+    deadlineAt: pending.deadlineAt,
+    requestDigest: pending.sanitized.requestDigest,
+  });
+  f.runner.answer.mockResolvedValue({ delivered });
+  f.client.consumeDeliveryExecution.mockResolvedValue({
+    outcome: "admitted",
+    admissionId: "answer-admission",
+    receipt: signed({
+      ...answer.claims,
+      aud: "konteks:delivery-execution-admission",
+      admissionId: "answer-admission",
+      admittedAt: f.clock.nowIso(),
+      checkExpiresAt: new Date(f.clock.coreNow() + 30000).toISOString(),
+    }),
+  });
+  const receiver = new PermissionAnswerReceiver({
+    verifier,
+    core: f.client,
+    coreProducer: "core-answer",
+    now: () => f.clock.coreNow(),
+    captureConnection: () => ({
+      instanceId: "instance",
+      workspaceId: "tenant",
+      runnerIncarnation: "runner",
+      connectionEpoch: 1,
+      leaseExpiresAt: expiresAt,
+      assertCurrent: () => {
+        if (!isCurrent())
+          throw new RemoteInstanceError("execution_fenced", "Captured answer owner changed.");
+      },
+    }),
+    deliver: (operation, claims, current) =>
+      WorkOrchestrator.prototype.onPermissionAnswer.call(
+        currentOwner as never,
+        operation,
+        claims,
+        current,
+      ),
+  });
+  const authorizationState = () =>
+    f.journal.pendingRequests.get("acp:issued:pending")?.authorization?.state;
+  return {
+    f,
+    broker,
+    body,
+    receiver,
+    authorizationState,
+    consumeDeliveryExecution: f.client.consumeDeliveryExecution,
+  };
+}
+
+/** Pause the real capture journal write after its actual Codex call and hash were resolved. */
+async function coordinationCaptureBarrier(f: SessionFixture) {
+  const tool = "platform__coordination__send";
+  const args = {
+    target: { kind: "ticket", id: "TKT-2" },
+    kind: "question",
+    body: "Which interface?",
+  };
+  await f.session.onRunnerEvent({
+    kind: "session_update",
+    acpSessionRef: "acp",
+    params: {
+      sessionId: "acp",
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId: "provider-call",
+        rawInput: { server: "konteks-platform", tool, arguments: args },
+        _meta: { is_mcp_tool_call: true },
+      },
+    },
+  } as never);
+  const request: RequestPermissionRequest = {
+    sessionId: "acp",
+    toolCall: { toolCallId: "provider-call", kind: "other" },
+    options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+    _meta: { is_mcp_tool_approval: true },
+  };
+  (
+    f.session as unknown as { pendingToolPermissions: Map<string, RequestPermissionRequest> }
+  ).pendingToolPermissions.set("pending", request);
+  let enter!: () => void, release!: () => void;
+  const entered = new Promise<void>((resolve) => {
+    enter = resolve;
+  });
+  const paused = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const original = f.journal.coordinationInvocations.update.bind(f.journal.coordinationInvocations);
+  const write = vi
+    .spyOn(f.journal.coordinationInvocations, "update")
+    .mockImplementationOnce(async (...args) => {
+      enter();
+      await paused;
+      return original(...args);
+    });
+  return { entered, release, write };
+}
+
+it.each([
+  ["session/request_permission", true],
+  ["elicitation/create", true],
+  ["session/request_permission", false],
+] as const)(
+  "a QA %s answer is completed only after the actual runner reports delivered=%s",
+  async (method, delivered) => {
+    const { f, broker, body, receiver, authorizationState, consumeDeliveryExecution } =
+      await qaAnswerFixture(method, delivered, () => true, false);
+    if (delivered) {
+      await receiver.receive(body);
+      await receiver.receive(body);
+      expect(authorizationState()).toBe("completed");
+    } else {
+      await expect(receiver.receive(body)).rejects.toMatchObject({ code: "operation_interrupted" });
+      expect(authorizationState()).toBe("dispatch_started");
+    }
+    const expectedAnswer =
+      method === "session/request_permission"
+        ? { outcome: { outcome: "selected", optionId: "allow" } }
+        : { action: "cancel" };
+    expect(f.runner.answer).toHaveBeenCalledExactlyOnceWith("acp", "pending", expectedAnswer);
+    expect(consumeDeliveryExecution).toHaveBeenCalledOnce();
+    expect(f.client.consumeExecution).not.toHaveBeenCalled();
+    broker.cancelSession("acp");
+  },
+);
+
+it.each(["connection", "permit_expiry"] as const)(
+  "rechecks the current %s fence after genuine coordination capture and before the QA runner answer",
+  async (mode) => {
+    let current = true;
+    const { f, broker, body, receiver, authorizationState, consumeDeliveryExecution } =
+      await qaAnswerFixture("session/request_permission", true, () => current, true);
+    const barrier = await coordinationCaptureBarrier(f);
+    const delivery = receiver.receive(body);
+    void delivery.catch(() => undefined);
+    try {
+      await barrier.entered;
+      if (mode === "connection") current = false;
+      else f.advance(31_000);
+      barrier.release();
+      await expect(delivery).rejects.toMatchObject({
+        code: mode === "connection" ? "execution_fenced" : "permission_denied",
+      });
+      expect(barrier.write).toHaveBeenCalledOnce();
+      expect(f.journal.coordinationInvocations.all()).toEqual([
+        expect.objectContaining({
+          operationId: "operation",
+          toolCallId: "provider-call",
+          state: "captured",
+        }),
+      ]);
+      expect(f.runner.answer).not.toHaveBeenCalled();
+      expect(authorizationState()).toBe("dispatch_started");
+      expect(consumeDeliveryExecution).toHaveBeenCalledTimes(2);
+      expect(f.client.consumeExecution).not.toHaveBeenCalled();
+    } finally {
+      barrier.release();
+      barrier.write.mockRestore();
+      broker.cancelSession("acp");
+      await f.session.close("cancelled");
+    }
+  },
+);
 
 async function admittedProtocolFailure(failure: Error) {
   const onRuntimeFailure = vi.fn((_fact: unknown, _context: unknown) => undefined);

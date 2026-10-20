@@ -26,6 +26,10 @@ whole permission path.
   approval is matched by tool call id to the `tool_call` codex-acp announced
   (`McpToolCallLedger`). A title (Claude's Bash title is model-written) can
   only refuse, and an MCP call with no readable server/tool is refused.
+  DSH's verified ACP bridge projects its committed tool name into an announced
+  call's title and drains that call before its id-only approval. Match only
+  the retained call and the deterministic public names of this session's known
+  coordination tools; never use an approval title or reverse-parse a namespace.
 - **`allow_once` only.** Every policy allow is `allow_once`; `allow_always` is
   never offered to policy or a person (OpenCode would store it and stop
   asking; Antigravity's offer is stripped before anything sees it).

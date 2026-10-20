@@ -1,6 +1,9 @@
 import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
+import { createHash } from "node:crypto";
+import { canonicalize, CoordinationAgentToolNames, plainRecord, type JsonValue } from "@konteks/remote-common";
 import { BROWSER_MCP_SERVER_NAME, DSH_READ_ONLY_TOOLS, isDeniedBrowserTool } from "@konteks/remote-agent-runner";
 import { resolveIn } from "./host-decisions.js";
+import type { HostPermissionDecision } from "./host-tool-governance.js";
 
 /**
  * Permission parity for DeepSeek Harness.
@@ -17,12 +20,44 @@ import { resolveIn } from "./host-decisions.js";
  * treats a hook that cannot run as non-blocking. `observe` therefore also
  * trips when a gated tool completes without having asked.
  */
-type DshPermissionDecision =
-  | { kind: "allow" }
-  | { kind: "deny"; reason: string }
-  | { kind: "evaluate"; request: RequestPermissionRequest };
+type DshPermissionDecision = HostPermissionDecision;
 
-interface ObservedCall { title: string; rawInput: Record<string, unknown> }
+interface ObservedCall { title: string; rawInput: Record<string, unknown>; inputFingerprint: string | null; conflicted: boolean; sourceShapeValid: boolean }
+
+/** DSH's provider-owned publicToolName contract, not reverse parsing a title. */
+function publicMcpName(server: string, tool: string): string {
+  const joined = `mcp__${server}__${tool}`;
+  const normalized = joined.replace(/[^A-Za-z0-9_-]/g, "_");
+  if (normalized === joined && normalized.length <= 64) return normalized;
+  const hash = createHash("sha256").update(`${server}\0${tool}`).digest("hex").slice(0, 12);
+  return `${normalized.slice(0, 51)}_${hash}`;
+}
+
+function coordinationIdentity(title: string, servers: ReadonlySet<string>): { server: string; tool: string } | null {
+  for (const server of servers) {
+    for (const tool of CoordinationAgentToolNames) {
+      if (publicMcpName(server, tool) === title) return { server, tool };
+    }
+  }
+  return null;
+}
+
+/** A name pattern can refuse a foreign coordination tool, never grant it. */
+function coordinationDecision(call: ObservedCall, toolCallId: string, servers: ReadonlySet<string>): DshPermissionDecision | null {
+  const identity = coordinationIdentity(call.title, servers);
+  if (!identity) return call.title.includes("__platform__coordination__")
+    ? { kind: "deny", reason: "coordination tool is not from this session's platform server" } : null;
+  if (!toolCallId || !call.sourceShapeValid || !call.inputFingerprint || call.conflicted) return { kind: "deny", reason: "coordination call identity or arguments are malformed or changed" };
+  return { kind: "allow", coordinationInvocation: { toolCallId, ...identity, arguments: call.rawInput } };
+}
+
+function announcedInput(value: unknown): Pick<ObservedCall, 'rawInput' | 'inputFingerprint'> {
+  const rawInput = plainRecord(value);
+  if (!rawInput) return { rawInput: {}, inputFingerprint: null };
+  try {
+    return { rawInput: structuredClone(rawInput), inputFingerprint: createHash("sha256").update(canonicalize(rawInput as JsonValue)).digest("hex") };
+  } catch { return { rawInput: {}, inputFingerprint: null }; }
+}
 
 const EXECUTE = new Set(["bash", "pwsh"]);
 const EDIT = new Set(["write", "edit", "str_replace_editor"]);
@@ -131,9 +166,13 @@ export class DshToolGovernance {
 
   /** A newly announced call, newest last; the oldest are forgotten past the limit. */
   private recordCall(toolCallId: string, value: Record<string, unknown>): void {
-    const rawInput = value.rawInput !== null && typeof value.rawInput === "object" && !Array.isArray(value.rawInput) ? value.rawInput as Record<string, unknown> : {};
+    const input = announcedInput(value.rawInput);
+    const title = typeof value.title === "string" ? value.title : "";
+    const sourceShapeValid = value.kind === "other" && value.status === "in_progress";
+    const prior = this.calls.get(toolCallId);
+    const conflicted = prior ? prior.conflicted || prior.title !== title || prior.inputFingerprint !== input.inputFingerprint || prior.sourceShapeValid !== sourceShapeValid : false;
     this.calls.delete(toolCallId);
-    this.calls.set(toolCallId, { title: typeof value.title === "string" ? value.title : "", rawInput });
+    this.calls.set(toolCallId, { title, ...input, conflicted, sourceShapeValid });
     while (this.calls.size > this.limit) {
       const oldest = this.calls.keys().next().value!;
       this.calls.delete(oldest);
@@ -152,11 +191,13 @@ export class DshToolGovernance {
     return null;
   }
 
-  decide(request: RequestPermissionRequest, cwd: string, options: { browserTools?: boolean } = {}): DshPermissionDecision {
+  decide(request: RequestPermissionRequest, cwd: string, options: { browserTools?: boolean; servers?: ReadonlySet<string> } = {}): DshPermissionDecision {
     const toolCallId = request.toolCall.toolCallId;
     this.asked.add(toolCallId);
     const observed = this.calls.get(toolCallId);
     if (!observed) return { kind: "deny", reason: "no tool call precedes this permission request" };
     if (widerSandbox(observed.rawInput.sandbox_permissions)) return { kind: "deny", reason: "a wider sandbox than workspace-write is never granted" };
+    const coordination = coordinationDecision(observed, toolCallId, options.servers ?? new Set());
+    if (coordination) return coordination;
     return toolDecision(request, observed, cwd, options.browserTools === true);
   }}

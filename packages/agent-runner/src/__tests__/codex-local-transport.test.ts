@@ -2,7 +2,7 @@ import { chmod, mkdtemp, rm, symlink } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { once } from "node:events";
+import { EventEmitter, once } from "node:events";
 import { WebSocketServer } from "ws";
 import { afterEach, expect, it, vi } from "vitest";
 import { connectCodexLocalTransport } from "../bridge/codex-local-transport.js";
@@ -104,39 +104,77 @@ it.skipIf(process.platform === "win32")("rejects a disconnect between loaded-lis
 });
 
 /** 10-15, taufan-mac: a 15 s budget for every loaded thread together ended a healthy owner's update preflight. */
-function slowServer(f: Awaited<ReturnType<typeof fixture>>, loaded: string[], answerThreadRead: boolean) {
+function slowServer(
+  f: Awaited<ReturnType<typeof fixture>>,
+  loaded: string[],
+  answerThreadRead: boolean,
+  readiness: Promise<void> = Promise.resolve(),
+) {
   const held: Array<() => void> = [];
-  f.ws.on("connection", socket => socket.on("message", data => {
-    const message = JSON.parse(data.toString());
-    if (message.id === undefined) return;
-    const reply = (result: unknown) => socket.send(JSON.stringify({ id: message.id, result }));
-    if (message.method === "thread/read") {
-      if (answerThreadRead) held.push(() => reply({ thread: { id: message.params.threadId, status: { type: "idle" } } }));
-      return;
-    }
-    reply(message.method === "thread/loaded/list" ? { data: loaded, nextCursor: null } : {});
-  }));
-  return held;
+  const requests = new EventEmitter();
+  f.ws.on("connection", (socket) =>
+    socket.on("message", (data) => {
+      const message = JSON.parse(data.toString());
+      if (message.id === undefined) return;
+      const reply = (result: unknown) => socket.send(JSON.stringify({ id: message.id, result }));
+      if (message.method === "thread/read") {
+        requests.emit("received");
+        if (answerThreadRead)
+          void readiness.then(() => {
+            held.push(() =>
+              reply({ thread: { id: message.params.threadId, status: { type: "idle" } } }),
+            );
+            requests.emit("ready");
+          });
+        return;
+      }
+      reply(message.method === "thread/loaded/list" ? { data: loaded, nextCursor: null } : {});
+    }),
+  );
+  return { held, requests };
 }
-async function until(check: () => boolean) {
-  for (let i = 0; i < 200 && !check(); i++) await new Promise(resolve => setImmediate(resolve));
-  expect(check()).toBe(true);
-}
-it.skipIf(process.platform === "win32")("reads many loaded threads past the old 15 s budget while each answer comes in time", async () => {
-  const f = await fixture();
-  const loaded = ["00000000-0000-7000-8000-000000000101", "00000000-0000-7000-8000-000000000102", "00000000-0000-7000-8000-000000000103"];
-  const held = slowServer(f, loaded, true);
-  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-  try {
+it.skipIf(process.platform === "win32")(
+  "reads many loaded threads past the old 15 s budget while each answer comes in time",
+  async () => {
+    const f = await fixture();
+    const loaded = [
+      "00000000-0000-7000-8000-000000000101",
+      "00000000-0000-7000-8000-000000000102",
+      "00000000-0000-7000-8000-000000000103",
+    ];
+    const readiness = Promise.withResolvers<void>();
+    const { held, requests } = slowServer(f, loaded, true, readiness.promise);
+    const received = once(requests, "received");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const read = codexLoadedThreadStatuses(f.socket);
-    for (let answered = 0; answered < loaded.length; answered++) {
-      await until(() => held.length > 0);
-      vi.advanceTimersByTime(6_000);
-      held.shift()!();
+    const settled = read.then(
+      () => undefined,
+      () => undefined,
+    );
+    try {
+      await Promise.race([received, read]);
+      for (let answered = 0; answered < loaded.length; answered++) {
+        const ready = once(requests, "ready");
+        void ready.catch(() => undefined);
+        if (answered === 0) {
+          // Real I/O readiness can arrive after the old scheduler-turn budget.
+          for (let turn = 0; turn < 201; turn++)
+            await new Promise<void>((resolve) => setImmediate(resolve));
+          readiness.resolve();
+        }
+        await ready;
+        vi.advanceTimersByTime(6_000);
+        held.shift()!();
+      }
+      expect([...(await read).values()]).toEqual(["idle", "idle", "idle"]);
+    } finally {
+      readiness.resolve();
+      for (const client of f.ws.clients) client.terminate();
+      await settled;
+      vi.useRealTimers();
     }
-    expect([...(await read).values()]).toEqual(["idle", "idle", "idle"]);
-  } finally { vi.useRealTimers(); }
-});
+  },
+);
 it.skipIf(process.platform === "win32")("fails closed when the owner stops answering one request", async () => {
   const f = await fixture();
   slowServer(f, ["00000000-0000-7000-8000-000000000201"], false);

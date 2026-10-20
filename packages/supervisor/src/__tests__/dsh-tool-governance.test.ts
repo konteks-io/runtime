@@ -1,6 +1,7 @@
 import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import { describe, expect, it } from "vitest";
 import { DshToolGovernance } from "../session/dsh-tool-governance.js";
+import { dshCoordinationArguments, dshCoordinationCall, dshCoordinationPermission } from "./fixtures/dsh-acp-coordination.js";
 
 // Shapes as dsh 0.1.7-rc.2 sends them: every tool
 // call is `kind: other` titled with the dsh tool name, and its permission
@@ -15,6 +16,58 @@ const ask = (toolCallId: string): RequestPermissionRequest => ({
 const CWD = "/rt/workspaces/dsh/assignment-1";
 
 describe("DeepSeek Harness tool governance", () => {
+  it("projects coordination identity from the committed call under the exact installed platform server", () => {
+    const governance = new DshToolGovernance();
+    governance.observe(dshCoordinationCall);
+    const context = { browserTools: false, servers: new Set(["konteks-platform"]) };
+    expect(governance.decide(dshCoordinationPermission as RequestPermissionRequest, CWD, context)).toEqual({
+      kind: "allow",
+      coordinationInvocation: { toolCallId: "dsh-call-1", server: "konteks-platform",
+        tool: "platform__coordination__send", arguments: dshCoordinationArguments },
+    });
+  });
+
+  it("does not accept a coordination namespace belonging to a different session server", () => {
+    const governance = new DshToolGovernance();
+    governance.observe(dshCoordinationCall);
+    const context = { browserTools: false, servers: new Set(["different-platform"]) };
+    expect(governance.decide(dshCoordinationPermission as RequestPermissionRequest, CWD, context)).toMatchObject({ kind: "deny" });
+  });
+
+  it.each([{ rawInput: null }, { rawInput: "{malformed" }, { rawInput: ["not-an-object"] }])("refuses malformed committed coordination arguments before approving: $rawInput", ({ rawInput }) => {
+    const governance = new DshToolGovernance();
+    governance.observe({ ...dshCoordinationCall, rawInput });
+    const context = { browserTools: false, servers: new Set(["konteks-platform"]) };
+    expect(governance.decide(dshCoordinationPermission as RequestPermissionRequest, CWD, context)).toMatchObject({ kind: "deny" });
+  });
+
+  it.each([{ kind: "execute" }, { status: "pending" }, { toolCallId: "" }])("refuses a coordination announcement outside the verified DSH ACP shape: %j", invalid => {
+    const governance = new DshToolGovernance();
+    governance.observe({ ...dshCoordinationCall, ...invalid });
+    const permission = { ...dshCoordinationPermission, toolCall: { toolCallId: invalid.toolCallId ?? "dsh-call-1" } };
+    const context = { browserTools: false, servers: new Set(["konteks-platform"]) };
+    expect(governance.decide(permission as RequestPermissionRequest, CWD, context)).toMatchObject({ kind: "deny" });
+  });
+
+  it("keeps identical committed replay usable and retires it on its paired result", () => {
+    const governance = new DshToolGovernance();
+    const context = { browserTools: false, servers: new Set(["konteks-platform"]) };
+    governance.observe(dshCoordinationCall);
+    governance.observe({ ...dshCoordinationCall, rawInput: { body: dshCoordinationArguments.body,
+      kind: "question", target: dshCoordinationArguments.target } });
+    expect(governance.decide(dshCoordinationPermission as RequestPermissionRequest, CWD, context)).toMatchObject({ kind: "allow", coordinationInvocation: { toolCallId: "dsh-call-1" } });
+    governance.observe({ sessionUpdate: "tool_call_update", toolCallId: "dsh-call-1", status: "completed" });
+    expect(governance.decide(dshCoordinationPermission as RequestPermissionRequest, CWD, context)).toMatchObject({ kind: "deny" });
+  });
+
+  it("refuses a changed coordination call identity before approval instead of replacing its retained arguments", () => {
+    const governance = new DshToolGovernance();
+    governance.observe(dshCoordinationCall);
+    governance.observe({ ...dshCoordinationCall, rawInput: { ...dshCoordinationArguments, body: "changed" } });
+    const context = { browserTools: false, servers: new Set(["konteks-platform"]) };
+    expect(governance.decide(dshCoordinationPermission as RequestPermissionRequest, CWD, context)).toMatchObject({ kind: "deny" });
+  });
+
   it("fills in a shell request from its tool call so the runtime policy judges the real command", () => {
     const governance = new DshToolGovernance();
     governance.observe(call("c1", "bash", { command: "git push origin main", description: "push" }));

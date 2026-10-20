@@ -14,6 +14,21 @@ function fixture(executionPermitsReady?: () => boolean, cancellationDeliveryRead
 }
 
 describe("native host inventory", () => {
+  it.each([
+    { hostAgentVersion: "0.1.7-rc.2", expected: true },
+    { hostAgentVersion: "0.1.5-rc.3", expected: false },
+    { hostAgentVersion: undefined, expected: false },
+  ])("advertises DSH capture only for the qualified provider event contract: $hostAgentVersion", async ({ hostAgentVersion, expected }) => {
+    const dsh = { ...agent, agentId: "dsh", displayName: "DeepSeek Harness", ...(hostAgentVersion ? { hostAgentVersion } : {}) };
+    const readiness = vi.fn(async () => ({ agent: dsh, utilization: { activeSessions: 0, activeTurns: 0 } }));
+    let owned = true;
+    const inventory = new NativeInventoryCollector({ runners: new Map([["dsh", { readiness }]]),
+      sampler: { sample: async () => signals }, bundleVersion: "1.0.0", coordinationInvocationsReady: () => owned });
+    expect((await inventory.collect()).components[0]?.capabilities?.includes("coordination-invocations-v1:dsh")).toBe(expected);
+    owned = false;
+    expect((await inventory.collect()).components[0]?.capabilities).not.toContain("coordination-invocations-v1:dsh");
+  });
+
   it("advertises coordination invocation capture only for its supported ready adapters with live ownership", async () => {
     const readiness = vi.fn(async () => ({ agent, utilization: { activeSessions: 0, activeTurns: 0 } }));
     let owned = true;
@@ -120,6 +135,42 @@ describe("native host inventory", () => {
     answers = false;
     expect(await collect(true)).not.toContain("permission-answer-delivery.v1");
   });
+
+  it.each([
+    { delivery: true, assistant: false, trusted: true, ready: true, advertised: true },
+    { delivery: false, assistant: true, trusted: true, ready: true, advertised: false },
+    { delivery: true, assistant: true, trusted: false, ready: true, advertised: false },
+    { delivery: true, assistant: true, trusted: true, ready: false, advertised: false },
+  ])(
+    "advertises the distinct delivery answer protocol only under its own live composition: %j",
+    async (mode) => {
+      const inventory = new NativeInventoryCollector({
+        runners: new Map([
+          [
+            "codex",
+            {
+              readiness: async () => ({
+                agent: {
+                  ...agent,
+                  readiness: mode.ready ? ("ready" as const) : ("not_configured" as const),
+                },
+                utilization: { activeSessions: 0, activeTurns: 0 },
+              }),
+            },
+          ],
+        ]),
+        sampler: { sample: async () => signals },
+        bundleVersion: "1.0.0",
+        now: () => new Date(signals.observedAt),
+        executionPermitsReady: () => mode.assistant,
+        deliveryExecutionPermitsReady: () => mode.delivery,
+        permissionAnswersReady: () => mode.trusted,
+      });
+      const capabilities = (await inventory.collect()).components[0]?.capabilities;
+      expect(capabilities?.includes("delivery-permission-answer.v1")).toBe(mode.advertised);
+      if (!mode.assistant) expect(capabilities).not.toContain("permission-answer-delivery.v1");
+    },
+  );
 
   it("reports only the actual in-process runner and host pressure, never appliance components", async () => {
     const f = fixture();
