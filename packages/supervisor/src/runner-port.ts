@@ -43,6 +43,8 @@ export interface RunnerSessionInput {
   sessionLabel?: RemoteSessionLabel;
   /** A person's direct session: the agent titles it; Konteks adds only `[konteks] `. */
   agentTitled?: true;
+  /** Instance-bound direct Claude session; account tools still require a one-time human decision. */
+  directAccountConnectors?: true;
   /**
    * Give the agent the session's browser (QA and validator sessions): the
    * runner adds its bundled browser MCP server, launched through this
