@@ -699,6 +699,7 @@ class InputPreparation {
     const outputHead = await this.outputHead(inputs, root, source);
     return {
       ...prepared,
+      ...(inputs.selection.repository && !direct ? { managedRepository: true as const } : {}),
       skillInstructions: skillInstructions(current, inputs.selection.repository, prepared.skillInstructions),
       beforePrompt: this.beforePrompt(inputs, source, prepared),
       ...this.deliveryOutput(inputs, source, outputHead),

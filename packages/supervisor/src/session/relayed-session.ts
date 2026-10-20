@@ -765,6 +765,7 @@ export class RelayedSession {
       readinessDeadlineAt: new Date(Date.now() + Math.max(0, Date.parse(this.assignment.expiresAt) - this.deps.clock.coreNow())).toISOString(),
       cwd,
       readOnlyRoots: this.readOnlyRoots,
+      ...(this.preparedInputs?.managedRepository ? { managedRepository: true as const } : {}),
       mcpServers,
       ...(this.assignment.agentRoute.sessionConfig ? { sessionConfig: this.assignment.agentRoute.sessionConfig } : {}),
       ...this.directModelOptions(),

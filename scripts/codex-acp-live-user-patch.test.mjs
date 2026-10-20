@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { konteksPrefixedName } from "./konteks-session-prefix.mjs";
 import {
   codexAcpLiveUserPatch,
+  konteksRepositoryConfig,
   konteksTitlePrefixCheck,
   missingCodexToolTerminals,
   reconcileCodexToolTerminals,
@@ -151,7 +152,7 @@ test("the reviewed bridge disables configured MCP servers on every thread start,
   assert.match(source, /async createSessionConfig\(projectPath, additionalDirectories, mcpServers, admittedMcpServerNames = \[\]\) \{/);
   assert.match(source, /const disabledMcpServers = konteksCodexMcpServers\(existingMcpServerNames, requestedServers\.map\(\(mcp\) => mcp\.name\), admittedMcpServerNames\.map\(sanitizeMcpServerName\)\);/);
   assert.doesNotMatch(source, /shouldDeduplicateMcpConflicts\(\)\) \{\n      const existingNames/);
-  assert.equal(codexAcpLiveUserPatch.id, "konteks-codex-acp-live-user-v11");
+  assert.equal(codexAcpLiveUserPatch.id, "konteks-codex-acp-live-user-v12");
 },
 );
 
@@ -170,7 +171,7 @@ test("the reviewed bridge passes the admission on thread start only, never on re
   const { readFileSync } = await import("node:fs");
   const { join } = await import("node:path");
   const { source } = patchCodexAcpLiveUsers(readFileSync(join(process.env.CODEX_ACP_FIXTURE_DIR, "index.js"), "utf8"), codexAcpLiveUserPatch.version);
-  assert.match(source, /config: await this\.createSessionConfig\(request\.cwd, additionalDirectories, request\.mcpServers, konteksAdmittedMcpServerNames\(request\._meta\)\),/);
+  assert.match(source, /config: konteksRepositoryConfig\(await this\.createSessionConfig\(request\.cwd, additionalDirectories, request\.mcpServers, konteksAdmittedMcpServerNames\(request\._meta\)\), request\._meta\),/);
   assert.equal(source.split("konteksAdmittedMcpServerNames(request._meta)").length, 2);
   assert.match(source, /function konteksAdmittedMcpServerNames\(meta\)/);
 });
@@ -376,4 +377,32 @@ test("an engineering or unprefixed thread keeps upstream naming, and a name set 
   generator.onTurnCompleted("the person renames it while the title is generated");
   await new Promise(resolve => setTimeout(resolve, 20));
   assert.deepEqual(renamed.named, []);
+});
+
+
+test("repository lifecycle policy is per thread and leaves direct configuration unchanged", () => {
+  const base = { "sandbox_mode": "workspace-write", "mcp_servers": { owned: { enabled: true } } };
+  const policy = { konteksRepository: { version: 1, managed: true } };
+  assert.deepEqual(konteksRepositoryConfig(base, policy), {
+    ...base, "shell_environment_policy.set.HUSKY": "0",
+  });
+  assert.equal(konteksRepositoryConfig(base, undefined), base);
+  assert.equal(konteksRepositoryConfig(base, { konteksRepository: { version: 2, managed: true } }), base);
+  assert.equal(konteksRepositoryConfig(base, { konteksRepository: { version: 1, managed: false } }), base);
+  assert.equal(Object.hasOwn(base, "shell_environment_policy.set.HUSKY"), false);
+});
+
+
+test("managed repository policy reaches start, resume and load on the pinned bridge", { skip: !process.env.CODEX_ACP_FIXTURE_DIR }, async () => {
+  const { readFileSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { source } = patchCodexAcpLiveUsers(readFileSync(join(process.env.CODEX_ACP_FIXTURE_DIR, "index.js"), "utf8"), codexAcpLiveUserPatch.version);
+  for (const method of ["newSession", "resumeSession", "loadSession"]) {
+    const start = source.indexOf(`async ${method}(request`);
+    assert.notEqual(start, -1, method);
+    const next = source.indexOf("\n  async ", start + 1);
+    const body = source.slice(start, next === -1 ? undefined : next);
+    assert.match(body, /config: konteksRepositoryConfig\(await this\.createSessionConfig\([^\n]+request\._meta\),/);
+  }
+  assert.equal(source.match(/config: konteksRepositoryConfig\(/g)?.length, 3);
 });

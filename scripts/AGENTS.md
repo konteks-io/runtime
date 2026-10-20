@@ -38,7 +38,7 @@ and the agent-on-every-OS proof. Most are called from `.github/workflows/`
   `id`, the bridge `version` and the sha256 of every upstream file it edits:
   - Claude: `id: "konteks-claude-project-settings-v5"`, version `0.75.1`,
     `hashes` for `acp-agent.js`, `settings.js`, `session-titles.js`.
-  - Codex: `id: "konteks-codex-acp-live-user-v11"`, version `1.10.0`,
+  - Codex: `id: "konteks-codex-acp-live-user-v12"`, version `1.10.0`,
     `upstreamSha256` for the bridge entry.
   A mismatch throws ("requires review of this upstream artifact") and every
   anchor must match exactly once. Bumping a bridge in

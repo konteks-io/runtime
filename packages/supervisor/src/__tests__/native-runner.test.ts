@@ -99,6 +99,13 @@ describe("native in-process runner", () => {
     expect(() => g.runner.adoptSession(owned.acpSessionRef, task)).toThrow(/never-prompted integration session/);
   });
 
+  it("passes repository lifecycle authority to the session without changing the shared process environment", async () => {
+    const f = fixture(); await f.runner.start();
+    await f.runner.createSession({ ...f.input, managedRepository: true });
+    expect(f.connection.newSession).toHaveBeenCalledWith(expect.objectContaining({ _meta: expect.objectContaining({
+      konteksRepository: { version: 1, managed: true },
+    }) }));
+  });
   it("asks a direct session's agent only for the [konteks] prefix ahead of its own title", async () => {
     const f = fixture(); await f.runner.start();
     await f.runner.createSession({ ...f.input, agentTitled: true });

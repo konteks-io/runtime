@@ -444,6 +444,21 @@ describe("session manager bootstrap", () => {
     expect(calls.loadSession?.[0]).not.toHaveProperty("_meta");
     expect(calls.newSession).toHaveLength(1);
   });
+  it("retains repository lifecycle policy when reopening and excludes a subsequent direct session", async () => {
+    let sequence = 0;
+    const newSession = vi.fn(async (_request: unknown) => ({ sessionId: `bridge-policy-${++sequence}` }));
+    const { bridge, calls } = fakeBridge({ newSession }, { agentCapabilities: { loadSession: true } });
+    const store = new InMemorySessionRefStore();
+    const manager = new SessionManager({ bridge: () => bridge, events: new RunnerEventBus(), refStore: store });
+    const args = { context, cwd: "/w", mcpServers: [], managedRepository: true as const };
+    await manager.create(args);
+    expect(newSession.mock.calls[0]?.[0]).toMatchObject({ _meta: { konteksRepository: { version: 1, managed: true } } });
+    await store.put("acp-prior", "bridge-old");
+    await manager.create({ ...args, acpSessionRef: "acp-prior" });
+    expect(calls.loadSession?.[0]).toMatchObject({ _meta: { konteksRepository: { version: 1, managed: true } } });
+    await manager.create({ context, cwd: "/direct", mcpServers: [], agentTitled: true });
+    expect(newSession.mock.calls[1]?.[0]).not.toHaveProperty("_meta.konteksRepository");
+  });
   it("names a new session from Core's display label", async () => {
     const { bridge, calls } = fakeBridge();
     const manager = new SessionManager({ bridge: () => bridge, events: new RunnerEventBus(), refStore: new InMemorySessionRefStore() });
