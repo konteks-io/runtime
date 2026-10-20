@@ -241,6 +241,31 @@ describe("supervised preview process manager", () => {
     f.instance.touchByAgent("missing");
   });
 
+  // D214: releasing the agent's session stopped a preview the person was trying.
+  it("knows a preview a person's viewer used recently, and only that one", async () => {
+    const f = manager();
+    f.setUp(true);
+    await f.instance.start("viewed", "/work/viewed");
+    await f.instance.start("quiet", "/work/quiet");
+    await f.instance.waitForSettled("viewed", 2_000);
+    await f.instance.waitForSettled("quiet", 2_000);
+    f.instance.touchByViewer("viewed");
+    // Prompt or update traffic keeps a preview from idling but is not a person viewing it.
+    f.instance.touch("quiet");
+    f.instance.touchByAgent("quiet");
+    expect(f.instance.viewedWithin("viewed", 10 * 60_000)).toBe(true);
+    expect(f.instance.viewedWithin("quiet", 10 * 60_000)).toBe(false);
+    f.advance(11 * 60_000);
+    expect(f.instance.viewedWithin("viewed", 10 * 60_000)).toBe(false);
+    f.instance.touchByViewer("viewed");
+    expect(f.instance.viewedWithin("viewed", 10 * 60_000)).toBe(true);
+    // A stopped preview is not in use.
+    await f.instance.stop("viewed", "idle");
+    expect(f.instance.viewedWithin("viewed", 10 * 60_000)).toBe(false);
+    f.instance.touchByViewer("missing");
+    expect(f.instance.viewedWithin("missing", 10 * 60_000)).toBe(false);
+  });
+
   it("runs install before the server, and reports a failing step with its log", async () => {
     const f = manager({}, { ok: true, plan: { command: "npm run dev", install: "npm install", healthPath: "/", env: {}, source: "inferred", explanation: "x", notes: [] } });
     await f.instance.start("s", "/w");

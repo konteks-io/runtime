@@ -186,6 +186,8 @@ interface Entry {
   lastActivityAt: number;
   /** When the agent last started or used it (its preview tool or browser); viewer traffic never moves it. */
   agentActiveAt: number | null;
+  /** When a person's viewer last asked it for something through the relay. */
+  viewerActiveAt: number | null;
   settled: Promise<void>;
   stopping: Promise<void> | null;
 }
@@ -255,7 +257,7 @@ export class PreviewProcessManager {
     return {
       sessionId, cwd, startedBy, generation: ++this.generation, state: "starting", phase: null, plan: null, port: null, host: null, child: null, cleanupFailed: false,
       logs: [], message: "Starting: reading how to serve this working copy.", reason: null, notes: [], startedAt: this.now(), readyAt: null,
-      lastActivityAt: this.now(), agentActiveAt: startedBy === "agent" ? this.now() : null, settled: Promise.resolve(), stopping: null,
+      lastActivityAt: this.now(), agentActiveAt: startedBy === "agent" ? this.now() : null, viewerActiveAt: null, settled: Promise.resolve(), stopping: null,
     };
   }
 
@@ -316,6 +318,20 @@ export class PreviewProcessManager {
   touch(sessionId: string): void {
     const entry = this.entries.get(sessionId);
     if (entry) entry.lastActivityAt = this.now();
+  }
+
+  /** A person's viewer used the preview: keeps it from idling and marks it viewed. */
+  touchByViewer(sessionId: string): void {
+    const entry = this.entries.get(sessionId);
+    if (!entry) return;
+    entry.lastActivityAt = this.now();
+    entry.viewerActiveAt = this.now();
+  }
+
+  /** Whether a person's viewer used the session's starting or running preview within the last `windowMs`. */
+  viewedWithin(sessionId: string, windowMs: number): boolean {
+    const entry = this.entries.get(sessionId);
+    return !!entry && activeState(entry.state) && entry.viewerActiveAt !== null && entry.viewerActiveAt >= this.now() - windowMs;
   }
 
   /** The session's agent used its preview (its preview tool or browser): keeps it from idling and marks the agent active. */

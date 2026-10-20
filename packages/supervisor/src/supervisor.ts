@@ -157,6 +157,8 @@ const PREVIEW_START_WAIT_MS = 45_000;
 const PREVIEW_VIEWER_RETRY_MS = 60_000;
 /** How recently the agent must have used a preview for the heartbeat to report it (Core's "moving" window). */
 const PREVIEW_AGENT_ACTIVE_WINDOW_MS = 3 * 60_000;
+/** A preview a person's viewer used this recently outlives its session's release (D214). */
+const PREVIEW_VIEWER_KEEP_MS = 10 * 60_000;
 
 /** bb releases sessions idle for 30 minutes, checked every 5 minutes. */
 /**
@@ -931,6 +933,26 @@ export class Supervisor {
   }
 
   /** Not stopping, and still the same state ownership, lease, identity and incarnation. */
+  /** A person's viewer has a stream open on the session's preview, or used it within the keep window. */
+  private previewInUse(sessionId: string): boolean {
+    return (this.previewChannel?.activeStreamsFor(sessionId) ?? 0) > 0 || this.previews.viewedWithin(sessionId, PREVIEW_VIEWER_KEEP_MS);
+  }
+
+  /**
+   * The dev server stops with its session; its worktree stays openable by a
+   * viewer while it exists (a delivery's preview after the delivery). A person
+   * trying it keeps it (D214: a restart mid-try lost the app's in-memory
+   * sign-in); the idle sweep stops it once they leave.
+   */
+  private async releaseSessionPreview(sessionId: string): Promise<void> {
+    this.previewViewerStarts.forget(sessionId);
+    if (this.previewInUse(sessionId)) {
+      this.logger.info({ event: "preview.kept_for_viewer", sessionId }, "kept the preview a person is using after its session was released");
+      return;
+    }
+    await this.previews.stop(sessionId, "session_released");
+  }
+
   private ownerUnchanged(owner: CapturedOwner): boolean {
     return (
       !this.stopping && this.nativeOwnership === owner.ownership && this.lease.current() === owner.lease &&
@@ -1062,7 +1084,7 @@ export class Supervisor {
       lease: this.lease,
       previews: {
         originFor: sessionId => this.previews.originFor(sessionId),
-        touch: sessionId => this.previews.touch(sessionId),
+        touch: sessionId => this.previews.touchByViewer(sessionId),
         autoStart: sessionId => this.previewViewerStarts.start(sessionId),
         failureFor: sessionId => this.previews.status(sessionId).state === "failed" ? this.previews.lastFailureFor(sessionId)?.reason ?? null : null,
       },
@@ -1129,12 +1151,7 @@ export class Supervisor {
           client: () => new NativeInputClient({ baseUrl: this.config.SUPERVISOR_CORE_URL, roots: this.roots, clock: this.clock,
             credential: () => this.lease.mode() === "active" ? (this.lease.current()?.lease ?? null) : null }) }).seal(admission, assertCurrent);
       },
-      onSessionReleased: async sessionId => {
-        // The dev server stops with the session; its worktree stays openable
-        // by a viewer while it exists (a delivery's preview after the delivery).
-        this.previewViewerStarts.forget(sessionId);
-        await this.previews.stop(sessionId, "session_released");
-      },
+      onSessionReleased: sessionId => this.releaseSessionPreview(sessionId),
       ...(this.assignmentSender ? { assignmentSender: this.assignmentSender } : {}),
       runnerIncarnation: () => this.runnerIncarnation,
       assertOwned: () => {
