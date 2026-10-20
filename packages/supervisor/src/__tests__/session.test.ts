@@ -56,6 +56,17 @@ describe("sanitized permission facts", () => {
 });
 
 describe("policy responder", () => {
+  it("requires a one-time human decision for direct Claude account tools and refuses other servers", async () => {
+    const responder = new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true);
+    const context = { assignmentId: "a", agentId: "claude-code", workspaceRoot: "/w", sessionServers: new Set<string>(), directAccountConnectors: true };
+    const request = (toolName: string) => ({ ...permissionRequest, toolCall: { toolCallId: "asana", title: "Read task", kind: "other" as const,
+      _meta: { claudeCode: { toolName } } } });
+    const asana = request("mcp__claude_ai_Asana__get_task");
+    expect(await responder.evaluatePermission(asana, context)).toEqual({ kind: "defer", allowOnceOnly: true });
+    expect(await responder.evaluatePermission(request("mcp__repository__get_task"), context)).toEqual({ kind: "deny", optionId: "reject" });
+    expect(await responder.evaluatePermission(asana, { ...context, directAccountConnectors: false })).toEqual({ kind: "deny", optionId: "reject" });
+    expect(await new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => false).evaluatePermission(asana, context)).toEqual({ kind: "deny", optionId: "reject" });
+  });
   it("answers allow/deny locally from the PolicyEvaluator and defers only when policy defers", async () => {
     const allow = new EvaluatorPolicyResponder({ evaluateToolUse: async () => ({ allowed: true }) }, () => true);
     expect(await allow.evaluatePermission(permissionRequest as never, { assignmentId: "a", agentId: "codex", workspaceRoot: "/w" })).toEqual({ kind: "allow", optionId: "allow" });
@@ -572,6 +583,31 @@ describe("relayed session", () => {
       agentRoute: { requiredRole: "assistant", agentId: "claude-code", mcpCapabilityTokenRef: "ref-1" },
       source: { kind: "direct_session", portability: "instance_bound", ownerInstanceId: "inst", sessionId: "s", turnRef: "turn-2", acpSessionRef: "acp-0" } };
     const options = [{ optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" }];
+
+    it("admits account connectors only for an instance-bound direct Claude session", async () => {
+      const f = await build({}, directWork);
+      try {
+        await f.session.bootstrap();
+        expect(f.runner.createSession).toHaveBeenCalledWith(expect.objectContaining({ directAccountConnectors: true, mcpServers: [] }), undefined);
+      } finally { await f.session.close("cancelled"); }
+      const ordinary = await build({}, { ...assignment, agentRoute: { ...assignment.agentRoute, agentId: "claude-code" } });
+      try {
+        await ordinary.session.bootstrap();
+        expect(ordinary.runner.createSession.mock.calls[0]?.[0]).not.toHaveProperty("directAccountConnectors");
+      } finally { await ordinary.session.close("cancelled"); }
+    });
+
+    it.each(["foreign-instance", "codex"])("excludes direct account connectors for %s", async mode => {
+      const work = { ...directWork,
+        agentRoute: { ...directWork.agentRoute, agentId: mode === "codex" ? "codex" : "claude-code" },
+        source: { ...directWork.source, ownerInstanceId: mode === "foreign-instance" ? "foreign" : "inst" },
+      } as RemoteWorkAssignment;
+      const f = await build({}, work);
+      try {
+        await f.session.bootstrap();
+        expect(f.runner.createSession.mock.calls[0]?.[0]).not.toHaveProperty("directAccountConnectors");
+      } finally { await f.session.close("cancelled"); }
+    });
 
     const modelSelection = {
       configId: "model",

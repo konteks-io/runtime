@@ -39,6 +39,7 @@ const inputSchema = z.object({
   freshSessionWhenRestoreLost: z.boolean().optional(),
   sessionLabel: RemoteSessionLabelSchema.optional(),
   agentTitled: z.literal(true).optional(),
+  directAccountConnectors: z.literal(true).optional(),
   browser: z.object({
     proxyUrl: z.string().regex(/^http:\/\/127\.0\.0\.1:\d{1,5}$/),
     outputDir: z.string().min(1).refine(isAbsolute),
@@ -52,6 +53,7 @@ const inputSchema = z.object({
     utility: z.object({ model: z.string().min(1).max(256).optional() }).strict().optional(),
   }).strict().optional(),
 }).strict().refine(value => value.acpSessionRef === undefined || value.restoreAcpSessionRef === undefined)
+  .refine(value => value.directAccountConnectors !== true || (value.context.agentId === "claude-code" && value.integration === undefined))
   .refine(
     (value) =>
       value.integration === undefined ||
@@ -249,7 +251,7 @@ export class NativeRunner implements RunnerPort {
     const { context, readinessDeadlineAt, cwd, readOnlyRoots, sessionConfig,
       modelSelectionPolicy,
       modelSelection,
-      acpSessionRef, freshProviderSessionOnRestore, freshSessionWhenRestoreLost, sessionLabel, agentTitled, browser, integration,
+      acpSessionRef, freshProviderSessionOnRestore, freshSessionWhenRestoreLost, sessionLabel, agentTitled, directAccountConnectors, browser, integration,
     } = data;
     // The session's browser is a stdio MCP server the agent launches (its own
     // package's, or the connector's for an agent without one); composed here,
@@ -264,7 +266,7 @@ export class NativeRunner implements RunnerPort {
         acpSessionRef, freshProviderSessionOnRestore, freshSessionWhenRestoreLost, sessionLabel,
       }),
       ...(agentTitled ? { agentTitled } : {}),
-      ...withoutUndefined({ integration }),
+      ...withoutUndefined({ integration, directAccountConnectors }),
       lifecycle: this.sessionLifecycle(lifecycle),
     };
   }

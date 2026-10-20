@@ -17,7 +17,7 @@ interface InstructionScopeV3 extends Omit<InstructionScopeV2, "version"> {
   accountConnectors: "excluded";
 }
 
-/** The same, except an integration task's own session admits the account connectors (every call still meets the gate). */
+/** Account connector admission, for gated integration tasks or owner direct sessions. */
 interface InstructionScopeV4 extends Omit<InstructionScopeV3, "version" | "accountConnectors" | "settings"> {
   version: 4;
   settings: "project" | "none";
@@ -61,7 +61,7 @@ function decodeInstructionScope(line: string): InstructionScope | null {
   return v2 ? { version: 2, ...SCOPE_BASE, exclusionCount: Number(v2[1]) } : null;
 }
 
-/** An integration session loads no setting sources at all (`settings=none`) and only it admits the account connectors. */
+/** Account connector admission loads no repository setting sources (`settings=none`). */
 function scopeV4(match: RegExpExecArray): InstructionScope | null {
   if ((match[1] === "none") !== (match[3] === "integration")) return null;
   return { version: 4, ...SCOPE_BASE, settings: match[1] as "project" | "none", exclusionCount: Number(match[2]), hooks: "disabled", repositoryMcp: "excluded", accountConnectors: match[3] as "excluded" | "integration" };

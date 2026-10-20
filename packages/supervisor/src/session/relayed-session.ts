@@ -768,6 +768,7 @@ export class RelayedSession {
       mcpServers,
       ...(this.assignment.agentRoute.sessionConfig ? { sessionConfig: this.assignment.agentRoute.sessionConfig } : {}),
       ...this.directModelOptions(),
+      ...(this.directAccountConnectors() ? { directAccountConnectors: true as const } : {}),
       ...(priorRef ? { acpSessionRef: priorRef } : {}),
       ...this.restoreOptions(restoreRef),
       ...this.titleOptions(),
@@ -788,6 +789,12 @@ export class RelayedSession {
       ...(source.modelSelectionPolicy ? { modelSelectionPolicy: source.modelSelectionPolicy } : {}),
       ...(selection ? { modelSelection: selection } : {}),
     };
+  }
+
+  /** Core admits personally signed-in direct agents only for the runtime's owner. */
+  private directAccountConnectors(): boolean {
+    return this.assignment.kind === "direct" && this.assignment.source.kind === "direct_session" &&
+      this.assignment.source.ownerInstanceId === this.deps.instanceId && this.assignment.agentRoute.agentId === "claude-code";
   }
 
   /**
@@ -1868,6 +1875,7 @@ export class RelayedSession {
   private permissionContext(): Parameters<PolicyResponder["evaluatePermission"]>[1] {
     return { assignmentId: this.assignment.id, agentId: this.assignment.agentRoute.agentId, workspaceRoot: this.policyRoot(),
       cwd: this.sessionCwd(), readOnlyRoots: this.readOnlyRoots, browserTools: this.browserGateway !== null, sessionServers: this.sessionServers, ...(this.mcpCalls ? { ledger: this.mcpCalls } : {}),
+      directAccountConnectors: this.directAccountConnectors(),
       admittedMcpTools: this.deps.admittedMcpTools?.(this.assignment) ?? [] };
   }
 

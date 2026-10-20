@@ -52,7 +52,8 @@ export function hardenClaudeSession(settings, accountConnectors = false) {
   return hardened;
 }
 
-// Only the connector's integration session/new carries this, versioned; any
+// The connector supplies this versioned admission for integration tasks and
+// owner-admitted direct Claude sessions (also on load/resume); any
 // other shape (or a client option) admits nothing.
 export function konteksAccountConnectors(meta) {
   const integration = meta && typeof meta === 'object' ? meta.konteksIntegration : undefined;

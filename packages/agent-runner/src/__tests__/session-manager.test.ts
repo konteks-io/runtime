@@ -906,6 +906,31 @@ describe("session manager bootstrap", () => {
 });
 
 describe("integration sessions", () => {
+  it("carries direct runtime connector admission into new and restored Claude sessions, separately from display naming", async () => {
+    const { bridge, calls } = fakeBridge({}, { agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {} } } });
+    const store = new InMemorySessionRefStore();
+    await store.put("prior", "bridge-prior");
+    const events = new RunnerEventBus();
+    const manager = new SessionManager({ bridge: () => bridge, events, refStore: store });
+    const args = { context: { ...context, agentId: "claude-code" }, cwd: "/w", mcpServers: [], directAccountConnectors: true as const };
+    const first = await manager.create(args);
+    const completed = nextEvent(events, "prompt_result");
+    manager.prompt(first.acpSessionRef, "read", { prompt: [] });
+    await completed;
+    await manager.sealCompletedTurn(first.acpSessionRef);
+    await manager.continueLive({ ...args, context: { ...args.context, assignmentId: "next" }, acpSessionRef: first.acpSessionRef,
+      lifecycle: { beforeCreate: async () => undefined, recordProcessOwner: async () => undefined, assertCurrent: () => undefined } });
+    const restored = fakeBridge();
+    await new SessionManager({ bridge: () => restored.bridge, events: new RunnerEventBus(), refStore: store }).restore(args, "prior");
+    for (const call of [calls.newSession?.[0], calls.resumeSession?.[0], restored.calls.loadSession?.[0]]) {
+      expect(call).toMatchObject({ _meta: { konteksIntegration: { version: 1, admittedMcpServerNames: [], accountConnectors: true } } });
+      expect(call).not.toHaveProperty("_meta.claudeCode.options.tools");
+    }
+    const plain = fakeBridge();
+    await new SessionManager({ bridge: () => plain.bridge, events: new RunnerEventBus(), refStore: new InMemorySessionRefStore() })
+      .create({ context, cwd: "/w", mcpServers: [], agentTitled: true });
+    expect(plain.calls.newSession?.[0]).not.toHaveProperty("_meta.konteksIntegration");
+  });
   it("tells the bridge which personal server or account connectors this one session admits", async () => {
     const { bridge, calls } = fakeBridge();
     const manager = new SessionManager({ bridge: () => bridge, events: new RunnerEventBus(), refStore: new InMemorySessionRefStore() });

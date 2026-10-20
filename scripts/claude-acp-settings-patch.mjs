@@ -9,10 +9,12 @@ import { konteksPrefixedName } from "./konteks-session-prefix.mjs";
 // (`disableAllHooks`; the SDK's callback hooks, the bridge's own, still run)
 // on new, loaded and resumed sessions alike; and every permission request
 // names its tool in `_meta.claudeCode.toolName`. An integration task's own session (`_meta.konteksIntegration`,
-// sent only by the connector's integration carrier) loads the account's
+// sent by the connector after admission) loads the account's
 // claude.ai connectors so the bound one can be called, with NO setting
 // sources so no repository `.mcp.json` server starts; hooks stay off and
-// every call still meets the connector's integration gate. A direct
+// every call still meets the connector's integration gate. Owner-admitted
+// direct Claude sessions use the same account connector admission on new, load
+// and resume, with one-time human decisions for external tools. A direct
 // session's own title shows behind the [konteks] prefix.
 export const claudeAcpSettingsPatch = {
   id: "konteks-claude-project-settings-v5",

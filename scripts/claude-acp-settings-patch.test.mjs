@@ -22,7 +22,7 @@ test("reviewed bridge uses project settings in both SDK resolution and query", {
   assert.match(settings, /resolveSettings\(\{ cwd: this.cwd, settingSources: \["project"\] \}\)/);
   assert.doesNotMatch(settings, /path.join\(CLAUDE_CONFIG_DIR, "settings.json"\)/);
   const agent = load("acp-agent.js");
-  // An integration session (and only one, `_meta.konteksIntegration`)
+  // An admitted session (`_meta.konteksIntegration`)
   // loads the account connectors, with no setting sources at all so no
   // repository .mcp.json server starts; every other session is as Stage 0.
   assert.match(agent, /\.\.\.userProvidedOptions,\s+settingSources: konteksAccountConnectors\(params\._meta\) \? \[\] : \["project"\],\s+strictMcpConfig: !konteksAccountConnectors\(params\._meta\),/);
