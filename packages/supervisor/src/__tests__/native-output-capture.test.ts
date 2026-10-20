@@ -56,7 +56,7 @@ describe("native delivery output capture", () => {
 
   it("keeps tracked and pre-staged internal cache changes out without altering the real index or HEAD", async () => {
     await writeFixtureFiles(["graft/.cache/tracked.json", "graft/.graph/base.db"]);
-    await run("git", ["-C", dir, "add", "graft"]);
+    await run("git", ["-C", dir, "add", "--force", "graft"]);
     await run("git", ["-C", dir, "-c", "user.name=Test", "-c", "user.email=test@invalid", "commit", "-qm", "tracked fixtures"]);
     const options = await outputOptions();
     await writeFile(join(dir, "graft", ".cache", "tracked.json"), "changed cache\n");
