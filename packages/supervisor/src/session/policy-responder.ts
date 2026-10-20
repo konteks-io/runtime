@@ -53,6 +53,8 @@ export interface PermissionContext {
   ledger?: McpToolCallLedger;
   toolIdentity?: PermissionToolIdentity;
   admittedMcpTools?: readonly AdmittedMcpTool[];
+  /** Local direct-session admission, never read from tool arguments or titles. */
+  directAccountConnectors?: boolean;
 }
 
 export interface PolicyResponder {
@@ -125,6 +127,7 @@ function browserRule(identity: PermissionToolIdentity, request: RequestPermissio
 }
 
 function admittedTool(identity: { server: string; tool: string }, context: PermissionContext): boolean {
+  if (context.directAccountConnectors && context.agentId === "claude-code" && /^claude_ai_[A-Za-z0-9_-]+$/.test(identity.server)) return true;
   return context.admittedMcpTools?.some(entry => entry.server === identity.server && entry.tools.includes(identity.tool)) ?? false;
 }
 
@@ -173,7 +176,8 @@ export class EvaluatorPolicyResponder implements PolicyResponder {
    * An MCP call whose server and tool cannot be read is never guessed. Only
    * the MCP servers this session gave its agent are callable: the person's
    * claude.ai connectors and own Codex servers, a repository's servers,
-   * anything else is refused, and never put to a person. A tool an
+   * anything else is refused, and never put to a person. An owner-admitted
+   * direct Claude session may ask for account connector calls, once. A tool an
    * integration binding admitted goes to that binding's gate: asked, once.
    */
   private mcpRule(identity: PermissionToolIdentity, context: PermissionContext, deny: string | null): PolicyDecision | null {

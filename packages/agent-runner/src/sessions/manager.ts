@@ -79,6 +79,8 @@ interface CreateSessionArgs {
   integration?: IntegrationSessionAdmission;
   /** A person's direct session: the agent titles it; Konteks asks only for the `[konteks]` prefix. */
   agentTitled?: boolean;
+  /** Connector-admitted direct Claude session, including continuation and recovery. */
+  directAccountConnectors?: true;
   /** Native in-process owner; opaque connector ref, never the bridge session ID. */
   lifecycle?: {
     beforeCreate(opaqueRef: string): Promise<void>;
@@ -116,6 +118,10 @@ function adoption(args: Pick<CreateSessionArgs, "integration" | "lifecycle">): {
 /** The `_meta` an integration session's `session/new` carries, versioned for the bridge patches. */
 function konteksIntegrationMeta(admission: IntegrationSessionAdmission) {
   return { konteksIntegration: { version: 1 as const, admittedMcpServerNames: [...admission.admittedMcpServerNames], accountConnectors: admission.accountConnectors } };
+}
+
+function runtimeConnectorMeta(admitted: true | undefined) {
+  return admitted ? konteksIntegrationMeta({ admittedMcpServerNames: [], accountConnectors: true }) : {};
 }
 
 /**
@@ -442,17 +448,17 @@ export class SessionManager {
   }
 
   /** `_meta` for `session/load` and `session/resume`: the agent's own (a persisted tool filter is overridden there). */
-  private reopenMeta(args?: Pick<CreateSessionArgs, "agentTitled">): { _meta?: Record<string, unknown> } {
+  private reopenMeta(args?: Pick<CreateSessionArgs, "agentTitled" | "directAccountConnectors">): { _meta?: Record<string, unknown> } {
     // A reopened direct session the agent has not titled yet still gets the prefix when it does.
     const naming = args?.agentTitled ? { konteksSession: konteksAgentTitledMetadata().konteksSession } : {};
-    const meta = { ...naming, ...this.options.sessionMeta };
+    const meta = { ...naming, ...this.options.sessionMeta, ...runtimeConnectorMeta(args?.directAccountConnectors) };
     return Object.keys(meta).length ? { _meta: meta } : {};
   }
 
   private newSessionMeta(args: CreateSessionArgs, acpSessionRef: string): Record<string, unknown> {
     const naming = args.agentTitled ? konteksAgentTitledMetadata(args.context.agentId)
       : konteksSessionMetadata(konteksCodingSessionTitle(args.sessionLabel, acpSessionRef.slice(-8)), args.context.agentId);
-    const meta = { ...naming, ...this.options.sessionMeta, ...(args.integration ? konteksIntegrationMeta(args.integration) : {}) };
+    const meta = { ...naming, ...this.options.sessionMeta, ...runtimeConnectorMeta(args.directAccountConnectors), ...(args.integration ? konteksIntegrationMeta(args.integration) : {}) };
     const locked = args.integration ? withIntegrationToolLock(meta) : meta;
     return args.integration?.utility ? withUtilityTurnOptions(locked) : locked;
   }

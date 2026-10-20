@@ -48,8 +48,11 @@ and the agent-on-every-OS proof. Most are called from `.github/workflows/`
   extend the patch tests. Never relax a hash check to get a build through.
 - What the patches enforce is security, not convenience: the Claude bridge
   loads only `settingSources: ["project"]` (none for an integration session),
-  `strictMcpConfig`, hooks disabled and claude.ai connectors off
-  (`hardenClaudeSession`), and names the tool in
+  `strictMcpConfig`, hooks disabled and claude.ai connectors off by default
+  (`hardenClaudeSession`). An owner-admitted direct Claude session uses the
+  same versioned account-connector admission as integration tasks, including
+  load/resume, with no setting sources or repository MCP servers; its external
+  calls require a one-time human decision. The bridge names the tool in
   `toolCall._meta.claudeCode.toolName`; the Codex patch turns the person's and
   trusted projects' MCP servers off per thread and admits only
   `admittedMcpServerNames` for an integration session.
