@@ -172,6 +172,11 @@ export class PreviewChannel {
     return this.forwarders.has(`preview:${sessionId}`);
   }
 
+  /** The viewer streams open on this session's preview channel now (an event stream, a download). */
+  activeStreamsFor(sessionId: string): number {
+    return this.forwarders.get(`preview:${sessionId}`)?.activeStreams ?? 0;
+  }
+
   activeStreams(): number {
     let total = 0;
     for (const forwarder of this.forwarders.values()) total += forwarder.activeStreams;
