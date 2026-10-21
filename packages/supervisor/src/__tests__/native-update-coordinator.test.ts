@@ -9,6 +9,7 @@ import { buildReleaseFixture } from "@konteks/remote-release";
 import { NativeUpdateCoordinator } from "../native/update.js";
 import { readNativeUpdateLedger, recordNativeUpdateAttempt, type NativeUpdateAttempt, type NativeUpdateLedger } from "../native/update-ledger.js";
 import { launchNativeUpdater } from "../native/update-launch.js";
+import type { NativeUpdaterExitListener } from "../native/update-launch-diagnostics.js";
 
 const roots: string[] = [];
 afterEach(async () => { vi.unstubAllEnvs(); for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
@@ -215,6 +216,21 @@ describe("native update coordinator", () => {
     expect((await c.check()).inFlight).toBeNull();
     expect(launch).toHaveBeenCalledTimes(1);
   });
+  it("correlates sanitized startup failures without changing status shape or retry authority", async () => {
+    const logger = createLogger({ name: "test", silent: true });
+    const warn = vi.spyOn(logger, "warn");
+    const { c, launch } = coordinator({ logger });
+    let exit: NativeUpdaterExitListener | undefined;
+    launch.mockImplementationOnce(async () => ({ pid: 99, launchId: "konteks-remote-update-123", onExit: (listener: NativeUpdaterExitListener) => { exit = listener; } }));
+    await c.apply("periodic");
+    expect(c.status().inFlight).not.toHaveProperty("launchId");
+    exit!(1, { reason: "systemd_environment_invalid", stderrBytes: 90, stderrTruncated: false });
+    expect(c.status().lastError).toContain("systemd_environment_invalid");
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({ stage: "updater_launch", pid: 99, launchId: "konteks-remote-update-123",
+      bundleVersion: "1.1.0", code: 1, reason: "systemd_environment_invalid", stderrBytes: 90, stderrTruncated: false }), expect.any(String));
+    expect(await c.apply("periodic")).toMatchObject({ started: true });
+    c.stop();
+  });
 });
 
 describe("re-check while Konteks has not accepted the newest release (R5-O39)", () => {
@@ -378,8 +394,7 @@ describe("native updater launch", () => {
     expect(JSON.parse(options.env[NATIVE_UPDATE_TARGET_ENV]!)).toEqual(target);
     if (os === "windows") expect(options.windowsHide).toBe(true);
     if (os === "debian") {
-      expect(spawnFn.mock.calls[0]?.[1]).toContain(`--setenv=${NATIVE_UPDATE_TARGET_ENV}`);
-      expect(spawnFn.mock.calls[0]?.[1].join(" ")).not.toContain(target.manifestDigest);
+      expect(spawnFn.mock.calls[0]?.[1]).toContain(`--setenv=${NATIVE_UPDATE_TARGET_ENV}=${JSON.stringify(target)}`);
     }
     spawnFn.mockClear();
     await expect(launchNativeUpdater({ root, executable: join(root, "konteks-connector"), os, target,
