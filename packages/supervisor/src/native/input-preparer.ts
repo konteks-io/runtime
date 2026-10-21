@@ -3,9 +3,9 @@ import { NativeWorkspaceCheckpointStore } from "./workspace-preservation.js";
 import { NativeRecoveredWorkspaceStore } from "./workspace-recovery.js";
 import { constants, type Stats } from "node:fs";
 import { execFile } from "node:child_process";
-import { chmod, lstat, mkdir, mkdtemp, open, realpath, rename, rm } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open, readdir, realpath, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, parse, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, parse, resolve } from "node:path";
 import { z } from "zod";
 import {
   canonicalize,
@@ -109,6 +109,15 @@ async function sameDirectory(path: string, before?: Stats): Promise<Stats> {
   if (before && (before.ino !== stat.ino || before.dev !== stat.dev)) throw unavailable();
   return stat;
 }
+/** The other agents' private workspaces beside this one (`workspaces/<agent>`). */
+async function siblingAgentRoots(root: string): Promise<string[]> {
+  const parent = dirname(root);
+  if (basename(parent) !== "workspaces") return [];
+  const entries = await readdir(parent, { withFileTypes: true }).catch(() => []);
+  return entries.filter((entry) => entry.isDirectory() && join(parent, entry.name) !== root)
+    .map((entry) => join(parent, entry.name)).sort();
+}
+
 async function privateRoot(value: string): Promise<string> {
   if (!isAbsolute(value) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(value)) throw unavailable();
   const path = resolve(value);
@@ -875,9 +884,20 @@ class InputPreparation {
     const repositoryWorkspace = inputs.selection.repositoryWorkspace;
     if (repositoryWorkspace?.mode === "preserve" && repositoryWorkspace.expectedAcceptedResult) {
       if (!outputHead || !harnessTurn) throw unavailable();
+      await this.adoptRebound(outputHead, root, repositoryWorkspace.expectedAcceptedResult, inputs.selection.binding.sessionId);
       await this.verifyOutputHead(outputHead, repositoryWorkspace.expectedAcceptedResult, { invocationId: harnessTurn.invocationId, claimId: inputs.claimId }, source.recoveredCheckpointDigest);
     }
     return outputHead;
+  }
+
+  /** A session rebound to this agent on this computer keeps the accepted output its previous agent recorded (A44). */
+  private async adoptRebound(head: NativeOutputSessionHeadStore, root: string,
+    expected: Parameters<NativeOutputSessionHeadStore["adoptFromSibling"]>[1], sessionId: string): Promise<void> {
+    const siblings = await siblingAgentRoots(root);
+    if (siblings.length === 0 || !(await head.adoptFromSibling(siblings, expected))) return;
+    this.options.logger?.info?.({ event: "native.output.adopted_from_previous_agent", assignmentId: this.assignment.id,
+      attempt: this.assignment.attempt, sessionId, invocationId: expected.invocationId },
+    "kept the accepted output the session's previous agent recorded on this computer");
   }
 
   private async verifyOutputHead(head: NativeOutputSessionHeadStore, expected: Parameters<NativeOutputSessionHeadStore["verifyExpected"]>[0],

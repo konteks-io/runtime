@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -127,5 +127,53 @@ describe("durable native output state", () => {
       acceptanceId: first.receipt.acceptanceId, resultDigest: first.receipt.resultDigest },
     { invocationId: "next", claimId: "claim-next" })).resolves.toBeUndefined();
     await expect(head.begin({ invocationId: "next", claimId: "claim-next" })).resolves.toBeUndefined();
+  });
+});
+
+// A44 (production 2026-10-21): TKT-A's session was rebound from Codex to
+// DeepSeek Harness on the same computer. Its accepted output lived in
+// workspaces/codex, so every continuation in workspaces/dsh refused with
+// capability_unavailable and the delivery looped.
+describe("a session rebound to another agent on this computer", () => {
+  async function acceptedIn(root: string) {
+    const head = new NativeOutputSessionHeadStore(root, "session");
+    const turn = { invocationId: "first", claimId: "claim-first" };
+    const accepted = fixture(turn.invocationId, turn.claimId);
+    await head.begin(turn); await head.record(turn).savePending(accepted.candidate, accepted.completion);
+    await head.record(turn).saveAccepted(accepted.candidate, accepted.receipt); await head.promote(turn);
+    return { turn, expected: { ...turn, acceptanceId: accepted.receipt.acceptanceId, resultDigest: accepted.receipt.resultDigest }, accepted };
+  }
+  async function roots() {
+    const previous = join(dir, "codex"); const current = join(dir, "dsh");
+    for (const root of [previous, current]) { await mkdir(root, { mode: 0o700 }); await chmod(root, 0o700); }
+    return { previous, current };
+  }
+  const next = { invocationId: "second", claimId: "claim-second" };
+
+  it("adopts the previous agent's accepted turn and verifies it", async () => {
+    const { previous, current } = await roots();
+    const { turn, expected, accepted } = await acceptedIn(previous);
+    const head = new NativeOutputSessionHeadStore(current, "session");
+    await expect(head.verifyExpected(expected, next)).rejects.toBeDefined();
+    await expect(head.adoptFromSibling([previous], expected)).resolves.toBe(true);
+    await expect(head.verifyExpected(expected, next)).resolves.toBeUndefined();
+    expect(await head.record(turn).read()).toEqual({ version: 1, state: "accepted", ...accepted });
+    expect(await new NativeOutputSessionHeadStore(previous, "session").latestAccepted()).not.toBeNull();
+  });
+
+  it("adopts nothing that differs from Core's expected acceptance", async () => {
+    const { previous, current } = await roots();
+    const { expected } = await acceptedIn(previous);
+    const head = new NativeOutputSessionHeadStore(current, "session");
+    await expect(head.adoptFromSibling([previous], { ...expected, resultDigest: `sha256:${"b".repeat(64)}` })).resolves.toBe(false);
+    await expect(head.adoptFromSibling([previous], { ...expected, invocationId: "other" })).resolves.toBe(false);
+    await expect(head.verifyExpected(expected, next)).rejects.toBeDefined();
+  });
+
+  it("never replaces a head this agent already has", async () => {
+    const { previous, current } = await roots();
+    const { expected } = await acceptedIn(previous);
+    await acceptedIn(current);
+    await expect(new NativeOutputSessionHeadStore(current, "session").adoptFromSibling([previous], expected)).resolves.toBe(false);
   });
 });
