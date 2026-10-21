@@ -8,6 +8,16 @@ const mapping = { ...body, mappingDigest: computeAgentModelCapabilityMappingDige
 const ready = { agentId: "claude-code", displayName: "Claude", authMode: "agent_local_subscription" as const, accountScope: "personal" as const, authIdentityFingerprint: "identity-a", connectionState: "ready" as const, readiness: "ready" as const, capabilities: [], acpCapabilities: { sessionResume: false, forkSession: false, structuredOutputShim: true, toolControl: "approve" as const }, tokenUsageObservable: true, lastProbeAt: "2026-09-06T00:00:00Z" };
 
 describe("authenticated model offered-values snapshot producer", () => {
+  it("reports bounded discovery failures without persisting provider error details", async () => {
+    const onDiagnostic = vi.fn();
+    const producer = new ModelCapabilitySnapshotProducer({ clock, instanceId: () => "instance", runnerIncarnation: () => "process", manifestId: () => "manifest", mappings: () => [], catalogueAgents: () => ["codex"],
+      discover: async () => { throw new Error("private provider response"); }, onDiagnostic });
+    await producer.refresh([{ ...ready, agentId: "codex" }]);
+    expect(onDiagnostic).toHaveBeenCalledWith({ reason: "discovery_failed", agentId: "codex", errorKind: "discovery_error" });
+    expect(JSON.stringify(onDiagnostic.mock.calls)).not.toContain("private provider response");
+    expect(producer.snapshots()).toEqual([]);
+  });
+
   it("coalesces discovery for one authority tuple and emits a bounded stable snapshot", async () => {
     const discover = vi.fn(async () => ({ currentValue: "sonnet", offeredValues: ["sonnet", "opus"] }));
     const producer = new ModelCapabilitySnapshotProducer({ clock, instanceId: () => "instance", runnerIncarnation: () => "process", manifestId: () => "manifest", mappings: () => [{ agentId: "claude-code", mapping }], discover, newId: () => "snapshot" });
