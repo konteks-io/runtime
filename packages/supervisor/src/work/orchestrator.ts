@@ -1958,6 +1958,7 @@ export class WorkOrchestrator {
     const key = `${directive.assignmentId}:${directive.attempt}`;
     const entry = this.deps.journal.assignments.get(key);
     if (!entry || entry.reports.terminalSequence !== undefined) return;
+    if (entry.kind === "assistant_execution") return this.cancelAssistantExecution(directive);
     if (this.recoveryFences.has(key)) return this.cancelFencedExecution(key, directive);
     const session = this.sessions.get(key);
     if (session) {
@@ -1965,7 +1966,39 @@ export class WorkOrchestrator {
       return;
     }
     if (entry.kind === "planning") return; // Hosted settlement supplies the directive-bound terminal winner.
-    await this.reports.submit({ assignmentId: directive.assignmentId, attempt: directive.attempt, claimId: entry.claimId, draft: { terminal: true, result: { class: "cancelled", reason: directive.reason, terminalResultHash: jcsDigest({ class: "cancelled", reason: directive.reason }) } } });
+    await this.reportCancelledAssignment(directive, entry);
+  }
+
+  /** A conversation cancellation settles through the exact-process recovery
+   * owner, including when the stop survived but its in-memory retry did not. */
+  private async cancelAssistantExecution(directive: CancelDirective): Promise<void> {
+    const key = `${directive.assignmentId}:${directive.attempt}`;
+    const session = this.sessions.get(key);
+    if (session && !this.recoveryFences.has(key)) return session.close("cancelled");
+    const observed = this.ownedClaim(directive.assignmentId, directive.attempt);
+    const assertCurrent = () => {
+      this.requireNativeOwner();
+      const current = this.ownedClaim(directive.assignmentId, directive.attempt);
+      if (!observed || !current || current.admission.executionGeneration !== observed.admission.executionGeneration ||
+          current.entry.claimId !== observed.entry.claimId) {
+        throw new RemoteInstanceError("recovery_required", "Cancellation execution owner is unavailable.");
+      }
+      this.deps.journal.execution.assertAdmission(observed.admission);
+      return current;
+    };
+    assertCurrent();
+    await this.stopForRecovery(directive.assignmentId, directive.attempt, assertCurrent);
+    const owned = assertCurrent();
+    // The durable admission fence proves no process opened; preserve the
+    // existing pre-dispatch cancellation rather than requiring stop evidence.
+    if (!this.deps.journal.execution.execution(owned.admission)) return this.reportCancelledAssignment(directive, owned.entry);
+    await this.recoverLostExecutionAuthority(directive.assignmentId, directive.attempt, directive.reason);
+  }
+
+  private async reportCancelledAssignment(directive: CancelDirective, entry: JournalEntry): Promise<void> {
+    const result = { class: "cancelled" as const, reason: directive.reason };
+    await this.reports.submit({ assignmentId: directive.assignmentId, attempt: directive.attempt, claimId: entry.claimId,
+      draft: { terminal: true, result: { ...result, terminalResultHash: jcsDigest(result) } } });
   }
 
   private assertSignedCancellation(directive: CancelDirective): void {

@@ -2,7 +2,10 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { FixedClock, RemoteInstanceError, ed25519Sign, generateEd25519, remoteControlSigningBytes, type CancelDirective, type RemoteWorkAssignment } from "@konteks/remote-common";
+import { FixedClock, RemoteInstanceError, ed25519Sign, generateEd25519, remoteControlSigningBytes, type CancelDirective, type RemoteWorkAssignment, type JsonValue } from "@konteks/remote-common";
+import { CoreSignatureVerifier } from "../control/core-signature.js";
+import { CancellationReceiver } from "../control/cancellation-receiver.js";
+import { CancellationReplay } from "../control/cancellation-replay.js";
 import { SessionManager, InMemorySessionRefStore } from "../../../agent-runner/src/sessions/manager.js";
 import { RunnerEventBus } from "../../../agent-runner/src/events.js";
 import { RelayedSession, type RelayedSessionDeps } from "../session/relayed-session.js";
@@ -47,7 +50,7 @@ async function sessionFixture(overrides: Partial<RelayedSessionDeps> = {}, mutat
   return { session, runner, transport, onClosed, deps, journal, outbox };
 }
 
-async function realOwnedWork() {
+async function realOwnedWork(completeStart = false) {
   let failWrite = false;
   const m = managerFixture();
   const f = await sessionFixture({}, async operation => { if (failWrite) throw new Error("disk unavailable"); return operation(); });
@@ -67,7 +70,14 @@ async function realOwnedWork() {
   const entry = { assignmentId: "assignment", attempt: 1, claimId: "claim", kind: "assistant_execution" as const, placementId: "placement", workspaceId: "workspace", agentId: "codex", state: "claimed" as const, recoveryEpoch: 0, reports: { nextSequence: 1, durableWatermark: 0 }, evidenceUpload: "structured_only" as const, expiresAt: assignment.expiresAt, latestResumeAt: assignment.policy.latestResumeAt, updatedAt: clock.nowIso() };
   await f.journal.assignments.put(entry);
   const admission = { instanceId: "instance", workspaceId: "workspace", runnerIncarnation: "process", assignmentId: "assignment", attempt: 1, claimId: "claim", agentId: "codex", executionGeneration: "generation", openedAt: clock.nowIso() };
-  await f.journal.execution.admit(admission, () => undefined);
+  if (completeStart) {
+    const seed = { enrollmentId: "enrollment", activationId: "activation", keyDigest: "a".repeat(43), createdAt: clock.nowIso() };
+    await f.journal.execution.seedEnrollment(seed);
+    await f.journal.execution.bindEnrollment({ ...seed, instanceId: "instance", workspaceId: "workspace", exchangeNonce: "exchange" });
+    await f.journal.execution.beginAdmission({ schemaVersion: 1, mandatoryOpenVersion: 1, admission, assignment,
+      evidenceUpload: "structured_only", projectionCreatedAt: clock.nowIso(), claimCreatedAt: clock.nowIso() }, () => undefined);
+    await f.journal.execution.reserveAllocation(admission, () => undefined);
+  } else await f.journal.execution.admit(admission, () => undefined);
   const internal = work as unknown as { captureNativeAuthority(id: string, attempt: number): () => void; dispatch(a: RemoteWorkAssignment, e: typeof entry, check: () => void): Promise<void> };
   const originalAuthority = internal.captureNativeAuthority(assignment.id, assignment.attempt);
   const dispatch = () => internal.dispatch(assignment, entry, originalAuthority);
@@ -682,8 +692,8 @@ describe("settling an execution whose authority was lost (production 2026-10-02)
   const processOwner = { version: 1 as const, platform: "darwin" as const, pid: 321, processGroupId: 321, startToken: "start", commandDigest: "A".repeat(43) };
 
   /** A running turn whose agent will not settle its cancelled prompt, as on the loaded Mac. */
-  async function fencedRun(stopRetainedExecution: ReturnType<typeof vi.fn>) {
-    const f = await realOwnedWork(); await f.dispatch();
+  async function fencedRun(stopRetainedExecution: ReturnType<typeof vi.fn>, completeStart = false) {
+    const f = await realOwnedWork(completeStart); await f.dispatch();
     await vi.waitFor(() => expect(f.journal.assignments.get("assignment:1")?.state).toBe("running"));
     await f.journal.execution.bindProcessOwner(f.admission, processOwner, () => undefined);
     Object.assign(f.runner, { stopRetainedExecution });
@@ -761,6 +771,126 @@ describe("settling an execution whose authority was lost (production 2026-10-02)
     await f.work.onCancel(directive);
     expect(stop).toHaveBeenCalledTimes(2);
     expect(f.outbox.depth).toBe(1);
+  });
+
+  it("settles a signed conversation cancellation after recovery stopped its process without a terminal owner", async () => {
+    const stop = vi.fn(async () => undefined);
+    const f = await fencedRun(stop);
+    await f.work.stopForRecovery("assignment", 1);
+    expect(f.journal.execution.execution(f.admission)?.phase).toBe("interrupted_unqualified");
+    expect(f.internal.lostAuthority.size).toBe(0);
+    expect(terminal(f)).toBeUndefined();
+    f.internal.deps.verifyCancellation = () => true;
+    const core = generateEd25519();
+    const unsigned = { assignmentId: "assignment", attempt: 1, reason: "policy_denied" as const, issuedAt: clock.nowIso() };
+    const directive = { ...unsigned, signature: ed25519Sign(core.privateKey, remoteControlSigningBytes(unsigned)) };
+    await f.work.onCancel(directive);
+    expect(terminal(f)).toMatchObject({ class: "cancelled", reason: "policy_denied" });
+    expect(() => f.journal.execution.assertQuiescent(f.admission)).toThrow();
+    await f.work.onCancel(directive);
+    expect(stop).toHaveBeenCalledOnce();
+    expect(f.outbox.depth).toBe(1);
+  });
+
+  it("preserves cancellation before a conversation agent process was ever opened", async () => {
+    const f = await realOwnedWork();
+    const internal = f.work as unknown as Settling;
+    internal.deps.verifyCancellation = () => true;
+    await f.work.onCancel({ assignmentId: "assignment", attempt: 1, reason: "user_cancelled",
+      issuedAt: clock.nowIso(), signature: "AA" });
+    expect(f.journal.execution.execution(f.admission)).toBeUndefined();
+    expect(f.work.reports.queuedTerminalReport("assignment", 1, "claim")?.result)
+      .toMatchObject({ class: "cancelled", reason: "user_cancelled" });
+    expect(f.outbox.depth).toBe(1);
+  });
+
+  it("replays cancellation after owner reconstruction without certifying quiescence", async () => {
+    const stop = vi.fn(async () => undefined);
+    const f = await fencedRun(stop);
+    await f.work.stopForRecovery("assignment", 1);
+    f.internal.deps.verifyCancellation = () => true;
+    const reconstructed = new WorkOrchestrator({ ...f.internal.deps } as never);
+    const directive = { assignmentId: "assignment", attempt: 1, reason: "policy_denied" as const,
+      issuedAt: clock.nowIso(), signature: "AA" };
+    await reconstructed.onCancel(directive);
+    expect(reconstructed.reports.queuedTerminalReport("assignment", 1, "claim")?.result)
+      .toMatchObject({ class: "cancelled", reason: "policy_denied" });
+    // A reconstructed owner rechecks the retained exact process independently.
+    expect(stop).toHaveBeenCalledTimes(2);
+    await reconstructed.onCancel(directive);
+    expect(f.outbox.depth).toBe(1);
+    expect(stop).toHaveBeenCalledTimes(2);
+    expect(() => f.journal.execution.assertQuiescent(f.admission)).toThrow();
+  });
+
+  it("keeps an uncertain process fenced and retries the same signed cancellation after proof becomes available", async () => {
+    let uncertain = true;
+    const f = await fencedRun(vi.fn(async () => {
+      if (uncertain) throw new RemoteInstanceError("recovery_required", "process stop unconfirmed");
+    }));
+    await expect(f.work.stopForRecovery("assignment", 1)).rejects.toMatchObject({ code: "recovery_required" });
+    f.internal.deps.verifyCancellation = () => true;
+    const directive = { assignmentId: "assignment", attempt: 1, reason: "policy_denied" as const,
+      issuedAt: clock.nowIso(), signature: "AA" };
+    await expect(f.work.onCancel(directive)).rejects.toMatchObject({ code: "recovery_required" });
+    expect(terminal(f)).toBeUndefined();
+    expect(f.outbox.depth).toBe(0);
+    uncertain = false;
+    await f.work.onCancel(directive);
+    expect(terminal(f)).toMatchObject({ class: "cancelled", reason: "policy_denied" });
+    expect(f.outbox.depth).toBe(1);
+    expect(() => f.journal.execution.assertQuiescent(f.admission)).toThrow();
+  });
+
+  it("refuses a replacement claim after the original conversation process stopped", async () => {
+    const f = await fencedRun(vi.fn(async () => undefined));
+    await f.work.stopForRecovery("assignment", 1);
+    f.internal.deps.verifyCancellation = () => true;
+    const entry = f.journal.assignments.get("assignment:1")!;
+    await f.journal.assignments.put({ ...entry, claimId: "replacement" });
+    await expect(f.work.onCancel({ assignmentId: "assignment", attempt: 1, reason: "policy_denied",
+      issuedAt: clock.nowIso(), signature: "AA" })).rejects.toMatchObject({ code: "recovery_required" });
+    expect(f.outbox.depth).toBe(0);
+  });
+
+  it("replays a durable, cryptographically verified conversation cancellation through terminal ACK without releasing quiescence fences", async () => {
+    const f = await fencedRun(vi.fn(async () => undefined), true);
+    await f.work.stopForRecovery("assignment", 1);
+    const key = generateEd25519();
+    const verifier = new CoreSignatureVerifier([{ keyId: "release", publicKey: key.publicKeyPem,
+      coreControlKeys: [{ keyId: "control", publicKeyJwk: key.publicJwk }] }]);
+    f.internal.deps.verifyCancellation = directive => verifier.verify(directive, directive.signature);
+    const journal = new SupervisorJournal(dir); await journal.load();
+    const outbox = new DurableOutbox(dir); await outbox.load();
+    const work = new WorkOrchestrator({ ...f.internal.deps, journal, outbox } as never);
+    const replay = new CancellationReplay({ journal,
+      owner: () => ({ instanceId: "instance", workspaceId: "workspace", runnerIncarnation: "process", assertCurrent: () => undefined }),
+      cancelAssignment: directive => work.onCancel(directive) });
+    const receiver = new CancellationReceiver({ verifier, inbox: journal.cancellations, claims: journal.execution,
+      captureConnection: () => ({ instanceId: "instance", workspaceId: "workspace", runnerIncarnation: "process", connectionEpoch: 2,
+        leaseExpiresAt: new Date(clock.now() + 60_000).toISOString(), assertCurrent: () => undefined }),
+      now: () => clock.now(), onPersisted: record => replay.notify(record) });
+    const sign = (body: Record<string, JsonValue>) => ({ ...body, signature: ed25519Sign(key.privateKey, remoteControlSigningBytes(body)) });
+    const directive = sign({ assignmentId: "assignment", attempt: 1, reason: "policy_denied", issuedAt: clock.nowIso() });
+    const request = sign({ type: "runtime_cancellation_delivery", method: "POST", path: { instanceId: "instance" },
+      nodeId: "node", connectionRef: "connection", connectionEpoch: 2, keyId: "control", nonce: "N".repeat(22),
+      issuedAt: clock.nowIso(), expiresAt: new Date(clock.now() + 30_000).toISOString(),
+      intent: { intentId: "intent", tenantId: "workspace", instanceId: "instance", sessionId: "cloud-session", claimId: "claim",
+        delegationRef: "delegation", directive } });
+    await receiver.receive(request); await replay.settle();
+    const report = work.reports.queuedTerminalReport("assignment", 1, "claim")!;
+    expect(report.result).toMatchObject({ class: "cancelled", reason: "policy_denied" });
+    expect(journal.activeAssignments()).toHaveLength(1); // Durable report is not Core acceptance.
+    await work.reports.onAck({ assignmentId: "assignment", attempt: 1, claimId: "claim",
+      acknowledged: { reportId: report.reportId, reportSequence: report.reportSequence },
+      durableWatermark: report.reportSequence, terminalSequence: report.reportSequence, outcome: "accepted" });
+    expect(journal.activeAssignments()).toHaveLength(0);
+    expect(outbox.depth).toBe(0);
+    await receiver.receive(request); await replay.settle();
+    expect(journal.cancellations.pending()).toHaveLength(1);
+    expect(journal.assignments.get("assignment:1")?.reports.terminalAck?.outcome).toBe("accepted");
+    expect(outbox.depth).toBe(0);
+    expect(() => journal.execution.assertQuiescent(f.admission)).toThrow();
   });
 
   it("after a restart, settles the execution a failed live stop left `stopping`", async () => {

@@ -1301,8 +1301,7 @@ export class Supervisor {
   private composeRecovery(verifier: CoreSignatureVerifier): void {
     this.cancellationReplay = new CancellationReplay({
       journal: this.journal,
-      stopForRecovery: (assignmentId, attempt) => this.work.stopForRecovery(assignmentId, attempt),
-      cancelDelivery: directive => this.work.onCancel(directive),
+      cancelAssignment: directive => this.work.onCancel(directive),
       owner: () => {
         const ownership = this.nativeOwnership;
         const instanceId = this.instanceId;

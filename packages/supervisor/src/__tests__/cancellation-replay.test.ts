@@ -45,83 +45,90 @@ async function fixture(count = 1, work: typeof conversation | typeof delivery | 
         issuedAt: now, signature: "AA" } }, now, () => {});
   }
   const owner = { instanceId: "instance", workspaceId: "tenant", runnerIncarnation: "runner", assertCurrent: vi.fn() };
-  const stop = vi.fn<(id: string, attempt: number) => Promise<void>>(async () => { throw new Error("Qualified quiescence unavailable"); });
-  const cancelDelivery = vi.fn<(directive: CancelDirective) => Promise<void>>(async () => undefined);
-  const replay = new CancellationReplay({ journal, owner: () => ({ ...owner }), stopForRecovery: stop, cancelDelivery });
-  return { journal, owner, stop, cancelDelivery, replay };
+  const cancelAssignment = vi.fn<(directive: CancelDirective) => Promise<void>>(async () => undefined);
+  const replay = new CancellationReplay({ journal, owner: () => ({ ...owner }), cancelAssignment });
+  return { journal, owner, cancelAssignment, replay };
 }
 
 it("cancels a claimed, unprompted delivery turn through its signed cancel instead of a recovery fence", async () => {
   const f = await fixture(1, delivery);
   f.replay.tick(); await f.replay.settle();
-  expect(f.cancelDelivery).toHaveBeenCalledOnce();
-  expect(f.cancelDelivery.mock.calls[0]![0]).toMatchObject({ assignmentId: "assignment-0", attempt: 1, reason: "superseded" });
-  expect(f.stop).not.toHaveBeenCalled();
+  expect(f.cancelAssignment).toHaveBeenCalledOnce();
+  expect(f.cancelAssignment.mock.calls[0]![0]).toMatchObject({ assignmentId: "assignment-0", attempt: 1, reason: "superseded" });
   // Retained until the terminal report exists; then nothing is left to do.
-  f.replay.tick(); await f.replay.settle(); expect(f.cancelDelivery).toHaveBeenCalledTimes(2);
+  f.replay.tick(); await f.replay.settle(); expect(f.cancelAssignment).toHaveBeenCalledTimes(2);
   const entry = f.journal.assignments.get("assignment-0:1")!;
   await f.journal.assignments.put({ ...entry, reports: { ...entry.reports, terminalSequence: 1 } });
-  f.replay.tick(); await f.replay.settle(); expect(f.cancelDelivery).toHaveBeenCalledTimes(2);
+  f.replay.tick(); await f.replay.settle(); expect(f.cancelAssignment).toHaveBeenCalledTimes(2);
   expect(f.journal.cancellations.pending()).toHaveLength(1);
 });
 
 it("answers a direct session turn's signed cancel with its cancelled terminal, never a recovery fence", async () => {
   const f = await fixture(1, direct);
   f.replay.tick(); await f.replay.settle();
-  expect(f.cancelDelivery).toHaveBeenCalledOnce();
-  expect(f.stop).not.toHaveBeenCalled();
+  expect(f.cancelAssignment).toHaveBeenCalledOnce();
+});
+
+it("hands a same-owner conversation cancellation to the native terminal owner", async () => {
+  const f = await fixture();
+  const admission = f.journal.execution.admission("assignment-0", 1)!;
+  f.replay.tick(); await f.replay.settle();
+  expect(f.cancelAssignment).toHaveBeenCalledOnce();
+  // Handoff itself certifies neither terminal settlement nor quiescence.
+  expect(f.journal.assignments.get("assignment-0:1")?.reports.terminalSequence).toBeUndefined();
+  expect(() => f.journal.execution.assertQuiescent(admission)).toThrow();
 });
 
 it("refuses a delivery cancellation that names another role session", async () => {
   const f = await fixture(1, { ...delivery, source: { ...delivery.source, executionSessionId: "other-session" } });
   f.replay.tick(); await f.replay.settle();
-  expect(f.cancelDelivery).not.toHaveBeenCalled(); expect(f.stop).not.toHaveBeenCalled();
+  expect(f.cancelAssignment).not.toHaveBeenCalled(); expect(f.cancelAssignment).not.toHaveBeenCalled();
 });
 
 it("replays durable records after restart into the exact stop owner without inventing completion", async () => {
   const f = await fixture(); const restarted = new SupervisorJournal(dir); await restarted.load();
-  const replay = new CancellationReplay({ journal: restarted, owner: () => ({ ...f.owner }), stopForRecovery: f.stop });
-  replay.tick(); expect(f.stop).toHaveBeenCalledWith("assignment-0", 1); await replay.settle();
+  const replay = new CancellationReplay({ journal: restarted, owner: () => ({ ...f.owner }), cancelAssignment: f.cancelAssignment });
+  replay.tick(); expect(f.cancelAssignment).toHaveBeenCalledWith(expect.objectContaining({ assignmentId: "assignment-0", attempt: 1 })); await replay.settle();
   expect(restarted.cancellations.pending()).toEqual(f.journal.cancellations.pending());
   expect(restarted.assignments.get("assignment-0:1")?.reports.terminalSequence).toBeUndefined();
 });
 
 it("coalesces duplicate notifications while a stop is pending and retains failure for another pass", async () => {
   const f = await fixture(); const pending = Promise.withResolvers<void>();
-  f.stop.mockImplementationOnce(() => pending.promise);
+  f.cancelAssignment.mockImplementationOnce(() => pending.promise);
   const record = f.journal.cancellations.pending()[0]!;
-  f.replay.notify(record); f.replay.notify(record); f.replay.tick(); expect(f.stop).toHaveBeenCalledOnce();
+  f.replay.notify(record); f.replay.notify(record); f.replay.tick(); expect(f.cancelAssignment).toHaveBeenCalledOnce();
   pending.reject(new Error("uncertain")); await f.replay.settle();
-  f.replay.tick(); await f.replay.settle(); expect(f.stop).toHaveBeenCalledTimes(2);
+  f.replay.tick(); await f.replay.settle(); expect(f.cancelAssignment).toHaveBeenCalledTimes(2);
   expect(f.journal.cancellations.pending()).toEqual([record]);
 });
 
 it.each(["runnerIncarnation", "workspaceId", "instanceId"] as const)("does not fence another current %s", async field => {
   const f = await fixture(); f.owner[field] = "foreign";
-  f.replay.tick(); await f.replay.settle(); expect(f.stop).not.toHaveBeenCalled();
+  f.replay.tick(); await f.replay.settle(); expect(f.cancelAssignment).not.toHaveBeenCalled();
 });
 
 it("refuses a replacement claim and missing or changed durable record before the synchronous fence", async () => {
   const f = await fixture(); const record = f.journal.cancellations.pending()[0]!;
   f.replay.notify({ ...record, receivedAt: "2026-09-10T00:00:01.000Z" });
   await f.journal.assignments.put({ ...f.journal.assignments.get("assignment-0:1")!, claimId: "replacement" });
-  f.replay.notify(record); expect(f.stop).not.toHaveBeenCalled();
+  f.replay.notify(record); expect(f.cancelAssignment).not.toHaveBeenCalled();
 });
 
 it("bounds active stops and rotates past unavailable historical owners", async () => {
   const f = await fixture(10); const pending = Promise.withResolvers<void>();
-  f.stop.mockImplementation(() => pending.promise);
-  f.replay.tick(); expect(f.stop).toHaveBeenCalledTimes(8);
-  f.replay.tick(); expect(f.stop).toHaveBeenCalledTimes(8);
+  f.cancelAssignment.mockImplementation(() => pending.promise);
+  f.replay.tick(); expect(f.cancelAssignment).toHaveBeenCalledTimes(8);
+  f.replay.tick(); expect(f.cancelAssignment).toHaveBeenCalledTimes(8);
   pending.resolve(); await f.replay.settle();
   f.replay.tick(); await f.replay.settle();
-  expect(new Set(f.stop.mock.calls.map(call => call[0])).size).toBe(10);
+  expect(new Set(f.cancelAssignment.mock.calls.map(call => call[0].assignmentId)).size).toBe(10);
   expect(f.journal.cancellations.pending()).toHaveLength(10);
 });
 
 it("does not interpret successful callback completion as quiescence or resume after shutdown", async () => {
-  const f = await fixture(); f.stop.mockResolvedValue(undefined);
+  const f = await fixture(); f.cancelAssignment.mockResolvedValue(undefined);
   f.replay.tick(); await f.replay.stop(); f.replay.tick(); f.replay.notify(f.journal.cancellations.pending()[0]!);
-  expect(f.stop).toHaveBeenCalledOnce(); expect(f.journal.cancellations.pending()).toHaveLength(1);
+  expect(f.cancelAssignment).toHaveBeenCalledOnce(); expect(f.journal.cancellations.pending()).toHaveLength(1);
   expect(() => f.journal.execution.assertQuiescent(f.journal.execution.admission("assignment-0", 1)!)).toThrow();
 });
