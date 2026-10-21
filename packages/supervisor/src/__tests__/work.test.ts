@@ -547,6 +547,40 @@ describe("work orchestrator claim validation", () => {
     expect(f.sent).toEqual([]);
   });
 
+  // A46 (production 2026-10-21): taufan-mac claimed nothing for four hours;
+  // every nudge logged "pulling now" and the pull's refusals were only counted.
+  it("says once per reason when it holds a pull back", async () => {
+    const warn = vi.fn();
+    const logger = { warn, info: vi.fn(), debug: vi.fn(), error: vi.fn(), child: () => logger } as never;
+    const f = await orchestrator({ headroom: () => 0, logger });
+    f.work.pull(); f.work.pull();
+    expect(f.work.counters.no_headroom).toBe(2);
+    const held = warn.mock.calls.filter(([fields]) => fields?.event === "assignment_pull.held");
+    expect(held).toHaveLength(1);
+    expect(held[0]![0]).toMatchObject({ reason: "no_headroom" });
+    expect(f.sent).toEqual([]);
+  });
+
+  it("lets a later pull through when a prepared pull never settles", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const warn = vi.fn();
+      const logger = { warn, info: vi.fn(), debug: vi.fn(), error: vi.fn(), child: () => logger } as never;
+      const preparePull = vi.fn(() => new Promise<never>(() => undefined));
+      const sender = { preparePull, scheduleRetained: vi.fn() };
+      const f = await orchestrator({ logger, assignmentSender: sender as never });
+      f.work.pull();
+      f.work.pull();
+      expect(preparePull).toHaveBeenCalledTimes(1);
+      vi.setSystemTime(Date.now() + 2 * 60_000 + 1);
+      f.work.pull();
+      expect(preparePull).toHaveBeenCalledTimes(2);
+      expect(warn.mock.calls.some(([fields]) => fields?.event === "assignment_pull.stuck")).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("closes local work on an unrecoverable relay replay gap", async () => {
     const fake = (kind: string, source: string) => ({
       channelId: "session:live", isClosed: false, close: vi.fn(async () => undefined),

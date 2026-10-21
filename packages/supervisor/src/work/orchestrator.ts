@@ -152,6 +152,11 @@ function runsToCompletionInDispatch(
     Boolean(deps.onboardCarrier && isOnboardWorkAssignment(assignment));
 }
 
+/** How often a held pull is said again for the same reason. */
+const HELD_PULL_LOG_MS = 5 * 60_000;
+/** A prepared pull older than this no longer holds later pulls back. */
+const STUCK_PULL_MS = 2 * 60_000;
+
 export class WorkOrchestrator {
   readonly reports: ReportSender;
   private readonly sessions = new Map<string, RelayedSession>();
@@ -179,6 +184,8 @@ export class WorkOrchestrator {
   private recoveryEvidenceRetryRequested = false;
   private readonly logger: Logger;
   private pullTask: Promise<void> | null = null;
+  private pullTaskStartedAt = 0;
+  private readonly heldPullLoggedAt = new Map<ClaimRejection, number>();
   readonly counters: Record<ClaimRejection, number> = { unknown_kind: 0, stale_attempt: 0, workspace_mismatch: 0, instance_mismatch: 0, checkout_owned_elsewhere: 0, role_not_advertised: 0, agent_unavailable: 0, expired: 0, draining: 0, lease_invalid: 0, reconciliation_pending: 0, no_headroom: 0 };
 
   constructor(private readonly deps: OrchestratorDeps) {
@@ -278,6 +285,7 @@ export class WorkOrchestrator {
     const gate = this.canPull();
     if (gate !== null) {
       this.counters[gate] += 1;
+      this.noteHeldPull(gate);
       return;
     }
     const body = { instanceId: this.deps.instanceId(), maxItems: Math.min(this.deps.maxPullItems, this.deps.headroom()), acceptedKinds: this.deps.acceptedKinds() };
@@ -285,7 +293,7 @@ export class WorkOrchestrator {
       this.deps.transport.send({ channel: "assignment", channelId: coreChannelId("assignment", this.deps.instanceId()), body });
       return;
     }
-    if (this.pullTask) return;
+    if (this.pullTask && !this.releaseStuckPull()) return;
     const sender = this.deps.assignmentSender;
     const task = (async () => {
       const assertCurrent = new RecoveryAuthority(this.deps.recoveryAuthority).capture("assignment");
@@ -295,8 +303,34 @@ export class WorkOrchestrator {
       sender.scheduleRetained(message => { assertCurrent(); this.deps.transport.send(message); });
     })();
     this.pullTask = task;
+    this.pullTaskStartedAt = Date.now();
     void task.catch(error => this.logger.warn({ err: error }, "prepared pull requires retry or recovery"))
       .finally(() => { if (this.pullTask === task) this.pullTask = null; });
+  }
+
+  /**
+   * A pull this computer held back, said once per reason every few minutes
+   * (A46, 2026-10-21: taufan-mac claimed nothing for four hours while every
+   * nudge logged "pulling now" and the refusals were only counted).
+   */
+  private noteHeldPull(gate: ClaimRejection): void {
+    const now = Date.now();
+    if (now - (this.heldPullLoggedAt.get(gate) ?? 0) < HELD_PULL_LOG_MS) return;
+    this.heldPullLoggedAt.set(gate, now);
+    this.logger.warn({ event: "assignment_pull.held", reason: gate, held: this.counters[gate] }, "work was not pulled; this computer is holding new work back");
+  }
+
+  /**
+   * A prepared pull that never settled must not hold every later pull back
+   * (A46). Preparing again reuses the same outstanding request, so letting
+   * the next pull through after the bound sends no second one.
+   */
+  private releaseStuckPull(): boolean {
+    const age = Date.now() - this.pullTaskStartedAt;
+    if (age < STUCK_PULL_MS) return false;
+    this.logger.warn({ event: "assignment_pull.stuck", ageMs: age }, "a prepared pull did not settle; pulling again");
+    this.pullTask = null;
+    return true;
   }
 
   /** Local validation of an assignment Core returned; the closed refusal list. */
