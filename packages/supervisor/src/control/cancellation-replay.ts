@@ -1,7 +1,7 @@
 import type { SupervisorJournal } from "../state/journal.js";
 import { CancellationInboxRecordSchema, type CancellationInboxRecord } from "../state/cancellation-inbox.js";
 import { allEqual, type CancelDirective } from "@konteks/remote-common";
-import { cancellationNamesAssignment, isDeliveryCancellation } from "./cancellation-receiver.js";
+import { cancellationNamesAssignment } from "./cancellation-receiver.js";
 
 interface ReplayOwner {
   instanceId: string;
@@ -21,11 +21,9 @@ export class CancellationReplay {
   constructor(private readonly deps: {
     journal: SupervisorJournal;
     owner: () => ReplayOwner | null;
-    /** Must synchronously fence the exact attempt before returning its task. */
-    stopForRecovery: (assignmentId: string, attempt: number) => Promise<void>;
-    /** A native delivery turn's signed cancel: close its session and report
-     * the cancelled terminal. Idempotent once reported. */
-    cancelDelivery?: (directive: CancelDirective) => Promise<void>;
+    /** The signed cancellation owner must stop the exact attempt and qualify
+     * its terminal report independently. Completion is not quiescence proof. */
+    cancelAssignment: (directive: CancelDirective) => Promise<void>;
   }) {}
 
   /** Called immediately after fsync. Never waits for ACP before receipt I/O. */
@@ -70,13 +68,12 @@ export class CancellationReplay {
     }
   }
 
-  /** The stop to start; null for a delivery turn that already reported, which is already stopped. */
+  /** Every admitted cancellation belongs to the native signed terminal owner. */
   private stopFor(record: CancellationInboxRecord): Promise<void> | null {
     const { assignmentId, attempt } = record.intent.directive;
     const entry = this.deps.journal.assignments.get(`${assignmentId}:${attempt}`);
-    const delivery = isDeliveryCancellation(this.deps.journal.execution.start(assignmentId, attempt)!.assignment);
-    if (delivery && (entry?.reports.terminalSequence !== undefined || !this.deps.cancelDelivery)) return null;
-    return delivery ? this.deps.cancelDelivery!(record.intent.directive) : this.deps.stopForRecovery(assignmentId, attempt);
+    if (entry?.reports.terminalSequence !== undefined) return null;
+    return this.deps.cancelAssignment(record.intent.directive);
   }
 
   private assertOwned(record: CancellationInboxRecord, owner: ReplayOwner): void {
