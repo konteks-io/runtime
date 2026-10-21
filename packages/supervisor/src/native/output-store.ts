@@ -104,6 +104,17 @@ export class NativeOutputStore {
     await this.remove();
   }
 
+  /** Keep another workspace's accepted record of this exact turn here, unchanged. */
+  async adopt(record: NativeOutputRecord): Promise<void> {
+    if (record.state !== "accepted" || (this.turn && !candidateOfTurn(record.candidate, this.turn))) throw unavailable();
+    const existing = await this.read();
+    if (existing) {
+      if (canonicalize(existing as never) !== canonicalize(record as never)) throw unavailable();
+      return;
+    }
+    await this.write(record);
+  }
+
   async removePending(): Promise<void> {
     const record = await this.read();
     if (!record || record.state !== "pending") throw unavailable();
@@ -229,6 +240,30 @@ export class NativeOutputSessionHeadStore {
         record.receipt.resultDigest !== expected.resultDigest) throw unavailable();
   }
 
+  /**
+   * The session's agent changed on this computer (D206 rebind): its accepted
+   * output is recorded in the previous agent's workspace, and this one had
+   * none, so every continuation refused (A44, 2026-10-21). Adopt exactly the
+   * head that names Core's expected accepted turn and that turn's accepted
+   * record, unchanged. Nothing is adopted when this workspace already has a
+   * head, and `verifyExpected` still checks everything adopted.
+   */
+  async adoptFromSibling(siblingRoots: ReadonlyArray<string>, expected: ExpectedAcceptance): Promise<boolean> {
+    if (await this.read()) return false;
+    const turn = { invocationId: expected.invocationId, claimId: expected.claimId };
+    for (const root of siblingRoots) {
+      const sibling = new NativeOutputSessionHeadStore(root, this.sessionId);
+      const head = await sibling.read().catch(() => null);
+      if (!head?.latest || !turnIs(head.latest, expected)) continue;
+      const record = await sibling.record(turn).read().catch(() => null);
+      if (!acceptedAs(record, expected)) continue;
+      await this.record(turn).adopt(record);
+      await this.write({ version: 1, latest: head.latest });
+      return true;
+    }
+    return false;
+  }
+
   async promote(current: Omit<TurnIdentity, "sessionId">): Promise<void> {
     const identity = TurnIdentitySchema.parse({ sessionId: this.sessionId, ...current });
     const before = await this.read();
@@ -319,6 +354,12 @@ function sameCandidate(existing: NativeOutputRecord, candidate: RemoteDeliveryRe
 
 function latestOf(head: SessionHead | null): Pick<SessionHead, "latest" | "recovered"> {
   return { ...(head?.latest ? { latest: head.latest } : {}), ...(head?.recovered ? { recovered: head.recovered } : {}) };
+}
+
+/** An accepted record of exactly the turn, acceptance and result Core expects. */
+function acceptedAs(record: NativeOutputRecord | null, expected: ExpectedAcceptance): record is NativeOutputRecord & { state: "accepted" } {
+  return record?.state === "accepted" && record.receipt.acceptanceId === expected.acceptanceId &&
+    record.receipt.resultDigest === expected.resultDigest;
 }
 
 /** Whether a head entry names this invocation and claim. */
