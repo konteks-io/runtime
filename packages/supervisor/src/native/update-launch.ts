@@ -3,6 +3,7 @@ import { open } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { NATIVE_UPDATE_TARGET_ENV, NativeUpdateTargetSchema, sanitizeInheritedChildProcessEnv } from "@konteks/remote-common";
 import type { NativeUpdateTarget } from "./update.js";
+import { observeNativeUpdaterExit, type NativeUpdaterExitListener } from "./update-launch-diagnostics.js";
 
 interface NativeUpdateLaunchOptions {
   root: string;
@@ -31,8 +32,9 @@ interface NativeUpdateLaunch {
   pid: number | null;
   command: string;
   args: string[];
+  launchId?: string;
   /** Fires when the spawned transaction exits while this service is still alive (a refusal or early failure); a successful update stops this service first. */
-  onExit: (listener: (code: number | null) => void) => void;
+  onExit: (listener: NativeUpdaterExitListener) => void;
 }
 
 export async function launchNativeUpdater(options: NativeUpdateLaunchOptions): Promise<NativeUpdateLaunch> {
@@ -50,24 +52,23 @@ export async function launchNativeUpdater(options: NativeUpdateLaunchOptions): P
   }
 }
 
-function launchDebianUpdater(options: NativeUpdateLaunchOptions, env: NodeJS.ProcessEnv, updateArgs: string[]): Promise<NativeUpdateLaunch> {
+async function launchDebianUpdater(options: NativeUpdateLaunchOptions, env: NodeJS.ProcessEnv, updateArgs: string[]): Promise<NativeUpdateLaunch> {
   const unit = `konteks-remote-update-${Date.now()}`;
-  // A transient service inherits the user manager's environment. --setenv
-  // without a value explicitly copies these names from the client process,
-  // keeping the fixed target and per-process network trust without exposing
-  // proxy credentials in command arguments.
-  const forwarded = [...UPDATER_ENV_ALLOWLIST, NATIVE_UPDATE_TARGET_ENV].filter(name => env[name] !== undefined).map(name => `--setenv=${name}`);
+  // systemd249 requires an assignment for the public frozen release target.
+  // Keep network settings on their existing name-only path: proxy credentials
+  // must never become process arguments. These require a newer systemd client.
+  const forwarded = UPDATER_ENV_ALLOWLIST.filter(name => env[name] !== undefined).map(name => `--setenv=${name}`);
+  if (env[NATIVE_UPDATE_TARGET_ENV] !== undefined) forwarded.push(`--setenv=${NATIVE_UPDATE_TARGET_ENV}=${env[NATIVE_UPDATE_TARGET_ENV]}`);
   const args = ["--user", "--collect", "--quiet", `--unit=${unit}`, "--property=KillMode=process", ...forwarded, options.executable, ...updateArgs];
-  return launchProcess(options, "systemd-run", args, env, "ignore");
+  const launched = await launchProcess(options, "systemd-run", args, env, ["ignore", "ignore", "pipe"], true);
+  return { ...launched, launchId: unit };
 }
 
-async function launchProcess(options: NativeUpdateLaunchOptions, command: string, args: string[], env: NodeJS.ProcessEnv, stdio: StdioOptions): Promise<NativeUpdateLaunch> {
+async function launchProcess(options: NativeUpdateLaunchOptions, command: string, args: string[], env: NodeJS.ProcessEnv, stdio: StdioOptions, captureStderr = false): Promise<NativeUpdateLaunch> {
   const spawnFn = options.spawnFn ?? spawn;
   options.assertCurrent?.();
   const child = spawnFn(command, args, { env, stdio, detached: true, windowsHide: true });
-  let exitCode: number | null | undefined;
-  let exitListener: ((code: number | null) => void) | undefined;
-  child.once("exit", code => { exitCode = code; exitListener?.(code); });
+  const onExit = observeNativeUpdaterExit(child, captureStderr);
   await new Promise<void>((resolve, reject) => {
     // Retain the listener after spawn, so a later child error cannot end the
     // serving connector. Before spawn it rejects admission without unref.
@@ -75,8 +76,5 @@ async function launchProcess(options: NativeUpdateLaunchOptions, command: string
     child.once("spawn", resolve);
   });
   child.unref();
-  return { pid: child.pid ?? null, command, args, onExit: listener => {
-    if (exitCode !== undefined) listener(exitCode);
-    else exitListener = listener;
-  } };
+  return { pid: child.pid ?? null, command, args, onExit };
 }

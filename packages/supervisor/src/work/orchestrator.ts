@@ -152,6 +152,11 @@ function runsToCompletionInDispatch(
     Boolean(deps.onboardCarrier && isOnboardWorkAssignment(assignment));
 }
 
+/** How often a held pull is said again for the same reason. */
+const HELD_PULL_LOG_MS = 5 * 60_000;
+/** A prepared pull older than this no longer holds later pulls back. */
+const STUCK_PULL_MS = 2 * 60_000;
+
 export class WorkOrchestrator {
   readonly reports: ReportSender;
   private readonly sessions = new Map<string, RelayedSession>();
@@ -179,6 +184,8 @@ export class WorkOrchestrator {
   private recoveryEvidenceRetryRequested = false;
   private readonly logger: Logger;
   private pullTask: Promise<void> | null = null;
+  private pullTaskStartedAt = 0;
+  private readonly heldPullLoggedAt = new Map<ClaimRejection, number>();
   readonly counters: Record<ClaimRejection, number> = { unknown_kind: 0, stale_attempt: 0, workspace_mismatch: 0, instance_mismatch: 0, checkout_owned_elsewhere: 0, role_not_advertised: 0, agent_unavailable: 0, expired: 0, draining: 0, lease_invalid: 0, reconciliation_pending: 0, no_headroom: 0 };
 
   constructor(private readonly deps: OrchestratorDeps) {
@@ -278,6 +285,7 @@ export class WorkOrchestrator {
     const gate = this.canPull();
     if (gate !== null) {
       this.counters[gate] += 1;
+      this.noteHeldPull(gate);
       return;
     }
     const body = { instanceId: this.deps.instanceId(), maxItems: Math.min(this.deps.maxPullItems, this.deps.headroom()), acceptedKinds: this.deps.acceptedKinds() };
@@ -285,7 +293,7 @@ export class WorkOrchestrator {
       this.deps.transport.send({ channel: "assignment", channelId: coreChannelId("assignment", this.deps.instanceId()), body });
       return;
     }
-    if (this.pullTask) return;
+    if (this.pullTask && !this.releaseStuckPull()) return;
     const sender = this.deps.assignmentSender;
     const task = (async () => {
       const assertCurrent = new RecoveryAuthority(this.deps.recoveryAuthority).capture("assignment");
@@ -295,8 +303,34 @@ export class WorkOrchestrator {
       sender.scheduleRetained(message => { assertCurrent(); this.deps.transport.send(message); });
     })();
     this.pullTask = task;
+    this.pullTaskStartedAt = Date.now();
     void task.catch(error => this.logger.warn({ err: error }, "prepared pull requires retry or recovery"))
       .finally(() => { if (this.pullTask === task) this.pullTask = null; });
+  }
+
+  /**
+   * A pull this computer held back, said once per reason every few minutes
+   * (A46, 2026-10-21: taufan-mac claimed nothing for four hours while every
+   * nudge logged "pulling now" and the refusals were only counted).
+   */
+  private noteHeldPull(gate: ClaimRejection): void {
+    const now = Date.now();
+    if (now - (this.heldPullLoggedAt.get(gate) ?? 0) < HELD_PULL_LOG_MS) return;
+    this.heldPullLoggedAt.set(gate, now);
+    this.logger.warn({ event: "assignment_pull.held", reason: gate, held: this.counters[gate] }, "work was not pulled; this computer is holding new work back");
+  }
+
+  /**
+   * A prepared pull that never settled must not hold every later pull back
+   * (A46). Preparing again reuses the same outstanding request, so letting
+   * the next pull through after the bound sends no second one.
+   */
+  private releaseStuckPull(): boolean {
+    const age = Date.now() - this.pullTaskStartedAt;
+    if (age < STUCK_PULL_MS) return false;
+    this.logger.warn({ event: "assignment_pull.stuck", ageMs: age }, "a prepared pull did not settle; pulling again");
+    this.pullTask = null;
+    return true;
   }
 
   /** Local validation of an assignment Core returned; the closed refusal list. */
@@ -1274,6 +1308,8 @@ export class WorkOrchestrator {
   private async takeOverHarnessHead(assignment: HarnessAssignment, admission: LocalAdmission, sessionId: string, assertCurrent: () => void): Promise<Takeover | undefined> {
     const pendingRestore = this.deps.journal.execution.pendingRestore(admission, assignment);
     if (pendingRestore) return { reference: pendingRestore, mode: "restore" };
+    const rebound = this.reboundHead(assignment);
+    if (rebound) return this.startFreshAfterRebound(assignment, rebound, assertCurrent);
     let retained;
     try {
       retained = this.deps.journal.execution.liveContinuation(assignment);
@@ -1287,6 +1323,52 @@ export class WorkOrchestrator {
       return undefined;
     }
     return this.transferHead(retained, admission, sessionId, assertCurrent);
+  }
+
+  /**
+   * Core moved the session to another agent or model (A44): the head's ACP
+   * session can never continue under the new one. Only the exact predecessor
+   * turn, terminal and acknowledged by Core, with nothing here still owning
+   * it, qualifies. Its changes stay in the workspace and its accepted output
+   * is adopted at input preparation.
+   */
+  private reboundHead(successor: HarnessAssignment): LocalAdmission | null {
+    const head = this.reboundPredecessorHead(successor);
+    if (!head || this.deps.journal.execution.headContinuationTip(successor)) return null;
+    if (this.ownedLocally(head, `${head.assignmentId}:${head.attempt}`) || !this.claimSettledByCore(head)) return null;
+    return head;
+  }
+
+  /** The role head, when it is this successor's exact predecessor turn under another agent or model. */
+  private reboundPredecessorHead(successor: HarnessAssignment): LocalAdmission | null {
+    const predecessorTurn = successor.source.turn.predecessor;
+    const head = this.deps.journal.execution.harnessRoleHead(successor);
+    const before = head && this.deps.journal.execution.start(head.assignmentId, head.attempt)?.assignment;
+    if (!predecessorTurn || !head || !before || !reboundRoleSession(before, successor)) return null;
+    return turnIdentity(before.source.turn) === turnIdentity(predecessorTurn) ? head : null;
+  }
+
+  /** Prove the previous agent's retained process gone, then start a fresh ACP session for the new one. */
+  private async startFreshAfterRebound(successor: HarnessAssignment, head: LocalAdmission, assertCurrent: () => void): Promise<undefined> {
+    const key = `${head.assignmentId}:${head.attempt}`;
+    const phase = this.deps.journal.execution.execution(head)?.phase;
+    if (phase !== undefined && UNFINISHED_PHASES.has(phase)) {
+      const assertHead = () => {
+        assertCurrent();
+        this.requireNativeOwner();
+        if (this.ownedLocally(head, key) || this.deps.journal.assignments.get(key)?.claimId !== head.claimId) {
+          throw new RemoteInstanceError("recovery_required", "The previous agent's turn gained a local owner during its stop.");
+        }
+      };
+      if (!(await this.retireTip(successor, head, assertHead))) {
+        throw new RemoteInstanceError("recovery_required", "The previous agent's turn could not be confirmed stopped.",
+          { diagnostic: "rebound_head_stop_unconfirmed" });
+      }
+    }
+    this.logger.warn({ assignmentId: successor.id, attempt: successor.attempt, predecessorAssignmentId: head.assignmentId,
+      predecessorAgentId: head.agentId, agentId: successor.agentRoute.agentId, stage: "channel_handoff", outcome: "fresh_after_rebound" },
+    "the session moved to another agent; the previous agent's session is stopped and a fresh ACP session starts");
+    return undefined;
   }
 
   /**
@@ -2760,6 +2842,28 @@ function sameHarnessRoleSession(predecessor: RemoteWorkAssignment, successor: Re
     before.executionSessionId === after.executionSessionId &&
     before.repositoryId === after.repositoryId &&
     jcsDigest(before.modelBinding as JsonValue) === jcsDigest(after.modelBinding as JsonValue);
+}
+
+/** The same repository role session, moved by Core to another agent or model (A44). */
+function reboundRoleSession(predecessor: RemoteWorkAssignment, successor: HarnessAssignment): predecessor is HarnessAssignment {
+  if (!harnessDelivery(predecessor)) return false;
+  const moved = predecessor.agentRoute.agentId !== successor.agentRoute.agentId ||
+    jcsDigest(predecessor.source.modelBinding as JsonValue) !== jcsDigest(successor.source.modelBinding as JsonValue);
+  return moved && samePlacedRoleSession(predecessor, successor);
+}
+
+/** Same instance, workspace, task, role, owner, session and repository; agent and model aside. */
+function samePlacedRoleSession(predecessor: HarnessAssignment, successor: HarnessAssignment): boolean {
+  const before = predecessor.source, after = successor.source;
+  return allSame([
+    [predecessor.instanceId, successor.instanceId], [predecessor.workspaceId, successor.workspaceId], [predecessor.taskId, successor.taskId],
+    [predecessor.agentRoute.requiredRole, successor.agentRoute.requiredRole], [before.ownerInstanceId, after.ownerInstanceId],
+    [before.executionSessionId, after.executionSessionId], [before.repositoryId, after.repositoryId],
+  ]);
+}
+
+function allSame(pairs: ReadonlyArray<readonly [unknown, unknown]>): boolean {
+  return pairs.every(([left, right]) => left === right);
 }
 
 /** Same instance, workspace, task, role, agent and model. */
