@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -37,6 +37,29 @@ describe("the worktrees a viewer may preview (09-30)", () => {
     const afterRestart = new PreviewWorktreePermits(file);
     expect(afterRestart.get("qa-session")).toBe(second);
     expect(afterRestart.get("generator-session")).toBe(first);
+  });
+
+  it("retains managed repository policy after restart and clears it on a new ordinary bootstrap", async () => {
+    const data = await mkdtemp(join(tmpdir(), "permits-")); dirs.push(data);
+    const cwd = join(data, "qa"); await mkdir(cwd);
+    const file = join(data, "permits.json");
+    new PreviewWorktreePermits(file).set("qa", cwd, true);
+    const restored = new PreviewWorktreePermits(file);
+    expect(restored.get("qa")).toBe(cwd);
+    expect(restored.managedRepository("qa")).toBe(true);
+    restored.set("qa", cwd);
+    expect(new PreviewWorktreePermits(file).managedRepository("qa")).toBeUndefined();
+  });
+
+  it("reads legacy entries without promoting them to managed repository authority", async () => {
+    const data = await mkdtemp(join(tmpdir(), "permits-")); dirs.push(data);
+    const cwd = join(data, "ordinary"); await mkdir(cwd);
+    const file = join(data, "permits.json");
+    await writeFile(file, JSON.stringify({ legacy: cwd, invalid: { cwd, managedRepository: "true" } }));
+    const permits = new PreviewWorktreePermits(file);
+    expect(permits.get("legacy")).toBe(cwd);
+    expect(permits.managedRepository("legacy")).toBeUndefined();
+    expect(permits.get("invalid")).toBeUndefined();
   });
 
   it("starts empty when nothing was kept", async () => {

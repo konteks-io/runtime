@@ -124,6 +124,14 @@ describe("preview configuration: .konteks/preview.yaml, else a sensible inferred
 });
 
 describe("preview environment and PATH", () => {
+  it("suppresses Husky only for managed repository previews, without accepting a repository override", () => {
+    const managed = buildPreviewEnv({ HUSKY: "1", PRIVATE_PROVIDER_SENTINEL: "private" }, "/tools", 43000, { HUSKY: "1" }, true);
+    expect(managed.HUSKY).toBe("0");
+    expect(managed).not.toHaveProperty("PRIVATE_PROVIDER_SENTINEL");
+    expect(buildPreviewEnv({ HUSKY: "0" }, "/tools", 43000, {})).not.toHaveProperty("HUSKY");
+    expect(buildPreviewEnv({}, "/tools", 43000, { HUSKY: "1" }).HUSKY).toBe("1");
+  });
+
   it("passes only allow-listed variables, never connector secrets, and pins HOST/PORT", () => {
     const env = buildPreviewEnv({ HOME: "/Users/a", LANG: "en_US.UTF-8", LC_ALL: "en_US.UTF-8", KONTEKS_ACTIVATION_CODE: "secret", ANTHROPIC_API_KEY: "sk", SUPERVISOR_DATA_DIR: "/d", GITHUB_TOKEN: "t", NODE_OPTIONS: "--require x" },
       "/opt/homebrew/bin:/usr/bin", 43100, { VITE_FLAG: "1", PORT: "1", HOST: "0.0.0.0" });
@@ -168,6 +176,36 @@ describe("supervised preview process manager", () => {
     });
     return { instance, children, terminated, stopped, setUp: (value: boolean) => { up = value; }, advance: (ms: number) => { now += ms; } };
   }
+
+  it("protects install, prepare and serve phases of a managed repository preview", async () => {
+    const f = manager({}, { ok: true, plan: { command: "npm run dev", install: "npm install", prepare: "npm run build", healthPath: "/", env: { HUSKY: "1" }, source: "preview_yaml", explanation: "test", notes: [] } });
+    try {
+      f.setUp(true);
+      await f.instance.start("qa", "/qa", "agent", true);
+      await vi.waitFor(() => expect(f.children).toHaveLength(1));
+      f.children[0]!.exit(0);
+      await vi.waitFor(() => expect(f.children).toHaveLength(2));
+      f.children[1]!.exit(0);
+      await f.instance.waitForSettled("qa", 2000);
+      expect(f.children.map(child => child.env.HUSKY)).toEqual(["0", "0", "0"]);
+      expect(f.children.every(child => child.env.OPENAI_API_KEY === undefined)).toBe(true);
+    } finally { await f.instance.close(); }
+  });
+
+  it("restarts instead of reusing a preview started with different repository policy", async () => {
+    const f = manager();
+    try {
+      f.setUp(true);
+      await f.instance.start("s", "/same");
+      await f.instance.waitForSettled("s", 2000);
+      await f.instance.start("s", "/same", "agent", true);
+      await f.instance.waitForSettled("s", 2000);
+      expect(f.children.map(child => child.env.HUSKY)).toEqual([undefined, "0"]);
+      expect(f.terminated).toHaveLength(1);
+      await f.instance.start("s", "/same", "viewer", true);
+      expect(f.children).toHaveLength(2);
+    } finally { await f.instance.close(); }
+  });
 
   it("starts one preview per session in its working copy, reports the inferred command and serves only once healthy", async () => {
     const f = manager();

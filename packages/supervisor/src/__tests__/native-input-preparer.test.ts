@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildReleaseFixture } from "@konteks/remote-release";
 import {
   FixedClock,
+  RemoteInstanceError,
   computeRemoteFileTreeDigest,
   computeRemoteSkillCatalogDigest,
   computeRemoteAssignmentInputSelectionDigest,
@@ -15,6 +16,7 @@ import {
 } from "@konteks/remote-common";
 import { NativeInputClient } from "../native/input-client.js";
 import { createNativeInputPreparer } from "../native/input-preparer.js";
+import { dispatchFailureOutcome } from "../work/dispatch-failure-outcome.js";
 import { StateMutationGate } from "../state/mutation-gate.js";
 import { testGitCommand, testGitTool } from "./native-git-fixture.js";
 import { captureWorkspaceCheckpoint } from "../native/workspace-checkpoint.js";
@@ -401,6 +403,52 @@ describe("native authorized input composition", () => {
       .rejects.toMatchObject({ code: "capability_unavailable", retryable: false });
     expect(onRuntimeFailure).toHaveBeenCalledOnce();
     await Promise.resolve();
+  });
+
+  it("reports isolated repository config drift through input preparation without changing retained work", async () => {
+    const f = await repositoryFixture(continuityFiles);
+    const options = { ...f.options, git: f.git, repositoryCacheRoot: join(f.root, "cache") };
+    const current = nativeRepositoryAssignment();
+    const prepare = createNativeInputPreparer(options);
+    const prepared = await prepare(current);
+    await writeFile(join(prepared.cwd, "retained.txt"), "unpublished work");
+    await testGitCommand(f.git, prepared.cwd, ["config", "core.hooksPath", ".husky/_"]);
+    let caught: unknown;
+    try { await prepare(current); } catch (error) { caught = error; }
+    expect(caught).toMatchObject({ code: "capability_unavailable", diagnostic: "workspace_policy_invalid" });
+    expect(dispatchFailureOutcome(caught, "7.13")).toEqual({ class: "failed", reason: "workspace_policy_invalid" });
+    expect(await readFile(join(prepared.cwd, "retained.txt"), "utf8")).toBe("unpublished work");
+    expect((await testGitCommand(f.git, prepared.cwd, ["config", "core.hooksPath"])).trim()).toBe(".husky/_");
+  });
+
+  it("preserves the typed workspace policy verdict through the real input factory", async () => {
+    const f = await fixture();
+    const client = f.options.client();
+    const failure = new RemoteInstanceError("capability_unavailable", "Workspace policy refused.",
+      { diagnostic: "workspace_policy_invalid" });
+    vi.spyOn(client, "prepare").mockRejectedValueOnce(failure);
+    let caught: unknown;
+    try { await createNativeInputPreparer({ ...f.options, client: () => client })(assignment); }
+    catch (error) { caught = error; }
+    expect(caught).toBe(failure);
+    expect(dispatchFailureOutcome(caught, "7.13")).toEqual({ class: "failed", reason: "workspace_policy_invalid" });
+    expect(dispatchFailureOutcome(caught, "7.12")).toEqual({ class: "failed", reason: "internal" });
+  });
+
+  it.each([
+    new Error("workspace_policy_invalid"),
+    new RemoteInstanceError("capability_unavailable", "workspace_policy_invalid"),
+    new RemoteInstanceError("permission_denied", "refused", { diagnostic: "workspace_policy_invalid" }),
+  ])("does not promote an untyped or unrelated input failure into a policy verdict: %s", async failure => {
+    const f = await fixture();
+    const client = f.options.client();
+    vi.spyOn(client, "prepare").mockRejectedValueOnce(failure);
+    let caught: unknown;
+    try { await createNativeInputPreparer({ ...f.options, client: () => client })(assignment); }
+    catch (error) { caught = error; }
+    expect(caught).toMatchObject({ code: "capability_unavailable", retryable: false });
+    expect(caught).not.toHaveProperty("diagnostic", "workspace_policy_invalid");
+    expect(dispatchFailureOutcome(caught, "7.13")).toEqual({ class: "failed", reason: "internal" });
   });
 
   it("does not infer errno from preparation error prose", async () => {

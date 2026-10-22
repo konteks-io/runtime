@@ -23,7 +23,7 @@ const MAX_REQUEST_BYTES = 256 * 1024;
 
 /** What a session may do with this machine's previews: only its own, in its own worktree. */
 export interface SessionPreviewAccess {
-  start(sessionId: string, cwd: string): Promise<PreviewStatus>;
+  start(sessionId: string, cwd: string, managedRepository?: true): Promise<PreviewStatus>;
   stop(sessionId: string, reason: string): Promise<PreviewStatus>;
   status(sessionId: string): PreviewStatus;
   /** A prompt or update on the session: keeps its preview from idling. */
@@ -35,7 +35,7 @@ export interface SessionPreviewAccess {
    * Konteks starts it when nothing runs. Kept while the worktree exists,
    * however the session ends (a later bootstrap of the session replaces it).
    */
-  permit?(sessionId: string, cwd: string): void;
+  permit?(sessionId: string, cwd: string, managedRepository?: true): void;
   /** The loopback origin of the session's preview while it answers (what its browser may reach), else null. */
   origin?(sessionId: string): string | null;
   /** Where Playwright's own Chromium is installed when this computer has no Chrome; absent = no browsers. */

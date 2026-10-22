@@ -10,12 +10,12 @@ const REFUSED_REASON = "This computer could not start the preview. Try again in 
 
 interface ViewerStartDeps {
   previews: {
-    start(sessionId: string, cwd: string, startedBy: PreviewStarter): Promise<PreviewStatus>;
+    start(sessionId: string, cwd: string, startedBy: PreviewStarter, managedRepository?: true): Promise<PreviewStatus>;
     status(sessionId: string): PreviewStatus;
     lastFailureFor(sessionId: string): PreviewFailure | null;
   };
   /** The session's kept worktree, whatever happened to the session since (D96). */
-  permits: { get(sessionId: string): string | undefined };
+  permits: { get(sessionId: string): string | undefined; managedRepository?(sessionId: string): true | undefined };
   /** False while this computer is stopping, draining or without an active lease. */
   takingWork(): boolean;
   /** How long a failed viewer start waits before a viewer may start it again. */
@@ -49,7 +49,7 @@ export class PreviewViewerStarts {
     const pending = pendingViewerRetry(this.#lastStart.get(sessionId), this.deps.previews.lastFailureFor(sessionId), now, this.deps.retryMs);
     if (pending !== null) return this.decline(sessionId, "retry_pending", pending);
     this.#lastStart.set(sessionId, now);
-    const started = await this.deps.previews.start(sessionId, cwd, "viewer");
+    const started = await this.deps.previews.start(sessionId, cwd, "viewer", this.deps.permits.managedRepository?.(sessionId));
     return this.startResult(sessionId, started);
   }
 

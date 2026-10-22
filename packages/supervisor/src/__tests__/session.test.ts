@@ -371,7 +371,7 @@ describe("relayed session", () => {
       const answer = await (await fetch(tools.url, { method: "POST", headers: { authorization: tools.headers[0]!.value, "content-type": "application/json" },
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "preview_start", arguments: {} } }) })).json();
       expect(answer).toMatchObject({ result: { structuredContent: { sessionId: "s", state: "running" } } });
-      expect(preview.start).toHaveBeenCalledWith("s", "/private/native/checkout");
+      expect(preview.start).toHaveBeenCalledWith("s", "/private/native/checkout", undefined);
       // The agent reading its preview is the agent using it.
       await (await fetch(tools.url, { method: "POST", headers: { authorization: tools.headers[0]!.value, "content-type": "application/json" },
         body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "preview_status", arguments: {} } }) })).json();
@@ -386,6 +386,23 @@ describe("relayed session", () => {
       await expect(fetch(tools.url, { method: "POST", headers: { authorization: tools.headers[0]!.value }, body: "{}" })).rejects.toThrow();
     });
 
+    it("passes verified repository policy to both preview start and retained viewer permission", async () => {
+      const preview = previewAccess();
+      const f = await build({ preview, prepareInputs: async target => ({
+        binding: { workspaceId: target.workspaceId, sessionId: "s", assignmentId: target.id, instanceId: target.instanceId, attempt: target.attempt },
+        cwd: "/private/native/checkout", managedRepository: true, skillInstructions: "", beforePrompt: async () => undefined,
+      }) });
+      try {
+        await f.session.bootstrap();
+        expect(preview.permit).toHaveBeenCalledWith("s", "/private/native/checkout", true);
+        const servers = (f.runnerCalls[0]![1][0] as { mcpServers: Array<{ name: string; url: string; headers: Array<{ value: string }> }> }).mcpServers;
+        const tools = servers.find(server => server.name === "konteks-preview")!;
+        await fetch(tools.url, { method: "POST", headers: { authorization: tools.headers[0]!.value, "content-type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "preview_start", arguments: {} } }) });
+        expect(preview.start).toHaveBeenCalledWith("s", "/private/native/checkout", true);
+      } finally { await f.session.close("cancelled"); }
+    });
+
     it("keeps the session's worktree openable by a viewer however the session ends, across a restart (D96)", async () => {
       const data = await mkdtemp(join(tmpdir(), "permits-"));
       try {
@@ -398,7 +415,7 @@ describe("relayed session", () => {
           const preview = { ...previewAccess(), permit: vi.fn((sessionId: string, cwd: string) => permits.set(sessionId, cwd)) };
           const f = await build({ preview });
           await f.session.bootstrap();
-          expect(preview.permit).toHaveBeenCalledWith("s", "/private/native/checkout");
+          expect(preview.permit).toHaveBeenCalledWith("s", "/private/native/checkout", undefined);
           await f.session.close(reason);
           expect(preview.stop).toHaveBeenCalledWith("s", reason);
           expect(new PreviewWorktreePermits(file, () => true).get("s")).toBe("/private/native/checkout");
