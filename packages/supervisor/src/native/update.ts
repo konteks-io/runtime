@@ -52,6 +52,13 @@ const DEFAULT_STALE_ATTEMPT_MS = 45 * 60_000;
  */
 const ACCEPTANCE_RECHECK_FIRST_MS = 15 * 60_000;
 const ACCEPTANCE_RECHECK_MAX_MS = 60 * 60_000;
+/**
+ * Between channel checks, Konteks is asked this often which release it
+ * accepts: a newer one is checked for and installed at once instead of at the
+ * next 6-hour tick (A49, 10-22: Core accepted 0.19.20 at 13:55Z and taufan-mac
+ * only looked at 15:41Z, while a fix it needed waited).
+ */
+const ACCEPTED_RELEASE_POLL_MS = 60 * 60_000;
 
 /** Why the update is checked again soon, for the scheduled re-check. */
 interface AwaitingAcceptance {
@@ -91,6 +98,7 @@ export class NativeUpdateCoordinator {
   private timer: NodeJS.Timeout | null = null;
   private initialTimer: NodeJS.Timeout | null = null;
   private recheckTimer: NodeJS.Timeout | null = null;
+  private acceptedPollTimer: NodeJS.Timeout | null = null;
   /** Re-checks scheduled since the release last stopped waiting for Core. */
   private recheckStreak = 0;
   private lastUnlaunchedReason: string | null = null;
@@ -111,12 +119,25 @@ export class NativeUpdateCoordinator {
     this.initialTimer.unref();
     this.timer = setInterval(tick, this.options.checkIntervalMs ?? DEFAULT_CHECK_INTERVAL_MS);
     this.timer.unref();
+    this.acceptedPollTimer = setInterval(() => void this.followAcceptedRelease().catch(() => undefined), ACCEPTED_RELEASE_POLL_MS);
+    this.acceptedPollTimer.unref();
+  }
+
+  /** Konteks moved its accepted release past this one: check for it now. Nothing else is read until it does. */
+  private async followAcceptedRelease(): Promise<void> {
+    if (this.stopped || this.inFlight || this.recheckTimer || !this.options.acceptedRelease) return;
+    const accepted = await this.options.acceptedRelease().catch(() => undefined);
+    if (!accepted || compareSemver(accepted.bundleVersion, this.options.currentBundleVersion) <= 0) return;
+    this.options.logger.info({ event: "native.update.accepted_moved", accepted: accepted.bundleVersion, current: this.options.currentBundleVersion },
+      "Konteks accepts a newer release; checking for it now");
+    await this.apply("periodic");
   }
 
   stop(): void {
     this.stopped = true;
     if (this.initialTimer) clearTimeout(this.initialTimer);
     if (this.timer) clearInterval(this.timer);
+    if (this.acceptedPollTimer) clearInterval(this.acceptedPollTimer);
     if (this.recheckTimer) clearTimeout(this.recheckTimer);
     this.initialTimer = null;
     this.timer = null;
