@@ -1334,7 +1334,7 @@ export class WorkOrchestrator {
    */
   private reboundHead(successor: HarnessAssignment): LocalAdmission | null {
     const head = this.reboundPredecessorHead(successor);
-    if (!head || this.deps.journal.execution.headContinuationTip(successor)) return null;
+    if (!head || !this.reboundContinuationSettled(successor)) return null;
     if (this.ownedLocally(head, `${head.assignmentId}:${head.attempt}`) || !this.claimSettledByCore(head)) return null;
     return head;
   }
@@ -1346,6 +1346,21 @@ export class WorkOrchestrator {
     const before = head && this.deps.journal.execution.start(head.assignmentId, head.attempt)?.assignment;
     if (!predecessorTurn || !head || !before || !reboundRoleSession(before, successor)) return null;
     return turnIdentity(before.source.turn) === turnIdentity(predecessorTurn) ? head : null;
+  }
+
+  /**
+   * A head the previous agent already continued is spent once that
+   * continuation, of this same predecessor turn, was stopped and settled
+   * by Core (TKT-A 10-22: codex's retry failed and was retired, then the
+   * session moved to DeepSeek Harness). Never continued counts as settled.
+   */
+  private reboundContinuationSettled(successor: HarnessAssignment): boolean {
+    const tip = this.deps.journal.execution.headContinuationTip(successor);
+    if (!tip) return true;
+    const continuation = this.deps.journal.execution.start(tip.assignmentId, tip.attempt)?.assignment;
+    const predecessorTurn = successor.source.turn.predecessor;
+    if (!continuation || !harnessDelivery(continuation) || !continuation.source.turn.predecessor || !predecessorTurn) return false;
+    return turnIdentity(continuation.source.turn.predecessor) === turnIdentity(predecessorTurn) && this.recoveredExecutionSettled(tip);
   }
 
   /** Prove the previous agent's retained process gone, then start a fresh ACP session for the new one. */
