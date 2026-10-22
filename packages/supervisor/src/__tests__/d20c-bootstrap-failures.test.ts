@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -7,10 +7,15 @@ import {
   RemoteInstanceError,
   RuntimeFailureObservationSchema,
   jcsDigest,
+  canonicalize,
+  sha256Hex,
   type JsonValue,
   type RemoteWorkAssignment,
   type RuntimeFailureObservation,
 } from "@konteks/remote-common";
+import { NativeRepositoryCache } from "../native/repository-cache.js";
+import { testGitCommand, testGitTool } from "./native-git-fixture.js";
+import { dispatchFailureOutcome } from "../work/dispatch-failure-outcome.js";
 import { RuntimeFailureDelivery } from "../control/runtime-failure-delivery.js";
 import { SupervisorConfigSchema } from "../config.js";
 import { LeaseState } from "../lease/lease.js";
@@ -119,6 +124,86 @@ async function fixture(seedClaim = true) {
     return created;
   }
   return { clock, supervisor, owner, reporter, captures, sent, transport, runner, ready, deps, onUsage, session };
+}
+
+async function workFixture(f: Awaited<ReturnType<typeof fixture>>, coreContractVersion: string | undefined = "7.12") {
+  const lease = new LeaseState(f.clock);
+  lease.set({
+    lease: "fixture-lease",
+    mode: "active",
+    workspaceId: assignment.workspaceId,
+    issuedAt: f.clock.nowIso(),
+    expiresAt: assignment.expiresAt,
+    drainDeadline: null,
+  });
+  const outbox = new DurableOutbox(dir);
+  await outbox.load();
+  const work = new WorkOrchestrator({
+    clock: f.clock,
+    journal: f.supervisor.journal,
+    outbox,
+    transport: f.transport,
+    lease,
+    instanceId: () => assignment.instanceId,
+    runnerIncarnation: () => "runner",
+    assertOwned: () => undefined,
+    workspaceId: () => assignment.workspaceId,
+    agents: () => [
+      {
+        agentId: "codex",
+        displayName: "Codex",
+        connectionState: "ready",
+        authMode: "agent_local_subscription",
+        accountScope: "personal",
+        readiness: "ready",
+        tokenUsageObservable: true,
+        acpCapabilities: {
+          sessionResume: true,
+          forkSession: false,
+          structuredOutputShim: true,
+          toolControl: "approve",
+        },
+      },
+    ],
+    roleBindings: () => [{ role: "assistant", agentPreference: ["codex"] }],
+    advertisedRoles: () => ["assistant"],
+    acceptedKinds: () => ["assistant_execution"],
+    instanceEvidencePolicy: () => "structured_only",
+    draining: () => false,
+    reconciliationComplete: () => true,
+    recoveryAuthority: () => "accepted-recovery",
+    reportDeliveryAllowed: () => true,
+    headroom: () => 2,
+    maxPullItems: 1,
+    runners: new Map([["codex", f.runner]]),
+    coreContractVersion: () => coreContractVersion,
+    onUsage: f.onUsage,
+    sessionDeps: (target, runner) => ({
+      ...f.deps,
+      runner,
+      registerReady: createNativeReadyRegistrar({
+        clock: f.clock,
+        journal: f.supervisor.journal,
+        instanceId: target.instanceId,
+        workspaceId: target.workspaceId,
+        runnerIncarnation: "runner",
+        assertActive: () => undefined,
+        client: {
+          registerExecutionReady: async (_instanceId, request) => ({
+            ...request,
+            workspaceId: target.workspaceId,
+            instanceId: target.instanceId,
+            sessionId: "session",
+            channelId: "session:session",
+            readyRevision: 1,
+            registeredAt: f.clock.nowIso(),
+          }),
+        },
+      }),
+    }),
+  });
+  cleanups.push(() => work.drainSessions("drain"));
+  return work;
 }
 
 function assertSafeFact(failure: RuntimeFailureObservation, stage: string, code: string) {
@@ -375,81 +460,7 @@ describe("D20c claim-bound bootstrap failure history", () => {
         diagnostic === undefined ? {} : { diagnostic },
       );
       vi.mocked(f.runner.createSession).mockRejectedValueOnce(original);
-      const lease = new LeaseState(f.clock);
-      lease.set({
-        lease: "fixture-lease",
-        mode: "active",
-        workspaceId: assignment.workspaceId,
-        issuedAt: f.clock.nowIso(),
-        expiresAt: assignment.expiresAt,
-        drainDeadline: null,
-      });
-      const outbox = new DurableOutbox(dir);
-      await outbox.load();
-      const work = new WorkOrchestrator({
-        clock: f.clock,
-        journal: f.supervisor.journal,
-        outbox,
-        transport: f.transport,
-        lease,
-        instanceId: () => assignment.instanceId,
-        runnerIncarnation: () => "runner",
-        assertOwned: () => undefined,
-        workspaceId: () => assignment.workspaceId,
-        agents: () => [
-          {
-            agentId: "codex",
-            displayName: "Codex",
-            connectionState: "ready",
-            authMode: "agent_local_subscription",
-            accountScope: "personal",
-            readiness: "ready",
-            tokenUsageObservable: true,
-            acpCapabilities: {
-              sessionResume: true,
-              forkSession: false,
-              structuredOutputShim: true,
-              toolControl: "approve",
-            },
-          },
-        ],
-        roleBindings: () => [{ role: "assistant", agentPreference: ["codex"] }],
-        advertisedRoles: () => ["assistant"],
-        acceptedKinds: () => ["assistant_execution"],
-        instanceEvidencePolicy: () => "structured_only",
-        draining: () => false,
-        reconciliationComplete: () => true,
-        recoveryAuthority: () => "accepted-recovery",
-        reportDeliveryAllowed: () => true,
-        headroom: () => 2,
-        maxPullItems: 1,
-        runners: new Map([["codex", f.runner]]),
-        onUsage: f.onUsage,
-        sessionDeps: (target, runner) => ({
-          ...f.deps,
-          runner,
-          registerReady: createNativeReadyRegistrar({
-            clock: f.clock,
-            journal: f.supervisor.journal,
-            instanceId: target.instanceId,
-            workspaceId: target.workspaceId,
-            runnerIncarnation: "runner",
-            assertActive: () => undefined,
-            client: {
-              registerExecutionReady: async (_instanceId, request) => ({
-                ...request,
-                workspaceId: target.workspaceId,
-                instanceId: target.instanceId,
-                sessionId: "session",
-                channelId: "session:session",
-                readyRevision: 1,
-                registeredAt: f.clock.nowIso(),
-              }),
-            },
-          }),
-        }),
-      });
-      cleanups.push(() => work.drainSessions("drain"));
+      const work = await workFixture(f);
       await work.onAssignmentMessage({ assignments: [assignment] });
       const claim = f.supervisor.journal.assignments.get("asg:1")!;
       expect(claim).toMatchObject({ assignmentId: "asg", state: "claimed" });
@@ -486,4 +497,108 @@ describe("D20c claim-bound bootstrap failure history", () => {
       expect(JSON.stringify(reports)).not.toContain("private-d20c");
     },
   );
+});
+
+async function policyGitFixture() {
+  const tool = await testGitTool();
+  const seed = join(dir, "policy-seed");
+  await mkdir(seed, { mode: 0o700 });
+  await testGitCommand(tool, seed, ["init", "--initial-branch=main"]);
+  await writeFile(join(seed, "app.txt"), "original\n");
+  await writeFile(join(seed, "delete.txt"), "keep until deleted\n");
+  await testGitCommand(tool, seed, ["add", "."]);
+  await testGitCommand(tool, seed, ["-c", "user.name=Test", "-c", "user.email=test@invalid", "commit", "-m", "fixture"]);
+  const revision = (await testGitCommand(tool, seed, ["rev-parse", "HEAD"])).trim();
+  const root = join(dir, "policy-repositories");
+  const agentWorkspaceRoot = join(dir, "policy-agent");
+  await mkdir(root, { mode: 0o700 });
+  await mkdir(agentWorkspaceRoot, { mode: 0o700 });
+  const repositoryId = "repository:policy-fixture";
+  const cache = new NativeRepositoryCache({ root, tool, fetchRevision: async ({ gitDir, revision }) => {
+    await testGitCommand(tool, seed, ["--git-dir", gitDir, "fetch", "--no-tags", "--no-write-fetch-head", seed,
+      `${revision}:refs/konteks/fetched/${revision}`]);
+  } });
+  const request = { repositoryId, revision, agentWorkspaceRoot, worktreeId: "engineering" };
+  await cache.prepare(request);
+  const shared = join(root, `${sha256Hex(canonicalize({ repositoryId }))}.git`);
+  const worktrees: string[] = [];
+  for (const role of ["engineering", "qa", "retained"]) {
+    const cwd = join(dir, `legacy-${role}`);
+    await testGitCommand(tool, seed, ["--git-dir", shared, "worktree", "add", "--detach", cwd, revision]);
+    await writeFile(join(cwd, "app.txt"), "staged correction\n");
+    await testGitCommand(tool, cwd, ["add", "app.txt"]);
+    await writeFile(join(cwd, "app.txt"), "unstaged correction\n");
+    await testGitCommand(tool, cwd, ["rm", "delete.txt"]);
+    await writeFile(join(cwd, "notes.txt"), "untracked work\n");
+    worktrees.push(cwd);
+  }
+  // The exact mutation made by Husky 9.1.7 during the production prepare lifecycle.
+  await testGitCommand(tool, worktrees[1], ["config", "core.hooksPath", ".husky/_"]);
+  const config = await readFile(join(shared, "config"));
+  expect(sha256Hex(config)).toBe("1bdec8526c501f13b0f5bfca21b911294a74ed550aad87f82b4053a3ecb10693");
+  async function preservedWork() {
+    const result = [];
+    for (const cwd of worktrees) result.push({
+      head: await testGitCommand(tool, cwd, ["rev-parse", "HEAD"]),
+      status: await testGitCommand(tool, cwd, ["status", "--porcelain"]),
+      staged: await testGitCommand(tool, cwd, ["diff", "--cached", "--binary"]),
+      unstaged: await testGitCommand(tool, cwd, ["diff", "--binary"]),
+      notes: await readFile(join(cwd, "notes.txt"), "utf8"),
+    });
+    return result;
+  }
+  return { cache, request: { ...request, worktreeId: "new-engineering" }, preservedWork, shared, config };
+}
+
+async function dispatchFixture(f: Awaited<ReturnType<typeof fixture>>, work: WorkOrchestrator) {
+  await work.onAssignmentMessage({ assignments: [assignment] });
+  const claim = f.supervisor.journal.assignments.get("asg:1")!;
+  await work.onAssignmentMessage({ assignmentId: "asg", attempt: 1, claimId: claim.claimId, outcome: "claimed" });
+  const state = work as unknown as { bootstrapping: Map<string, Promise<void>> };
+  await vi.waitFor(() => expect(state.bootstrapping.has("asg:1")).toBe(false));
+  await Promise.all(f.captures);
+  return f.sent.map(message => message.body).filter(body => "reportId" in (body as object));
+}
+
+describe("repository policy refusal through native bootstrap and terminal reports", () => {
+  it.each([
+    { contract: "7.13", expectedReason: "workspace_policy_invalid" },
+    { contract: "7.12", expectedReason: "internal" },
+  ])("reports $expectedReason on Core $contract without opening an agent or changing retained work", async ({ contract, expectedReason }) => {
+    const f = await fixture(false);
+    const git = await policyGitFixture();
+    const before = await git.preservedWork();
+    f.deps.prepareInputs = async target => {
+      const prepared = await git.cache.prepare(git.request);
+      return { binding: { workspaceId: target.workspaceId, instanceId: target.instanceId,
+        sessionId: "session", assignmentId: target.id, attempt: target.attempt }, cwd: prepared.cwd,
+        skillInstructions: "", beforePrompt: async () => undefined };
+    };
+    const reports = await dispatchFixture(f, await workFixture(f, contract));
+    expect(reports).toEqual([expect.objectContaining({ assignmentId: "asg",
+      result: expect.objectContaining({ class: "failed", reason: expectedReason }) })]);
+    expect(f.runner.createSession).not.toHaveBeenCalled();
+    expect(f.ready).not.toHaveBeenCalled();
+    expect(f.onUsage).not.toHaveBeenCalled();
+    expect(await git.preservedWork()).toEqual(before);
+    expect(await readFile(join(git.shared, "config"))).toEqual(git.config);
+    expect(JSON.stringify(reports)).not.toContain(dir);
+  });
+
+  it.each([
+    () => new Error(`${privateDetail} workspace_policy_invalid`),
+    () => new RemoteInstanceError("permission_denied", privateDetail, { diagnostic: "workspace_policy_invalid" }),
+    () => new RemoteInstanceError("capability_unavailable", privateDetail, { diagnostic: "private_token_canary" }),
+  ])("does not promote unknown errors or disclose their diagnostic/message", async makeError => {
+    const f = await fixture();
+    let captured: unknown;
+    try { await f.session({ prepareInputs: async () => { throw makeError(); } }).bootstrap(); }
+    catch (error) { captured = error; }
+    expect(captured).toBeInstanceOf(RemoteInstanceError);
+    const error = captured as RemoteInstanceError;
+    expect(error.diagnostic).toBeUndefined();
+    expect(error.message).toBe("Required local session inputs are unavailable.");
+    expect(dispatchFailureOutcome(error, "7.13")).toMatchObject({ class: "failed", reason: "internal" });
+    expect(JSON.stringify(error)).not.toMatch(/private-d20c|provider\.invalid|private_token_canary/);
+  });
 });
