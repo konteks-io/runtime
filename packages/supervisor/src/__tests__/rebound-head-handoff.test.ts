@@ -141,3 +141,37 @@ it("does not start fresh for a turn that names another predecessor", async () =>
   await expect(internal.takeOverCompletedChannel(moved(f.next, "qa-2", "qa-0", "dsh"), f.next, current)).rejects.toBeInstanceOf(RemoteInstanceError);
   expect(runner.stopRetainedExecution).not.toHaveBeenCalled();
 });
+
+/** The head the previous agent continued once more; that retry failed and, unless `settled` is false, was retired and acknowledged. */
+async function continuedThenRetired(settled = true) {
+  const f = await completedHead();
+  const retry = admission("retry", "process", "2026-10-01T09:35:00.000Z");
+  await admit(f.journal, retry, review(retry, "qa-1b", "qa-1"));
+  await f.journal.execution.transferLiveContinuation({ predecessor: f.completed, successor: retry, sessionId: "repository-qa-session",
+    acpSessionRef: "qa-ref", processOwner, continuedAt: "2026-10-01T09:36:00.000Z" }, current);
+  if (settled) {
+    await f.journal.execution.markStopping(retry, "2026-10-01T09:37:00.000Z", current);
+    await f.journal.execution.markProcessStopped(retry, "2026-10-01T09:37:01.000Z", current);
+    await f.journal.execution.markInterruptedWithoutQuiescence(retry, "2026-10-01T09:37:02.000Z", current);
+  }
+  await terminalClaim(f.journal, retry, { class: "cancelled", reason: "user_cancelled" }, settled);
+  return { ...f, retry };
+}
+
+it("starts fresh for the new agent when the previous agent's retry of that turn was already stopped and settled", async () => {
+  const f = await continuedThenRetired();
+  const { internal, runner } = orchestrator(f.journal, f.outbox, "restarted-process");
+
+  await expect(internal.takeOverCompletedChannel(moved(f.next, "qa-2", "qa-1", "dsh"), f.next, current)).resolves.toBeUndefined();
+  // Its process was already proven gone when the retry was retired.
+  expect(runner.stopRetainedExecution).not.toHaveBeenCalled();
+  expect(f.journal.execution.execution(f.next)).toBeUndefined();
+});
+
+it("keeps refusing while the previous agent's retry of that turn is not settled", async () => {
+  const f = await continuedThenRetired(false);
+  const { internal, runner } = orchestrator(f.journal, f.outbox, "restarted-process");
+
+  await expect(internal.takeOverCompletedChannel(moved(f.next, "qa-2", "qa-1", "dsh"), f.next, current)).rejects.toBeInstanceOf(RemoteInstanceError);
+  expect(runner.stopRetainedExecution).not.toHaveBeenCalled();
+});
