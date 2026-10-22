@@ -17,7 +17,7 @@ export function dispatchFailureOutcome(error: unknown, coreContractVersion?: str
 
 
 /** Only a typed guard verdict identifies a policy failure; free-form messages never do. */
-function isWorkspacePolicyFailure(error: unknown): boolean {
+export function isWorkspacePolicyFailure(error: unknown): boolean {
   return error instanceof RemoteInstanceError && error.code === "capability_unavailable" && error.diagnostic === "workspace_policy_invalid";
 }
 
