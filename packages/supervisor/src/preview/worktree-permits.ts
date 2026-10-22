@@ -11,25 +11,42 @@ import { dirname } from "node:path";
  * the changes on disk); a later bootstrap of the session replaces it. An
  * entry whose worktree is gone is dropped when the store is loaded.
  */
+type Permit = { cwd: string; managedRepository?: true };
+
+function readPermit(value: unknown): Permit | undefined {
+  if (typeof value === "string") return { cwd: value };
+  if (value === null || typeof value !== "object") return undefined;
+  const candidate = value as Partial<Permit>;
+  if (typeof candidate.cwd !== "string" || candidate.managedRepository !== true) return undefined;
+  if (Object.keys(candidate).some(key => key !== "cwd" && key !== "managedRepository")) return undefined;
+  return { cwd: candidate.cwd, managedRepository: true };
+}
+
 export class PreviewWorktreePermits {
-  readonly #entries = new Map<string, string>();
+  readonly #entries = new Map<string, Permit>();
 
   constructor(private readonly file: string, exists: (path: string) => boolean = existsSync) {
     try {
       const stored = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
-      for (const [sessionId, cwd] of Object.entries(stored)) {
-        if (typeof cwd === "string" && exists(cwd)) this.#entries.set(sessionId, cwd);
+      for (const [sessionId, value] of Object.entries(stored)) {
+        const permit = readPermit(value);
+        if (permit && exists(permit.cwd)) this.#entries.set(sessionId, permit);
       }
     } catch { /* none kept yet, or unreadable: start empty */ }
   }
 
   get(sessionId: string): string | undefined {
-    return this.#entries.get(sessionId);
+    return this.#entries.get(sessionId)?.cwd;
   }
 
-  set(sessionId: string, cwd: string): void {
-    if (this.#entries.get(sessionId) === cwd) return;
-    this.#entries.set(sessionId, cwd);
+  managedRepository(sessionId: string): true | undefined {
+    return this.#entries.get(sessionId)?.managedRepository;
+  }
+
+  set(sessionId: string, cwd: string, managedRepository?: true): void {
+    const previous = this.#entries.get(sessionId);
+    if (previous?.cwd === cwd && previous.managedRepository === managedRepository) return;
+    this.#entries.set(sessionId, { cwd, ...(managedRepository ? { managedRepository } : {}) });
     this.#save();
   }
 
@@ -37,7 +54,7 @@ export class PreviewWorktreePermits {
     try {
       mkdirSync(dirname(this.file), { recursive: true, mode: 0o700 });
       const temp = `${this.file}.tmp`;
-      writeFileSync(temp, JSON.stringify(Object.fromEntries(this.#entries)), { mode: 0o600 });
+      writeFileSync(temp, JSON.stringify(Object.fromEntries([...this.#entries].map(([id, permit]) => [id, permit.managedRepository ? permit : permit.cwd]))), { mode: 0o600 });
       renameSync(temp, this.file);
     } catch { /* the permits still hold for this run */ }
   }

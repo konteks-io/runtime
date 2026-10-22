@@ -2368,18 +2368,18 @@ export class Supervisor {
    */
   private sessionPreviewAccess(): SessionPreviewAccess {
     return {
-      start: async (sessionId, cwd) => {
+      start: async (sessionId, cwd, managedRepository) => {
         if (this.stopping || this.draining || this.lease.mode() !== "active") {
           return { ...this.previews.status(sessionId), message: "This computer is not taking new work right now, so a preview cannot start." };
         }
-        const started = await this.previews.start(sessionId, cwd);
+        const started = await this.previews.start(sessionId, cwd, "agent", managedRepository);
         return started.state === "starting" ? this.previews.waitForSettled(sessionId, PREVIEW_START_WAIT_MS) : started;
       },
       stop: (sessionId, reason) => this.previews.stop(sessionId, reason),
       status: sessionId => this.previews.status(sessionId),
       touch: sessionId => this.previews.touch(sessionId),
       touchByAgent: sessionId => this.previews.touchByAgent(sessionId),
-      permit: (sessionId, cwd) => this.previewWorktrees.set(sessionId, cwd),
+      permit: (sessionId, cwd, managedRepository) => this.previewWorktrees.set(sessionId, cwd, managedRepository),
       origin: sessionId => this.previews.originFor(sessionId),
       // Playwright's own Chromium, when this computer has no Chrome, is installed here once.
       browsersPath: join(this.config.SUPERVISOR_DATA_DIR, "browsers"),

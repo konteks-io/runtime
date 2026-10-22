@@ -128,10 +128,11 @@ const PREVIEW_ENV_ALLOWLIST: readonly string[] = [
   "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "OS",
 ];
 
-export function buildPreviewEnv(base: NodeJS.ProcessEnv, path: string, port: number, extra: Record<string, string>): NodeJS.ProcessEnv {
+export function buildPreviewEnv(base: NodeJS.ProcessEnv, path: string, port: number, extra: Record<string, string>, managedRepository?: true): NodeJS.ProcessEnv {
   return {
     ...inheritedEnv(base),
     ...repositoryEnv(extra),
+    ...(managedRepository ? { HUSKY: "0" } : {}),
     PATH: path,
     HOST: PREVIEW_HOST,
     PORT: String(port),
@@ -166,6 +167,7 @@ function activeState(state: PreviewState): boolean {
 }
 
 interface Entry {
+  managedRepository?: true;
   sessionId: string;
   cwd: string;
   startedBy: PreviewStarter;
@@ -234,18 +236,18 @@ export class PreviewProcessManager {
    * Resolves as soon as the attempt is under way; `waitForSettled` waits for
    * it to answer or fail.
    */
-  async start(sessionId: string, cwd: string, startedBy: PreviewStarter = "agent"): Promise<PreviewStatus> {
+  async start(sessionId: string, cwd: string, startedBy: PreviewStarter = "agent", managedRepository?: true): Promise<PreviewStatus> {
     if (this.closed) return this.refusal(sessionId, "The connector is stopping; previews cannot start now.", "The connector on this computer is stopping. Try again once it is back.");
     const current = this.entries.get(sessionId);
-    if (current && reusable(current, cwd)) return this.reuse(current, startedBy);
+    if (current && reusable(current, cwd, managedRepository)) return this.reuse(current, startedBy);
     if (current) await this.stop(sessionId, "restart");
-    if (this.entries.has(sessionId)) return this.start(sessionId, cwd, startedBy);
+    if (this.entries.has(sessionId)) return this.start(sessionId, cwd, startedBy, managedRepository);
     const active = [...this.entries.values()].filter(entry => activeState(entry.state) || entry.child !== null || entry.stopping !== null);
     if (active.length >= this.maxRunning) {
       return this.refusal(sessionId, `${active.length} previews are already running on this computer (the limit is ${this.maxRunning}, to keep it responsive). Stop one with preview_stop, or wait until one stops after ${Math.round(this.idleMs / 60_000)} idle minutes.`,
         `This computer already runs ${active.length} previews, its limit. Stop one, or try again once one stops after ${Math.round(this.idleMs / 60_000)} idle minutes.`);
     }
-    const entry = this.newEntry(sessionId, cwd, startedBy);
+    const entry = this.newEntry(sessionId, cwd, startedBy, managedRepository);
     this.entries.set(sessionId, entry);
     entry.settled = this.launch(entry).catch(error => {
       return this.fail(entry, `The preview could not start: ${error instanceof Error ? error.message.slice(0, 300) : "unexpected error"}.`, UNEXPECTED_REASON);
@@ -253,9 +255,9 @@ export class PreviewProcessManager {
     return this.view(entry);
   }
 
-  private newEntry(sessionId: string, cwd: string, startedBy: PreviewStarter): Entry {
+  private newEntry(sessionId: string, cwd: string, startedBy: PreviewStarter, managedRepository?: true): Entry {
     return {
-      sessionId, cwd, startedBy, generation: ++this.generation, state: "starting", phase: null, plan: null, port: null, host: null, child: null, cleanupFailed: false,
+      sessionId, cwd, startedBy, ...(managedRepository ? { managedRepository } : {}), generation: ++this.generation, state: "starting", phase: null, plan: null, port: null, host: null, child: null, cleanupFailed: false,
       logs: [], message: "Starting: reading how to serve this working copy.", reason: null, notes: [], startedAt: this.now(), readyAt: null,
       lastActivityAt: this.now(), agentActiveAt: startedBy === "agent" ? this.now() : null, viewerActiveAt: null, settled: Promise.resolve(), stopping: null,
     };
@@ -407,7 +409,7 @@ export class PreviewProcessManager {
     if (plan === null) return;
     const address = await this.launchAddress(entry);
     if (address === null) return;
-    const env = buildPreviewEnv(this.options.env ?? process.env, address.path, address.port, plan.env);
+    const env = buildPreviewEnv(this.options.env ?? process.env, address.path, address.port, plan.env, entry.managedRepository);
     const values = { host: PREVIEW_HOST, port: address.port };
     if (!await this.runSetupPhases(entry, plan, values, env)) return;
     entry.phase = "serve";
@@ -723,8 +725,8 @@ function setupFailure(phase: "install" | "prepare", command: string, code: numbe
 
 type ServeWatch = { exited: { code: number | null; signal: NodeJS.Signals | null } | null };
 
-function reusable(entry: Entry, cwd: string): boolean {
-  return activeState(entry.state) && entry.cwd === cwd && !entry.stopping && !entry.cleanupFailed;
+function reusable(entry: Entry, cwd: string, managedRepository?: true): boolean {
+  return activeState(entry.state) && entry.cwd === cwd && entry.managedRepository === managedRepository && !entry.stopping && !entry.cleanupFailed;
 }
 
 /** The first install, prepare or serve command the command policy refuses, and the agent's message for it. */
