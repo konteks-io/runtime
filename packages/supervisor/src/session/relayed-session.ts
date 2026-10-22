@@ -62,6 +62,7 @@ import {
   assertDirectModelAuthority,
 } from "../native/direct-model-selection.js";
 import { continuedSession, isDirectAssignment, isNativeTurn } from "../work/continued-session.js";
+import { isWorkspacePolicyFailure } from "../work/dispatch-failure-outcome.js";
 import { hostToolGovernance, type HostToolBypass, type HostToolGovernance } from "./host-tool-governance.js";
 import { McpToolCallLedger, type ObservedMcpInvocation } from "./permission-tool-identity.js";
 import { FolderAccessCue, type FolderAccessCueOptions } from "./folder-access-cue.js";
@@ -477,8 +478,12 @@ export class RelayedSession {
           attempt: this.assignment.attempt, preparationAttempt: deferral }, "native input preparation resumed after a transient failure");
         return prepared;
       } catch (error) {
-        // Xcode's license gate keeps its plain finding (git-choice.ts); anything else stays unexplained here.
+        // Keep the Xcode finding and the bounded workspace-policy verdict;
+        // every other permanent failure stays generic.
         if (isGitXcodeLicenseError(error)) throw error;
+        if (isWorkspacePolicyFailure(error))
+          throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable.",
+            { diagnostic: "workspace_policy_invalid" });
         const transient = transientInputFailure(error);
         if (!transient) throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable.");
         await this.deferInputPreparation(deferral, transient, error as RemoteInstanceError);
