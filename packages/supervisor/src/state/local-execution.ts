@@ -615,13 +615,25 @@ export class LocalExecutionJournal {
     const source = assignment.source;
     const prior = this.harnessHeads.get(source.executionSessionId);
     const head = harnessHeadOf(assignment, admission, at);
-    if (prior && !sameHarnessHead(prior, head)) throw conflict();
+    if (prior && !sameHarnessHead(prior, head) && !this.reboundHead(prior, head)) throw conflict();
     if (prior && equal(prior.turn, head.turn)) {
       if (prior.executionGeneration !== admission.executionGeneration) throw conflict();
       return [{ kind: "execution", value: settled }];
     }
     assertHeadAdvance(prior, source.turn.predecessor);
     return [{ kind: "execution", value: settled }, { kind: "harness_session_head", value: head }];
+  }
+
+  /**
+   * Core moved the session to another agent or model, and this turn started
+   * fresh after the previous agent's head was retired (A44): its completion
+   * becomes the head. Only the agent and model may differ, and the previous
+   * head's execution must no longer be live (10-22: TKT-A's completed dsh
+   * turn was refused here and stayed "running", holding every update's drain).
+   */
+  private reboundHead(prior: HarnessHead, head: HarnessHead): boolean {
+    if (!sameHarnessPlacement(prior, head) || equal(prior.turn, head.turn)) return false;
+    return this.executions.get(prior.executionGeneration)?.phase !== "opened";
   }
 
   /** Atomically hand one still-live, idle ACP owner to the next admitted turn.
@@ -841,6 +853,15 @@ export class LocalExecutionJournal {
   }
 }
 function equal(a: unknown, b: unknown): boolean { return a !== undefined && b !== undefined && jcsDigest(a as never) === jcsDigest(b as never); }
+/** The same repository role session on this computer; agent and model aside. */
+function sameHarnessPlacement(left: HarnessHead, right: HarnessHead): boolean {
+  const placement = (value: HarnessHead) => ({
+    executionSessionId: value.executionSessionId, instanceId: value.instanceId, workspaceId: value.workspaceId,
+    taskId: value.taskId, repositoryId: value.repositoryId, requiredRole: value.requiredRole,
+  });
+  return equal(placement(left), placement(right));
+}
+
 function sameHarnessHead(
   left: z.infer<typeof HarnessSessionHeadSchema>,
   right: z.infer<typeof HarnessSessionHeadSchema>,
