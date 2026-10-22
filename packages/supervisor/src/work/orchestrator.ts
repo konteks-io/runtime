@@ -1308,6 +1308,8 @@ export class WorkOrchestrator {
   private async takeOverHarnessHead(assignment: HarnessAssignment, admission: LocalAdmission, sessionId: string, assertCurrent: () => void): Promise<Takeover | undefined> {
     const pendingRestore = this.deps.journal.execution.pendingRestore(admission, assignment);
     if (pendingRestore) return { reference: pendingRestore, mode: "restore" };
+    const rebound = this.reboundHead(assignment);
+    if (rebound) return this.startFreshAfterRebound(assignment, rebound, assertCurrent);
     let retained;
     try {
       retained = this.deps.journal.execution.liveContinuation(assignment);
@@ -1321,6 +1323,52 @@ export class WorkOrchestrator {
       return undefined;
     }
     return this.transferHead(retained, admission, sessionId, assertCurrent);
+  }
+
+  /**
+   * Core moved the session to another agent or model (A44): the head's ACP
+   * session can never continue under the new one. Only the exact predecessor
+   * turn, terminal and acknowledged by Core, with nothing here still owning
+   * it, qualifies. Its changes stay in the workspace and its accepted output
+   * is adopted at input preparation.
+   */
+  private reboundHead(successor: HarnessAssignment): LocalAdmission | null {
+    const head = this.reboundPredecessorHead(successor);
+    if (!head || this.deps.journal.execution.headContinuationTip(successor)) return null;
+    if (this.ownedLocally(head, `${head.assignmentId}:${head.attempt}`) || !this.claimSettledByCore(head)) return null;
+    return head;
+  }
+
+  /** The role head, when it is this successor's exact predecessor turn under another agent or model. */
+  private reboundPredecessorHead(successor: HarnessAssignment): LocalAdmission | null {
+    const predecessorTurn = successor.source.turn.predecessor;
+    const head = this.deps.journal.execution.harnessRoleHead(successor);
+    const before = head && this.deps.journal.execution.start(head.assignmentId, head.attempt)?.assignment;
+    if (!predecessorTurn || !head || !before || !reboundRoleSession(before, successor)) return null;
+    return turnIdentity(before.source.turn) === turnIdentity(predecessorTurn) ? head : null;
+  }
+
+  /** Prove the previous agent's retained process gone, then start a fresh ACP session for the new one. */
+  private async startFreshAfterRebound(successor: HarnessAssignment, head: LocalAdmission, assertCurrent: () => void): Promise<undefined> {
+    const key = `${head.assignmentId}:${head.attempt}`;
+    const phase = this.deps.journal.execution.execution(head)?.phase;
+    if (phase !== undefined && UNFINISHED_PHASES.has(phase)) {
+      const assertHead = () => {
+        assertCurrent();
+        this.requireNativeOwner();
+        if (this.ownedLocally(head, key) || this.deps.journal.assignments.get(key)?.claimId !== head.claimId) {
+          throw new RemoteInstanceError("recovery_required", "The previous agent's turn gained a local owner during its stop.");
+        }
+      };
+      if (!(await this.retireTip(successor, head, assertHead))) {
+        throw new RemoteInstanceError("recovery_required", "The previous agent's turn could not be confirmed stopped.",
+          { diagnostic: "rebound_head_stop_unconfirmed" });
+      }
+    }
+    this.logger.warn({ assignmentId: successor.id, attempt: successor.attempt, predecessorAssignmentId: head.assignmentId,
+      predecessorAgentId: head.agentId, agentId: successor.agentRoute.agentId, stage: "channel_handoff", outcome: "fresh_after_rebound" },
+    "the session moved to another agent; the previous agent's session is stopped and a fresh ACP session starts");
+    return undefined;
   }
 
   /**
@@ -2794,6 +2842,28 @@ function sameHarnessRoleSession(predecessor: RemoteWorkAssignment, successor: Re
     before.executionSessionId === after.executionSessionId &&
     before.repositoryId === after.repositoryId &&
     jcsDigest(before.modelBinding as JsonValue) === jcsDigest(after.modelBinding as JsonValue);
+}
+
+/** The same repository role session, moved by Core to another agent or model (A44). */
+function reboundRoleSession(predecessor: RemoteWorkAssignment, successor: HarnessAssignment): predecessor is HarnessAssignment {
+  if (!harnessDelivery(predecessor)) return false;
+  const moved = predecessor.agentRoute.agentId !== successor.agentRoute.agentId ||
+    jcsDigest(predecessor.source.modelBinding as JsonValue) !== jcsDigest(successor.source.modelBinding as JsonValue);
+  return moved && samePlacedRoleSession(predecessor, successor);
+}
+
+/** Same instance, workspace, task, role, owner, session and repository; agent and model aside. */
+function samePlacedRoleSession(predecessor: HarnessAssignment, successor: HarnessAssignment): boolean {
+  const before = predecessor.source, after = successor.source;
+  return allSame([
+    [predecessor.instanceId, successor.instanceId], [predecessor.workspaceId, successor.workspaceId], [predecessor.taskId, successor.taskId],
+    [predecessor.agentRoute.requiredRole, successor.agentRoute.requiredRole], [before.ownerInstanceId, after.ownerInstanceId],
+    [before.executionSessionId, after.executionSessionId], [before.repositoryId, after.repositoryId],
+  ]);
+}
+
+function allSame(pairs: ReadonlyArray<readonly [unknown, unknown]>): boolean {
+  return pairs.every(([left, right]) => left === right);
 }
 
 /** Same instance, workspace, task, role, agent and model. */
