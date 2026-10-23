@@ -80,9 +80,13 @@ export async function startScriptedModels(options) {
   /** Every tool call this model issued, by call id → its step; each result is recorded once, wherever it appears in the history. */
   const issued = new Map();
   const recorded = new Set();
+  const latestOutputs = new Map();
+  const polls = new Map();
   function record(id, text) {
-    const step = issued.get(id);
-    if (step === undefined || recorded.has(id)) return;
+    const issuedCall = issued.get(id);
+    if (issuedCall === undefined || recorded.has(id)) return;
+    const { step, name } = issuedCall;
+    latestOutputs.set(step, { name, text });
     recorded.add(id);
     toolResults.set(step, [...(toolResults.get(step) ?? []), text]);
   }
@@ -109,9 +113,13 @@ export async function startScriptedModels(options) {
     if (answersWithText(intent, step, tools, afterTool)) return { text: `DONE ${step ?? ""}`.trim() };
     const call = toolCall(intent, tools, options.windows === true);
     if (!call) { log(`scripted model: step ${step} found no tool for ${intent.type} among ${tools.map(tool => tool.name).join(",")}`); return { text: `NO TOOL ${step}` }; }
-    served.set(step, 1);
+    return issue(protocol, step, call);
+  }
+
+  function issue(protocol, step, call) {
+    served.set(step, (served.get(step) ?? 0) + 1);
     call.id = `${protocol === "anthropic" ? "toolu" : "call"}_konteks_${callId()}`;
-    issued.set(call.id, step);
+    issued.set(call.id, { step, name: call.name });
     log(`scripted model (${protocol}) step ${step}: ${call.name}(${JSON.stringify(call.input).slice(0, 240)})`);
     return { call };
   }
@@ -201,8 +209,21 @@ export async function startScriptedModels(options) {
       return streamResponse(res, body, { type: "tool_search_call", id: `tsc_${callId()}`, call_id: `call_${callId()}`, status: "completed", execution: "client", arguments: { query: `${search.server} ${search.tool}`, limit: 8 } });
     }
     const afterTool = typeof last?.type === "string" && last.type.endsWith("_output") && !searchedLast;
-    const answer = decide("responses", step, tools.filter(tool => tool.kind !== "tool_search"), afterTool);
+    const followup = afterTool ? pendingShellPoll(step, tools) : undefined;
+    const answer = followup ? issue("responses", step, followup) : decide("responses", step, tools.filter(tool => tool.kind !== "tool_search"), afterTool);
     return streamResponse(res, body, responseItem(answer));
+  }
+
+  /** A yielded Codex shell must be polled, with the same output assertions and a finite limit. */
+  function pendingShellPoll(step, tools) {
+    if (options.intents.get(step)?.type !== "shell") return undefined;
+    const sessionId = runningShellSession(latestOutputs.get(step));
+    const tool = tools.find(tool => lower(tool.name) === "write_stdin");
+    const count = polls.get(step) ?? 0;
+    if (sessionId === null || !tool || count >= 12) return undefined;
+    polls.set(step, count + 1);
+    return { name: tool.name, kind: tool.kind, ...(tool.namespace ? { namespace: tool.namespace } : {}),
+      input: { session_id: sessionId, chars: "", yield_time_ms: 1000, max_output_tokens: 2000 } };
   }
 
   /** The step's MCP intent while its tool call is not served and the last input is not a search result. */
@@ -388,4 +409,11 @@ function harmlessValue(prop) {
   if (prop.type === "boolean") return false;
   if (prop.type === "array") return [];
   return prop.type === "object" ? {} : "Konteks OS proof step";
+}
+
+function runningShellSession(result) {
+  if (!result || !["exec_command", "write_stdin"].includes(result.name)) return null;
+  const match = result.text.match(/^Process running with session ID ([0-9]+)\s*$/m);
+  const value = Number(match?.[1]);
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
 }

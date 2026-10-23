@@ -51,6 +51,7 @@ interface ModelCapabilitySnapshotProducerOptions {
    * option unlabelled, which an older Core requires.
    */
   optionBilling?: (agentId: string, value: string, agent: ConnectedAgentView) => "subscription" | "pay_per_use" | undefined;
+  onDiagnostic?: (detail: { reason: string; agentId?: string; errorKind?: string }) => void;
   newId?: () => string;
   ttlMs?: number;
   /** Renew asynchronously before expiry so heartbeat publication never gaps. */
@@ -158,7 +159,8 @@ export class ModelCapabilitySnapshotProducer {
       const snapshotRevision = (this.revisions.get(id) ?? 0) + 1;
       const snapshot = this.snapshotFor({ resolved, observed, currentAgent, manifestId, window, snapshotRevision });
       this.revisions.set(id, snapshotRevision); this.cache.set(id, { authorityKey: key, snapshot }); this.retry.delete(key);
-    } catch {
+    } catch (error) {
+      this.options.onDiagnostic?.({ reason: "discovery_failed", agentId: resolved.agentId, errorKind: discoveryErrorKind(error) });
       this.recordFailure(id, key);
     }
   }
@@ -261,3 +263,7 @@ function eligible(agent: ConnectedAgentView | undefined): agent is ConnectedAgen
   return agent?.authMode === "agent_local_subscription" && agent.readiness === "ready" && agent.connectionState === "ready" && typeof agent.authIdentityFingerprint === "string" && agent.authIdentityFingerprint.length > 0;
 }
 function identity(value: OfferedAuthority): string { return `${value.agentId}\0${value.mappingId}`; }
+
+function discoveryErrorKind(error: unknown): "invalid_snapshot" | "discovery_error" {
+  return error instanceof Error && error.name === "ZodError" ? "invalid_snapshot" : "discovery_error";
+}

@@ -692,8 +692,14 @@ export class Supervisor {
   }
 
   private composeModelCapabilities(): void {
+    let lastDiagnostic = "";
     this.modelCapabilities = new ModelCapabilitySnapshotProducer({
       clock: this.clock, instanceId: () => this.instanceId ?? "", runnerIncarnation: () => this.runnerIncarnation,
+      onDiagnostic: detail => {
+        const key = JSON.stringify(detail);
+        if (key !== lastDiagnostic) this.logger.warn({ event: "model_capability.unavailable", ...detail }, "native model capability unavailable");
+        lastDiagnostic = key;
+      },
       manifestId: () => this.journal.recovery.current(this.instanceId ?? "", this.runnerIncarnation)?.manifest?.manifestId ?? null,
       mappings: () => this.nativeRelease ? selectNativeModelCapabilityMappings(this.nativeRelease, {
         os: this.config.SUPERVISOR_PLATFORM_OS,
