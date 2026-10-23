@@ -36,12 +36,16 @@ function permissionCapture(request: RequestPermissionRequest, agentId: string, s
 export class NativeCoordinationInvocations {
   constructor(private readonly journal: SupervisorJournal, private readonly context: () => InvocationContext | null, private readonly now: () => Date = () => new Date()) {}
 
-  async capture(request: RequestPermissionRequest, agentId: string, servers: ReadonlySet<string>, ledger?: McpToolCallLedger, observed?: ObservedMcpInvocation): Promise<void> {
+  /**
+   * `acpSessionRef` is the session the runner delivered the request on: the
+   * runner removes the bridge's own `sessionId` from the request it forwards.
+   */
+  async capture(request: RequestPermissionRequest, acpSessionRef: string, agentId: string, servers: ReadonlySet<string>, ledger?: McpToolCallLedger, observed?: ObservedMcpInvocation): Promise<void> {
     if (!coordinationInvocationAgent(agentId)) return;
     const { identity, arguments: args } = permissionCapture(request, agentId, servers, ledger, observed);
     if (!capturedTool(identity, servers)) return;
     const context = this.context();
-    if (!context || context.acpSessionRef !== request.sessionId) throw unavailable();
+    if (!context || context.acpSessionRef !== acpSessionRef) throw unavailable();
     const invocation = NativeCoordinationInvocationSchema.parse({ version: 1, ...context, toolCallId: request.toolCall.toolCallId, tool: identity.tool, payloadHash: await coordinationPayloadHash(args) });
     await this.retain(invocation);
   }
