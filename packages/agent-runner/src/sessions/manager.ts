@@ -194,6 +194,8 @@ const REFUSED_MODEL_MESSAGE = "That model is not available to this agent here. O
 type AcpNativeObservation = z.infer<typeof AcpNativeObservationSchema>;
 
 export interface SessionManagerOptions {
+  /** Detach an idle managed subscription before resuming assignment-scoped MCP authority. */
+  detachMcpOnContinuation?: true;
   /** The signed bridge's raw-list marker, required rather than trusting an injected current menu value. */
   requireRawModelOffer?: true;
   bridge: () => BridgeProcess | null;
@@ -939,11 +941,13 @@ export class SessionManager {
       // The supervisor has already durably transferred this sealed reference.
       // A different fixed file authority needs a verified old-group stop and
       // a fresh bound child before any provider load or resume.
-      const continuedBridge = await this.rebindContinuation(args, record, bridge);
+      const rebound = await this.rebindContinuation(args, record, bridge);
+      const continuedBridge = rebound.bridge;
       record.bridge = continuedBridge;
       adoptSuccessor(record, args);
       record.assertCurrent?.();
-      const refreshed = await this.refreshReboundAuthority(continuedBridge, bridge, record, args);
+      const detached = await this.detachContinuationMcp(args, record, continuedBridge, rebound.closed);
+      const refreshed = await this.refreshReboundAuthority(continuedBridge, bridge, record, args, detached);
       const modelSelection = await this.confirmContinuation(args, record, refreshed);
       return { acpSessionRef: ref, resumed: true, capabilities: capabilitiesOf(continuedBridge),
         ...(modelSelection ? { modelSelection } : {}),
@@ -953,25 +957,39 @@ export class SessionManager {
     }
   }
 
-  private async rebindContinuation(args: CreateSessionArgs, record: SessionRecord, bridge: BridgeProcess): Promise<BridgeProcess> {
-    if (!this.options.rebindBridge) return bridge;
+  private async rebindContinuation(args: CreateSessionArgs, record: SessionRecord, bridge: BridgeProcess): Promise<{ bridge: BridgeProcess; closed: boolean }> {
+    if (!this.options.rebindBridge) return { bridge, closed: false };
+    let closed = false;
     this.rebindingBridges.add(bridge);
     try {
-      return await this.options.rebindBridge(record.acpSessionRef, bridge, args.lifecycle, args.cwd, args.readOnlyRoots ?? [], () => this.closeContinuationForRebind(args, record, bridge));
+      const next = await this.options.rebindBridge(record.acpSessionRef, bridge, args.lifecycle, args.cwd, args.readOnlyRoots ?? [], async () => {
+        await this.closeContinuationSubscription(args, record, bridge);
+        closed = true;
+      });
+      return { bridge: next, closed };
     } finally { this.rebindingBridges.delete(bridge); }
   }
 
-  /** Persist the completed native history before its immutable child is retired. */
-  private async closeContinuationForRebind(args: CreateSessionArgs, record: SessionRecord, bridge: BridgeProcess): Promise<void> {
+  private async detachContinuationMcp(args: CreateSessionArgs, record: SessionRecord, bridge: BridgeProcess, alreadyClosed: boolean): Promise<boolean> {
+    if (!this.options.detachMcpOnContinuation || !args.managedRepository || args.agentTitled || !args.lifecycle || args.lifecycle.ownerless || args.mcpServers.length === 0) return false;
+    if (!alreadyClosed) await this.closeContinuationSubscription(args, record, bridge);
+    this.logger.info({ agentId: record.context.agentId, assignmentId: record.context.assignmentId, serverCount: args.mcpServers.length },
+      "idle continuation subscription detached before refreshing MCP authority");
+    return true;
+  }
+
+  /** Close only the owned idle subscription; an uncertain close must fence the successor. */
+  private async closeContinuationSubscription(args: CreateSessionArgs, record: SessionRecord, bridge: BridgeProcess): Promise<void> {
+    args.lifecycle?.assertCurrent();
     if (bridge.initializeResult.agentCapabilities?.sessionCapabilities?.close == null) {
-      throw new RemoteInstanceError("recovery_required", "Agent cannot close its fixed-authority session before rebinding.");
+      throw new RemoteInstanceError("recovery_required", "Agent cannot detach its idle subscription before refreshing authority.");
     }
     const timeoutMs = Math.min(RELEASE_CLOSE_DEADLINE_MS, remainingReadinessMs(args, this.now()));
     if (!(timeoutMs > 0)) throw new RemoteInstanceError("agent_unavailable", "The outer execution readiness deadline expired.", { retryable: true });
     let timer: NodeJS.Timeout | undefined;
     try {
       const deadline = new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new RemoteInstanceError("recovery_required", "Authority rebind session-close deadline elapsed.")), timeoutMs);
+        timer = setTimeout(() => reject(new RemoteInstanceError("recovery_required", "Idle continuation session-close deadline elapsed.")), timeoutMs);
         timer.unref();
       });
       await Promise.race([bridge.connection.closeSession({ sessionId: record.bridgeSessionId }), deadline]);
@@ -979,8 +997,8 @@ export class SessionManager {
     } finally { if (timer) clearTimeout(timer); }
   }
 
-  private async refreshReboundAuthority(bridge: BridgeProcess, previous: BridgeProcess, record: SessionRecord, args: CreateSessionArgs): Promise<BootstrapResponse | null | undefined> {
-    try { return await this.refreshLiveAuthority(bridge, record, args); }
+  private async refreshReboundAuthority(bridge: BridgeProcess, previous: BridgeProcess, record: SessionRecord, args: CreateSessionArgs, detached: boolean): Promise<BootstrapResponse | null | undefined> {
+    try { return await this.refreshLiveAuthority(bridge, record, args, detached); }
     catch (error) {
       if (bridge !== previous) throw this.sessionLost(error);
       throw error;
@@ -1018,10 +1036,10 @@ export class SessionManager {
   }
 
   /** The live session reopened with the successor's tools and working copy: resumed, else loaded. */
-  private async refreshLiveAuthority(bridge: BridgeProcess, record: SessionRecord, args: CreateSessionArgs): Promise<BootstrapResponse | null | undefined> {
+  private async refreshLiveAuthority(bridge: BridgeProcess, record: SessionRecord, args: CreateSessionArgs, detached: boolean): Promise<BootstrapResponse | null | undefined> {
     const caps = bridge.initializeResult.agentCapabilities;
     const request = () => ({ sessionId: record.bridgeSessionId, cwd: args.cwd, mcpServers: args.mcpServers, ...this.reopenMeta(args) });
-    if (caps?.sessionCapabilities?.resume != null) return this.resumeLive(bridge, record, () => bridge.connection.resumeSession(request()), caps.sessionCapabilities.close != null);
+    if (caps?.sessionCapabilities?.resume != null) return this.resumeLive(bridge, record, () => bridge.connection.resumeSession(request()), !detached && caps.sessionCapabilities.close != null);
     if (caps?.loadSession === true) return bridge.connection.loadSession(request());
     throw new RemoteInstanceError("recovery_required", "Agent cannot refresh a live session's authority.", { diagnostic: "agent_cannot_refresh_authority" });
   }
