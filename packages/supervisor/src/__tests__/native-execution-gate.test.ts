@@ -991,12 +991,12 @@ async function coordinationCaptureBarrier(f: SessionFixture) {
       },
     },
   } as never);
-  const request: RequestPermissionRequest = {
-    sessionId: "acp",
+  // As the agent runner forwards it: the bridge's own session id removed.
+  const request = {
     toolCall: { toolCallId: "provider-call", kind: "other" },
     options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
     _meta: { is_mcp_tool_approval: true },
-  };
+  } as RequestPermissionRequest;
   (
     f.session as unknown as { pendingToolPermissions: Map<string, RequestPermissionRequest> }
   ).pendingToolPermissions.set("pending", request);
@@ -1171,7 +1171,7 @@ describe("native session dispatch uses genuine execution admission", () => {
       expect(recovered.coordinationInvocations.all()).toEqual([expect.objectContaining({ operationId: "operation", toolCallId: "provider-call", assignmentId: "assignment", attempt: 1, state: "captured" })]);
       return { delivered: true };
     });
-    await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp", requestId: "approval", params: { sessionId: "acp", toolCall: { toolCallId: "provider-call", kind: "other" }, options: [{ optionId: "allow", kind: "allow_once", name: "Allow" }, { optionId: "deny", kind: "reject_once", name: "Deny" }], _meta: { is_mcp_tool_approval: true } } } as never);
+    await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp", requestId: "approval", params: { toolCall: { toolCallId: "provider-call", kind: "other" }, options: [{ optionId: "allow", kind: "allow_once", name: "Allow" }, { optionId: "deny", kind: "reject_once", name: "Deny" }], _meta: { is_mcp_tool_approval: true } } } as never);
     expect(f.runner.answer).toHaveBeenCalledWith("acp", "approval", { outcome: { outcome: "selected", optionId: "allow" } });
     await f.session.close("cancelled");
   });

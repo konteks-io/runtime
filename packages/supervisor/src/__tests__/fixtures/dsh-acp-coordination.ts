@@ -16,8 +16,8 @@ export const dshCoordinationCall = {
   rawInput: dshCoordinationArguments,
 };
 
+/** As the agent runner forwards it: the bridge's own session id removed. */
 export const dshCoordinationPermission = {
-  sessionId: "acp",
   toolCall: { toolCallId: "dsh-call-1" },
   options: [
     { optionId: "allow-once", name: "Allow once", kind: "allow_once" },

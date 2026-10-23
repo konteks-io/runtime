@@ -1272,7 +1272,7 @@ export class RelayedSession {
     if (this.closed) return;
     this.deps.assertExecutionOwned?.();
     const answer = issuedAnswer(message, journaled.method);
-    await this.capturePermissionInvocation(message.id, answer);
+    await this.capturePermissionInvocation(ref, message.id, answer);
     await this.deps.runner.answer(ref, message.id, answer);
   }
 
@@ -1460,7 +1460,7 @@ export class RelayedSession {
     const answer = issuedAnswer(message, message.method);
     const verdict = this.deps.broker.answer(ref, message.id, answer);
     if (!verdict.ok) throw new RemoteInstanceError("operation_conflict", "The pending human answer is no longer admissible.");
-    await this.capturePermissionInvocation(message.id, answer);
+    await this.capturePermissionInvocation(ref, message.id, answer);
     assertDeliveryCurrent();
     this.notePermissionAnswer(message.id, answer);
     const delivered = await this.deps.runner.answer(ref, message.id, answer);
@@ -1949,7 +1949,7 @@ export class RelayedSession {
 
   /** Answer a permission request, telling a host agent's governance what was decided (Antigravity pairs its own reports with it). */
   private async answerPermission(ref: string, requestId: string, response: { outcome: { outcome: string; optionId?: string } }, observed?: ObservedMcpInvocation): Promise<void> {
-    try { await this.capturePermissionInvocation(requestId, response, observed); }
+    try { await this.capturePermissionInvocation(ref, requestId, response, observed); }
     catch {
       this.logger.warn({ event: "coordination.invocation_capture_failed", assignmentId: this.assignment.id, attempt: this.assignment.attempt }, "native coordination call refused before provider dispatch");
       response = cancelledPermission();
@@ -1958,7 +1958,7 @@ export class RelayedSession {
     await this.deps.runner.answer(ref, requestId, response);
   }
 
-  private async capturePermissionInvocation(requestId: string, response: unknown, observed?: ObservedMcpInvocation): Promise<void> {
+  private async capturePermissionInvocation(ref: string, requestId: string, response: unknown, observed?: ObservedMcpInvocation): Promise<void> {
     const request = this.pendingToolPermissions.get(requestId);
     this.pendingToolPermissions.delete(requestId);
     if (!request) return;
@@ -1966,7 +1966,7 @@ export class RelayedSession {
     if (answer.outcome?.outcome !== "selected") return;
     const option = request.options.find(candidate => candidate.optionId === answer.outcome?.optionId);
     if (option?.kind !== "allow_once") return;
-    await this.coordinationCalls.capture(request, this.assignment.agentRoute.agentId, this.platformServers, this.mcpCalls ?? undefined, observed);
+    await this.coordinationCalls.capture(request, ref, this.assignment.agentRoute.agentId, this.platformServers, this.mcpCalls ?? undefined, observed);
   }
 
   private notePermissionAnswer(requestId: string, response: unknown): void {
