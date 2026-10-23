@@ -30,6 +30,7 @@ import {
   prepareOrganizationSkillSession,
   type PreparedSessionInputs,
 } from "../skills/session-inputs.js";
+import { isWorkspacePolicyFailure } from "../work/dispatch-failure-outcome.js";
 import { continuedSession, isDirectAssignment } from "../work/continued-session.js";
 import { NativeInputResponseError, transientInputFailure, type NativeInputClient } from "./input-client.js";
 import type { NativeOutputClient } from "./output-client.js";
@@ -988,9 +989,9 @@ export function createNativeInputPreparer(
         return await preparation.prepare();
       } catch (error) {
         preparation.recordFailure(error);
-        // A transient upstream failure stays retryable for the session to
-        // resume (D132); anything else is withheld behind one refusal.
-        throw isGitXcodeLicenseError(error) || transientInputFailure(error) ? error : unavailable();
+        // Keep typed policy verdicts for terminal dispatch classification, and
+        // transient upstream failures for session resume; withhold anything else.
+        throw isGitXcodeLicenseError(error) || transientInputFailure(error) || isWorkspacePolicyFailure(error) ? error : unavailable();
       } finally {
         busy.delete(key);
       }

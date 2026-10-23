@@ -175,3 +175,22 @@ it("keeps refusing while the previous agent's retry of that turn is not settled"
   await expect(internal.takeOverCompletedChannel(moved(f.next, "qa-2", "qa-1", "dsh"), f.next, current)).rejects.toBeInstanceOf(RemoteInstanceError);
   expect(runner.stopRetainedExecution).not.toHaveBeenCalled();
 });
+
+it("lets the new agent's completed turn become the session's head after the move (TKT-A 10-22)", async () => {
+  const f = await completedHead();
+  const { internal } = orchestrator(f.journal, f.outbox, "restarted-process");
+  await expect(internal.takeOverCompletedChannel(moved(f.next, "qa-2", "qa-1", "dsh"), f.next, current)).resolves.toBeUndefined();
+  await f.journal.execution.open(f.next, current, f.next.openedAt);
+  await f.journal.execution.bindReference(f.next, "dsh-ref", current);
+
+  await expect(f.journal.execution.markCompletedTurnSettled(f.next, "dsh-ref", "2026-10-01T09:45:00.000Z", current)).resolves.toBeUndefined();
+  expect(f.journal.execution.harnessRoleHead(moved(f.next, "qa-3", "qa-2", "dsh"))).toMatchObject({ assignmentId: "next", agentId: "dsh" });
+});
+
+it("never replaces a head whose previous agent's execution is still live", async () => {
+  const f = await completedHead();
+  await f.journal.execution.open(f.next, current, f.next.openedAt);
+  await f.journal.execution.bindReference(f.next, "dsh-ref", current);
+
+  await expect(f.journal.execution.markCompletedTurnSettled(f.next, "dsh-ref", "2026-10-01T09:45:00.000Z", current)).rejects.toMatchObject({ code: "recovery_required" });
+});

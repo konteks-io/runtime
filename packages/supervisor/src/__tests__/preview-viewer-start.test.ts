@@ -18,7 +18,7 @@ class FakeChild extends EventEmitter implements PreviewChild {
   readonly stderr = new PassThrough();
   exitCode: number | null = null;
   signalCode: NodeJS.Signals | null = null;
-  constructor(readonly pid: number, readonly cwd: string) { super(); }
+  constructor(readonly pid: number, readonly cwd: string, readonly env: NodeJS.ProcessEnv) { super(); }
   exit(code: number | null, signal: NodeJS.Signals | null = null): void {
     this.exitCode = code; this.signalCode = signal;
     this.emit("exit", code, signal);
@@ -33,7 +33,7 @@ function manager(options: { plan?: PreviewPlanResult; maxRunning?: number } = {}
   const owner = (pid: number | undefined): PreviewProcessOwner => ({ version: 2, id: `owner:${pid}`, pid: pid ?? null, platform: "linux",
     process: { version: 1, platform: "linux", pid: pid!, processGroupId: pid!, startToken: `boot:${pid}`, commandDigest: "fixture" } });
   const instance = new PreviewProcessManager({
-    spawn: ({ cwd }) => { const child = new FakeChild(2000 + children.length, cwd); children.push(child); return child; },
+    spawn: ({ cwd, env }) => { const child = new FakeChild(2000 + children.length, cwd, env); children.push(child); return child; },
     captureOwner: owner,
     stopOwner: async stopped => { const child = children.find(value => value.pid === stopped.pid)!; if (child.exitCode === null) child.exit(null, "SIGTERM"); },
     resolvePlan: async () => options.plan ?? SERVES,
@@ -62,10 +62,10 @@ beforeEach(async () => { data = await mkdtemp(join(tmpdir(), "viewer-start-")); 
 afterEach(async () => { await rm(data, { recursive: true, force: true }); });
 
 describe("a viewer starting a session's preview (D96)", () => {
-  it("starts it again in the kept worktree after it idled out and after a connector restart", async () => {
+  it.each([undefined, true] as const)("keeps preview policy %s after idle and connector restart", async managedRepository => {
     const worktree = join(data, "worktree-qa"); await mkdir(worktree);
     const file = join(data, "preview-worktrees.json");
-    new PreviewWorktreePermits(file).set("qa", worktree);
+    new PreviewWorktreePermits(file).set("qa", worktree, managedRepository);
 
     const first = manager();
     const log = logger();
@@ -85,6 +85,7 @@ describe("a viewer starting a session's preview (D96)", () => {
     const restarted = new PreviewViewerStarts({ previews: second.instance, permits: new PreviewWorktreePermits(file), takingWork: () => true, retryMs: 60_000, logger: log.logger });
     expect(await restarted.start("qa")).toBe(true);
     await vi.waitFor(() => expect(second.children.map(child => child.cwd)).toEqual([worktree]));
+    expect([...first.children, ...second.children].map(child => child.env.HUSKY)).toEqual(Array(3).fill(managedRepository ? "0" : undefined));
     expect(log.events("preview.viewer_started")).toEqual([
       expect.objectContaining({ sessionId: "qa" }), expect.objectContaining({ sessionId: "qa" }), expect.objectContaining({ sessionId: "qa" })]);
     expect(log.events("preview.viewer_start_declined")).toEqual([]);

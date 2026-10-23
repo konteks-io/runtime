@@ -331,6 +331,30 @@ describe("re-check while Konteks has not accepted the newest release (R5-O39)", 
   });
 });
 
+describe("following the release Konteks accepts between channel checks (A49)", () => {
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("installs a release within the hour Konteks starts accepting it, without reading the channel every hour", async () => {
+    vi.useFakeTimers();
+    let accepted: { bundleVersion: string; manifestDigest?: string } = { bundleVersion: "1.0.0" };
+    const f = coordinator({ manifest: "same", logger: createLogger({ name: "test", silent: true }), acceptedRelease: async () => accepted });
+    try {
+      f.c.start();
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(f.fetchManifest).toHaveBeenCalledTimes(1);
+      // Nothing newer is accepted: hourly asks read nothing from the channel.
+      await vi.advanceTimersByTimeAsync(2 * 60 * 60_000);
+      expect(f.fetchManifest).toHaveBeenCalledTimes(1);
+
+      // 1.1.0 is published and Konteks starts accepting it.
+      f.fetchManifest.mockImplementation(async () => f.m.newer);
+      accepted = { bundleVersion: "1.1.0", manifestDigest: f.m.newer.digest };
+      await vi.advanceTimersByTimeAsync(60 * 60_000);
+      expect(f.launch).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ bundleVersion: "1.1.0", reason: "periodic" }));
+    } finally { f.c.stop(); }
+  });
+});
+
 describe("native update ledger", () => {
   it("round-trips attempts by id and keeps only the most recent fifty", async () => {
     const root = await mkdtemp(join(tmpdir(), "native-update-ledger-")); roots.push(root);

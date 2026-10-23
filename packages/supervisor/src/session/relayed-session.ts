@@ -423,7 +423,7 @@ export class RelayedSession {
     // browser (not a preview kind), no result tool.
     const direct = isDirectAssignment(this.assignment);
     await this.startCapabilityFacade(binding.sessionId, direct, mcpServers);
-    const browser = await this.startPreviewTools(binding.sessionId, prepared.cwd, mcpServers);
+    const browser = await this.startPreviewTools(binding.sessionId, prepared.cwd, mcpServers, prepared.managedRepository);
     // The turn result tool: every Konteks session gets it, so a turn that asks
     // for a structured result can be answered through a validated tool call.
     // A direct turn asks for none: it ends on the agent's own end_turn.
@@ -585,13 +585,13 @@ export class RelayedSession {
   }
 
   /** The preview tools (and the browser, when this computer has one) for a kind of work that runs a preview. */
-  private async startPreviewTools(sessionId: string, cwd: string, mcpServers: SessionMcpServer[],
+  private async startPreviewTools(sessionId: string, cwd: string, mcpServers: SessionMcpServer[], managedRepository?: true,
   ): Promise<SessionBrowser | undefined> {
     const preview = this.deps.preview;
     if (!preview || !PREVIEW_WORK_KINDS.has(this.assignment.kind)) return undefined;
     const browser = await this.startBrowserGateway(preview, sessionId);
     const tools = new PreviewMcpServer({
-      start: () => preview.start(sessionId, cwd),
+      start: () => preview.start(sessionId, cwd, managedRepository),
       stop: () => preview.stop(sessionId, "agent"),
       status: () => {
         preview.touchByAgent(sessionId);
@@ -602,7 +602,7 @@ export class RelayedSession {
     this.previewSessionId = sessionId;
     // A viewer may start this worktree's preview too (the same process
     // manager and inference as preview_start).
-    preview.permit?.(sessionId, cwd);
+    preview.permit?.(sessionId, cwd, managedRepository);
     mcpServers.push({ type: "http", ...(await this.bootstrapStage("preview_tools", () => tools.start())),
     });
     return browser;
