@@ -1136,6 +1136,9 @@ export class Supervisor {
 
   private composeWork(native: NativeOptions, verifier: CoreSignatureVerifier): void {
     this.broker = new PermissionBroker({ clock: this.clock, deadlineSeconds: () => this.configuration.permissionResponderDeadlineSeconds, onTimeout: async (request) => this.work.onPermissionTimeout(request) });
+    // Windows runs Codex without a shared app-server owner (see sharedCodexConfig).
+    const sharedCodexOwnerConfigured = native.runners.some(config => config.RUNNER_AGENT_ID === "codex" && config.RUNNER_NATIVE_CODEX_SOCKET !== undefined);
+    const legacyCodexRestore = sharedCodexOwnerConfigured ? {} : { legacyCodexFreshRestore: true as const };
     this.work = new WorkOrchestrator({
       verifyCancellation: directive => verifier.verify(directive, directive.signature),
       preserveStoppedWorkspace: async (admission, assertCurrent) => {
@@ -1213,6 +1216,7 @@ export class Supervisor {
         journal: this.journal,
         transport: this.transport,
         runner,
+        ...legacyCodexRestore,
         onRuntimeFailure: (fact, context) => this.recordRuntimeFailure(assignment, fact, context),
         directModelSelectionSupported: () =>
           coreContractAtLeast(
