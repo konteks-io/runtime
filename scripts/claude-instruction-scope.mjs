@@ -59,3 +59,45 @@ export function konteksAccountConnectors(meta) {
   const integration = meta && typeof meta === 'object' ? meta.konteksIntegration : undefined;
   return Boolean(integration && typeof integration === 'object' && integration.version === 1 && integration.accountConnectors === true);
 }
+
+// Only the connector's owner-direct admission loads the person's top-level MCP
+// definitions. Project entries, settings, hooks and permissions never enter.
+export async function ownerClaudeMcpServers(meta, userConfigDir, reservedNames) {
+  if (!ownerMcpAdmission(meta)) return {};
+  const file = process.env.CLAUDE_CONFIG_DIR
+    ? path.join(userConfigDir, '.claude.json') : path.join(userConfigDir, '..', '.claude.json');
+  const config = await readPersonalMcpConfig(file);
+  const servers = config.mcpServers ?? {};
+  if (!record(servers)) throw new Error('Invalid personal MCP configuration.');
+  for (const [name, server] of Object.entries(servers)) validatePersonalMcp(name, server, reservedNames);
+  return servers;
+}
+
+function record(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
+
+async function readPersonalMcpConfig(file) {
+  try {
+    const value = JSON.parse(await readFile(file, 'utf8'));
+    if (!record(value)) throw new Error('Invalid personal MCP configuration.');
+    return value;
+  } catch (error) {
+    if (error.code === 'ENOENT') return {};
+    throw new Error('Cannot read personal MCP configuration; check it in Claude Code.');
+  }
+}
+
+function ownerMcpAdmission(meta) {
+  return konteksAccountConnectors(meta) && meta?.konteksPersonalMcp?.version === 1;
+}
+
+function validatePersonalMcp(name, server, reservedNames) {
+  if (reservedNames.includes(name)) throw new Error('A personal MCP server conflicts with a Konteks session server; rename it in Claude Code.');
+  if (['__proto__', 'prototype', 'constructor'].includes(name)) throw new Error('Invalid personal MCP configuration.');
+  if (!/^[a-zA-Z0-9_-]{1,128}$/.test(name) || !record(server)) throw new Error('Invalid personal MCP configuration.');
+}
+
+export async function ownerClaudeMcpToolServer(meta, userConfigDir, toolName) {
+  if (!toolName.startsWith('mcp__')) return undefined;
+  const servers = await ownerClaudeMcpServers(meta, userConfigDir, []);
+  return Object.keys(servers).find(name => toolName.startsWith(`mcp__${name}__`));
+}

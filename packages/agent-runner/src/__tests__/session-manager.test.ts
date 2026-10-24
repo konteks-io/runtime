@@ -938,7 +938,7 @@ describe("integration sessions", () => {
     const restored = fakeBridge();
     await new SessionManager({ bridge: () => restored.bridge, events: new RunnerEventBus(), refStore: store }).restore(args, "prior");
     for (const call of [calls.newSession?.[0], calls.resumeSession?.[0], restored.calls.loadSession?.[0]]) {
-      expect(call).toMatchObject({ _meta: { konteksIntegration: { version: 1, admittedMcpServerNames: [], accountConnectors: true } } });
+      expect(call).toMatchObject({ _meta: { konteksIntegration: { version: 1, admittedMcpServerNames: [], accountConnectors: true }, konteksPersonalMcp: { version: 1 } } });
       expect(call).not.toHaveProperty("_meta.claudeCode.options.tools");
     }
     const plain = fakeBridge();
