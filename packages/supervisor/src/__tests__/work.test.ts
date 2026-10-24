@@ -966,7 +966,7 @@ describe("work orchestrator claim validation", () => {
     expect(journal.assignments.get("asg-1:1")?.state).toBe("claimed");
   });
 
-  async function nativeSessions(register: (target: RemoteWorkAssignment) => Promise<void>, recoveryAuthority = () => "accepted-A", inspectLegacyCodexThread?: (reference: string) => Promise<{ unloaded: boolean; ownerGeneration: string }>) {
+  async function nativeSessions(register: (target: RemoteWorkAssignment) => Promise<void>, recoveryAuthority = () => "accepted-A", inspectLegacyCodexThread?: (reference: string) => Promise<{ unloaded: boolean; ownerGeneration: string }>, legacyCodexFreshRestore = false) {
     const runner = {
       createSession: vi.fn(async (input: { context: { assignmentId: string }; acpSessionRef?: string; restoreAcpSessionRef?: string }, lifecycle?: RunnerSessionLifecycle) => { const ref = input.acpSessionRef ?? `acp:${input.context.assignmentId}`; await lifecycle?.beforeCreate(ref); lifecycle?.assertCurrent(); return { acpSessionRef: ref, resumed: input.acpSessionRef !== undefined || input.restoreAcpSessionRef !== undefined, capabilities: { forkSession: false, sessionResume: true } }; }),
       prompt: vi.fn(async () => undefined), cancel: vi.fn(async () => undefined), closeSession: vi.fn(async () => undefined),
@@ -975,7 +975,7 @@ describe("work orchestrator claim validation", () => {
       ...(inspectLegacyCodexThread ? { inspectLegacyCodexThread } : {}),
       advertisedRoles: () => ["generator", "assistant"],
       roleBindings: () => [{ role: "generator", agentPreference: ["codex"] }, { role: "assistant", agentPreference: ["codex"] }],
-      sessionDeps: (target, selected) => ({ clock, journal: f.journal, transport: f.transport, runner: selected, policy: new EvaluatorPolicyResponder(null, () => true), broker: new PermissionBroker({ clock, deadlineSeconds: () => 60, onTimeout: async () => undefined }), instanceId: "inst-1", redeemCapabilityToken: async () => ({ mcpServer: { name: "konteks", url: "https://mcp.example", headers: [{ name: "authorization", value: "Bearer fixture" }] }, expiresAt: "2026-09-07T00:00:00Z" }), workspaceRoot: "/native",         prepareInputs: async () => ({ binding: { workspaceId: target.workspaceId, assignmentId: target.id, attempt: target.attempt, instanceId: target.instanceId, sessionId: "cloud-session" }, cwd: "/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
+      sessionDeps: (target, selected) => ({ clock, journal: f.journal, transport: f.transport, runner: selected, ...(legacyCodexFreshRestore ? { legacyCodexFreshRestore: true } : {}), policy: new EvaluatorPolicyResponder(null, () => true), broker: new PermissionBroker({ clock, deadlineSeconds: () => 60, onTimeout: async () => undefined }), instanceId: "inst-1", redeemCapabilityToken: async () => ({ mcpServer: { name: "konteks", url: "https://mcp.example", headers: [{ name: "authorization", value: "Bearer fixture" }] }, expiresAt: "2026-09-07T00:00:00Z" }), workspaceRoot: "/native",         prepareInputs: async () => ({ binding: { workspaceId: target.workspaceId, assignmentId: target.id, attempt: target.attempt, instanceId: target.instanceId, sessionId: "cloud-session" }, cwd: "/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
         registerReady: async (_assignment, binding, acpSessionRef) => {
           await register(target);
           const claim = f.journal.assignments.get(`${target.id}:${target.attempt}`)!;
@@ -1091,6 +1091,26 @@ describe("work orchestrator claim validation", () => {
     await (await f.claim("legacy-second", { kind: "assistant_execution", source: { ...source, turnRef: "retry" }, agentRoute }))();
     expect(unloaded).toHaveBeenCalledTimes(2);
     expect(f.runner.createSession).toHaveBeenCalledOnce();
+  });
+
+  it("restores a legacy Codex thread into a new thread when no shared owner can prove it unloaded (A52, Windows)", async () => {
+    const inspect = vi.fn(async () => { throw new Error("The shared Codex owner is unavailable."); });
+    const f = await nativeSessions(async () => undefined, () => "accepted-A", inspect, true);
+    const source = { kind: "conversation", portability: "portable_before_claim", sessionId: "cloud-session", turnRef: "legacy-turn", acpSessionRef: "legacy-ref" } as const;
+    const agentRoute = { requiredRole: "assistant", agentId: "codex", mcpCapabilityTokenRef: "legacy-capability" } as const;
+    await (await f.claim("legacy-windows", { kind: "assistant_execution", source, agentRoute }))();
+    expect(f.runner.createSession).toHaveBeenCalledWith(
+      expect.objectContaining({ restoreAcpSessionRef: "legacy-ref", freshProviderSessionOnRestore: true }), expect.anything());
+    expect(f.sent).toContainEqual(expect.objectContaining({ body: expect.objectContaining({ kind: "session_ready" }) }));
+  });
+
+  it("still refuses a legacy Codex thread a shared owner reports loaded", async () => {
+    const inspect = vi.fn(async () => ({ unloaded: false, ownerGeneration: "owner-A" }));
+    const f = await nativeSessions(async () => undefined, () => "accepted-A", inspect);
+    const source = { kind: "conversation", portability: "portable_before_claim", sessionId: "cloud-session", turnRef: "legacy-turn", acpSessionRef: "legacy-ref" } as const;
+    const agentRoute = { requiredRole: "assistant", agentId: "codex", mcpCapabilityTokenRef: "legacy-capability" } as const;
+    await (await f.claim("legacy-loaded-mac", { kind: "assistant_execution", source, agentRoute }))();
+    expect(f.runner.createSession).not.toHaveBeenCalled();
   });
 
   it("allows the same legacy history after a refused pre-dispatch load and a safe owner transition", async () => {

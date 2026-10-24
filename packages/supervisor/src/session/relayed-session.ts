@@ -124,6 +124,12 @@ export interface RelayedSessionDeps {
   recordMcpLocalTransport?: (identity: McpLocalTransportIdentity) => Promise<void>;
   /** Legacy first load only: the owner must prove this reference absent. */
   assertLegacyCodexThreadUnloaded?: (reference: string) => Promise<boolean>;
+  /**
+   * No shared Codex owner exists on this computer (Windows), so no legacy
+   * thread can ever be proven unloaded: restore one into a new provider
+   * thread instead of refusing every turn (A52).
+   */
+  legacyCodexFreshRestore?: boolean;
   /** The runner's workspace folder: the confinement root the tool policy judges against. */
   workspaceRoot: string;
   /** Verified local inputs (workspace, skills, binding) for the claimed assignment. */
@@ -676,9 +682,9 @@ export class RelayedSession {
 
   /** The provider session to continue or restore, checked against the retained transport; then the facade opens. */
   private async chosenReferences(activation: ExecutionActivation | undefined): Promise<SessionReferences> {
-    const references = this.referencesFor(activation);
-    this.assertTransportReference(references);
-    await this.assertLegacyCodexThread(references);
+    const chosen = this.referencesFor(activation);
+    this.assertTransportReference(chosen);
+    const references = await this.legacyCodexReferences(chosen);
     this.mcpFacade?.enable();
     if (this.closed) throw sessionClosed();
     this.deps.assertExecutionOwned?.();
@@ -705,12 +711,26 @@ export class RelayedSession {
     }
   }
 
-  /** A Codex thread from before the retained local transport must not be loaded while its MCP transport is refreshed. */
-  private async assertLegacyCodexThread({ priorRef, restoreRef }: SessionReferences): Promise<void> {
-    if (!this.legacyCodexTransport(priorRef || restoreRef)) return;
+  /**
+   * A Codex thread from before the retained local transport must not be
+   * loaded while its MCP transport is refreshed. Without a shared owner to
+   * prove it unloaded, a restore opens a new provider thread instead: the
+   * legacy thread is never loaded, the files stay on disk, and Konteks
+   * restages the conversation as on every restarted native turn.
+   */
+  private async legacyCodexReferences(references: SessionReferences): Promise<SessionReferences> {
+    const { priorRef, restoreRef } = references;
+    if (!this.legacyCodexTransport(priorRef || restoreRef)) return references;
     const legacyReference = priorRef ?? restoreRef!;
     const unloaded = await this.deps.assertLegacyCodexThreadUnloaded?.(legacyReference).catch(() => false);
-    if (!unloaded) throw new RemoteInstanceError("recovery_required", "The retained Codex thread cannot safely refresh its local MCP transport.",
+    if (unloaded) return references;
+    if (this.deps.legacyCodexFreshRestore && priorRef === undefined) {
+      this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, stage: "session_bootstrap",
+        outcome: "legacy_codex_fresh_thread", diagnostic: "legacy_mcp_thread_without_shared_owner" },
+      "no shared Codex owner can prove the earlier thread unloaded; this turn restores into a new thread");
+      return { ...references, freshRestore: true };
+    }
+    throw new RemoteInstanceError("recovery_required", "The retained Codex thread cannot safely refresh its local MCP transport.",
       { diagnostic: "legacy_mcp_thread_loaded_or_unverified" });
   }
 
@@ -763,7 +783,7 @@ export class RelayedSession {
     this.deps.assertExecutionOwned?.();
   }
 
-  private sessionRequest(cwd: string, mcpServers: SessionMcpServer[], { priorRef, restoreRef }: SessionReferences, browser: SessionBrowser | undefined,
+  private sessionRequest(cwd: string, mcpServers: SessionMcpServer[], { priorRef, restoreRef, freshRestore }: SessionReferences, browser: SessionBrowser | undefined,
   ): RunnerSessionInput {
     return {
       context: { instanceId: this.deps.instanceId, assignmentId: this.assignment.id, attempt: this.assignment.attempt, agentId: this.assignment.agentRoute.agentId },
@@ -776,7 +796,7 @@ export class RelayedSession {
       ...this.directModelOptions(),
       ...(this.directAccountConnectors() ? { directAccountConnectors: true as const } : {}),
       ...(priorRef ? { acpSessionRef: priorRef } : {}),
-      ...this.restoreOptions(restoreRef),
+      ...this.restoreOptions(restoreRef, freshRestore),
       ...this.titleOptions(),
       ...(browser ? { browser } : {}),
     };
@@ -809,9 +829,10 @@ export class RelayedSession {
    * whose transcript cannot be reopened gets a new session rather than a
    * refusal that every later message would repeat.
    */
-  private restoreOptions(restoreRef: string | undefined): Partial<RunnerSessionInput> {
+  private restoreOptions(restoreRef: string | undefined, freshRestore?: true): Partial<RunnerSessionInput> {
     if (!restoreRef) return {};
-    const fresh = this.assignment.source.kind === "conversation" && this.assignment.agentRoute.agentId === "claude-code";
+    const fresh = freshRestore === true ||
+      (this.assignment.source.kind === "conversation" && this.assignment.agentRoute.agentId === "claude-code");
     if (fresh) return { restoreAcpSessionRef: restoreRef, freshProviderSessionOnRestore: true };
     return { restoreAcpSessionRef: restoreRef, ...(continuedSession(this.assignment.source) ? { freshSessionWhenRestoreLost: true } : {}) };
   }
@@ -2486,7 +2507,12 @@ function errorCode(error: unknown, fallback: string): { code: string; diagnostic
 
 type SessionMcpServer = { type: "http"; name: string; url: string; headers: Array<{ name: string; value: string }> };
 type SessionBrowser = { proxyUrl: string; outputDir: string; browsersPath: string };
-type SessionReferences = { priorRef: string | undefined; restoreRef: string | undefined };
+type SessionReferences = {
+  priorRef: string | undefined;
+  restoreRef: string | undefined;
+  /** Restore into a new provider thread (a legacy Codex thread nothing can prove unloaded). */
+  freshRestore?: true;
+};
 type ExecutionActivation = Awaited<ReturnType<NonNullable<RelayedSessionDeps["activateExecution"]>>>;
 type ReadyProjection = Pick<RemoteExecutionReadyResult, "attempt" | "recoveryEpoch" | "readyRevision">;
 
