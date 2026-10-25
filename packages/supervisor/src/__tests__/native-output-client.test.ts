@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
-import { FixedClock, computeRemoteDeliveryOutputDigest, computeRemoteFileTreeDigest, type RemoteWorkAssignment } from "@konteks/remote-common";
+import { FixedClock, computeRemoteDeliveryOutputDigest, computeRemoteFileTreeDigest, RemoteDeliveryOutputStatusResultSchema, type RemoteWorkAssignment } from "@konteks/remote-common";
 import { NativeOutputClient, isAssignmentGone } from "../native/output-client.js";
 
 const assignment: RemoteWorkAssignment = {
@@ -19,7 +19,71 @@ const candidate = { ...body, resultDigest: computeRemoteDeliveryOutputDigest(bod
 const receipt = { version: 1 as const, acceptanceId: "accepted", invocationRef: "invocation", binding, claimId: "claim", resultId: "result", resultDigest: candidate.resultDigest,
   inputSelectionDigest: candidate.inputSelectionDigest, baseRevision: "revision", acceptedAt: "2026-09-11T01:00:00Z" };
 
+const expiredStage = { resultId: "result", resultDigest: candidate.resultDigest, stagedReceiptId: "staged", expiresAt: "2026-09-11T00:59:59Z" };
+const jsonReply = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
+
+describe("expired output staging reconciliation", () => {
+  it.each(["staged", "rejected"] as const)("does not commit or invent acceptance for %s output", async state => {
+    const status = RemoteDeliveryOutputStatusResultSchema.parse({ state, receipt: null, publication: "not_started" });
+    const fetchFn = vi.fn(async (url: string | URL) => jsonReply(String(url).endsWith("/prepare") ? expiredStage : status));
+    const client = new NativeOutputClient({ baseUrl: "https://core.example", clock: new FixedClock(Date.parse("2026-09-11T01:00:00Z")), credential: () => "lease", fetchFn });
+    await expect(client.accept(assignment, candidate)).rejects.toMatchObject({ code: "capability_unavailable" });
+    expect(fetchFn.mock.calls.map(call => String(call[0]).split("/").at(-1))).toEqual(["prepare", "status"]);
+  });
+
+  it.each([
+    ["invocation", { invocationRef: "other" }], ["claim", { claimId: "other" }], ["result", { resultId: "other" }],
+    ["digest", { resultDigest: `sha256:${"b".repeat(64)}` }], ["input selection", { inputSelectionDigest: `sha256:${"b".repeat(64)}` }],
+    ["base revision", { baseRevision: "other" }],
+    ...Object.keys(binding).map(key => [`binding ${key}`, { binding: { ...binding, [key]: key === "attempt" ? 2 : "other" } }]),
+  ])("rejects an accepted receipt with another %s", async (_label, patch) => {
+    const fetchFn = vi.fn(async (url: string | URL) => jsonReply(String(url).endsWith("/prepare") ? expiredStage : { state: "accepted", receipt: { ...receipt, ...patch as object }, publication: "pending" }));
+    const client = new NativeOutputClient({ baseUrl: "https://core.example", clock: new FixedClock(Date.parse("2026-09-11T01:00:00Z")), credential: () => "lease", fetchFn });
+    await expect(client.accept(assignment, candidate)).rejects.toMatchObject({ code: "capability_unavailable" });
+    expect(fetchFn.mock.calls.map(call => String(call[0]).split("/").at(-1))).toEqual(["prepare", "status"]);
+  });
+
+  it.each([403, 404, 503])("fails closed when the status read returns HTTP%s", async status => {
+    const fetchFn = vi.fn(async (url: string | URL) => String(url).endsWith("/prepare") ? jsonReply(expiredStage) : jsonReply({}, status));
+    const client = new NativeOutputClient({ baseUrl: "https://core.example", clock: new FixedClock(Date.parse("2026-09-11T01:00:00Z")), credential: () => "lease", fetchFn, retrySleep: async () => undefined });
+    await expect(client.accept(assignment, candidate)).rejects.toMatchObject({ code: "capability_unavailable" });
+    expect(fetchFn.mock.calls.filter(call => String(call[0]).endsWith("/prepare"))).toHaveLength(1);
+    expect(fetchFn.mock.calls.some(call => String(call[0]).endsWith("/commit"))).toBe(false);
+  });
+
+  it("does not widen identity or probe status for a mismatched prepared result", async () => {
+    const fetchFn = vi.fn(async () => jsonReply({ ...expiredStage, resultId: "other" }));
+    const client = new NativeOutputClient({ baseUrl: "https://core.example", clock: new FixedClock(Date.parse("2026-09-11T01:00:00Z")), credential: () => "lease", fetchFn });
+    await expect(client.accept(assignment, candidate)).rejects.toMatchObject({ code: "capability_unavailable" });
+    expect(fetchFn).toHaveBeenCalledOnce();
+  });
+
+  it("does not extend the transfer deadline to recover an accepted result", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    try {
+      const fetchFn = vi.fn(async () => { now.mockReturnValue(32_001); return jsonReply(expiredStage); });
+      const client = new NativeOutputClient({ baseUrl: "https://core.example", clock: new FixedClock(Date.parse("2026-09-11T01:00:00Z")), credential: () => "lease", fetchFn });
+      await expect(client.accept(assignment, candidate)).rejects.toMatchObject({ code: "capability_unavailable" });
+      expect(fetchFn).toHaveBeenCalledOnce();
+    } finally { now.mockRestore(); }
+  });
+});
+
 describe("native claim-scoped output client", () => {
+  it.each(["2026-09-11T00:59:59Z", "2026-09-11T01:00:00Z"])("recovers the exact accepted receipt when replayed staging expires at %s", async expiresAt => {
+    const fetchFn = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      expect(init?.method).toBe("POST");
+      return jsonReply(String(url).endsWith("/prepare")
+        ? { resultId: "result", resultDigest: candidate.resultDigest, stagedReceiptId: "staged", expiresAt }
+        : { state: "accepted", receipt, publication: "pending" });
+    });
+    const client = new NativeOutputClient({ baseUrl: "https://core.example", clock: new FixedClock(Date.parse("2026-09-11T01:00:00Z")), credential: () => "lease", fetchFn });
+
+    await expect(client.accept(assignment, candidate)).resolves.toEqual(receipt);
+    await expect(client.acceptRetained({ instanceId: "instance", workspaceId: "tenant", assignmentId: "assignment", attempt: 1, claimId: "claim" }, candidate)).resolves.toEqual(receipt);
+    expect(fetchFn.mock.calls.map(call => String(call[0]).split("/").at(-1))).toEqual(["prepare", "status", "prepare", "status"]);
+    expect(JSON.parse(String(fetchFn.mock.calls[1]![1]?.body))).toEqual({ attempt: 1, claimId: "claim", invocationRef: "invocation", resultId: "result", resultDigest: candidate.resultDigest });
+  });
   it("does not let restart recovery widen the frozen candidate's durable owner", async () => {
     const fetchFn = vi.fn();
     const client = new NativeOutputClient({ baseUrl: "https://core.example", clock: new FixedClock(Date.parse("2026-09-11T01:00:00Z")), credential: () => "lease", fetchFn });
