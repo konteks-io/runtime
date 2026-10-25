@@ -134,7 +134,8 @@ export class NativeOutputClient {
       baseRevision: candidate.baseRevision, files: candidate.files, deletions: candidate.deletions, resultDigest: candidate.resultDigest });
     const prepared = await this.prepared(call, prepareBody);
     if (prepared.kind === "accepted") return prepared.receipt;
-    if (prepared.result.resultId !== candidate.resultId || prepared.result.resultDigest !== candidate.resultDigest || Date.parse(prepared.result.expiresAt) <= this.options.clock.coreNow()) throw unavailable();
+    if (prepared.result.resultId !== candidate.resultId || prepared.result.resultDigest !== candidate.resultDigest) throw unavailable();
+    if (Date.parse(prepared.result.expiresAt) <= this.options.clock.coreNow()) return this.finalStatus(call, "expired_prepare_status_hit");
     const commitBody = RemoteDeliveryOutputCommitRequestSchema.parse({ attempt: owner.attempt, claimId: candidate.claimId,
       invocationRef: candidate.invocationRef, resultId: candidate.resultId, resultDigest: candidate.resultDigest, stagedReceiptId: prepared.result.stagedReceiptId });
     try {
@@ -186,10 +187,10 @@ export class NativeOutputClient {
     }
   }
 
-  private async finalStatus(call: OutputCall): Promise<RemoteDeliveryAcceptanceReceipt> {
+  private async finalStatus(call: OutputCall, cacheOutcome = "commit_status_hit"): Promise<RemoteDeliveryAcceptanceReceipt> {
     const final = await this.status(call.owner, call.statusBody, call.deadlineAtMs, call.telemetry).catch(() => null);
     if (final?.state !== "accepted" || !final.receipt) throw unavailable();
-    return this.accepted(call, final.receipt, "commit_status_hit");
+    return this.accepted(call, final.receipt, cacheOutcome);
   }
 
   private accepted(call: OutputCall, value: unknown, cacheOutcome: string): RemoteDeliveryAcceptanceReceipt {
