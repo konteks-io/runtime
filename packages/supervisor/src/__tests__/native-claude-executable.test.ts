@@ -45,6 +45,32 @@ describe("native Claude Code executable discovery", () => {
     await expect(resolveNativeClaudeExecutable({ PATH: join(root, "Windows", "System32") }, profile, "win32")).resolves.toBe(installed);
   });
 
+  it("rediscovers Claude after an update removes the saved executable", async () => {
+    root = await realpath(await mkdtemp(join(tmpdir(), "claude-exe-")));
+    const installed = join(root, "bin", "claude");
+    const saved = join(root, "versions", "old", "claude");
+    await executable(saved);
+    await executable(installed);
+    const resolveSaved = () => resolveNativeClaudeExecutable({ PATH: join(root, "bin") }, join(root, "home"), process.platform, saved);
+    await expect(resolveSaved()).resolves.toBe(saved);
+    await rm(saved);
+    await expect(resolveSaved()).resolves.toBe(installed);
+  });
+
+  it("keeps an explicit operator override strict even when discovery or the saved binary would work", async () => {
+    root = await realpath(await mkdtemp(join(tmpdir(), "claude-exe-")));
+    const saved = join(root, "bin", "claude");
+    await executable(saved);
+    await expect(resolveNativeClaudeExecutable({ CLAUDE_CODE_EXECUTABLE: join(root, "missing"), PATH: join(root, "bin") }, root, process.platform, saved)).rejects.toMatchObject({ code: "prerequisite_missing" });
+  });
+
+  it("rediscovers an updated Windows install from a removed saved path", async () => {
+    root = await realpath(await mkdtemp(join(tmpdir(), "claude-exe-")));
+    const installed = join(root, ".local", "bin", "claude.exe");
+    await executable(installed);
+    await expect(resolveNativeClaudeExecutable({ PATH: "" }, root, "win32", join(root, "old", "claude.exe"))).resolves.toBe(installed);
+  });
+
   it("names the platform's own official installer when Claude Code is missing", async () => {
     root = await realpath(await mkdtemp(join(tmpdir(), "claude-exe-")));
     const windows = resolveNativeClaudeExecutable({ PATH: "" }, join(root, "empty"), "win32");

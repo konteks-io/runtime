@@ -20,19 +20,23 @@ export function claudeCodeInstaller(platform: NodeJS.Platform = process.platform
  * Locate the operator's own installed Claude Code CLI. Search order adapted
  * from bb's provider-claude-code session options: explicit operator override,
  * `claude` on PATH, then the documented native/Homebrew/npm-local locations.
+ * A saved installation path is preferred when still trusted, but may be
+ * rediscovered after an update. An explicit environment override stays strict.
  * Operator process configuration only; never take this path from Core or ACP.
  */
-export function resolveNativeClaudeExecutable(env: NodeJS.ProcessEnv = process.env, operatorHome = homedir(), platform: NodeJS.Platform = process.platform): Promise<string> {
-  return locateClaude(env, operatorHome, platform);
+export function resolveNativeClaudeExecutable(env: NodeJS.ProcessEnv = process.env, operatorHome = homedir(), platform: NodeJS.Platform = process.platform, savedExecutable?: string): Promise<string> {
+  return locateClaude(env, operatorHome, platform, savedExecutable);
 }
 
-async function locateClaude(env: NodeJS.ProcessEnv, operatorHome: string, platform: NodeJS.Platform): Promise<string> {
+async function locateClaude(env: NodeJS.ProcessEnv, operatorHome: string, platform: NodeJS.Platform, savedExecutable?: string): Promise<string> {
   const windows = platform === "win32";
   // What is missing and the one thing to do, with this platform's own installer.
   const invalid = () => new RemoteInstanceError("prerequisite_missing", `Claude Code is not installed for this user. Install it with Anthropic's installer (${claudeCodeInstaller(platform).command}), then retry.${windows ? "" : " It must be owned by you or root and not writable by others."}`);
   const override = env.CLAUDE_CODE_EXECUTABLE;
   if (override && !plainAbsolutePath(override)) throw invalid();
-  const candidates = override ? [override] : documentedLocations(env, operatorHome, windows);
+  const discovered = documentedLocations(env, operatorHome, windows);
+  const preferred = savedExecutable && plainAbsolutePath(savedExecutable) ? [savedExecutable, ...discovered] : discovered;
+  const candidates = override ? [override] : preferred;
   for (const candidate of candidates) {
     const trusted = await trustedExecutable(candidate, windows);
     if (trusted) return trusted;
