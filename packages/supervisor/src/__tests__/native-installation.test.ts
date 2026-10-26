@@ -33,9 +33,9 @@ beforeEach(async () => {
 afterEach(async () => { vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }); });
 
 type FixturePlatform = { os: "macos" | "windows" | "debian"; architecture: "amd64" | "arm64" };
-async function fixture(platform: FixturePlatform = { os: "macos", architecture: "arm64" }) {
+async function fixture(platform: FixturePlatform = { os: "macos", architecture: "arm64" }, agentId: "codex" | "claude-code" = "codex") {
   const keys = buildReleaseFixture();
-  const agent = offlineFixture(platform.os, platform.architecture);
+  const agent = offlineFixture(platform.os, platform.architecture, agentId);
   const bytes = "verified-test-bridge-not-executed";
   const artifact = { id: "connector", kind: "connector", format: "executable", ...platform, url: "https://release.example/connector", digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}`, sizeBytes: Buffer.byteLength(bytes) };
   const body = { bundleVersion: "1.0.0", protocol: { min: "1.0", max: "1.0" }, deploymentKind: "native_connector", components: ["agent_runner"], images: [], agentBridges: [], nativeArtifacts: [artifact, agent.artifact], expiresAt: "2027-01-01T00:00:00Z" };
@@ -51,7 +51,7 @@ async function fixture(platform: FixturePlatform = { os: "macos", architecture: 
   await writeSecretFile(join(releaseDir, "manifest.json"), JSON.stringify(manifest));
   const archive = join(releaseDir, "agent.tgz");
   await writeFile(archive, agent.archive, { mode: 0o600 });
-  await installOfflineAgentPackage(archive, join(releaseDir, "agents", "codex"), agent.artifact as never);
+  await installOfflineAgentPackage(archive, join(releaseDir, "agents", agentId), agent.artifact as never);
   const executable = join(releaseDir, "agents", "codex", "bin", platform.os === "windows" ? "node.exe" : "node");
   const options = { roots: [{ ...keys.root, coreControlKeys: [{ keyId: keys.keyId, publicKeyJwk: keys.root.publicKeyJwk }] }], platform, nowMs: Date.parse("2026-09-06T00:00:00Z") };
   return { record, manifest, releaseDir, executable, options, agentArtifact: agent.artifact as Parameters<NativeBridgeVerification["verifyPackage"]>[1] };
@@ -67,6 +67,19 @@ describe("preview tuning from the service environment", () => {
 });
 
 describe("closed native runtime installation", () => {
+  it("loads the updated Claude binary when the runtime record pins a removed version", async () => {
+    const f = await fixture(undefined, "claude-code");
+    const installed = join(root, "person-bin", process.platform === "win32" ? "claude.exe" : "claude");
+    await mkdir(join(installed, ".."), { recursive: true });
+    await writeFile(installed, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    vi.stubEnv("PATH", join(root, "person-bin"));
+    vi.stubEnv("CLAUDE_CODE_EXECUTABLE", undefined as unknown as string);
+    for (const kind of ["credentials", "workspaces"]) await mkdir(join(root, kind, "claude-code"), { mode: 0o700 });
+    await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, agents: ["claude-code"], claudeExecutable: join(root, "removed-version", "claude") }));
+    const loaded = await loadNativeInstallation(root, f.options);
+    expect(loaded.runners).toHaveLength(1);
+    expect(loaded.runners[0]).toMatchObject({ RUNNER_AGENT_ID: "claude-code", RUNNER_NATIVE_CLAUDE_EXECUTABLE: installed });
+  });
   it("fully verifies a bundled package once within one installation load", async () => {
     const f = await fixture();
     const verify = vi.spyOn(releasePackages, "verifyOfflineAgentPackage");
