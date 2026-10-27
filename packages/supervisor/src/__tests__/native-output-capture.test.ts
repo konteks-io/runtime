@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
@@ -40,6 +40,115 @@ describe("native delivery output capture", () => {
       await writeFile(join(dir, file), "fixture content\n");
     }
   }
+
+  async function gitlinkOptions() {
+    const initial = await outputOptions();
+    await writeFile(join(dir, "README.md"), "before\n");
+    await run("git", ["-C", dir, "add", "README.md"]);
+    await run("git", ["-C", dir, "update-index", "--add", "--cacheinfo", `160000,${initial.baselineCommit},lib/external`]);
+    await run("git", ["-C", dir, "-c", "user.name=Test", "-c", "user.email=test@invalid", "commit", "-qm", "gitlink base"]);
+    await mkdir(join(dir, "lib", "external"), { recursive: true });
+    return outputOptions();
+  }
+
+  it("captures only README beside an unchanged empty gitlink, retaining the real index and HEAD", async () => {
+    const options = await gitlinkOptions();
+    const index = await readFile(join(dir, ".git", "index"));
+    await writeFile(join(dir, "README.md"), "architecture\n");
+    const result = await captureNativeDeliveryOutput(options);
+    expect(result.files.entries.map(entry => entry.path)).toEqual(["README.md"]);
+    expect(result.deletions).toEqual([]);
+    expect(await readFile(join(dir, ".git", "index"))).toEqual(index);
+    expect((await run("git", ["-C", dir, "rev-parse", "HEAD"])).stdout.trim()).toBe(options.baselineCommit);
+    const { resultDigest: _digest, ...body } = result;
+    expect(result.resultDigest).toBe(computeRemoteDeliveryOutputDigest(body));
+  });
+
+  it("classifies clean, unsaved and accepted README work beside an unchanged empty gitlink", async () => {
+    const options = await gitlinkOptions();
+    const input = { ...options, publishedCommit: options.baselineCommit };
+    await expect(staleCheckoutVerdict(input)).resolves.toBe("clean");
+    await writeFile(join(dir, "README.md"), "architecture\n");
+    await expect(staleCheckoutVerdict(input)).resolves.toBe("unsaved");
+    const result = await captureNativeDeliveryOutput(options);
+    await expect(staleCheckoutVerdict({ ...input, accepted: { files: result.files, treeDigest: result.files.treeDigest, deletions: [] } })).resolves.toBe("accepted");
+  });
+
+  it("recognizes published README work beside an unchanged empty gitlink", async () => {
+    const options = await gitlinkOptions();
+    await writeFile(join(dir, "README.md"), "architecture\n");
+    await run("git", ["-C", dir, "add", "README.md"]);
+    await run("git", ["-C", dir, "-c", "user.name=Test", "-c", "user.email=test@invalid", "commit", "-qm", "published"]);
+    const published = (await run("git", ["-C", dir, "rev-parse", "HEAD"])).stdout.trim();
+    await expect(staleCheckoutVerdict({ ...options, publishedCommit: published })).resolves.toBe("published");
+  });
+
+  const gitlinkChanges = {
+    populated: async (_head: string) => writeFile(join(dir, "lib", "external", "private-untracked.txt"), "retained\n"),
+    initialized: async (_head: string) => writeFile(join(dir, "lib", "external", ".git"), "gitdir: retained-private-location\n"),
+    missing: async (_head: string) => rm(join(dir, "lib", "external"), { recursive: true }),
+    replaced: async (_head: string) => {
+      await rm(join(dir, "lib", "external"), { recursive: true });
+      await writeFile(join(dir, "lib", "external"), "retained replacement\n");
+    },
+    symlink: async (_head: string) => {
+      await rm(join(dir, "lib", "external"), { recursive: true });
+      await symlink(join(dir, "kept.txt"), join(dir, "lib", "external"));
+    },
+    "staged changed": async (head: string) => run("git", ["-C", dir, "update-index", "--cacheinfo", `160000,${head},lib/external`]),
+    "staged removed": async (_head: string) => run("git", ["-C", dir, "update-index", "--force-remove", "lib/external"]),
+    "staged new": async (head: string) => {
+      await mkdir(join(dir, "lib", "new"));
+      await run("git", ["-C", dir, "update-index", "--add", "--cacheinfo", `160000,${head},lib/new`]);
+    },
+  };
+
+  it.each(Object.entries(gitlinkChanges))("refuses %s gitlinks without certifying a stale checkout as disposable", async (_name, change) => {
+    const options = await gitlinkOptions();
+    await change(options.baselineCommit);
+    await expect(captureNativeDeliveryOutput(options)).rejects.toThrow();
+    await expect(staleCheckoutVerdict({ ...options, publishedCommit: options.baselineCommit })).rejects.toThrow();
+  });
+
+  it("refuses a newly staged gitlink when the baseline has none", async () => {
+    const options = await outputOptions();
+    await mkdir(join(dir, "external"));
+    await run("git", ["-C", dir, "update-index", "--add", "--cacheinfo", `160000,${options.baselineCommit},external`]);
+    await expect(captureNativeDeliveryOutput(options)).rejects.toThrow();
+    await expect(staleCheckoutVerdict({ ...options, publishedCommit: options.baselineCommit })).rejects.toThrow();
+  });
+
+  it("refuses an unchanged gitlink reached through a symlinked parent", async () => {
+    const options = await gitlinkOptions();
+    await mkdir(join(dir, "elsewhere", "external"), { recursive: true });
+    await rm(join(dir, "lib"), { recursive: true });
+    await symlink(join(dir, "elsewhere"), join(dir, "lib"), "dir");
+    await expect(captureNativeDeliveryOutput(options)).rejects.toThrow();
+    await expect(staleCheckoutVerdict({ ...options, publishedCommit: options.baselineCommit })).rejects.toThrow();
+  });
+
+  it.each(["file", "deletion"])("does not silently discard a legacy accepted %s at a protected gitlink", async kind => {
+    const options = await gitlinkOptions();
+    const bytes = Buffer.from("previous regular output\n");
+    const entries = kind === "file" ? [{ path: "lib/external", mode: 384 as const,
+      sizeBytes: bytes.length, contentBase64: bytes.toString("base64"), digest: "sha256:" + createHash("sha256").update(bytes).digest("hex") }] : [];
+    const previousOutput = { files: { format: "konteks-file-tree-v1" as const, entries, treeDigest: computeRemoteFileTreeDigest(entries) },
+      deletions: kind === "deletion" ? ["lib/external"] : [] };
+    await expect(captureNativeDeliveryOutput({ ...options, previousOutput })).rejects.toThrow();
+  });
+
+  it("logs only a bounded gitlink reason when hidden submodule work prevents capture", async () => {
+    const options = await gitlinkOptions();
+    await writeFile(join(dir, "lib", "external", "credential-shaped-private-file"), "retained-private-content\n");
+    const warn = vi.fn();
+    await expect(captureNativeDeliveryOutput({ ...options, logger: { warn } as never })).rejects.toThrow();
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({ event: "native.output.capture_failed", diagnostic: "gitlink_not_empty" }), expect.any(String));
+    const logs = JSON.stringify(warn.mock.calls);
+    expect(logs).not.toContain("lib/external");
+    expect(logs).not.toContain("credential-shaped-private-file");
+    expect(logs).not.toContain("retained-private-content");
+    expect(await readFile(join(dir, "lib", "external", "credential-shaped-private-file"), "utf8")).toBe("retained-private-content\n");
+  });
 
   it("excludes internal Graft output without wiring while retaining project Graft files", async () => {
     const options = await outputOptions();
