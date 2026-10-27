@@ -17,6 +17,7 @@ import {
   type RemoteDeliveryResultCandidate,
   type RemoteTransferBinding,
 } from "@konteks/remote-common";
+import { acceptUnchangedGitlink, baselineGitlinks, requireAllGitlinksSeen, verifyEmptyGitlinks } from "./output-gitlinks.js";
 
 const MAX_GIT_OUTPUT = 16 * 1024 * 1024;
 const oidPattern = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/;
@@ -115,14 +116,17 @@ async function captureAcceptedPaths(executable: string, cwd: string, env: NodeJS
   if (paths.length) await runGit(executable, cwd, ["--literal-pathspecs", "add", "--no-renormalize", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"], env, paths.join("\0") + "\0");
 }
 
-function parseTree(value: Buffer): Map<string, { oid: string; mode: 0o600 | 0o700 }> {
+function parseTree(value: Buffer, gitlinks: ReadonlyMap<string, string>): Map<string, { oid: string; mode: 0o600 | 0o700 }> {
   const decoded = new TextDecoder("utf-8", { fatal: true }).decode(value);
   const entries = new Map<string, { oid: string; mode: 0o600 | 0o700 }>();
+  const seen = new Set<string>();
   for (const row of decoded.split("\0").filter(Boolean)) {
+    if (acceptUnchangedGitlink(row, gitlinks, seen)) continue;
     const match = /^(100644|100755) blob ([a-f0-9]{40}(?:[a-f0-9]{24})?)\t(.+)$/u.exec(row);
     if (!match || entries.has(match[3]!)) throw unavailable();
     entries.set(match[3]!, { oid: match[2]!, mode: match[1] === "100755" ? 0o700 : 0o600 });
   }
+  requireAllGitlinksSeen(gitlinks, seen);
   return entries;
 }
 
@@ -175,11 +179,17 @@ export async function captureNativeDeliveryOutput(options: CaptureOptions): Prom
   } catch (error) {
     logger.warn({ event: "native.output.capture_failed", correlationId: options.invocationRef,
       assignmentId: options.binding.assignmentId, stage: "capture", outcome: "failed",
-      errorClass: error instanceof Error ? error.name : "UnknownError", durationMs: Date.now() - startedAt },
+      errorClass: error instanceof Error ? error.name : "UnknownError", diagnostic: captureDiagnostic(error), durationMs: Date.now() - startedAt },
       "native delivery output capture failed");
     throw unavailable();
   }
   finally { if (temporary) await rm(temporary, { recursive: true, force: true }).catch(() => undefined); }
+}
+
+function captureDiagnostic(error: unknown): string {
+  const allowed = ["output_exceeds_limits", "gitlink_changed", "gitlink_not_empty"];
+  if (error instanceof RemoteInstanceError && allowed.includes(error.diagnostic ?? "")) return error.diagnostic!;
+  return "capture_unavailable";
 }
 
 interface CaptureOptions {
@@ -206,13 +216,16 @@ async function commonObjectDirectory(gitExecutable: string, root: string): Promi
 
 /** The files written and deleted since the baseline, captured twice into the private index and required to agree. */
 async function capturedChanges(gitExecutable: string, root: string, baselineCommit: string, env: NodeJS.ProcessEnv, previous?: PreviousOutput | null): Promise<{ entries: CapturedEntry[]; deletions: string[] }> {
+  const gitlinks = baselineGitlinks(await runGit(gitExecutable, root, ["ls-tree", "-rz", baselineCommit]));
+  await verifyEmptyGitlinks(root, gitlinks, await runGit(gitExecutable, root, ["ls-files", "--stage", "-z"]));
   const first = await captureIndex(gitExecutable, root, baselineCommit, env, previous);
   const second = await captureIndex(gitExecutable, root, baselineCommit, env, previous);
   if (first !== second) throw unavailable();
   let deletions = decodePaths(await runGit(gitExecutable, root, ["diff", "--cached", "--diff-filter=D", "--name-only", "-z", "--no-renames", baselineCommit, "--"], env));
   const writes = decodePaths(await runGit(gitExecutable, root, ["diff", "--cached", "--diff-filter=ACMRTUXB", "--name-only", "-z", "--no-renames", baselineCommit, "--"], env));
-  const tree = parseTree(await runGit(gitExecutable, root, ["ls-tree", "-rz", second], env));
+  const tree = parseTree(await runGit(gitExecutable, root, ["ls-tree", "-rz", second], env), gitlinks);
   const touched = new Set([...writes, ...deletions, ...(previous?.files.entries.map(entry => entry.path) ?? []), ...(previous?.deletions ?? [])].filter(path => !isToolArtifactPath(path)));
+  if ([...touched].some(path => gitlinks.has(path))) throw new RemoteInstanceError("capability_unavailable", "Generated delivery output changes a submodule.", { diagnostic: "gitlink_changed" });
   deletions = [...touched].filter(path => !tree.has(path)).sort();
   const selected = [...touched].filter(path => tree.has(path)).sort().map(path => ({ path, item: tree.get(path) }));
   if (selected.some(value => !value.item)) throw unavailable();
@@ -223,6 +236,7 @@ async function capturedChanges(gitExecutable: string, root: string, baselineComm
       digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}`, contentBase64: bytes.toString("base64") };
   });
   checkOutputTreeLimits(entries);
+  await verifyEmptyGitlinks(root, gitlinks, await runGit(gitExecutable, root, ["ls-files", "--stage", "-z"]));
   return { entries, deletions };
 }
 
