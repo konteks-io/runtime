@@ -44,6 +44,7 @@ import type { RetainedProcessOwner } from "@konteks/remote-common";
 import type { DurableOutbox } from "../state/outbox.js";
 import type { TransportManager } from "../transport/relay-transport.js";
 import { RecoveryAuthority } from "../transport/recovery-authority.js";
+import { checkpointCause } from "../native/workspace-checkpoint-failure.js";
 import type { RunnerPort } from "../runner-port.js";
 import { RelayedSession, type RelayedSessionDeps, type SessionClosedReason } from "../session/relayed-session.js";
 import type { PendingHumanRequest } from "../session/permissions.js";
@@ -1770,7 +1771,7 @@ export class WorkOrchestrator {
       assertCurrent();
       this.logger.warn({ event: "workspace.checkpoint_retained_locally", assignmentId: admission.assignmentId,
         attempt: admission.attempt, claimId: admission.claimId,
-        code: error instanceof RemoteInstanceError ? error.code : "unexpected_error" },
+        code: error instanceof RemoteInstanceError ? error.code : "unexpected_error", cause: checkpointCause(error) },
       "Workspace preservation is incomplete; its original checkout stays on this runtime and migration remains withheld");
     }
     assertCurrent();

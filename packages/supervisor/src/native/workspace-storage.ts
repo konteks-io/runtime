@@ -2,13 +2,15 @@ import { constants, type Stats } from "node:fs";
 import { lstat, open, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { RemoteInstanceError } from "@konteks/remote-common";
-const unavailable = () => new RemoteInstanceError("recovery_required", "Private workspace recovery storage is unavailable.");
+import { NamedRefusal } from "./named-refusal.js";
+const unavailable = (diagnostic: string) => new NamedRefusal("recovery_required", "Private workspace recovery storage is unavailable.", diagnostic);
 
 export async function privateWorkspaceDirectory(path: string): Promise<void> {
   const stat = await lstat(path);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) throw unavailable();
-  if (process.platform !== "win32" && (stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0)) throw unavailable();
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw unavailable("storage_not_directory");
+  if (process.platform === "win32") return;
+  if (stat.uid !== process.getuid?.()) throw unavailable("storage_not_owned");
+  if ((stat.mode & 0o077) !== 0) throw unavailable("storage_not_private");
 }
 
 export function readPrivateWorkspaceFile(path: string, maxBytes: number): Promise<Buffer | null> {
@@ -30,9 +32,9 @@ async function readWorkspaceFile(path: string, maxBytes: number, privateMode: bo
   const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   try {
     const actual = await handle.stat();
-    if (!sameFile(info, actual)) throw unavailable();
+    if (!sameFile(info, actual)) throw unavailable("storage_file_changed");
     const bytes = await handle.readFile();
-    if (!sameFile(info, await handle.stat()) || bytes.length !== info.size) throw unavailable();
+    if (!sameFile(info, await handle.stat()) || bytes.length !== info.size) throw unavailable("storage_file_changed");
     return bytes;
   } finally { await handle.close(); }
 }
@@ -60,12 +62,15 @@ export async function writePrivateWorkspaceBytes(folder: string, path: string, v
 
 
 function assertWorkspaceFile(info: Stats, maxBytes: number): void {
-  if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.size > maxBytes) throw unavailable();
+  if (!info.isFile() || info.isSymbolicLink()) throw unavailable("storage_not_a_file");
+  if (info.nlink !== 1) throw unavailable("storage_file_hardlinked");
+  if (info.size > maxBytes) throw unavailable("storage_file_too_large");
 }
 
 function assertWorkspaceFileOwner(info: Stats, privateMode: boolean): void {
   if (process.platform === "win32") return;
-  if (info.uid !== ownerUid() || (privateMode && (info.mode & 0o077) !== 0)) throw unavailable();
+  if (info.uid !== ownerUid()) throw unavailable("storage_file_not_owned");
+  if (privateMode && (info.mode & 0o077) !== 0) throw unavailable("storage_file_not_private");
 }
 
 function sameFile(before: Stats, after: Stats): boolean {

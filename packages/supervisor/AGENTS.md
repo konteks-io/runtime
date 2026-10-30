@@ -148,3 +148,11 @@ QA browser, structured results, updates and doctor/support.
 - A repository role session whose turn ended unfinished is retired after its
   process is proven gone (`retireAfterClose` in `work/orchestrator.ts`);
   generated changes in the working copy are kept.
+- The delivery-output path names every refusal: capture throws
+  `OutputCaptureRefusal` with a diagnostic and Git step, and `DeliveryOutput`
+  tags each step (`native/delivery-output-failure.ts`). A retained retry
+  (attempt 1, then every 12th) is also reported as a `turn` runtime failure.
+  A new bare refusal there is a blind spot again: give it a name.
+  The recovery-checkpoint path does the same (`NamedRefusal`, each Git call
+  takes a `CheckpointGitStep`); `seal()` reports the cause in the stage, e.g.
+  `workspace_capture_file_hardlinked` (`native/workspace-checkpoint-failure.ts`).
