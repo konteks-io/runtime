@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CONVERSATION_HAS_NO_APP, NOTHING_TO_SERVE_REASON, inferPreviewPlan, parsePreviewYaml, resolvePreviewPlan, frameworkFlags, substitutePreviewVariables, type PreviewPlanResult } from "../preview/config.js";
-import { buildPreviewEnv, pendingViewerRetry, PreviewProcessManager, PreviewProcessRegistry, allocatePreviewPort, type PreviewChild } from "../preview/process-manager.js";
+import { buildPreviewEnv, missingStepCommand, pendingViewerRetry, PreviewProcessManager, PreviewProcessRegistry, allocatePreviewPort, type PreviewChild } from "../preview/process-manager.js";
 import { resolvePreviewPath } from "../preview/user-path.js";
 import type { PreviewProcessOwner } from "../preview/process-owner.js";
 
@@ -534,5 +534,22 @@ describe("preview process registry (restart never adopts)", () => {
     await writeFile(join(dir, "other"), "");
     const registry = new PreviewProcessRegistry(join(dir, "preview-processes.json"), { stop: async () => { throw new Error("never"); } });
     expect(await registry.sweep()).toBe(0);
+  });
+});
+
+describe("missingStepCommand (E56)", () => {
+  it.each([
+    ["dotnet restore App.sln", "dotnet"],
+    ["DOTNET_CLI_TELEMETRY_OPTOUT=1 /usr/local/bin/dotnet restore", "dotnet"],
+    ["mvn -q install", "mvn"],
+  ])("names %s's own program when the shell could not find it", (command, program) => {
+    expect(missingStepCommand(command, 127)).toBe(program);
+  });
+
+  it("leaves a script runner's 127 and every other exit to the agent", () => {
+    expect(missingStepCommand("npm run build", 127)).toBeUndefined();
+    expect(missingStepCommand("pnpm install", 127)).toBeUndefined();
+    expect(missingStepCommand("dotnet restore", 1)).toBeUndefined();
+    expect(missingStepCommand("dotnet restore", null)).toBeUndefined();
   });
 });
