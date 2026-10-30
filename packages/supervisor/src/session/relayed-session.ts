@@ -57,6 +57,7 @@ import {
 import { NativeExecutionGate, isTransientExecutionRefusal, type NativeExecutionGateOptions } from "../native/execution-gate.js";
 import { transientInputFailure, type TransientInputFailure } from "../native/input-client.js";
 import { nativeDeferralDelayMs } from "../native/transient-retry.js";
+import { deliveryOutputFailure } from "../native/delivery-output-failure.js";
 import {
   admittedDirectModelReceipt,
   assertDirectModelAuthority,
@@ -997,12 +998,16 @@ export class RelayedSession {
     if (accepted && (parsed.result as { stopReason?: string }).stopReason === "end_turn") await this.close("completed");
   }
 
-  /** Name the refusal: without it a Core 422 repeated 120+ times read as a transport stall. Codes and statuses only, never messages. */
+  /** Name the refusal: without it a Core 422 repeated 120+ times read as a transport stall. Codes and statuses only, never messages.
+   * The same facts go to Konteks as a `turn` runtime failure: seven 10-30 attempts failed on a computer whose log nobody could read. */
   private logDeliveryRetry(error: unknown, attempt: number): void {
     if (attempt !== 1 && attempt % 12 !== 0) return;
     const status = httpStatus(error);
+    const failure = deliveryOutputFailure(error);
     this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, transferAttempt: attempt,
-      ...errorCode(error, "delivery_output_transfer_failed"), ...(status === undefined ? {} : { status }) }, "durable delivery output retained for retry");
+      ...errorCode(error, "delivery_output_transfer_failed"), stage: failure.stage, ...(status === undefined ? {} : { status }) },
+      "durable delivery output retained for retry");
+    reportRuntimeFailure(this.deps.onRuntimeFailure, failure, { assignmentId: this.assignment.id, attempt: this.assignment.attempt });
   }
 
   /** The assignment's lifetime, or the later one Core renewed a delivery turn to. */
