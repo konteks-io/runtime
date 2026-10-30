@@ -53,7 +53,7 @@ describe("the onboard role is the machine's git", () => {
       { role: "qa" as const, agentPreference: ["codex"] },
       { role: "ops" as const, agentPreference: ["codex"] },
     ];
-    expect(deriveAdvertisedRoles(all, [ready], { gitVersion: null })).toEqual(["planner", "generator", "qa"]);
+    expect(deriveAdvertisedRoles(all, [ready], { gitVersion: null })).toEqual(["planner", "generator", "qa", "ops"]);
   });
 });
 

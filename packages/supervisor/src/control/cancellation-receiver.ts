@@ -4,18 +4,19 @@ import type { CoreSignatureVerifier } from "./core-signature.js";
 import type { CancellationInbox, CancellationInboxRecord } from "../state/cancellation-inbox.js";
 import type { LocalExecutionJournal } from "../state/local-execution.js";
 import type { CoreClient } from "../core/client.js";
+import { isAssistantTurnKind } from "../work/continued-session.js";
 
 type StartedAssignment = NonNullable<ReturnType<LocalExecutionJournal["start"]>>["assignment"];
 
-/** The work a Core cancellation may name: an Assistant conversation turn, a
- * person's direct session prompt, or a native delivery turn of a
- * repository-role Session whose cleanup Core owns. The session must be the
- * assignment's own. */
+/** The work a Core cancellation may name: an Assistant conversation turn (an
+ * ordinary or an operations one), a person's direct session prompt, or a
+ * native delivery turn of a repository-role Session whose cleanup Core owns.
+ * The session must be the assignment's own. */
 export function cancellationNamesAssignment(assignment: StartedAssignment, sessionId: string): boolean {
   const source = assignment.source;
   if (source.kind === "harness_delivery") return source.executionSessionId === sessionId;
   if (assignment.kind === "direct" && source.kind === "direct_session") return source.sessionId === sessionId;
-  return assignment.kind === "assistant_execution" && source.kind === "conversation" && source.sessionId === sessionId;
+  return isAssistantTurnKind(assignment.kind) && source.kind === "conversation" && source.sessionId === sessionId;
 }
 
 /** Whether the started assignment is the one the cancellation names, claimed by this connection's runner. */

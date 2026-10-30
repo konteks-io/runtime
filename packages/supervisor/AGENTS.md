@@ -88,7 +88,9 @@ QA browser, structured results, updates and doctor/support.
   checkouts at another commit still refuse.
 - **Core contract gating.** `availableCommands`, `supportedAgents`,
   `connectorCommands`, pay-per-use and option billing go only to a 7.1 Core;
-  `integration` work only from 7.3 (`work/accepted-kinds.ts`); a heartbeat's
+  `operations` work (an ops session's conversation turn, the `ops` role any
+  ready agent advertises) from 7.1 too; `integration` work only from 7.3
+  (`work/accepted-kinds.ts`); a heartbeat's
   `previews` only from 7.8; workspace checkpoints and their chunk transfer
   only from 7.9. The
   `agent_runner` component always advertises `core-contract-version-v1`.

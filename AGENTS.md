@@ -86,8 +86,8 @@ Node 22 (`.nvmrc`; CI and releases use 22.23.2). From the repo root:
   naming it still loads without it (`parseNativeRuntimeRecord`).
 - **Core contract gating.** New wire fields and work kinds go only to a Core
   that signs `coreContractVersion` high enough into the desired configuration
-  (`coreContractAtLeast`; `direct` from 7.1, `integration` from 7.3 in
-  `packages/supervisor/src/work/accepted-kinds.ts`). Never infer it from
+  (`coreContractAtLeast`; `operations` and `direct` from 7.1, `integration`
+  from 7.3 in `packages/supervisor/src/work/accepted-kinds.ts`). Never infer it from
   another field; an older Core refuses a pull naming an unknown kind.
 - **Vendored contracts.** Workspaces link `file:../packages/...`; the root
   `konteksContracts` names the version of `vendor/konteks-*-<ver>.tgz`, and CI

@@ -222,7 +222,7 @@ describe("roles and utilization", () => {
   it("advertises a role only when a preferred agent is ready and capable", () => {
     const bindings = [{ role: "planner" as const, agentPreference: ["claude-code", "codex"] }, { role: "generator" as const, agentPreference: ["codex"] }, { role: "qa" as const, agentPreference: ["codex"] }, { role: "assistant" as const, agentPreference: ["pi"] }];
     expect(deriveAdvertisedRoles(bindings, [ready], {})).toEqual(["planner", "generator", "qa"]);
-    expect(deriveAdvertisedRoles([{ role: "ops", agentPreference: [ready.agentId] }], [ready], {})).toEqual([]);
+    expect(deriveAdvertisedRoles([{ role: "ops", agentPreference: [ready.agentId] }], [ready], {})).toEqual(["ops"]);
     expect(deriveAdvertisedRoles(bindings, [ready], {})).toEqual(["planner", "generator", "qa"]);
     expect(deriveAdvertisedRoles(bindings, [{ ...ready, readiness: "not_configured" }], {})).toEqual([]);
     // Enrollment binds a machine's roles before it has said what it has, so
