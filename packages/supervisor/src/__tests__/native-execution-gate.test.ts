@@ -20,6 +20,7 @@ import { CoreSignatureVerifier } from "../control/core-signature.js";
 import { PermissionAnswerReceiver } from "../control/permission-answer-receiver.js";
 import { SupervisorJournal } from "../state/journal.js";
 import { NativeExecutionGate, NATIVE_EXECUTION_RENEWAL_BUDGET_MS } from "../native/execution-gate.js";
+import { OutputCaptureRefusal, tagDeliveryOutputStage } from "../native/delivery-output-failure.js";
 import { terminalOperationDispositions } from "../state/operation-dispositions.js";
 import { RelayedSession, type RelayedSessionDeps } from "../session/relayed-session.js";
 import { PermissionBroker } from "../session/permissions.js";
@@ -1246,6 +1247,44 @@ describe("native session dispatch uses genuine execution admission", () => {
     expect(acceptDeliveryOutput).toHaveBeenCalledTimes(2);
     expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ transferAttempt: 1, code: "capability_unavailable",
       diagnostic: "response_status_invalid" }), "durable delivery output retained for retry");
+  });
+
+  // 10-30: seven attempts stopped locally before Core's output client, and
+  // the reason sat only in a connector log Konteks could not read.
+  it("reports a retained delivery output retry as a turn runtime failure on attempts 1 and 12 only", async () => {
+    const receipt = { version: 1 as const, acceptanceId: "acceptance", invocationRef: "invocation",
+      binding: { workspaceId: "tenant", instanceId: "instance", sessionId: "session", assignmentId: "assignment", attempt: 1 },
+      claimId: "claim", resultId: "result", resultDigest: `sha256:${"a".repeat(64)}`, inputSelectionDigest: `sha256:${"b".repeat(64)}`,
+      baseRevision: "base", acceptedAt: new Date().toISOString() };
+    const refusal = () => {
+      const error = new OutputCaptureRefusal("git_timeout", { gitStep: "ls_files" });
+      tagDeliveryOutputStage(error, "output_capture");
+      return error;
+    };
+    const acceptDeliveryOutput = vi.fn<(authority: { claimId: string; invocationRef: string }) => Promise<RemoteDeliveryAcceptanceReceipt>>();
+    for (let attempt = 0; attempt < 12; attempt += 1) acceptDeliveryOutput.mockRejectedValueOnce(refusal());
+    acceptDeliveryOutput.mockResolvedValueOnce(receipt);
+    const logger = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    // The transfer attempt each report followed: Core was asked that many times.
+    const reportedAfter: number[] = [];
+    const onRuntimeFailure = vi.fn((_fact: unknown, _context: unknown) => { reportedAfter.push(acceptDeliveryOutput.mock.calls.length); });
+    const f = await sessionFixture(deliveryTurn, acceptDeliveryOutput, logger, {}, { onRuntimeFailure });
+    await f.session.onToRuntime(f.envelope);
+    vi.useFakeTimers();
+    try {
+      const completion = f.session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp", requestId: "request", result: { stopReason: "end_turn" } } as never);
+      while (acceptDeliveryOutput.mock.calls.length < 13) await vi.advanceTimersByTimeAsync(1_000);
+      await completion;
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(reportedAfter).toEqual([1, 12]);
+    const fact = { phase: "turn", stage: "delivery_output_capture_git_ls_files", code: "git_timeout",
+      evidence: { kind: "runtime_condition" }, retryable: true };
+    expect(onRuntimeFailure.mock.calls).toEqual([[fact, { assignmentId: "assignment", attempt: 1 }], [fact, { assignmentId: "assignment", attempt: 1 }]]);
+    const retained = logger.warn.mock.calls.filter(([, message]) => message === "durable delivery output retained for retry").map(([fields]) => fields);
+    expect(retained).toEqual([1, 12].map(transferAttempt => expect.objectContaining({ transferAttempt, code: "capability_unavailable",
+      diagnostic: "git_timeout", stage: "delivery_output_capture_git_ls_files" })));
   });
 
   it("never falls back to bare ACP or borrowed Assistant permits for prepared delivery", async () => {

@@ -46,6 +46,7 @@ import {
 } from "./git-workspace.js";
 import { NativeRepositoryCache } from "./repository-cache.js";
 import { reportRuntimeFailure, type RuntimeFailureFact, type RuntimeFailureReporter } from "../runtime-failure-types.js";
+import { deliveryStep, tagDeliveryOutputStage, type DeliveryOutputStage } from "./delivery-output-failure.js";
 
 interface NativeInputPreparerOptions {
   /** Signed Core contract gate; older Core never receives checkpoint requests. */
@@ -548,8 +549,9 @@ class DeliveryOutput {
     claimIdOf: (assignment: RemoteWorkAssignment) => string | null;
   }) {}
 
+  /** Each step names itself on what it throws (deliveryOutputStage), so a retained retry says where it stopped. */
   async deliver(authority: DeliveryAuthority, completion?: SessionToCoreMessage): Promise<DeliveredOutput | null> {
-    if (this.busy) throw unavailable();
+    if (this.busy) throw refused("output_busy");
     this.busy = true;
     try {
       return await this.deliverOnce(authority, completion);
@@ -562,10 +564,10 @@ class DeliveryOutput {
     const { inputs, mutate } = this.delivery;
     await this.authorizeFor(authority);
     const store = this.store(authority);
-    const prior = await mutate(() => store.read());
-    if (prior && !this.matches(prior.candidate, authority)) throw unavailable();
+    const prior = await deliveryStep("output_record_read", () => mutate(() => store.read()));
+    if (prior && !this.matches(prior.candidate, authority)) throw refused("output_record_mismatch");
     if (prior?.state === "accepted") {
-      await mutate(() => this.delivery.outputHead.promote({ invocationId: authority.invocationRef, claimId: inputs.claimId }));
+      await deliveryStep("output_promote", () => mutate(() => this.delivery.outputHead.promote({ invocationId: authority.invocationRef, claimId: inputs.claimId })));
       return { receipt: prior.receipt, completion: prior.completion };
     }
     if (!prior && !completion) return null;
@@ -573,8 +575,8 @@ class DeliveryOutput {
   }
 
   private async authorizeFor(authority: DeliveryAuthority): Promise<void> {
-    if (authority.claimId !== this.delivery.inputs.claimId) throw unavailable();
-    await this.delivery.inputs.authorize();
+    if (authority.claimId !== this.delivery.inputs.claimId) throw refused("output_claim_moved");
+    await deliveryStep("output_authorize", () => this.delivery.inputs.authorize());
   }
 
   private store(authority: DeliveryAuthority): NativeOutputStore {
@@ -584,33 +586,34 @@ class DeliveryOutput {
   /** Capture the worktree's output between two verifications and freeze it as pending, under a fresh authorization. */
   private async capture(store: NativeOutputStore, authority: DeliveryAuthority, completion: SessionToCoreMessage): Promise<NativeOutputRecord | null> {
     const { inputs, source, mutate } = this.delivery;
-    await mutate(() => this.delivery.outputHead.begin({ invocationId: authority.invocationRef, claimId: inputs.claimId }));
-    await source.verify();
-    const captured = await captureNativeDeliveryOutput({
+    await deliveryStep("output_begin", () => mutate(() => this.delivery.outputHead.begin({ invocationId: authority.invocationRef, claimId: inputs.claimId })));
+    await deliveryStep("output_source_verify", () => source.verify());
+    const previousOutput = await deliveryStep("output_previous", () => mutate(() => this.delivery.outputHead.latestAccepted()));
+    const captured = await deliveryStep("output_capture", () => captureNativeDeliveryOutput({
       cwd: source.cwd,
       gitExecutable: this.delivery.git.executable,
       baselineCommit: source.baselineCommit!,
-      previousOutput: await mutate(() => this.delivery.outputHead.latestAccepted()),
+      previousOutput,
       binding: inputs.selection.binding,
       claimId: inputs.claimId,
       invocationRef: authority.invocationRef,
       inputSelectionDigest: inputs.digest,
       baseRevision: inputs.selection.source.revision,
-    });
-    await source.verify();
-    await inputs.authorize();
-    await mutate(() => store.savePending(captured, completion));
-    return mutate(() => store.read());
+    }));
+    await deliveryStep("output_source_verify", () => source.verify());
+    await deliveryStep("output_authorize", () => inputs.authorize());
+    await deliveryStep("output_save", () => mutate(() => store.savePending(captured, completion)));
+    return deliveryStep("output_record_read", () => mutate(() => store.read()));
   }
 
   private async accept(store: NativeOutputStore, prior: NativeOutputRecord | null, authority: DeliveryAuthority): Promise<DeliveredOutput> {
     const { inputs, mutate } = this.delivery;
-    if (!prior || !this.matches(prior.candidate, authority)) throw unavailable();
-    await inputs.authorize();
-    const receipt = await this.delivery.outputClient().accept(inputs.current, prior.candidate);
-    await mutate(() => store.saveAccepted(prior.candidate, receipt));
-    await mutate(() => this.delivery.outputHead.promote({ invocationId: authority.invocationRef, claimId: inputs.claimId }));
-    if (this.delivery.claimIdOf(inputs.current) !== inputs.claimId) throw unavailable();
+    if (!prior || !this.matches(prior.candidate, authority)) throw refused("output_record_mismatch");
+    await deliveryStep("output_authorize", () => inputs.authorize());
+    const receipt = await deliveryStep("output_accept", () => this.delivery.outputClient().accept(inputs.current, prior.candidate));
+    await deliveryStep("output_save", () => mutate(() => store.saveAccepted(prior.candidate, receipt)));
+    await deliveryStep("output_promote", () => mutate(() => this.delivery.outputHead.promote({ invocationId: authority.invocationRef, claimId: inputs.claimId })));
+    if (this.delivery.claimIdOf(inputs.current) !== inputs.claimId) throw refused("output_claim_moved");
     return { receipt, completion: prior.completion };
   }
 
@@ -622,6 +625,13 @@ class DeliveryOutput {
       candidate.baseRevision === inputs.selection.source.revision &&
       canonicalize((candidate as { binding?: unknown }).binding as never) === canonicalize(inputs.selection.binding as never);
   }
+}
+
+/** A local delivery-output refusal: the same code and message as before, named by its step. */
+function refused(stage: DeliveryOutputStage): RemoteInstanceError {
+  const error = new RemoteInstanceError("capability_unavailable", "Required assignment inputs are unavailable or no longer authorized.", { diagnostic: stage });
+  tagDeliveryOutputStage(error, stage);
+  return error;
 }
 
 function harnessTurnOf(assignment: RemoteWorkAssignment) {
