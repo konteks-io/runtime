@@ -8,6 +8,15 @@ import { REMOTE_DIRECT_MIN_CORE_CONTRACT_VERSION, REMOTE_INTEGRATION_MIN_CORE_CO
 const BASE_KINDS: readonly RemoteWorkKind[] = ["planning", "delivery", "validation", "qa", "assistant_execution", "search_generation", "onboarding", "repository_relocation"];
 
 /**
+ * An `operations` turn (an ops session on an Incident) runs as a conversation
+ * turn like `assistant_execution`. Core has placed the kind since before it
+ * signed contract versions, so every Core that signs 7.1 knows it. Leaving it
+ * out meant Core placed ops turns on this runtime and never handed them over
+ * (prod 10-30: an ops turn queued until it expired).
+ */
+const OPERATIONS_MIN_CORE_CONTRACT_VERSION = "7.1";
+
+/**
  * The work kinds this connector names in a pull. A Core built before a kind
  * refuses a pull naming it, so each later kind is asked for only once Core
  * signs the contract version that introduced it into the desired
@@ -18,6 +27,7 @@ const BASE_KINDS: readonly RemoteWorkKind[] = ["planning", "delivery", "validati
 export function acceptedWorkKinds(coreContractVersion: string | undefined): RemoteWorkKind[] {
   return [
     ...BASE_KINDS,
+    ...(coreContractAtLeast(coreContractVersion, OPERATIONS_MIN_CORE_CONTRACT_VERSION) ? ["operations" as const] : []),
     ...(coreContractAtLeast(coreContractVersion, REMOTE_DIRECT_MIN_CORE_CONTRACT_VERSION) ? ["direct" as const] : []),
     ...(coreContractAtLeast(coreContractVersion, REMOTE_INTEGRATION_MIN_CORE_CONTRACT_VERSION) ? ["integration" as const] : []),
   ];

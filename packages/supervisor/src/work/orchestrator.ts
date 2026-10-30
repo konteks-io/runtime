@@ -53,7 +53,7 @@ import type { AssignmentSender } from "./assignment-sender.js";
 import { coreChannelId } from "../relay/channel-ids.js";
 import { isSearchAssignment, type SearchControllerBoundary } from "./search-assignment-carrier.js";
 import { isOnboardWorkAssignment, onboardTerminalResult, type OnboardWorkAssignment, type OnboardWorkCarrier } from "../onboard/carrier.js";
-import { continuedSession, logicalSessionId } from "./continued-session.js";
+import { continuedSession, isAssistantTurnKind, logicalSessionId } from "./continued-session.js";
 import { integrationTerminalResult, isIntegrationWorkAssignment, type IntegrationWorkAssignment, type IntegrationWorkCarrier } from "../integration/carrier.js";
 
 /**
@@ -2055,7 +2055,7 @@ export class WorkOrchestrator {
     const key = `${directive.assignmentId}:${directive.attempt}`;
     const entry = this.deps.journal.assignments.get(key);
     if (!entry || entry.reports.terminalSequence !== undefined) return;
-    if (entry.kind === "assistant_execution") return this.cancelAssistantExecution(directive);
+    if (isAssistantTurnKind(entry.kind)) return this.cancelAssistantExecution(directive);
     if (this.recoveryFences.has(key)) return this.cancelFencedExecution(key, directive);
     const session = this.sessions.get(key);
     if (session) {

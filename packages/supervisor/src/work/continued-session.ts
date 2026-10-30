@@ -1,3 +1,4 @@
+import { isConversationWorkKind } from "@konteks/backstage-plugin-common";
 import { isDirectWorkKind, type RemoteWorkAssignment } from "@konteks/remote-common";
 
 /**
@@ -30,9 +31,14 @@ export function isDirectAssignment(assignment: Pick<RemoteWorkAssignment, "kind"
   return isDirectWorkKind(assignment.kind);
 }
 
+/** An Assistant conversation turn, ordinary or an operations session's: what Core cancels as one. */
+export function isAssistantTurnKind(kind: string): boolean {
+  return kind === "assistant_execution" || kind === "operations";
+}
+
 /** A conversation retains its authorized placement kind while using signed turn admission. */
 export function conversationTurnSource(assignment: Pick<RemoteWorkAssignment, "kind" | "source">) {
-  if (assignment.kind !== "assistant_execution" && assignment.kind !== "onboarding") return null;
+  if (!isConversationWorkKind(assignment.kind)) return null;
   return assignment.source.kind === "conversation" ? assignment.source : null;
 }
 
