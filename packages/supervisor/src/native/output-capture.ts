@@ -19,6 +19,7 @@ import {
 } from "@konteks/remote-common";
 import { acceptUnchangedGitlink, baselineGitlinks, requireAllGitlinksSeen, verifyEmptyGitlinks } from "./output-gitlinks.js";
 import { OutputCaptureRefusal, diagnosticIdentifier, type OutputGitStep, type OutputRefusalFacts } from "./delivery-output-failure.js";
+import { filesystemFailure, gitFailure } from "./named-refusal.js";
 
 const MAX_GIT_OUTPUT = 16 * 1024 * 1024;
 const oidPattern = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/;
@@ -75,11 +76,8 @@ function gitEnv(executable: string, overrides: NodeJS.ProcessEnv = {}): NodeJS.P
 
 /** Which way a Git call failed: killed at the 30 s timeout, past the output cap, unable to start, or a nonzero exit. */
 function gitRefusal(error: ExecFileException, gitStep: OutputGitStep): OutputCaptureRefusal {
-  const code = (error as { code?: unknown }).code;
-  if (code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") return unavailable("git_output_too_large", { gitStep });
-  if (error.killed) return unavailable("git_timeout", { gitStep });
-  if (typeof code === "string") return unavailable("git_spawn_failed", { gitStep, errno: code });
-  return unavailable("git_failed", { gitStep, ...(typeof code === "number" ? { exitCode: code } : {}), ...(error.signal ? { signal: error.signal } : {}) });
+  const { diagnostic, facts } = gitFailure(error);
+  return unavailable(diagnostic, { ...facts, gitStep });
 }
 
 function runGit(executable: string, cwd: string, gitStep: OutputGitStep, args: string[], env?: NodeJS.ProcessEnv, input?: Buffer | string): Promise<Buffer> {
@@ -223,10 +221,8 @@ function captureRefusal(error: unknown): OutputCaptureRefusal {
 
 /** An OS refusal from the capture's own filesystem calls (temporary folder, realpath, lstat), by syscall and errno. */
 function filesystemRefusal(error: unknown): OutputCaptureRefusal | undefined {
-  const failure = error as NodeJS.ErrnoException | null;
-  if (!(error instanceof Error) || typeof failure?.syscall !== "string" || typeof failure.code !== "string") return undefined;
-  const diagnostic = diagnosticIdentifier(`fs_${failure.syscall}_${failure.code}`.toLowerCase()) ?? "filesystem_error";
-  return unavailable(diagnostic, { errno: failure.code });
+  const failure = filesystemFailure(error);
+  return failure && unavailable(failure.diagnostic, failure.facts);
 }
 
 interface CaptureOptions {

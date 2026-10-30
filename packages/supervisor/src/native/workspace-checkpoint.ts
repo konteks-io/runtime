@@ -1,22 +1,32 @@
-import { execFile } from "node:child_process";
+import { execFile, type ExecFileException } from "node:child_process";
 import { constants, type Stats } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, open, readdir, readlink, realpath, rename, rm, symlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { randomUUID } from "node:crypto";
 import {
-  canonicalize, RemoteInstanceError, RemoteTransferPathSchema,
+  canonicalize, RemoteTransferPathSchema,
   RemoteWorkspaceAnyCheckpointSchema, computeRemoteWorkspaceCheckpointDigest, REMOTE_WORKSPACE_CHECKPOINT_LIMITS, REMOTE_WORKSPACE_CHUNK_LIMITS,
   type RemoteWorkspaceCheckpoint, type RemoteWorkspaceCheckpointV2, type RemoteWorkspaceAnyCheckpoint,
 } from "@konteks/remote-common";
 import { inspectWorkspaceGitControl, type WorkspaceGitControl, type WorkspaceGitScope } from "./workspace-git-control.js";
 import { verifyNativeGitTool, type NativeGitTool } from "./git-workspace.js";
+import { gitFailure, NamedRefusal, type RefusalFacts } from "./named-refusal.js";
+import type { CheckpointGitStep } from "./workspace-checkpoint-failure.js";
 
 import { readCheckpointBytes, writeCheckpointBytes, workspaceFileUnchanged as unchanged, type WorkspaceChunkCapture, type WorkspaceChunkRead } from "./workspace-checkpoint-bytes.js";
 
-const unavailable = () => new RemoteInstanceError("capability_unavailable", "The unfinished workspace could not be preserved or verified. The original workspace was kept.");
+const MESSAGE = "The unfinished workspace could not be preserved or verified. The original workspace was kept.";
+const unavailable = (diagnostic: string, facts: RefusalFacts = {}) => new NamedRefusal("capability_unavailable", MESSAGE, diagnostic, facts);
 type Entry = RemoteWorkspaceAnyCheckpoint["entries"][number];
 type Bytes = RemoteWorkspaceAnyCheckpoint["index"];
-type Git = (cwd: string, args: string[], input?: Buffer | string) => Promise<Buffer>;
+type Git = (cwd: string, step: CheckpointGitStep, args: string[], input?: Buffer | string) => Promise<Buffer>;
+const GIT_CALL_TIMEOUT_MS = 30_000;
+
+/** Which way a Git call failed, and which call; a kill cut short by the shared deadline is `git_deadline`. */
+function gitRefusal(error: ExecFileException, gitStep: CheckpointGitStep, timeout: number): NamedRefusal {
+  const { diagnostic, facts } = gitFailure(error, timeout < GIT_CALL_TIMEOUT_MS ? "git_deadline" : "git_timeout");
+  return unavailable(diagnostic, { ...facts, gitStep });
+}
 
 function gitRunner(tool: NativeGitTool): Git {
   const deadline = Date.now() + 120_000;
@@ -25,12 +35,13 @@ function gitRunner(tool: NativeGitTool): Git {
     GIT_AUTHOR_NAME: "Konteks recovery checkpoint", GIT_AUTHOR_EMAIL: "checkpoint@invalid",
     GIT_COMMITTER_NAME: "Konteks recovery checkpoint", GIT_COMMITTER_EMAIL: "checkpoint@invalid",
     ...(process.platform === "win32" && process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}) };
-  return (cwd, args, input) => new Promise((resolve, reject) => {
+  return (cwd, step, args, input) => new Promise((resolve, reject) => {
     const remaining = deadline - Date.now();
-    if (remaining <= 0) { reject(unavailable()); return; }
+    if (remaining <= 0) { reject(unavailable("git_deadline", { gitStep: step })); return; }
+    const timeout = Math.min(GIT_CALL_TIMEOUT_MS, remaining);
     const child = execFile(tool.executable, ["-c", "core.hooksPath=", "-c", "core.autocrlf=false", "-c", "core.safecrlf=false", "-c", "core.fsmonitor=false", "--no-pager", ...args],
-      { cwd, env, timeout: Math.min(30_000, remaining), maxBuffer: REMOTE_WORKSPACE_CHECKPOINT_LIMITS.bytes, encoding: "buffer", windowsHide: true },
-      (error, output) => error ? reject(unavailable()) : resolve(output));
+      { cwd, env, timeout, maxBuffer: REMOTE_WORKSPACE_CHECKPOINT_LIMITS.bytes, encoding: "buffer", windowsHide: true },
+      (error, output) => error ? reject(gitRefusal(error, step, timeout)) : resolve(output));
     child.stdin?.on("error", () => undefined);
     child.stdin?.end(input);
   });
@@ -38,7 +49,7 @@ function gitRunner(tool: NativeGitTool): Git {
 
 async function directory(value: string): Promise<Stats> {
   const stat = await lstat(value);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) throw unavailable();
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw unavailable("directory_invalid");
   return stat;
 }
 
@@ -46,19 +57,32 @@ function readOnlyNoFollow(): number { return constants.O_RDONLY | (constants.O_N
 
 async function readStable(path: string, observed?: Stats): Promise<Buffer> {
   const before = observed ?? await lstat(path);
-  if (!before.isFile() || before.nlink !== 1 || before.size > REMOTE_WORKSPACE_CHECKPOINT_LIMITS.bytes) throw unavailable();
+  assertStableSource(before);
   const handle = await open(path, readOnlyNoFollow());
   try {
-    if (!unchanged(before, await handle.stat())) throw unavailable();
+    if (!unchanged(before, await handle.stat())) throw unavailable("file_changed");
     const value = await handle.readFile();
-    if (!unchanged(before, await handle.stat()) || value.length !== before.size) throw unavailable();
+    if (!unchanged(before, await handle.stat()) || value.length !== before.size) throw unavailable("file_changed");
     return value;
   } finally { await handle.close(); }
 }
 
+function assertStableSource(stat: Stats): void {
+  if (!stat.isFile()) throw unavailable("not_a_file");
+  if (stat.nlink !== 1) throw unavailable("file_hardlinked");
+  if (stat.size > REMOTE_WORKSPACE_CHECKPOINT_LIMITS.bytes) throw unavailable("file_too_large");
+}
+
 function checkSize(count: number, size: number, chunks?: WorkspaceChunkCapture): void {
   const limits = chunks ? REMOTE_WORKSPACE_CHUNK_LIMITS : REMOTE_WORKSPACE_CHECKPOINT_LIMITS;
-  if (count > limits.files || size > limits.bytes) throw unavailable();
+  if (count > limits.files) throw unavailable("limit_files_exceeded");
+  if (size > limits.bytes) throw unavailable("limit_bytes_exceeded");
+}
+
+/** A path the transfer contract carries, never inside a nested Git folder. */
+function transferPath(path: string): void {
+  if (!RemoteTransferPathSchema.safeParse(path).success) throw unavailable("path_unsupported");
+  if (path.split("/").some(part => /^\.git(?:$|[ .~])/i.test(part))) throw unavailable("git_path_in_tree");
 }
 
 /** Reads links as links, all ignored files and empty directories; never follows a link. */
@@ -67,12 +91,11 @@ async function workingFiles(root: string, folder: string, entries: Entry[], chun
   for (const name of (await readdir(folder)).sort()) {
     if (folder === root && name === ".git") continue;
     const path = relative(root, join(folder, name)).split("\\").join("/");
-    RemoteTransferPathSchema.parse(path);
-    if (path.split("/").some(part => /^\.git(?:$|[ .~])/i.test(part))) throw unavailable();
+    transferPath(path);
     await addWorkingEntry(root, join(folder, name), path, entries, chunks, budget);
     checkSize(entries.length, budget.bytes, chunks);
   }
-  if (!unchanged(before, await lstat(folder))) throw unavailable();
+  if (!unchanged(before, await lstat(folder))) throw unavailable("directory_changed");
   return entries;
 }
 
@@ -93,52 +116,56 @@ async function addWorkingEntry(root: string, absolute: string, path: string, ent
 function ascii(value: Buffer): string { return value.toString("utf8").trim(); }
 
 async function gitState(git: Git, cwd: string, linked = false, chunks?: WorkspaceChunkCapture) {
-  const headCommit = ascii(await git(cwd, ["rev-parse", "HEAD"]));
-  const refValue = ascii(await git(cwd, ["rev-parse", "--symbolic-full-name", "HEAD"]));
-  const allRefs = ascii(await git(cwd, ["for-each-ref", "--format=%(refname) %(objectname)"])).split("\n").filter(Boolean)
+  const headCommit = ascii(await git(cwd, "rev_parse", ["rev-parse", "HEAD"]));
+  const refValue = ascii(await git(cwd, "rev_parse", ["rev-parse", "--symbolic-full-name", "HEAD"]));
+  const allRefs = ascii(await git(cwd, "for_each_ref", ["for-each-ref", "--format=%(refname) %(objectname)"])).split("\n").filter(Boolean)
     .map(row => { const [name, oid] = row.split(" "); return { name: name!, oid: oid! }; });
   // Stash stacks require their reflogs, which ordinary refs cannot preserve.
   // A linked repository also shares that stack with other sessions.
-  if (allRefs.some(ref => ref.name === "refs/stash")) throw unavailable();
+  if (allRefs.some(ref => ref.name === "refs/stash")) throw unavailable("stash_present");
   const refs = linked ? allRefs.filter(ref => ref.name === refValue) : allRefs;
-  const indexPath = ascii(await git(cwd, ["rev-parse", "--git-path", "index"]));
+  const indexPath = ascii(await git(cwd, "rev_parse", ["rev-parse", "--git-path", "index"]));
   const index = await readCheckpointBytes(isAbsolute(indexPath) ? indexPath : join(cwd, indexPath), undefined, chunks);
-  const indexEntries = await git(cwd, ["ls-files", "--stage", "-z"]);
+  const indexEntries = await git(cwd, "ls_files_stage", ["ls-files", "--stage", "-z"]);
   validateIndex(indexEntries);
   return { headCommit, headRef: refValue === "HEAD" ? null : refValue, refs, index, indexEntries };
 }
 
 function validateIndex(value: Buffer): void {
-  const rows = new TextDecoder("utf-8", { fatal: true }).decode(value).split("\0").filter(Boolean);
-  for (const row of rows) {
+  for (const row of indexRows(value)) {
     const match = /^(100644|100755|120000) ([a-f0-9]{40}) [0-3]\t(.+)$/u.exec(row);
-    if (!match) throw unavailable();
-    RemoteTransferPathSchema.parse(match[3]);
-    if (match[3]!.split("/").some(part => /^\.git(?:$|[ .~])/i.test(part))) throw unavailable();
+    if (!match) throw unavailable("index_unparsable");
+    transferPath(match[3]!);
+  }
+}
+
+function indexRows(value: Buffer): string[] {
+  try { return new TextDecoder("utf-8", { fatal: true }).decode(value).split("\0").filter(Boolean); } catch {
+    throw unavailable("index_unparsable");
   }
 }
 
 /** A private bare repository with read-only access to source objects. No source refs, index or objects are changed. */
 async function bundle(git: Git, cwd: string, temporary: string, state: Awaited<ReturnType<typeof gitState>>, baselineCommit: string, chunks?: WorkspaceChunkCapture): Promise<Bytes> {
   const bare = join(temporary, "git");
-  await git(temporary, ["init", "--bare", "--template=", bare]);
-  const objectPath = ascii(await git(cwd, ["rev-parse", "--path-format=absolute", "--git-path", "objects"]));
+  await git(temporary, "init_bare", ["init", "--bare", "--template=", bare]);
+  const objectPath = ascii(await git(cwd, "rev_parse", ["rev-parse", "--path-format=absolute", "--git-path", "objects"]));
   await writePrivate(join(bare, "objects", "info", "alternates"), Buffer.from(objectPath + "\n"));
-  for (const ref of state.refs) await git(bare, ["update-ref", ref.name, ref.oid]);
-  await git(bare, ["update-ref", "--no-deref", "HEAD", state.headCommit]);
+  for (const ref of state.refs) await git(bare, "update_ref", ["update-ref", ref.name, ref.oid]);
+  await git(bare, "update_ref", ["update-ref", "--no-deref", "HEAD", state.headCommit]);
   await retainIndexObjects(git, bare, state.indexEntries, state.headCommit, baselineCommit);
   const path = join(temporary, "checkpoint.bundle");
-  await git(bare, ["bundle", "create", path, "--all"]);
+  await git(bare, "bundle_create", ["bundle", "create", path, "--all"]);
   return readCheckpointBytes(path, undefined, chunks);
 }
 
 async function retainIndexObjects(git: Git, bare: string, index: Buffer, head: string, baseline: string): Promise<void> {
   const objects = [...new Set(index.toString("utf8").split("\0").filter(Boolean).map(row => row.split(" ")[1]!))];
   const treeInput = objects.map((oid, n) => `100644 blob ${oid}\t${n}\n`).join("");
-  const tree = ascii(await git(bare, ["mktree"], treeInput));
+  const tree = ascii(await git(bare, "mktree", ["mktree"], treeInput));
   const parents = [...new Set([head, baseline])].flatMap(value => ["-p", value]);
-  const commit = ascii(await git(bare, ["commit-tree", tree, ...parents], "Unfinished workspace recovery objects\n"));
-  await git(bare, ["update-ref", `refs/konteks-recovery/${randomUUID()}`, commit]);
+  const commit = ascii(await git(bare, "commit_tree", ["commit-tree", tree, ...parents], "Unfinished workspace recovery objects\n"));
+  await git(bare, "update_ref", ["update-ref", `refs/konteks-recovery/${randomUUID()}`, commit]);
 }
 
 /** Retention after the owning process stops. A snapshot does not establish
@@ -150,15 +177,15 @@ export async function captureWorkspaceCheckpoint(options: CaptureOptions & { chu
   const tool = await verifyNativeGitTool(options.tool);
   await directory(options.cwd);
   const root = await realpath(options.cwd);
-  if (!isAbsolute(options.cwd)) throw unavailable();
+  if (!isAbsolute(options.cwd)) throw unavailable("cwd_not_absolute");
   const before = await directory(root);
   const control = await inspectWorkspaceGitControl(options);
   assertGitControl(control, options.expectedControl);
   const run = gitRunner(tool);
-  const git: Git = (cwd, args, input) => run(cwd, cwd === root ? ["--git-dir", control.gitDir, "--work-tree", root, ...args] : args, input);
+  const git: Git = (cwd, step, args, input) => run(cwd, step, cwd === root ? ["--git-dir", control.gitDir, "--work-tree", root, ...args] : args, input);
   const linked = control.gitDir !== control.commonDir;
   await assertSupportedGitMetadata(control);
-  await git(root, ["cat-file", "-e", `${options.baselineCommit}^{commit}`]);
+  await git(root, "cat_file", ["cat-file", "-e", `${options.baselineCommit}^{commit}`]);
   const state = await gitState(git, root, linked, options.chunks);
   const entries = await workingFiles(root, root, [], options.chunks);
   const temporary = await mkdtemp(join(dirname(root), ".workspace-checkpoint-"));
@@ -167,13 +194,18 @@ export async function captureWorkspaceCheckpoint(options: CaptureOptions & { chu
     const packed = await bundle(git, root, temporary, state, options.baselineCommit, options.chunks);
     assertGitControl(await inspectWorkspaceGitControl(options), control);
     await assertSupportedGitMetadata(control);
-    const current = await gitState(git, root, linked, options.chunks);
-    if (!sameGitState(state, current) ||
-        canonicalize(entries as never) !== canonicalize(await workingFiles(root, root, [], options.chunks) as never) || !unchanged(before, await lstat(root))) throw unavailable();
+    await assertUnchangedDuringCapture(git, root, { state, entries, before, linked, chunks: options.chunks });
     const { indexEntries: _entries, ...metadata } = state;
     const body = { format: options.chunks ? "konteks-workspace-checkpoint-v2" as const : "konteks-workspace-checkpoint-v1" as const, baselineCommit: options.baselineCommit, ...metadata, bundle: packed, entries };
     return RemoteWorkspaceAnyCheckpointSchema.parse({ ...body, checkpointDigest: computeRemoteWorkspaceCheckpointDigest(body) });
   } finally { await rm(temporary, { recursive: true, force: true }); }
+}
+
+/** Nothing moved while the bundle was written: Git state, then working files, then the folder itself. */
+async function assertUnchangedDuringCapture(git: Git, root: string, captured: { state: Awaited<ReturnType<typeof gitState>>; entries: Entry[]; before: Stats; linked: boolean; chunks: WorkspaceChunkCapture | undefined }): Promise<void> {
+  if (!sameGitState(captured.state, await gitState(git, root, captured.linked, captured.chunks))) throw unavailable("git_state_changed");
+  if (canonicalize(captured.entries as never) !== canonicalize(await workingFiles(root, root, [], captured.chunks) as never)) throw unavailable("workspace_changed");
+  if (!unchanged(captured.before, await lstat(root))) throw unavailable("directory_changed");
 }
 
 function sameGitState(left: Awaited<ReturnType<typeof gitState>>, right: Awaited<ReturnType<typeof gitState>>): boolean {
@@ -188,31 +220,31 @@ async function writePrivate(path: string, value: Buffer): Promise<void> {
 }
 
 async function restoreGit(git: Git, cwd: string, checkpoint: RemoteWorkspaceAnyCheckpoint, chunks?: WorkspaceChunkRead): Promise<void> {
-  await git(cwd, ["init", "--template=", "--quiet"]);
+  await git(cwd, "init", ["init", "--template=", "--quiet"]);
   await chmod(join(cwd, ".git"), 0o700);
   const bundlePath = join(cwd, ".git", "recovery.bundle");
   await writeCheckpointBytes(bundlePath, checkpoint.bundle, chunks);
-  await git(cwd, ["bundle", "verify", bundlePath]);
-  await git(cwd, ["-c", "protocol.file.allow=always", "fetch", "--update-head-ok", "--no-tags", bundlePath, "+refs/*:refs/*"]);
+  await git(cwd, "bundle_verify", ["bundle", "verify", bundlePath]);
+  await git(cwd, "fetch", ["-c", "protocol.file.allow=always", "fetch", "--update-head-ok", "--no-tags", bundlePath, "+refs/*:refs/*"]);
   const expected = new Set(checkpoint.refs.map(ref => ref.name));
-  const actual = ascii(await git(cwd, ["for-each-ref", "--format=%(refname)"])).split("\n").filter(Boolean);
-  for (const ref of actual) if (!expected.has(ref)) await git(cwd, ["update-ref", "-d", ref]);
-  for (const ref of checkpoint.refs) await git(cwd, ["update-ref", ref.name, ref.oid]);
+  const actual = ascii(await git(cwd, "for_each_ref", ["for-each-ref", "--format=%(refname)"])).split("\n").filter(Boolean);
+  for (const ref of actual) if (!expected.has(ref)) await git(cwd, "update_ref", ["update-ref", "-d", ref]);
+  for (const ref of checkpoint.refs) await git(cwd, "update_ref", ["update-ref", ref.name, ref.oid]);
   await restoreHead(git, cwd, checkpoint);
   await writeCheckpointBytes(join(cwd, ".git", "index"), checkpoint.index, chunks);
-  validateIndex(await git(cwd, ["ls-files", "--stage", "-z"]));
-  await git(cwd, ["cat-file", "-e", `${checkpoint.baselineCommit}^{commit}`]);
+  validateIndex(await git(cwd, "ls_files_stage", ["ls-files", "--stage", "-z"]));
+  await git(cwd, "cat_file", ["cat-file", "-e", `${checkpoint.baselineCommit}^{commit}`]);
   await mkdir(join(cwd, ".git", "hooks-disabled"), { mode: 0o700 });
-  await git(cwd, ["config", "core.hooksPath", ".git/hooks-disabled"]);
-  await git(cwd, ["config", "core.autocrlf", "false"]);
-  await git(cwd, ["config", "core.fsmonitor", "false"]);
+  await git(cwd, "config", ["config", "core.hooksPath", ".git/hooks-disabled"]);
+  await git(cwd, "config", ["config", "core.autocrlf", "false"]);
+  await git(cwd, "config", ["config", "core.fsmonitor", "false"]);
   await rm(bundlePath);
 }
 
 async function restoreHead(git: Git, cwd: string, checkpoint: RemoteWorkspaceAnyCheckpoint): Promise<void> {
-  if (checkpoint.headRef) await git(cwd, ["symbolic-ref", "HEAD", checkpoint.headRef]);
-  else await git(cwd, ["update-ref", "--no-deref", "HEAD", checkpoint.headCommit]);
-  if (ascii(await git(cwd, ["rev-parse", "HEAD"])) !== checkpoint.headCommit) throw unavailable();
+  if (checkpoint.headRef) await git(cwd, "symbolic_ref", ["symbolic-ref", "HEAD", checkpoint.headRef]);
+  else await git(cwd, "update_ref", ["update-ref", "--no-deref", "HEAD", checkpoint.headCommit]);
+  if (ascii(await git(cwd, "rev_parse", ["rev-parse", "HEAD"])) !== checkpoint.headCommit) throw unavailable("restore_head_mismatch");
 }
 
 async function restoreFiles(cwd: string, entries: Entry[], chunks?: WorkspaceChunkRead): Promise<void> {
@@ -243,15 +275,15 @@ export async function verifyRestoredWorkspaceCheckpoint(options: { cwd: string; 
   const actual = { headCommit: state.headCommit, headRef: state.headRef, refs: state.refs, index: state.index };
   const expected = { headCommit: checkpoint.headCommit, headRef: checkpoint.headRef, refs: checkpoint.refs, index: checkpoint.index };
   if (canonicalize(actual as never) !== canonicalize(expected as never) ||
-      canonicalize(await workingFiles(options.cwd, options.cwd, [], capture) as never) !== canonicalize(checkpoint.entries as never)) throw unavailable();
-  await git(options.cwd, ["fsck", "--full", "--strict", "--no-reflogs"]);
+      canonicalize(await workingFiles(options.cwd, options.cwd, [], capture) as never) !== canonicalize(checkpoint.entries as never)) throw unavailable("restore_mismatch");
+  await git(options.cwd, "fsck", ["fsck", "--full", "--strict", "--no-reflogs"]);
 }
 
 /** Reserves a new private container, verifies all bytes, then publishes its source directory. Never overwrites an existing workspace. */
 export async function restoreWorkspaceCheckpoint(options: { destination: string; tool: NativeGitTool; checkpoint: unknown; chunks?: WorkspaceChunkRead }): Promise<{ cwd: string; baselineCommit: string }> {
   const checkpoint = RemoteWorkspaceAnyCheckpointSchema.parse(options.checkpoint);
   const tool = await verifyNativeGitTool(options.tool);
-  if (!isAbsolute(options.destination)) throw unavailable();
+  if (!isAbsolute(options.destination)) throw unavailable("destination_not_absolute");
   await directory(dirname(options.destination));
   const destination = join(await realpath(dirname(options.destination)), basename(options.destination));
   const parent = await directory(dirname(destination));
@@ -264,7 +296,7 @@ export async function restoreWorkspaceCheckpoint(options: { destination: string;
     await restoreGit(gitRunner(tool), temporary, checkpoint, options.chunks);
     await restoreFiles(temporary, checkpoint.entries, options.chunks);
     const files = await workingFiles(temporary, temporary, [], checkpoint.format === "konteks-workspace-checkpoint-v2" ? {} : undefined);
-    if (canonicalize(files as never) !== canonicalize(checkpoint.entries as never)) throw unavailable();
+    if (canonicalize(files as never) !== canonicalize(checkpoint.entries as never)) throw unavailable("restore_mismatch");
     await writePrivate(join(temporary, ".git", "konteks-checkpoint.json"), Buffer.from(JSON.stringify({ version: 1, checkpointDigest: checkpoint.checkpointDigest, baselineCommit: checkpoint.baselineCommit })));
     await syncRestoredTree(temporary);
     const cwd = join(destination, "source");
@@ -280,7 +312,7 @@ export async function restoreWorkspaceCheckpoint(options: { destination: string;
 }
 
 function assertPrivateParent(parent: Stats): void {
-  if (process.platform !== "win32" && (parent.uid !== process.getuid?.() || (parent.mode & 0o077) !== 0)) throw unavailable();
+  if (process.platform !== "win32" && (parent.uid !== process.getuid?.() || (parent.mode & 0o077) !== 0)) throw unavailable("destination_not_private");
 }
 
 function sameOwnedDirectory(owner: Stats, current: Stats): boolean {
@@ -293,13 +325,13 @@ async function assertSupportedGitMetadata(control: WorkspaceGitControl): Promise
   for (const folder of new Set([control.gitDir, control.commonDir])) {
     await directory(folder);
     const names = await readdir(folder);
-    if (names.some(name => /^(?:MERGE_|AUTO_MERGE$|CHERRY_PICK_HEAD$|REVERT_HEAD$|REBASE_HEAD$|SQUASH_MSG$|rebase-|sequencer$|sharedindex\.|shallow$)/u.test(name))) throw unavailable();
+    if (names.some(name => /^(?:MERGE_|AUTO_MERGE$|CHERRY_PICK_HEAD$|REVERT_HEAD$|REBASE_HEAD$|SQUASH_MSG$|rebase-|sequencer$|sharedindex\.|shallow$)/u.test(name))) throw unavailable("git_operation_in_progress");
     await assertDefaultGitInfo(folder);
   }
 }
 
 function assertGitControl(actual: WorkspaceGitControl, expected?: WorkspaceGitControl): void {
-  if (expected && canonicalize(actual as never) !== canonicalize(expected as never)) throw unavailable();
+  if (expected && canonicalize(actual as never) !== canonicalize(expected as never)) throw unavailable("git_control_changed");
 }
 
 async function assertDefaultGitInfo(folder: string): Promise<void> {
@@ -309,10 +341,10 @@ async function assertDefaultGitInfo(folder: string): Promise<void> {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
     throw error;
   }
-  if (names.some(name => name !== "exclude")) throw unavailable();
+  if (names.some(name => name !== "exclude")) throw unavailable("git_info_unsupported");
   if (!names.includes("exclude")) return;
   const lines = (await readStable(join(info, "exclude"))).toString("utf8").split("\n");
-  if (lines.some(line => line.trim() !== "" && !line.trim().startsWith("#"))) throw unavailable();
+  if (lines.some(line => line.trim() !== "" && !line.trim().startsWith("#"))) throw unavailable("git_info_exclude_custom");
 }
 
 async function syncRestoredTree(folder: string): Promise<void> {

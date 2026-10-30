@@ -32,10 +32,11 @@ const pointer = "gitdir: ../git\n";
 const attributes = "* -filter -text -ident -working-tree-encoding\n";
 const config =
   "[core]\nrepositoryformatversion = 0\nbare = false\nfilemode = true\nlogallrefupdates = true\nworktree = ../source\nhooksPath = ../hooks-disabled\nautocrlf = false\n[commit]\ngpgsign = false\n[tag]\ngpgsign = false\n";
-const unavailable = () =>
+const unavailable = (diagnostic?: string) =>
   new RemoteInstanceError(
     "capability_unavailable",
     "Private Git workspace or installer-selected Git tool is unavailable.",
+    diagnostic ? { diagnostic } : {},
   );
 
 async function directory(path: string) {
@@ -79,16 +80,19 @@ function unchangedWhileRead(count: number, before: Stats, after: Stats): boolean
   return count === before.size && after.mtimeMs === before.mtimeMs && after.ctimeMs === before.ctimeMs;
 }
 
+/** The recorded Git, byte for byte: a Git upgraded since it was recorded is `git_tool_changed`. */
 export async function verifyNativeGitTool(value: unknown): Promise<NativeGitTool> {
+  let tool: NativeGitTool;
+  let bytes: Buffer;
   try {
-    const tool = NativeGitToolSchema.parse(value);
-    const bytes = await boundedFile(tool.executable, 64 * 1024 * 1024, true);
-    if ("sha256:" + createHash("sha256").update(bytes).digest("hex") !== tool.digest)
-      throw unavailable();
-    return tool;
+    tool = NativeGitToolSchema.parse(value);
+    bytes = await boundedFile(tool.executable, 64 * 1024 * 1024, true);
   } catch {
-    throw unavailable();
+    throw unavailable("git_tool_unreadable");
   }
+  if ("sha256:" + createHash("sha256").update(bytes).digest("hex") !== tool.digest)
+    throw unavailable("git_tool_changed");
+  return tool;
 }
 async function write(path: string, bytes: string, exclusive = true) {
   const handle = await open(path, exclusive ? "wx" : "w", 0o600);

@@ -3,7 +3,7 @@ import { mkdir, realpath, lstat } from "node:fs/promises";
 import { isAbsolute, join, relative } from "node:path";
 import { randomUUID } from "node:crypto";
 import { z } from "zod/v4";
-import { RemoteWorkAssignmentSchema, RemoteWorkspaceAnyCheckpointSchema, sha256Hex, RemoteInstanceError,
+import { RemoteWorkAssignmentSchema, RemoteWorkspaceAnyCheckpointSchema, sha256Hex,
   type RemoteWorkAssignment, type RemoteWorkspaceAnyCheckpoint, type RemoteWorkspaceCheckpointV2 } from "@konteks/remote-common";
 import type { NativeInputClient } from "./input-client.js";
 import { NativeWorkspaceChunkStore, workspaceCheckpointChunks } from "./workspace-chunk-store.js";
@@ -11,8 +11,10 @@ import { captureWorkspaceCheckpoint } from "./workspace-checkpoint.js";
 import { inspectWorkspaceGitControl, WorkspaceGitControlSchema } from "./workspace-git-control.js";
 import type { NativeGitTool } from "./git-workspace.js";
 import { reportRuntimeFailure, type RuntimeFailureReporter } from "../runtime-failure-types.js";
+import { NamedRefusal } from "./named-refusal.js";
+import { checkpointFailure } from "./workspace-checkpoint-failure.js";
 
-const unavailable = () => new RemoteInstanceError("recovery_required", "The latest unfinished workspace could not be preserved. Its original checkout was kept.");
+const unavailable = (diagnostic: string) => new NamedRefusal("recovery_required", "The latest unfinished workspace could not be preserved. Its original checkout was kept.", diagnostic);
 const digest = z.string().regex(/^sha256:[a-f0-9]{64}$/);
 const RecordSchema = z.object({ version: z.literal(1), assignment: RemoteWorkAssignmentSchema,
   claimId: z.string().min(1).max(255), selectionDigest: digest, checkpointId: z.string().uuid(), cwd: z.string().min(1),
@@ -46,7 +48,7 @@ export class NativeWorkspaceCheckpointStore {
     const root = await realpath(this.options.root);
     const cwd = await realpath(record.cwd);
     const path = relative(root, cwd);
-    if (!isAbsolute(record.cwd) || !path || path.startsWith("..") || isAbsolute(path)) throw unavailable();
+    if (!isAbsolute(record.cwd) || !path || path.startsWith("..") || isAbsolute(path)) throw unavailable("cwd_outside_root");
     record.cwd = cwd;
     const folder = await this.folder();
     const admission = { assignmentId: record.assignment.id, attempt: record.assignment.attempt, claimId: record.claimId };
@@ -54,11 +56,11 @@ export class NativeWorkspaceCheckpointStore {
     // reconcile after stop, while no prompt can proceed without its receipt.
     await writePrivateWorkspaceJson(folder, join(folder, `${this.key(admission)}.owner.json`), record);
     const result = await this.options.client().workspace(record.assignment, "begin", this.request(record));
-    if (!isReceipt(result, record.checkpointId, "writing")) throw unavailable();
+    if (!isReceipt(result, record.checkpointId, "writing")) throw unavailable("begin_receipt_mismatch");
   }
 
   private assertFormatSupported(format: Record["format"]): void {
-    if (format && !this.options.chunksSupported?.()) throw unavailable();
+    if (format && !this.options.chunksSupported?.()) throw unavailable("checkpoint_format_unsupported");
   }
 
   async seal(admission: Admission, assertCurrent: () => void): Promise<void> {
@@ -78,11 +80,10 @@ export class NativeWorkspaceCheckpointStore {
       operation = { stage: "workspace_seal", code: "checkpoint_seal_failed" };
       const result = await this.options.client().workspace(record.assignment, "seal", { ...this.request(record), stop: "processes_stopped", checkpoint });
       assertCurrent();
-      if (!isReceipt(result, record.checkpointId, "sealed") || result.checkpointDigest !== checkpoint.checkpointDigest) throw unavailable();
+      if (!isReceipt(result, record.checkpointId, "sealed") || result.checkpointDigest !== checkpoint.checkpointDigest) throw unavailable("seal_receipt_mismatch");
     } catch (error) {
-      reportRuntimeFailure(this.options.onRuntimeFailure, {
-        phase: "checkpoint", ...operation, evidence: { kind: "runtime_exception" },
-      }, { assignmentId: admission.assignmentId, attempt: admission.attempt });
+      reportRuntimeFailure(this.options.onRuntimeFailure, checkpointFailure(error, operation),
+        { assignmentId: admission.assignmentId, attempt: admission.attempt });
       throw error;
     }
   }
@@ -93,7 +94,7 @@ export class NativeWorkspaceCheckpointStore {
     const bytes = await readPrivateWorkspaceFile(join(folder, `${this.key(admission)}.owner.json`), 128 * 1024);
     if (!bytes) return null;
     const record = RecordSchema.parse(JSON.parse(bytes.toString("utf8")));
-    if (this.key({ assignmentId: record.assignment.id, attempt: record.assignment.attempt, claimId: record.claimId }) !== this.key(admission)) throw unavailable();
+    if (this.key({ assignmentId: record.assignment.id, attempt: record.assignment.attempt, claimId: record.claimId }) !== this.key(admission)) throw unavailable("owner_record_mismatch");
     this.assertFormatSupported(record.format);
     return { folder, record };
   }
@@ -108,9 +109,9 @@ export class NativeWorkspaceCheckpointStore {
       await writePrivateWorkspaceJson(folder, snapshot, checkpoint);
       retained = await readPrivateWorkspaceFile(snapshot, 90 * 1024 * 1024);
     }
-    if (!retained) throw unavailable();
+    if (!retained) throw unavailable("snapshot_missing");
     const checkpoint = RemoteWorkspaceAnyCheckpointSchema.parse(JSON.parse(retained.toString("utf8")));
-    if (checkpoint.format !== (record.format ?? "konteks-workspace-checkpoint-v1")) throw unavailable();
+    if (checkpoint.format !== (record.format ?? "konteks-workspace-checkpoint-v1")) throw unavailable("snapshot_format_mismatch");
     return checkpoint;
   }
 
@@ -145,5 +146,5 @@ async function hasRecoveryFolder(root: string): Promise<boolean> {
 
 function assertChunkReceipt(value: unknown, checkpointId: string, chunk: { digest: string; sizeBytes: number }): void {
   const receipt = z.object({ checkpointId: z.string().uuid(), chunkDigest: z.string(), sizeBytes: z.number(), state: z.literal("stored") }).strict().parse(value);
-  if (receipt.checkpointId !== checkpointId || receipt.chunkDigest !== chunk.digest || receipt.sizeBytes !== chunk.sizeBytes) throw unavailable();
+  if (receipt.checkpointId !== checkpointId || receipt.chunkDigest !== chunk.digest || receipt.sizeBytes !== chunk.sizeBytes) throw unavailable("chunk_receipt_mismatch");
 }

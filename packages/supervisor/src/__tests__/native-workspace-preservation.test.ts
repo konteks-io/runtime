@@ -84,8 +84,8 @@ it('refuses changed Git configuration after work begins and keeps the source edi
   await testGitCommand(tool, cwd, ['config', 'core.autocrlf', 'true']);
   await expect(new NativeWorkspaceCheckpointStore(options).seal(admission, () => undefined)).rejects.toMatchObject({ code: 'capability_unavailable' });
   expect(onRuntimeFailure).toHaveBeenCalledExactlyOnceWith({
-    phase: 'checkpoint', stage: 'workspace_capture', code: 'checkpoint_capture_failed',
-    evidence: { kind: 'runtime_exception' },
+    phase: 'checkpoint', stage: 'workspace_capture_git_control_changed', code: 'checkpoint_capture_failed',
+    evidence: { kind: 'runtime_condition' },
   }, { assignmentId: assignment.id, attempt: assignment.attempt });
   expect(api.workspace).toHaveBeenCalledTimes(1);
   expect(await readFile(join(cwd, 'file.txt'), 'utf8')).toBe('keep these edits');
