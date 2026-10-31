@@ -59,9 +59,17 @@ describe("policy responder", () => {
   it("requires a one-time human decision for direct Claude account tools and refuses other servers", async () => {
     const responder = new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true);
     const context = { assignmentId: "a", agentId: "claude-code", workspaceRoot: "/w", sessionServers: new Set<string>(), directAccountConnectors: true };
-    const request = (toolName: string) => ({ ...permissionRequest, toolCall: { toolCallId: "asana", title: "Read task", kind: "other" as const,
-      _meta: { claudeCode: { toolName } } } });
+    const request = (toolName: string, personalMcpServer?: string) => ({ ...permissionRequest, toolCall: { toolCallId: "asana", title: "Read task", kind: "other" as const,
+      _meta: { claudeCode: { toolName, ...(personalMcpServer ? { personalMcpServer } : {}) } } } });
     const asana = request("mcp__claude_ai_Asana__get_task");
+    const localAsana = request("mcp__asana-recrebox__get_tasks");
+    expect(await responder.evaluatePermission(localAsana, context)).toEqual({ kind: "deny", optionId: "reject" });
+    const admittedLocalAsana = request("mcp__asana-recrebox__get_tasks", "asana-recrebox");
+    expect(await responder.evaluatePermission(admittedLocalAsana, context)).toEqual({ kind: "defer", allowOnceOnly: true });
+    expect(await responder.evaluatePermission(admittedLocalAsana, { ...context, directAccountConnectors: false })).toEqual({ kind: "deny", optionId: "reject" });
+    const mismatch = { ...localAsana, toolCall: { ...localAsana.toolCall, _meta: { claudeCode: { toolName: "mcp__repository__get_tasks", personalMcpServer: "asana-recrebox" } } } };
+    expect(await responder.evaluatePermission(mismatch, context)).toEqual({ kind: "deny", optionId: "reject" });
+
     expect(await responder.evaluatePermission(asana, context)).toEqual({ kind: "defer", allowOnceOnly: true });
     expect(await responder.evaluatePermission(request("mcp__repository__get_task"), context)).toEqual({ kind: "deny", optionId: "reject" });
     expect(await responder.evaluatePermission(asana, { ...context, directAccountConnectors: false })).toEqual({ kind: "deny", optionId: "reject" });

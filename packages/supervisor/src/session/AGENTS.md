@@ -46,7 +46,8 @@ whole permission path.
   allowed only on a session given the browser, and never a hidden browser tool.
   An admitted tool (`admittedMcpTools`) is deferred `allowOnceOnly`, never
   allowed by the general policy. Instance-bound direct Claude sessions admit
-  account connectors with one-time human deferral; ordinary sessions admit none.
+  account connectors and bridge-identified top-level personal MCP tools with
+  one-time human deferral; ordinary sessions admit none.
 - **Host agents are rebuilt, then judged.** For dsh, OpenCode and Antigravity,
   `hostToolGovernance` runs first and the unchanged general policy second. A
   request must match the `tool_call` it names; it is rebuilt into the policy's
