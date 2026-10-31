@@ -719,6 +719,7 @@ export class SessionManager {
     const modelSelection = this.directModelConfig(args, record, sessionConfig, configOptions);
     const model = this.substituteModel(args, record, sessionConfig, configOptions);
     if (model !== undefined) sessionConfig.model = model;
+    this.refuseUnofferedModel(args, record, sessionConfig.model, configOptions);
     for (const [configId, value] of Object.entries(sessionConfig)) {
       this.requireBridge(record);
       args.lifecycle?.assertCurrent();
@@ -811,6 +812,24 @@ export class SessionManager {
    * Retain ownership for recovery: an RPC failure does not prove the remote
    * change did not happen, nor that this session has stopped.
    */
+  /**
+   * A model the session's own selector does not list is refused before it is
+   * set: one agent rejects it at once, another accepts it and its provider then
+   * answers every prompt with a model error (codex on a ChatGPT plan that does
+   * not include it). Either way the turn cannot run, and saying so names it.
+   * A selector that lists nothing proves nothing, so it is not refused here.
+   */
+  private refuseUnofferedModel(args: CreateSessionArgs, record: SessionRecord, model: string | undefined, configOptions: unknown): void {
+    const offered = modelValues(configOptions);
+    if (model === undefined || offered.length === 0 || offered.includes(model)) return;
+    fenceRecord(record);
+    this.logger.warn({ assignmentId: args.context.assignmentId, attempt: args.context.attempt, agentId: args.context.agentId,
+      code: "model_unavailable", offeredCount: offered.length }, "the agent does not offer the turn's model; session fenced");
+    throw new RemoteInstanceError("agent_unavailable", "This agent does not offer the turn's model on this computer.", {
+      diagnostic: "model_unavailable",
+    });
+  }
+
   private unconfirmedConfig(error: unknown, args: CreateSessionArgs, record: SessionRecord, resumed: boolean): unknown {
     if (error instanceof RemoteInstanceError && error.retryable) return error;
     fenceRecord(record);

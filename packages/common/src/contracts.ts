@@ -496,4 +496,4 @@ export { RemoteWorkspaceAnyCheckpointSchema, RemoteWorkspaceCheckpointV2Schema, 
   REMOTE_WORKSPACE_CHUNK_LIMITS, REMOTE_WORKSPACE_CHUNK_CAPABILITY, REMOTE_WORKSPACE_CHUNK_MIN_CORE_CONTRACT_VERSION,
   type RemoteWorkspaceCheckpointV2, type RemoteWorkspaceAnyCheckpoint } from "@konteks/backstage-plugin-common/remote-instance-internal";
 
-export { REMOTE_WORKSPACE_POLICY_INVALID_MIN_CORE_CONTRACT_VERSION } from "@konteks/backstage-plugin-common/remote-instance-internal";
+export { REMOTE_WORKSPACE_POLICY_INVALID_MIN_CORE_CONTRACT_VERSION, REMOTE_MODEL_UNAVAILABLE_MIN_CORE_CONTRACT_VERSION } from "@konteks/backstage-plugin-common/remote-instance-internal";

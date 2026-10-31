@@ -324,7 +324,16 @@ describe("admitted direct model selection before work", () => {
         sessionConfig: { model: "requested-model" },
         agentTitled: true,
       }),
-    ).rejects.toThrow("did not confirm");
+    ).rejects.toThrow("does not offer the turn's model");
+    expect(connection.prompt).not.toHaveBeenCalled();
+  });
+
+  it("refuses a model its selector does not list before setting it, as a typed model verdict (10-31)", async () => {
+    const { manager, connection, setSessionConfigOption } = fixture(option("gpt-6-luna", ["gpt-6-luna", "gpt-5.6-terra"]));
+    const refusal = await manager.create({ context, cwd: "/work", mcpServers: [], sessionConfig: { model: "gpt-6-astra" } })
+      .catch((error: unknown) => error);
+    expect(refusal).toMatchObject({ code: "agent_unavailable", diagnostic: "model_unavailable" });
+    expect(setSessionConfigOption.mock.calls.some(([request]) => request.configId === "model")).toBe(false);
     expect(connection.prompt).not.toHaveBeenCalled();
   });
 
