@@ -425,6 +425,23 @@ describe("native install composition", () => {
     await expect(loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform })).resolves.toMatchObject({ record: { agents: ["claude-code"], releaseId: before.releaseId }, runners: [{ RUNNER_AGENT_ID: "claude-code" }] });
     expect(await readFile(join(f.root, "credentials", "claude-code", "keep"), "utf8")).toBe("credential-owned-by-agent");
   });
+  it.runIf(process.platform !== "win32")("adds Codex while preserving the person's existing OpenCode installation", async () => {
+    const f = await fixture();
+    const claude = join(f.root, "operator-claude");
+    await writeFile(claude, "claude-not-executed", { mode: 0o700 });
+    vi.stubEnv("CLAUDE_CODE_EXECUTABLE", claude);
+    const opencode = await personOpenCode(f.root);
+    const before = await installNative({ ...f.options, agents: ["claude-code", "opencode"], deps: { ...f.options.deps, manifest: f.oldManifest } } as never);
+    await writeFile(join(f.root, "credentials", "opencode", "keep"), "operator-owned-sign-in");
+
+    const added = await addNativeAgent({ root: f.root, agentId: "codex", output: f.options.output, deps: { roots: f.trust, platform: f.platform, manifest: f.manifest, fetchFn: f.fetchFn } });
+
+    expect(added).toMatchObject({ instanceId: before.instanceId, agents: ["claude-code", "opencode", "codex"], opencodeBinary: opencode.binary, opencodeVersion: "2.0.18" });
+    expect(await readFile(join(f.root, "credentials", "opencode", "keep"), "utf8")).toBe("operator-owned-sign-in");
+    const loaded = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
+    expect(loaded.runners.map(runner => runner.RUNNER_AGENT_ID)).toEqual(["claude-code", "opencode", "codex"]);
+    expect(f.activate).toHaveBeenCalledTimes(1);
+  });
   it("refuses stale or untrusted release evolution without changing the installed record", async () => {
     const f = await fixture();
     const claude = join(f.root, "operator-claude");
