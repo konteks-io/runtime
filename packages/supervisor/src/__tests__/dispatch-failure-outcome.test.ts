@@ -19,3 +19,16 @@ describe("repository policy dispatch failure", () => {
     expect(dispatchFailureOutcome(new RemoteInstanceError("agent_auth_required", "login"), "7.13")).toEqual({ class: "failed", reason: "agent_auth_required" });
   });
 });
+
+describe("unoffered model dispatch failure (10-31)", () => {
+  const unoffered = () => new RemoteInstanceError("agent_unavailable", "not offered", { diagnostic: "model_unavailable" });
+  it("names the unoffered model only to a Core that accepts the reason", () => {
+    expect(dispatchFailureOutcome(unoffered(), "7.14")).toEqual({ class: "failed", reason: "model_unavailable" });
+    for (const version of [undefined, "7.13", "invalid"]) {
+      expect(dispatchFailureOutcome(unoffered(), version)).toEqual({ class: "failed", reason: "internal" });
+    }
+  });
+  it("keeps an unconfirmed configuration without that verdict as internal", () => {
+    expect(dispatchFailureOutcome(new RemoteInstanceError("agent_unavailable", "not confirmed"), "7.14")).toEqual({ class: "failed", reason: "internal" });
+  });
+});
