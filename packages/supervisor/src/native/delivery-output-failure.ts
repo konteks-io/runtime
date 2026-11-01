@@ -1,5 +1,8 @@
-import { RemoteInstanceError, RuntimeFailureObservationSchema } from "@konteks/remote-common";
+import { RemoteInstanceError } from "@konteks/remote-common";
 import type { RuntimeFailureFact } from "../runtime-failure-types.js";
+import { diagnosticIdentifier, hasSyscall, NamedRefusal, refusalEvidence, type RefusalFacts } from "./named-refusal.js";
+
+export { diagnosticIdentifier };
 
 /**
  * Names for every refusal on the delivery-output path (10-30): seven attempts
@@ -19,23 +22,18 @@ export type DeliveryOutputStage =
   | "output_begin" | "output_source_verify" | "output_previous" | "output_capture" | "output_save"
   | "output_accept" | "output_claim_moved";
 
-export interface OutputRefusalFacts {
+export interface OutputRefusalFacts extends RefusalFacts {
   gitStep?: OutputGitStep;
-  exitCode?: number;
-  signal?: string;
-  errno?: string;
 }
 
 const CAPTURE_MESSAGE = "Generated delivery output is unavailable or changed during capture.";
-const IDENTIFIER = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/;
 
 /** A capture refusal: the same code and message as before, plus the check and Git step that refused. */
-export class OutputCaptureRefusal extends RemoteInstanceError {
-  readonly facts: OutputRefusalFacts;
+export class OutputCaptureRefusal extends NamedRefusal {
+  declare readonly facts: OutputRefusalFacts;
 
   constructor(diagnostic: string, facts: OutputRefusalFacts = {}) {
-    super("capability_unavailable", CAPTURE_MESSAGE, { diagnostic });
-    this.facts = facts;
+    super("capability_unavailable", CAPTURE_MESSAGE, diagnostic, facts);
   }
 }
 
@@ -60,11 +58,6 @@ export async function deliveryStep<T>(stage: DeliveryOutputStage, operation: () 
   }
 }
 
-/** A runtime failure's stage (96) or code (64): a stable snake_case identifier, or nothing. */
-export function diagnosticIdentifier(value: string | undefined, max = 64): string | undefined {
-  return value !== undefined && value.length <= max && IDENTIFIER.test(value) ? value : undefined;
-}
-
 function identifier(value: string, max: number, fallback: string): string {
   return diagnosticIdentifier(value, max) ?? fallback;
 }
@@ -86,37 +79,8 @@ function deliveryOutputFailureStage(error: unknown): string {
   return identifier(stage, 96, "delivery_output_transfer");
 }
 
-function hasSyscall(error: unknown): error is NodeJS.ErrnoException {
-  return error instanceof Error && typeof (error as NodeJS.ErrnoException).syscall === "string";
-}
-
-function errnoOf(error: unknown): string | undefined {
-  return refusalFacts(error).errno ?? (hasSyscall(error) ? (error.code as string | undefined) : undefined);
-}
-
-function processExitEvidence(facts: OutputRefusalFacts): RuntimeFailureFact["evidence"] | undefined {
-  if (facts.exitCode === undefined && facts.signal === undefined) return undefined;
-  const parsed = RuntimeFailureObservationSchema.shape.evidence.safeParse({ kind: "process_exit",
-    ...(facts.exitCode === undefined ? {} : { exitCode: facts.exitCode }), ...(facts.signal === undefined ? {} : { signal: facts.signal }) });
-  return parsed.success ? parsed.data : { kind: "runtime_condition" };
-}
-
-function exceptionEvidence(errno: string): RuntimeFailureFact["evidence"] {
-  const parsed = RuntimeFailureObservationSchema.shape.evidence.safeParse({ kind: "runtime_exception", errno });
-  return parsed.success ? parsed.data : { kind: "runtime_exception" };
-}
-
-/** Only what was observed: a Git exit, an OS errno, a refused check, or an unexpected exception. */
-function deliveryOutputEvidence(error: unknown): RuntimeFailureFact["evidence"] {
-  const exit = processExitEvidence(refusalFacts(error));
-  if (exit) return exit;
-  const errno = errnoOf(error);
-  if (errno !== undefined) return exceptionEvidence(errno);
-  return error instanceof RemoteInstanceError ? { kind: "runtime_condition" } : { kind: "runtime_exception" };
-}
-
 /** The retained retry as a `turn` runtime failure Konteks can read. */
 export function deliveryOutputFailure(error: unknown): RuntimeFailureFact {
   return { phase: "turn", stage: deliveryOutputFailureStage(error), code: deliveryOutputCode(error),
-    evidence: deliveryOutputEvidence(error), retryable: true };
+    evidence: refusalEvidence(error), retryable: true };
 }

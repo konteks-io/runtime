@@ -1,13 +1,14 @@
 import { constants, type Stats } from "node:fs";
 import { lstat, open, type FileHandle } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { RemoteInstanceError, REMOTE_WORKSPACE_CHECKPOINT_LIMITS, REMOTE_WORKSPACE_CHUNK_LIMITS,
+import { REMOTE_WORKSPACE_CHECKPOINT_LIMITS, REMOTE_WORKSPACE_CHUNK_LIMITS,
   type RemoteWorkspaceAnyCheckpoint } from "@konteks/remote-common";
+import { NamedRefusal } from "./named-refusal.js";
 
 type Blob = RemoteWorkspaceAnyCheckpoint["index"];
 export type WorkspaceChunkCapture = { put?: (bytes: Buffer) => Promise<void> };
 export type WorkspaceChunkRead = { get: (digest: string) => Promise<Buffer> };
-const unavailable = () => new RemoteInstanceError("recovery_required", "The unfinished workspace bytes could not be preserved or verified. Existing work was kept.");
+const unavailable = (diagnostic: string) => new NamedRefusal("recovery_required", "The unfinished workspace bytes could not be preserved or verified. Existing work was kept.", diagnostic);
 const hash = (bytes: Buffer) => `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 
 export function workspaceFileUnchanged(before: Stats, after: Stats): boolean {
@@ -23,16 +24,18 @@ export async function readCheckpointBytes(path: string, observed?: Stats, chunks
     assertStable(before, await handle.stat());
     const value = chunks ? await chunkedBytes(handle, before.size, chunks) : inlineBytes(await handle.readFile());
     assertStable(before, await handle.stat()); assertStable(before, await lstat(path));
-    if (value.sizeBytes !== before.size) throw unavailable();
+    if (value.sizeBytes !== before.size) throw unavailable("file_changed");
     return value;
   } finally { await handle.close(); }
 }
 
 function noFollow(): number { return constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0); }
-function assertStable(before: Stats, after: Stats): void { if (!workspaceFileUnchanged(before, after)) throw unavailable(); }
+function assertStable(before: Stats, after: Stats): void { if (!workspaceFileUnchanged(before, after)) throw unavailable("file_changed"); }
 function assertByteSource(stat: Stats, chunks?: WorkspaceChunkCapture): void {
   const limit = chunks ? REMOTE_WORKSPACE_CHUNK_LIMITS.bytes : REMOTE_WORKSPACE_CHECKPOINT_LIMITS.bytes;
-  if (!stat.isFile() || stat.nlink !== 1 || stat.size > limit) throw unavailable();
+  if (!stat.isFile()) throw unavailable("not_a_file");
+  if (stat.nlink !== 1) throw unavailable("file_hardlinked");
+  if (stat.size > limit) throw unavailable("file_too_large");
 }
 
 function inlineBytes(bytes: Buffer): Blob {
@@ -44,7 +47,7 @@ async function readExact(handle: FileHandle, length: number, position: number): 
   let read = 0;
   while (read < length) {
     const result = await handle.read(bytes, read, length - read, position + read);
-    if (result.bytesRead === 0) throw unavailable();
+    if (result.bytesRead === 0) throw unavailable("file_changed");
     read += result.bytesRead;
   }
   return bytes;
@@ -63,10 +66,10 @@ async function chunkedBytes(handle: FileHandle, sizeBytes: number, sink: Workspa
 
 async function* sourceBytes(blob: Blob, source?: WorkspaceChunkRead): AsyncGenerator<Buffer> {
   if ("contentBase64" in blob) { yield Buffer.from(blob.contentBase64, "base64"); return; }
-  if (!source) throw unavailable();
+  if (!source) throw unavailable("chunk_source_missing");
   for (const chunk of blob.chunks) {
     const bytes = await source.get(chunk.digest);
-    if (bytes.length !== chunk.sizeBytes || hash(bytes) !== chunk.digest) throw unavailable();
+    if (bytes.length !== chunk.sizeBytes || hash(bytes) !== chunk.digest) throw unavailable("chunk_mismatch");
     yield bytes;
   }
 }
@@ -78,10 +81,10 @@ export async function writeCheckpointBytes(path: string, blob: Blob, source?: Wo
   try {
     for await (const bytes of sourceBytes(blob, source)) {
       size += bytes.length;
-      if (size > blob.sizeBytes) throw unavailable();
+      if (size > blob.sizeBytes) throw unavailable("bytes_mismatch");
       whole.update(bytes); await handle.writeFile(bytes);
     }
-    if (size !== blob.sizeBytes || `sha256:${whole.digest("hex")}` !== blob.digest) throw unavailable();
+    if (size !== blob.sizeBytes || `sha256:${whole.digest("hex")}` !== blob.digest) throw unavailable("bytes_mismatch");
     await handle.sync();
   } finally { await handle.close(); }
 }

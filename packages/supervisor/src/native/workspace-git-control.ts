@@ -1,7 +1,8 @@
 import { lstat, realpath } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { z } from "zod/v4";
-import { RemoteInstanceError, sha256Hex, isFsErrorWithCode } from "@konteks/remote-common";
+import { sha256Hex, isFsErrorWithCode } from "@konteks/remote-common";
+import { NamedRefusal } from "./named-refusal.js";
 import { privateWorkspaceDirectory, readWorkspaceControlFile } from "./workspace-storage.js";
 
 const digest = z.string().regex(/^sha256:[a-f0-9]{64}$/);
@@ -9,7 +10,7 @@ export const WorkspaceGitControlSchema = z.object({ gitDir: z.string().min(1), c
   pointerDigest: digest.nullable(), configDigest: digest }).strict();
 export type WorkspaceGitControl = z.infer<typeof WorkspaceGitControlSchema>;
 export type WorkspaceGitScope = { cwd: string; ownerRoot?: string; repositoryCacheRoot?: string | undefined };
-const unavailable = () => new RemoteInstanceError("capability_unavailable", "The workspace's original Git control state is unavailable. Its checkout was kept.");
+const unavailable = (diagnostic: string) => new NamedRefusal("capability_unavailable", "The workspace's original Git control state is unavailable. Its checkout was kept.", diagnostic);
 
 /** Capture paths and control bytes only inside connector-owned roots. No
  * source Git command runs before these boundaries have been verified. */
@@ -39,7 +40,7 @@ export async function inspectWorkspaceGitControl(scope: WorkspaceGitScope): Prom
 async function inspectPointer(cwd: string, roots: string[]) {
   const pointer = join(cwd, ".git");
   const info = await lstat(pointer);
-  if (info.isSymbolicLink()) throw unavailable();
+  if (info.isSymbolicLink()) throw unavailable("git_pointer_symlink");
   const bytes = info.isDirectory() ? null : await requiredControlFile(pointer);
   const gitDir = await verifiedDirectory(bytes ? gitDirectoryPointer(bytes, cwd) : pointer, roots);
   return { gitDir, pointerDigest: bytes ? `sha256:${sha256Hex(bytes)}` : null };
@@ -52,24 +53,24 @@ async function inspectCommonDirectory(gitDir: string, roots: string[]): Promise<
 
 async function requiredControlFile(path: string): Promise<Buffer> {
   const bytes = await readWorkspaceControlFile(path);
-  if (!bytes) throw unavailable();
+  if (!bytes) throw unavailable("git_control_file_missing");
   return bytes;
 }
 
 function controlPath(bytes: Buffer): string {
   const value = new TextDecoder("utf-8", { fatal: true }).decode(bytes).replace(/\r?\n$/u, "");
-  if (!value || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(value)) throw unavailable();
+  if (!value || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(value)) throw unavailable("git_control_path_invalid");
   return value;
 }
 
 function gitDirectoryPointer(bytes: Buffer, cwd: string): string {
   const value = controlPath(bytes);
-  if (!value.startsWith("gitdir: ")) throw unavailable();
+  if (!value.startsWith("gitdir: ")) throw unavailable("git_pointer_invalid");
   return resolve(cwd, value.slice(8));
 }
 
 function assertInside(path: string, roots: string[], allowRoot = false): void {
-  if (!roots.some(root => inside(path, root, allowRoot))) throw unavailable();
+  if (!roots.some(root => inside(path, root, allowRoot))) throw unavailable("git_control_outside_root");
 }
 
 function inside(path: string, root: string, allowRoot: boolean): boolean {
@@ -79,7 +80,7 @@ function inside(path: string, root: string, allowRoot: boolean): boolean {
 
 async function verifiedDirectory(path: string, roots: string[]): Promise<string> {
   const info = await lstat(path);
-  if (!info.isDirectory() || info.isSymbolicLink()) throw unavailable();
+  if (!info.isDirectory() || info.isSymbolicLink()) throw unavailable("git_control_not_directory");
   const canonical = await realpath(path);
   assertInside(canonical, roots);
   return canonical;
