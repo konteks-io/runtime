@@ -280,6 +280,20 @@ describe("native delivery output capture", () => {
     expect(result.files.entries.map(entry => entry.path)).toEqual(["kept.txt"]);
   });
 
+  it("captures a repository that tracks files inside a folder its own rules ignore", async () => {
+    // Laravel's layout: storage/.gitignore ignores every folder under storage/, which still track their own .gitignore.
+    await writeFixtureFiles(["storage/logs/.gitignore", "storage/framework/views/.gitignore"]);
+    await writeFile(join(dir, "storage", ".gitignore"), "*\n!.gitignore\n");
+    await run("git", ["-C", dir, "add", "-f", "storage"]);
+    await run("git", ["-C", dir, "-c", "user.name=Test", "-c", "user.email=test@invalid", "commit", "-qm", "storage"]);
+    await writeFile(join(dir, "kept.txt"), "after\n");
+    await writeFixtureFiles(["app/New.php", "storage/logs/laravel.log", "storage/framework/views/compiled.php"]);
+    await unlink(join(dir, "deleted.txt"));
+    const result = await captureNativeDeliveryOutput(await outputOptions());
+    expect(result.files.entries.map(entry => entry.path)).toEqual(["app/New.php", "kept.txt"]);
+    expect(result.deletions).toEqual(["deleted.txt"]);
+  });
+
   it("emits bounded diagnostic-correlated capture telemetry without output content or paths", async () => {
     await writeFile(join(dir, "secret-path.txt"), "payload-canary-secret\n");
     const { stdout } = await run("git", ["-C", dir, "rev-parse", "HEAD"]);

@@ -110,8 +110,12 @@ async function captureIndex(executable: string, cwd: string, baselineCommit: str
   const paths = decodePaths(await runGit(executable, cwd, "ls_files",
     ["ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", ".", ...OUTPUT_CACHE_EXCLUSIONS], env))
     .filter(path => !isToolArtifactPath(path));
+  // The list above already applied the ignore rules, so `-f` adds only these
+  // names. Without it Git exits 1 on a tracked file inside an ignored folder
+  // (Laravel's storage/.gitignore `*` beside tracked storage/*/.gitignore),
+  // and every capture of that repository failed (E67, 11-01).
   if (paths.length) await runGit(executable, cwd, "add",
-    ["--literal-pathspecs", "add", "--no-renormalize", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"], env, paths.join("\0") + "\0");
+    ["--literal-pathspecs", "add", "--no-renormalize", "-A", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"], env, paths.join("\0") + "\0");
   await captureAcceptedPaths(executable, cwd, env, previous);
   const tree = (await runGit(executable, cwd, "write_tree", ["write-tree"], env)).toString("ascii").trim();
   if (!oidPattern.test(tree)) throw unavailable("tree_unparsable");
