@@ -263,6 +263,13 @@ describe("runner event schema", () => {
     expect(RunnerEventSchema.safeParse({ kind: "stdout", text: "x" }).success).toBe(false);
     expect(RunnerEventSchema.safeParse({ kind: "bridge_exited", code: 1, signal: null, extra: true }).success).toBe(false);
   });
+
+  it("carries a request error's unavailable route only as a closed cause", () => {
+    const error = { kind: "request_error", acpSessionRef: "acp", requestId: "r1", method: "session/prompt", code: -32603, class: "provider_failure", message: "out of credit", retryable: false };
+    expect(RunnerEventSchema.safeParse({ ...error, routeUnavailable: "provider_quota" }).success).toBe(true);
+    expect(RunnerEventSchema.safeParse({ ...error, routeUnavailable: "model_not_on_account" }).success).toBe(true);
+    expect(RunnerEventSchema.safeParse({ ...error, routeUnavailable: "billing" }).success).toBe(false);
+  });
 });
 
 // Last in this file: the choice is process-wide once made.

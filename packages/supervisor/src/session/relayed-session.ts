@@ -149,6 +149,8 @@ export interface RelayedSessionDeps {
     modelSelection?: DirectModelSelection,
   ) => Promise<RemoteExecutionReadyResult>;
   directModelSelectionSupported?: () => boolean;
+  /** Core (and its relay) accept `acp_error.routeUnavailable`; absent, the frame never carries it. */
+  routeUnavailableSupported?: () => boolean;
   /** Reserve an exclusive local channel after input verification, before bridge bootstrap. */
   reserveChannel?: (channelId: string, session: RelayedSession) => () => void;
   /** Actual WorkOrchestrator retained-admission fence, not a permission grant. */
@@ -204,16 +206,21 @@ export interface RelayedSessionDeps {
 
 export type SessionClosedReason = Extract<SessionToCoreMessage, { kind: "session_closed" }>["reason"];
 
-/** Why an agent exit failed, when the agent's own error says so; otherwise the exit reports `agent_failed`. */
-export type AgentFailureReason = "provider_failure" | "agent_auth_required";
+/**
+ * Why an agent exit failed, when the agent's own error says so; otherwise the
+ * exit reports `agent_failed`. `route_unavailable` is a provider_failure whose
+ * route cannot serve the turn; an older Core is told `provider_failure`.
+ */
+export type AgentFailureReason = "provider_failure" | "agent_auth_required" | "route_unavailable";
 
 /**
  * An agent's request error, as the terminal reason Core keeps (10-16: an
  * OpenCode turn out of credit reached Core only as `agent_failed`, so the
  * page later read "No answer came back").
  */
-function reportedAgentFailure(errorClass: unknown): AgentFailureReason | null {
-  return errorClass === "provider_failure" || errorClass === "agent_auth_required" ? errorClass : null;
+function reportedAgentFailure(event: RunnerEventOf<"request_error">): AgentFailureReason | null {
+  if (event.class === "provider_failure" && event.routeUnavailable !== undefined) return "route_unavailable";
+  return event.class === "provider_failure" || event.class === "agent_auth_required" ? event.class : null;
 }
 
 const HOLDER_REQUEST_METHODS = new Set(["session/prompt", "session/set_mode", "session/set_config_option"]);
@@ -1643,7 +1650,7 @@ export class RelayedSession {
   private async onRequestError(event: RunnerEventOf<"request_error">): Promise<void> {
     this.recordRequestFailure(event);
     if (event.method === "session/prompt" && (await this.settledPromptError(event.requestId))) return;
-    const accepted = await this.completeReceived(event.requestId, event.method, { kind: "acp_error", id: event.requestId, method: event.method, error: { code: event.code, class: event.class, message: event.message, retryable: event.retryable } });
+    const accepted = await this.completeReceived(event.requestId, event.method, { kind: "acp_error", id: event.requestId, method: event.method, error: this.relayedRequestError(event) });
     if (accepted && event.method === "session/prompt" && isNativeTurn(this.assignment)) {
       // Say why before the close: its SIGTERM on the bridge was the only
       // trace of a Codex sign-in that could not refresh.
@@ -1652,9 +1659,16 @@ export class RelayedSession {
       this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, code: event.code, errorClass: event.class, retryable: event.retryable,
         message: String(redactActivity(String(event.message ?? ""), this.sessionCwd())).slice(0, 240) },
         "native turn failed with a request error; closing the assignment as an agent exit");
-      this.agentFailure = reportedAgentFailure(event.class);
+      this.agentFailure = reportedAgentFailure(event);
       await this.close("agent_exited");
     }
+  }
+
+  /** The runner's request error as the relay frame carries it; the route cause only to a Core that accepts it. */
+  private relayedRequestError(event: RunnerEventOf<"request_error">): AcpJsonRpcError {
+    const { code, class: errorClass, message, retryable, routeUnavailable } = event;
+    const named = routeUnavailable !== undefined && this.deps.routeUnavailableSupported?.() === true;
+    return { code, class: errorClass, message, retryable, ...(named ? { routeUnavailable } : {}) };
   }
 
   /** A local exception is known; only SDK evidence attests a provider protocol code. */

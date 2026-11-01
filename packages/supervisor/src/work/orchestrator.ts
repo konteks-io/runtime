@@ -3,6 +3,8 @@ import { randomUUID } from "node:crypto";
 import {
   RemoteInstanceError,
   allEqual,
+  coreContractAtLeast,
+  REMOTE_ROUTE_UNAVAILABLE_MIN_CORE_CONTRACT_VERSION,
   type RemoteAuthorizedOperation,
   type RemoteExecutionOperationPermitClaims,
   type RemoteDeliveryOperationPermitClaims,
@@ -961,6 +963,7 @@ export class WorkOrchestrator {
       ...(assignment.kind === "planning" ? this.planningDeps(dispatch) : {}),
       ...(restoreReference !== undefined ? { restoreReference } : {}),
       activateExecution: () => this.activateExecution(dispatch),
+      routeUnavailableSupported: () => routeUnavailableAccepted(this.coreContractVersion()),
       ...this.executionRecordDeps(dispatch),
       reserveChannel: (channelId, owner) => this.reserveChannel(channelId, owner),
       onUsage: this.deps.onUsage,
@@ -1984,10 +1987,14 @@ export class WorkOrchestrator {
       assignmentId: session.assignment.id,
       attempt: session.assignment.attempt,
       claimId: entry.claimId,
-      draft: { terminal: true, result: closedSessionResult(session, reason), ...(usage ? { usage: [usage] } : {}), ...acpSessionRefField(session.acpSessionRef) },
+      draft: { terminal: true, result: closedSessionResult(session, reason, this.coreContractVersion()), ...(usage ? { usage: [usage] } : {}), ...acpSessionRefField(session.acpSessionRef) },
     });
     assertAuthority();
     if (!retainCompletedOwner) this.forgetSession(key, session);
+  }
+
+  private coreContractVersion(): string | undefined {
+    return this.deps.coreContractVersion?.();
   }
 
   /** Drop the session unless a recovery fenced its key or another session replaced it. */
@@ -2918,9 +2925,15 @@ const UNCOMPLETED_CLOSES = {
   relay_replay_gap: { result: { class: "interrupted", reason: "relay_replay_gap" }, hashed: { class: "interrupted", reason: "relay_replay_gap" } },
 } as const satisfies Record<Exclude<SessionClosedReason, "completed">, { result: object; hashed: JsonValue }>;
 
-function closedSessionResult(session: RelayedSession, reason: SessionClosedReason) {
+/** An older Core's closed enum knows no `route_unavailable`, so it gets `provider_failure`. */
+function routeUnavailableAccepted(coreContractVersion: string | undefined): boolean {
+  return coreContractAtLeast(coreContractVersion, REMOTE_ROUTE_UNAVAILABLE_MIN_CORE_CONTRACT_VERSION);
+}
+
+export function closedSessionResult(session: Pick<RelayedSession, "agentFailureReason" | "deliveryAcceptanceReceipt" | "acpSessionRef">, reason: SessionClosedReason, coreContractVersion?: string) {
   // An agent that failed on its provider or its sign-in says which, so the page can (10-16).
-  const failure = reason === "agent_exited" ? session.agentFailureReason() : null;
+  const reported = reason === "agent_exited" ? session.agentFailureReason() : null;
+  const failure = reported === "route_unavailable" && !routeUnavailableAccepted(coreContractVersion) ? "provider_failure" : reported;
   if (failure) return { class: "failed" as const, reason: failure, terminalResultHash: jcsDigest({ class: "failed", reason: failure }) };
   if (reason !== "completed") {
     const { result, hashed } = UNCOMPLETED_CLOSES[reason];

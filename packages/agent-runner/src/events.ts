@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { AgentTurnUsageObservationSchema, ConnectedAgentViewSchema, RuntimeFailureObservationSchema } from "@konteks/remote-common";
+import { AcpRouteUnavailableSchema, AgentTurnUsageObservationSchema, ConnectedAgentViewSchema, RuntimeFailureObservationSchema } from "@konteks/remote-common";
 
 /**
  * Events the runner streams to the supervisor over its internal WebSocket.
@@ -45,6 +45,8 @@ export const RunnerEventSchema = z.discriminatedUnion("kind", [
       class: z.enum(["cancelled", "provider_failure", "agent_auth_required", "invalid_params", "unknown_request", "malformed_response", "policy_denied", "internal"]),
       message: z.string().max(1_024),
       retryable: z.boolean(),
+      /** The turn's route cannot serve it (out of credit, model not on the account); another route can. */
+      routeUnavailable: AcpRouteUnavailableSchema.optional(),
       /** Structured provenance supplied by the owning runner boundary, never error prose. */
       failureEvidence: RuntimeFailureObservationSchema.shape.evidence.optional(),
     })
