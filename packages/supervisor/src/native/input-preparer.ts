@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { NativeWorkspaceCheckpointStore } from "./workspace-preservation.js";
 import { NativeRecoveredWorkspaceStore } from "./workspace-recovery.js";
+import { grantCodexSandboxRead } from "./codex-sandbox-read.js";
 import { constants, type Stats } from "node:fs";
 import { execFile } from "node:child_process";
 import { chmod, lstat, mkdir, mkdtemp, open, readdir, realpath, rename, rm } from "node:fs/promises";
@@ -712,6 +713,7 @@ class InputPreparation {
     await this.beginWorkspacePreservation(inputs, source);
     this.enter("organization_skills");
     const prepared = withSessionContext(source, await this.skills(inputs, root, source.cwd, direct));
+    await this.grantSandboxRead(current.agentRoute.agentId, prepared);
     this.logStage("skills", this.elapsed());
     this.enter("source_verification");
     await source.verify();
@@ -866,6 +868,12 @@ class InputPreparation {
       await rm(bundleDir, { recursive: true, force: true });
       record.durationMs = Date.now() - fetchStartedAt;
     }
+  }
+
+  /** Codex's Windows sandbox users read the staged skills and context only once granted. */
+  private grantSandboxRead(agentId: string, prepared: PreparedSessionInputs): Promise<void> {
+    return grantCodexSandboxRead({ platform: process.platform, agentId, directories: prepared.readOnlyRoots ?? [],
+      ...(this.options.logger ? { logger: this.options.logger } : {}) });
   }
 
   /** No skills and no instructions for a direct session: the person's text reaches the agent as typed. */
