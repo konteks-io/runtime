@@ -128,6 +128,13 @@ QA browser, structured results, updates and doctor/support.
   `maxHandshakeChannels` (512; over it the relay refuses every handshake
   with 4401). Fully acknowledged holder-bound channels are left out first,
   least recently active first, and keep their local cursor.
+- **Codex on Windows reads staged inputs only once granted.** Codex's
+  elevated Windows sandbox runs commands as its `CodexSandboxUsers` users,
+  which read only what an ACL grants and never the person's profile, where
+  the private root lives. After staging, `grantCodexSandboxRead`
+  (`native/codex-sandbox-read.ts`) gives that group inheritable read
+  (`(OI)(CI)(RX)`, never write) on exactly the turn's `readOnlyRoots`
+  (staged skills, session context). Without the group it logs and goes on.
 - **Host agents never fail the connector.** A listed host agent the load cannot
   find or verify is returned in `unavailableAgents` and parked with
   `NativeAgentRetry` (`parkUnavailableHostAgent`).
