@@ -714,8 +714,29 @@ export function pendingViewerRetry(lastViewerStart: number | undefined, failure:
   return Date.parse(failure.at) >= lastViewerStart ? failure.reason : null;
 }
 
+/** A script runner: a command it cannot find is the project's own dependency, which the agent can add. */
+const SCRIPT_RUNNERS = new Set(["npm", "npx", "yarn", "pnpm", "bun", "make"]);
+
+/**
+ * The step's own command when the shell could not find it (exit 127): it is
+ * not installed on this computer, which only the person can change (E56).
+ * Undefined for a script runner, whose 127 is a missing project dependency.
+ */
+export function missingStepCommand(command: string, code: number | null): string | undefined {
+  if (code !== 127) return undefined;
+  const program = /^\s*(?:[A-Za-z_][\w]*=\S*\s+)*([^\s;&|]+)/.exec(command)?.[1]?.split("/").pop();
+  return program && !SCRIPT_RUNNERS.has(program) ? program : undefined;
+}
+
 /** A failed install or prepare step: the agent's message and the person's reason. */
 function setupFailure(phase: "install" | "prepare", command: string, code: number | null): { message: string; reason: string } {
+  const missing = missingStepCommand(command, code);
+  if (missing) {
+    return {
+      message: `The ${phase} step (${command}) exited with code 127: \`${missing}\` is not installed on this computer. Only the person can install it; say so in your handoff instead of changing the project for it.`,
+      reason: `This computer does not have \`${missing}\`, which the project needs. Install it, then reload this page.`,
+    };
+  }
   const step = phase === "install" ? "Installing the project's dependencies" : "The project's prepare step";
   return {
     message: `The ${phase} step (${command}) ${code === null ? "timed out" : `exited with code ${code}`}. See the log lines.`,
