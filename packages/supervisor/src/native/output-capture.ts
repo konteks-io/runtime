@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { execFile } from "node:child_process";
+import { execFile, type ExecFileException } from "node:child_process";
 import { chmod, lstat, mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import {
@@ -18,10 +18,12 @@ import {
   type RemoteTransferBinding,
 } from "@konteks/remote-common";
 import { acceptUnchangedGitlink, baselineGitlinks, requireAllGitlinksSeen, verifyEmptyGitlinks } from "./output-gitlinks.js";
+import { OutputCaptureRefusal, diagnosticIdentifier, type OutputGitStep, type OutputRefusalFacts } from "./delivery-output-failure.js";
 
 const MAX_GIT_OUTPUT = 16 * 1024 * 1024;
 const oidPattern = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/;
-const unavailable = () => new RemoteInstanceError("capability_unavailable", "Generated delivery output is unavailable or changed during capture.");
+/** Every refusal names its check (delivery-output-failure.ts); the code and message stay the same. */
+const unavailable = (diagnostic = "capture_unavailable", facts: OutputRefusalFacts = {}) => new OutputCaptureRefusal(diagnostic, facts);
 
 /**
  * Package-manager and internal tool caches are never part of a delivered
@@ -53,11 +55,11 @@ export function checkOutputTreeLimits(entries: ReadonlyArray<{ sizeBytes: number
     { diagnostic: "output_exceeds_limits" });
 }
 
-async function checkedDirectory(value: string): Promise<string> {
-  if (!isAbsolute(value) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(value)) throw unavailable();
+async function checkedDirectory(value: string, diagnostic = "worktree_invalid"): Promise<string> {
+  if (!isAbsolute(value) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(value)) throw unavailable(diagnostic);
   const path = await realpath(value);
   const stat = await lstat(path);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) throw unavailable();
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw unavailable(diagnostic);
   return path;
 }
 
@@ -71,39 +73,59 @@ function gitEnv(executable: string, overrides: NodeJS.ProcessEnv = {}): NodeJS.P
   };
 }
 
-function runGit(executable: string, cwd: string, args: string[], env?: NodeJS.ProcessEnv, input?: Buffer | string): Promise<Buffer> {
+/** Which way a Git call failed: killed at the 30 s timeout, past the output cap, unable to start, or a nonzero exit. */
+function gitRefusal(error: ExecFileException, gitStep: OutputGitStep): OutputCaptureRefusal {
+  const code = (error as { code?: unknown }).code;
+  if (code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") return unavailable("git_output_too_large", { gitStep });
+  if (error.killed) return unavailable("git_timeout", { gitStep });
+  if (typeof code === "string") return unavailable("git_spawn_failed", { gitStep, errno: code });
+  return unavailable("git_failed", { gitStep, ...(typeof code === "number" ? { exitCode: code } : {}), ...(error.signal ? { signal: error.signal } : {}) });
+}
+
+function runGit(executable: string, cwd: string, gitStep: OutputGitStep, args: string[], env?: NodeJS.ProcessEnv, input?: Buffer | string): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const child = execFile(executable, ["-c", "core.hooksPath=", "-c", "status.renames=false", "-c", "core.autocrlf=false", "-c", "core.safecrlf=false", "-c", "core.eol=lf", "--no-pager", ...args], {
       cwd, env: gitEnv(executable, env), timeout: 30_000, killSignal: "SIGKILL", maxBuffer: MAX_GIT_OUTPUT, encoding: "buffer", windowsHide: true,
-    }, (error, stdout) => error ? reject(unavailable()) : resolve(stdout));
+    }, (error, stdout) => error ? reject(gitRefusal(error, gitStep)) : resolve(stdout));
     child.stdin?.on("error", () => undefined);
     child.stdin?.end(input);
   });
 }
 
+/** Git names a path that is not UTF-8: the transfer contract cannot carry it. */
+function decodeUtf8(value: Buffer): string {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(value);
+  } catch {
+    throw unavailable("path_not_utf8");
+  }
+}
+
 function decodePaths(value: Buffer): string[] {
-  return new TextDecoder("utf-8", { fatal: true }).decode(value).split("\0").filter(Boolean).sort();
+  return decodeUtf8(value).split("\0").filter(Boolean).sort();
 }
 
 async function captureIndex(executable: string, cwd: string, baselineCommit: string, env: NodeJS.ProcessEnv, previous?: PreviousOutput | null): Promise<string> {
-  await runGit(executable, cwd, ["read-tree", "--reset", baselineCommit], env);
+  await runGit(executable, cwd, "read_tree", ["read-tree", "--reset", baselineCommit], env);
   // Enumerate eligible names before reading their bytes. Naming an ignored
   // parent in an `add` exclusion makes Git refuse otherwise valid changes.
-  const paths = decodePaths(await runGit(executable, cwd,
+  const paths = decodePaths(await runGit(executable, cwd, "ls_files",
     ["ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", ".", ...OUTPUT_CACHE_EXCLUSIONS], env))
     .filter(path => !isToolArtifactPath(path));
-  if (paths.length) await runGit(executable, cwd,
+  if (paths.length) await runGit(executable, cwd, "add",
     ["--literal-pathspecs", "add", "--no-renormalize", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"], env, paths.join("\0") + "\0");
   await captureAcceptedPaths(executable, cwd, env, previous);
-  const tree = (await runGit(executable, cwd, ["write-tree"], env)).toString("ascii").trim();
-  if (!oidPattern.test(tree)) throw unavailable();
+  const tree = (await runGit(executable, cwd, "write_tree", ["write-tree"], env)).toString("ascii").trim();
+  if (!oidPattern.test(tree)) throw unavailable("tree_unparsable");
   return tree;
 }
 
 /** Previously accepted paths remain project output even if a later ignore rule hides them. */
 async function captureAcceptedPaths(executable: string, cwd: string, env: NodeJS.ProcessEnv, previous?: PreviousOutput | null): Promise<void> {
   if (!previous) return;
-  const files = RemoteFileTreeSchema.parse(previous.files);
+  const parsed = RemoteFileTreeSchema.safeParse(previous.files);
+  if (!parsed.success) throw unavailable("previous_output_invalid");
+  const files = parsed.data;
   const paths: string[] = [];
   for (const entry of files.entries) {
     if (isToolArtifactPath(entry.path)) continue;
@@ -113,17 +135,17 @@ async function captureAcceptedPaths(executable: string, cwd: string, env: NodeJS
     });
     if (stat && !stat.isDirectory()) paths.push(entry.path);
   }
-  if (paths.length) await runGit(executable, cwd, ["--literal-pathspecs", "add", "--no-renormalize", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"], env, paths.join("\0") + "\0");
+  if (paths.length) await runGit(executable, cwd, "add_accepted", ["--literal-pathspecs", "add", "--no-renormalize", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"], env, paths.join("\0") + "\0");
 }
 
 function parseTree(value: Buffer, gitlinks: ReadonlyMap<string, string>): Map<string, { oid: string; mode: 0o600 | 0o700 }> {
-  const decoded = new TextDecoder("utf-8", { fatal: true }).decode(value);
+  const decoded = decodeUtf8(value);
   const entries = new Map<string, { oid: string; mode: 0o600 | 0o700 }>();
   const seen = new Set<string>();
   for (const row of decoded.split("\0").filter(Boolean)) {
     if (acceptUnchangedGitlink(row, gitlinks, seen)) continue;
     const match = /^(100644|100755) blob ([a-f0-9]{40}(?:[a-f0-9]{24})?)\t(.+)$/u.exec(row);
-    if (!match || entries.has(match[3]!)) throw unavailable();
+    if (!match || entries.has(match[3]!)) throw unavailable("tree_unparsable");
     entries.set(match[3]!, { oid: match[2]!, mode: match[1] === "100755" ? 0o700 : 0o600 });
   }
   requireAllGitlinksSeen(gitlinks, seen);
@@ -132,25 +154,25 @@ function parseTree(value: Buffer, gitlinks: ReadonlyMap<string, string>): Map<st
 
 async function readBlobs(executable: string, cwd: string, env: NodeJS.ProcessEnv, oids: string[]): Promise<Buffer[]> {
   if (!oids.length) return [];
-  const output = await runGit(executable, cwd, ["cat-file", "--batch"], env, oids.join("\n") + "\n");
+  const output = await runGit(executable, cwd, "cat_file", ["cat-file", "--batch"], env, oids.join("\n") + "\n");
   const result: Buffer[] = []; let offset = 0;
   for (const expected of oids) {
     const blob = nextBlob(output, offset, expected);
     result.push(blob.bytes); offset = blob.next;
   }
-  if (offset !== output.length) throw unavailable();
+  if (offset !== output.length) throw unavailable("blob_unparsable");
   return result;
 }
 
 /** The `cat-file --batch` blob at `offset`: exactly the expected object, its stated size, and a closing newline. */
 function nextBlob(output: Buffer, offset: number, expected: string): { bytes: Buffer; next: number } {
   const newline = output.indexOf(0x0a, offset);
-  if (newline < 0) throw unavailable();
+  if (newline < 0) throw unavailable("blob_unparsable");
   const header = output.subarray(offset, newline).toString("ascii");
   const match = /^([a-f0-9]{40}(?:[a-f0-9]{24})?) blob ([0-9]+)$/u.exec(header);
-  if (!match || match[1] !== expected) throw unavailable();
+  if (!match || match[1] !== expected) throw unavailable("blob_unparsable");
   const size = Number(match[2]); const start = newline + 1;
-  if (!Number.isSafeInteger(size) || size < 0 || start + size >= output.length || output[start + size] !== 0x0a) throw unavailable();
+  if (!Number.isSafeInteger(size) || size < 0 || start + size >= output.length || output[start + size] !== 0x0a) throw unavailable("blob_unparsable");
   return { bytes: Buffer.from(output.subarray(start, start + size)), next: start + size + 1 };
 }
 
@@ -163,9 +185,9 @@ export async function captureNativeDeliveryOutput(options: CaptureOptions): Prom
   let temporary: string | undefined;
   try {
     const root = await checkedDirectory(options.cwd);
-    if (!isAbsolute(options.gitExecutable) || !oidPattern.test(options.baselineCommit)) throw unavailable();
+    assertCaptureInput(options);
     await connectorGit(options.gitExecutable);
-    await runGit(options.gitExecutable, root, ["cat-file", "-e", `${options.baselineCommit}^{commit}`]);
+    await runGit(options.gitExecutable, root, "baseline_commit", ["cat-file", "-e", `${options.baselineCommit}^{commit}`]);
     const objectDirectory = await commonObjectDirectory(options.gitExecutable, root);
     temporary = await mkdtemp(join(dirname(root), ".output-capture-")); await chmod(temporary, 0o700);
     const temporaryObjects = join(temporary, "objects"); await mkdir(temporaryObjects, { mode: 0o700 });
@@ -177,19 +199,34 @@ export async function captureNativeDeliveryOutput(options: CaptureOptions): Prom
       resultDigest: result.resultDigest, durationMs: Date.now() - startedAt }, "native delivery output capture completed");
     return result;
   } catch (error) {
+    const refusal = captureRefusal(error);
     logger.warn({ event: "native.output.capture_failed", correlationId: options.invocationRef,
       assignmentId: options.binding.assignmentId, stage: "capture", outcome: "failed",
-      errorClass: error instanceof Error ? error.name : "UnknownError", diagnostic: captureDiagnostic(error), durationMs: Date.now() - startedAt },
-      "native delivery output capture failed");
-    throw unavailable();
+      errorClass: error instanceof Error ? error.name : "UnknownError", diagnostic: refusal.diagnostic, ...refusal.facts,
+      durationMs: Date.now() - startedAt }, "native delivery output capture failed");
+    throw refusal;
   }
   finally { if (temporary) await rm(temporary, { recursive: true, force: true }).catch(() => undefined); }
 }
 
-function captureDiagnostic(error: unknown): string {
-  const allowed = ["output_exceeds_limits", "gitlink_changed", "gitlink_not_empty"];
-  if (error instanceof RemoteInstanceError && allowed.includes(error.diagnostic ?? "")) return error.diagnostic!;
-  return "capture_unavailable";
+function assertCaptureInput(options: CaptureOptions): void {
+  if (!isAbsolute(options.gitExecutable)) throw unavailable("git_executable_invalid");
+  if (!oidPattern.test(options.baselineCommit)) throw unavailable("baseline_invalid");
+}
+
+/** The refusal the caller sees: the named check that refused, never its message. */
+function captureRefusal(error: unknown): OutputCaptureRefusal {
+  if (error instanceof OutputCaptureRefusal) return error;
+  if (error instanceof RemoteInstanceError) return unavailable(diagnosticIdentifier(error.diagnostic) ?? "capture_unavailable");
+  return filesystemRefusal(error) ?? unavailable(error instanceof TypeError ? "capture_type_error" : "capture_unavailable");
+}
+
+/** An OS refusal from the capture's own filesystem calls (temporary folder, realpath, lstat), by syscall and errno. */
+function filesystemRefusal(error: unknown): OutputCaptureRefusal | undefined {
+  const failure = error as NodeJS.ErrnoException | null;
+  if (!(error instanceof Error) || typeof failure?.syscall !== "string" || typeof failure.code !== "string") return undefined;
+  const diagnostic = diagnosticIdentifier(`fs_${failure.syscall}_${failure.code}`.toLowerCase()) ?? "filesystem_error";
+  return unavailable(diagnostic, { errno: failure.code });
 }
 
 interface CaptureOptions {
@@ -209,26 +246,26 @@ type CapturedEntry = { path: string; mode: 384 | 448; sizeBytes: number; digest:
  * exposing it as the read-only alternate object store used for capture.
  */
 async function commonObjectDirectory(gitExecutable: string, root: string): Promise<string> {
-  const commonDirectory = await checkedDirectory((await runGit(gitExecutable, root,
-    ["rev-parse", "--path-format=absolute", "--git-common-dir"])).toString("utf8").trim());
-  return checkedDirectory(join(commonDirectory, "objects"));
+  const commonDirectory = await checkedDirectory((await runGit(gitExecutable, root, "rev_parse",
+    ["rev-parse", "--path-format=absolute", "--git-common-dir"])).toString("utf8").trim(), "object_store_invalid");
+  return checkedDirectory(join(commonDirectory, "objects"), "object_store_invalid");
 }
 
 /** The files written and deleted since the baseline, captured twice into the private index and required to agree. */
 async function capturedChanges(gitExecutable: string, root: string, baselineCommit: string, env: NodeJS.ProcessEnv, previous?: PreviousOutput | null): Promise<{ entries: CapturedEntry[]; deletions: string[] }> {
-  const gitlinks = baselineGitlinks(await runGit(gitExecutable, root, ["ls-tree", "-rz", baselineCommit]));
-  await verifyEmptyGitlinks(root, gitlinks, await runGit(gitExecutable, root, ["ls-files", "--stage", "-z"]));
+  const gitlinks = baselineGitlinks(await runGit(gitExecutable, root, "ls_tree", ["ls-tree", "-rz", baselineCommit]));
+  await verifyEmptyGitlinks(root, gitlinks, await runGit(gitExecutable, root, "ls_files_stage", ["ls-files", "--stage", "-z"]));
   const first = await captureIndex(gitExecutable, root, baselineCommit, env, previous);
   const second = await captureIndex(gitExecutable, root, baselineCommit, env, previous);
-  if (first !== second) throw unavailable();
-  let deletions = decodePaths(await runGit(gitExecutable, root, ["diff", "--cached", "--diff-filter=D", "--name-only", "-z", "--no-renames", baselineCommit, "--"], env));
-  const writes = decodePaths(await runGit(gitExecutable, root, ["diff", "--cached", "--diff-filter=ACMRTUXB", "--name-only", "-z", "--no-renames", baselineCommit, "--"], env));
-  const tree = parseTree(await runGit(gitExecutable, root, ["ls-tree", "-rz", second], env), gitlinks);
+  if (first !== second) throw unavailable("tree_unstable");
+  let deletions = decodePaths(await runGit(gitExecutable, root, "diff", ["diff", "--cached", "--diff-filter=D", "--name-only", "-z", "--no-renames", baselineCommit, "--"], env));
+  const writes = decodePaths(await runGit(gitExecutable, root, "diff", ["diff", "--cached", "--diff-filter=ACMRTUXB", "--name-only", "-z", "--no-renames", baselineCommit, "--"], env));
+  const tree = parseTree(await runGit(gitExecutable, root, "ls_tree", ["ls-tree", "-rz", second], env), gitlinks);
   const touched = new Set([...writes, ...deletions, ...(previous?.files.entries.map(entry => entry.path) ?? []), ...(previous?.deletions ?? [])].filter(path => !isToolArtifactPath(path)));
   if ([...touched].some(path => gitlinks.has(path))) throw new RemoteInstanceError("capability_unavailable", "Generated delivery output changes a submodule.", { diagnostic: "gitlink_changed" });
   deletions = [...touched].filter(path => !tree.has(path)).sort();
   const selected = [...touched].filter(path => tree.has(path)).sort().map(path => ({ path, item: tree.get(path) }));
-  if (selected.some(value => !value.item)) throw unavailable();
+  if (selected.some(value => !value.item)) throw unavailable("tree_entry_missing");
   const blobs = await readBlobs(gitExecutable, root, env, selected.map(value => value.item!.oid));
   const entries = selected.map((value, index) => {
     const bytes = blobs[index]!;
@@ -236,11 +273,20 @@ async function capturedChanges(gitExecutable: string, root: string, baselineComm
       digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}`, contentBase64: bytes.toString("base64") };
   });
   checkOutputTreeLimits(entries);
-  await verifyEmptyGitlinks(root, gitlinks, await runGit(gitExecutable, root, ["ls-files", "--stage", "-z"]));
+  await verifyEmptyGitlinks(root, gitlinks, await runGit(gitExecutable, root, "ls_files_stage", ["ls-files", "--stage", "-z"]));
   return { entries, deletions };
 }
 
+/** The captured tree as the transfer contract's candidate; a tree the contract refuses is named, not thrown raw. */
 function deliveryCandidate(options: CaptureOptions, entries: CapturedEntry[], deletions: string[]): RemoteDeliveryResultCandidate {
+  try {
+    return candidateOf(options, entries, deletions);
+  } catch {
+    throw unavailable("candidate_invalid");
+  }
+}
+
+function candidateOf(options: CaptureOptions, entries: CapturedEntry[], deletions: string[]): RemoteDeliveryResultCandidate {
   const files = RemoteFileTreeSchema.parse({ format: "konteks-file-tree-v1", entries, treeDigest: computeRemoteFileTreeDigest(entries) });
   const identity = { binding: options.binding, claimId: options.claimId, invocationRef: options.invocationRef,
     inputSelectionDigest: options.inputSelectionDigest, baseRevision: options.baseRevision, files, deletions };
@@ -278,7 +324,8 @@ type StaleCheckoutInput = { cwd: string; gitExecutable: string; baselineCommit: 
   publishedCommit: string; accepted?: { treeDigest: string; deletions: readonly string[]; files?: RemoteDeliveryResultCandidate["files"] } | null };
 
 function assertStaleInput(options: StaleCheckoutInput): void {
-  if (!isAbsolute(options.gitExecutable) || !oidPattern.test(options.baselineCommit) || !oidPattern.test(options.publishedCommit)) throw unavailable();
+  if (!isAbsolute(options.gitExecutable)) throw unavailable("git_executable_invalid");
+  if (!oidPattern.test(options.baselineCommit) || !oidPattern.test(options.publishedCommit)) throw unavailable("baseline_invalid");
 }
 
 async function verdictOf(options: StaleCheckoutInput, root: string, env: NodeJS.ProcessEnv): Promise<StaleCheckoutVerdict> {
@@ -287,8 +334,8 @@ async function verdictOf(options: StaleCheckoutInput, root: string, env: NodeJS.
   if (!entries.length && !deletions.length) return "clean";
   if (sameOutput(options.accepted, entries, deletions)) return "accepted";
   // The private index now holds the checkout exactly as captured.
-  const tree = (await runGit(options.gitExecutable, root, ["write-tree"], env)).toString("ascii").trim();
-  if (!oidPattern.test(tree)) throw unavailable();
+  const tree = (await runGit(options.gitExecutable, root, "write_tree", ["write-tree"], env)).toString("ascii").trim();
+  if (!oidPattern.test(tree)) throw unavailable("tree_unparsable");
   const changed = [...entries.map(entry => entry.path), ...deletions];
   const local = await treeEntries(options.gitExecutable, root, env, tree, changed);
   const published = await treeEntries(options.gitExecutable, root, env, options.publishedCommit, changed);
@@ -304,11 +351,11 @@ function sameOutput(accepted: StaleCheckoutInput["accepted"], entries: CapturedE
 async function treeEntries(executable: string, cwd: string, env: NodeJS.ProcessEnv, treeish: string, paths: string[]): Promise<Map<string, string>> {
   const result = new Map<string, string>();
   if (!paths.length) return result;
-  const rows = new TextDecoder("utf-8", { fatal: true }).decode(await runGit(executable, cwd,
+  const rows = decodeUtf8(await runGit(executable, cwd, "ls_tree",
     ["ls-tree", "-z", "--full-tree", treeish, "--", ...paths], env)).split("\0").filter(Boolean);
   for (const row of rows) {
     const match = /^(\d{6}) (blob|commit|tree) ([a-f0-9]{40}(?:[a-f0-9]{24})?)\t(.+)$/u.exec(row);
-    if (!match) throw unavailable();
+    if (!match) throw unavailable("tree_unparsable");
     result.set(match[4]!, `${match[1]} ${match[3]}`);
   }
   return result;
