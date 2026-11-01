@@ -44,16 +44,24 @@ describe("a DeepSeek Harness turn that failed on the provider after dsh's own re
 describe("OpenCode 2 turn failures (JSON-RPC -32603 with data.errorName)", () => {
   const failed = (safeMessage: string, errorName: string) => new RequestError(-32603, `Internal error: ${safeMessage}`, { service: "session", errorName });
 
-  it("reads an empty balance as out of credit, never retried", () => {
+  it("reads an empty balance as out of credit, never retried, on a route another can replace", () => {
     // Captured from OpenCode 2.0.18 with an empty OpenCode Zen balance.
     expect(classifyBridgeError(failed("Upstream request failed: Insufficient account funds", "provider.quota")))
-      .toEqual({ code: -32603, class: "provider_failure", retryable: false, message: expect.stringMatching(/out of credit/) });
+      .toEqual({ code: -32603, class: "provider_failure", retryable: false, message: expect.stringMatching(/out of credit/), routeUnavailable: "provider_quota" });
   });
 
-  it("reads a model outside the account as unavailable, never retried", () => {
+  it("reads a model outside the account as unavailable, never retried, on a route another can replace", () => {
     // Captured: a Go model through the Console sign-in.
     const result = classifyBridgeError(failed("Model unavailable: opencode/glm-5.1", "provider.no-route"));
-    expect(result).toMatchObject({ class: "provider_failure", retryable: false, message: expect.stringMatching(/not available.*Pick another model/) });
+    expect(result).toMatchObject({ class: "provider_failure", retryable: false, message: expect.stringMatching(/not available.*Pick another model/), routeUnavailable: "model_not_on_account" });
+  });
+
+  it("names no unavailable route for any other provider failure, nor for a quota answered 401", () => {
+    for (const name of ["provider.rate-limit", "provider.internal", "provider.content-filter", "provider.invalid-request"]) {
+      expect(classifyBridgeError(failed("Upstream request failed", name))).not.toHaveProperty("routeUnavailable");
+    }
+    expect(classifyBridgeError(failed("Upstream request failed: 401 Unauthorized", "provider.quota"))).toEqual({
+      code: -32603, class: "agent_auth_required", retryable: false, message: "agent authentication required" });
   });
 
   it.each([

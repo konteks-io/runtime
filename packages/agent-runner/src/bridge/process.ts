@@ -23,6 +23,7 @@ import {
   type Logger,
   type PipedChildProcess,
   type RetainedProcessOwner,
+  type AcpRouteUnavailable,
   type RuntimeFailureObservation,
 } from "@konteks/remote-common";
 import { instructionScopeObserver } from "./instruction-scope-observer.js";
@@ -317,12 +318,14 @@ type BridgeErrorClass = ReturnType<typeof classifyBridgeError>;
  * `provider.no-route`); a failed sign-in is ACP's auth-required error. The
  * provider's HTTP status is not forwarded, so 429 arrives as
  * `provider.rate-limit` and 5xx as `provider.internal`, `timeout` or
- * `transport`. Wording is for the person, plain and short.
+ * `transport`. Wording is for the person, plain and short. Quota and
+ * no-route name their `routeUnavailable` cause: another route can still take
+ * the same turn.
  */
-const OPENCODE_PROVIDER_ERRORS: Readonly<Record<string, { class: BridgeErrorClass["class"]; message: string; retryable: boolean }>> = {
+const OPENCODE_PROVIDER_ERRORS: Readonly<Record<string, Omit<BridgeErrorClass, "code">>> = {
   "provider.auth": { class: "agent_auth_required", message: "agent authentication required", retryable: false },
-  "provider.quota": { class: "provider_failure", message: "The provider account OpenCode uses is out of credit. Add credit or pick another model.", retryable: false },
-  "provider.no-route": { class: "provider_failure", message: "This model is not available to the account OpenCode is signed in with. Pick another model.", retryable: false },
+  "provider.quota": { class: "provider_failure", message: "The provider account OpenCode uses is out of credit. Add credit or pick another model.", retryable: false, routeUnavailable: "provider_quota" },
+  "provider.no-route": { class: "provider_failure", message: "This model is not available to the account OpenCode is signed in with. Pick another model.", retryable: false, routeUnavailable: "model_not_on_account" },
   // Transient: OpenCode already retried with backoff. The session is kept, so
   // the work resumes on the same session once the provider answers again.
   "provider.rate-limit": { class: "provider_failure", message: "The provider is limiting requests right now. The session is kept and can continue shortly.", retryable: true },
@@ -422,6 +425,8 @@ export function classifyBridgeError(error: unknown): {
   class: "cancelled" | "provider_failure" | "agent_auth_required" | "invalid_params" | "unknown_request" | "malformed_response" | "internal";
   message: string;
   retryable: boolean;
+  /** A provider_failure whose route (agent, provider account, model) cannot serve the turn. */
+  routeUnavailable?: AcpRouteUnavailable;
 } {
   if (error instanceof RequestError) return openCodeProviderError(error) ?? antigravityError(error) ?? classifyRequestError(error);
   if (error instanceof RemoteInstanceError && error.code === "agent_auth_required") {
