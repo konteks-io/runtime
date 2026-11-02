@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ensureGraft, graftAlreadyWired, planGraft, prepareDeliveryGraft, wireGraft, writeGraftRecord, type GraftTool } from "../native/graft.js";
 
 /**
@@ -57,6 +57,7 @@ describe("graft", () => {
     process.env.HOME = home;
   });
   afterEach(async () => {
+    vi.unstubAllEnvs();
     delete process.env.GRAFT_TEST_LOG;
     process.env.HOME = savedHome;
     await rm(dir, { recursive: true, force: true });
@@ -124,6 +125,32 @@ describe("graft", () => {
     // Wiring again adds no second exclude block.
     await wireGraft(root, repo, ["claude-code", "codex"], tool);
     expect((await readFile(join(repo, ".git", "info", "exclude"), "utf8")).split("# Konteks: Graft's local files").length).toBe(2);
+  });
+
+  it("keeps globally ignored Graft files local when delivery capture ignores global Git settings", async () => {
+    git(repo, "add", "index.ts");
+    git(repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "base");
+    await mkdir(home, { recursive: true });
+    const globalIgnore = join(home, "ignore");
+    await writeFile(globalIgnore, "graft/\n.mcp.json\n");
+    await writeFile(join(home, ".gitconfig"), `[core]\n  excludesFile = ${JSON.stringify(globalIgnore)}\n`);
+    vi.stubEnv("GIT_CONFIG_GLOBAL", join(home, ".gitconfig"));
+    await prepareDeliveryGraft(root, repo, "codex", {
+      available: async () => true, ensure: async () => tool, wire: wireGraft,
+    });
+    await writeFile(join(repo, "graft", "new-module.md"), "# regenerated node\n");
+    const noGlobalIgnore = ["-c", `core.excludesFile=${process.platform === "win32" ? "NUL" : "/dev/null"}`];
+    expect(git(repo, ...noGlobalIgnore, "status", "--porcelain", "--untracked-files=all").trim()).toBe("");
+
+    // Old wiring stamps did not retain files hidden by the global ignore.
+    const excludePath = git(repo, "rev-parse", "--git-path", "info/exclude").trim();
+    const exclude = join(repo, excludePath);
+    await writeFile(exclude, (await readFile(exclude, "utf8")).replace("/graft/\n", ""));
+    expect(await prepareDeliveryGraft(root, repo, "codex", {
+      available: async () => true, ensure: async () => tool,
+      wire: async () => { throw new Error("must not rebuild the index"); },
+    })).toBe("skipped");
+    expect(git(repo, ...noGlobalIgnore, "status", "--porcelain", "--untracked-files=all").trim()).toBe("");
   });
 
   it("says which tracked file Graft changed instead of hiding it", async () => {

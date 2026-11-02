@@ -237,14 +237,14 @@ export async function wireGraft(
   tool: GraftTool,
 ): Promise<{ added: string[]; changedTracked: string[]; mappedFiles: number | null }> {
   const { agents } = await planGraft(repo, families);
-  const before = new Set((await git(repo, ["status", "--porcelain=v1", "--untracked-files=all"])).split("\n").filter(Boolean));
+  const before = new Set(await wiringChanges(repo));
   await quietGraftUpdateCheck(process.env.HOME ?? homedir());
   await runGraft(tool, ["telemetry", "disable"], repo, 60_000);
   const output = await runGraft(tool, ["init", repo, "--agents", ...agents, "--no-global", "-y"], repo);
   await pointWiringAtTool(repo, tool);
   await installGraftShim(root, tool);
 
-  const after = (await git(repo, ["status", "--porcelain=v1", "--untracked-files=all"])).split("\n").filter(Boolean);
+  const after = await wiringChanges(repo);
   const fresh = after.filter(line => !before.has(line));
   const added = collapse(fresh.filter(line => line.startsWith("?? ")).map(line => line.slice(3)));
   const changedTracked = fresh.filter(line => !line.startsWith("?? ")).map(line => line.slice(3));
@@ -288,6 +288,8 @@ export async function prepareDeliveryGraft(root: string, repo: string, family: s
   const tool = await (deps.ensure ?? ensureGraft)(root);
   const stampPath = await wiredStampPath(repo);
   const stamp = `${JSON.stringify({ version: 1, family, node: tool.node, cli: tool.cli })}\n`;
+  // Generated index files stay local on reused worktrees too. Tracked files remain visible.
+  await excludeLocally(repo, ["graft/"]);
   if (await wiredWith(repo, stampPath, stamp)) return "skipped";
   // An interrupted wiring must never read as finished.
   await rm(stampPath, { force: true });
@@ -302,6 +304,13 @@ export async function prepareDeliveryGraft(root: string, repo: string, family: s
 /** Wired already, by this Graft for this family. */
 async function wiredWith(repo: string, stampPath: string, stamp: string): Promise<boolean> {
   return (await graftAlreadyWired(repo)) && (await readFile(stampPath, "utf8").catch(() => null)) === stamp;
+}
+
+/** Output capture ignores machine-wide Git settings, so wiring must see the same files. */
+async function wiringChanges(repo: string): Promise<string[]> {
+  const empty = process.platform === "win32" ? "NUL" : "/dev/null";
+  return (await git(repo, ["-c", `core.excludesFile=${empty}`, "status", "--porcelain=v1", "--untracked-files=all"]))
+    .split("\n").filter(Boolean);
 }
 
 /** `graft/a.md`, `graft/b.md` → `graft/`: exclude whole directories Graft owns. */

@@ -50,7 +50,8 @@ describe("Windows background installation helpers", () => {
     await mkdir(gitDir, { recursive: true });
     vi.stubEnv("HOME", join(directory, "home"));
     processes.capture.mockImplementation(async (_command, args: string[]) => ({
-      stdout: args.includes("--absolute-git-dir") ? `${gitDir}\n` : "",
+      stdout: args.includes("--git-path") ? `${join(gitDir, "info", "exclude")}\n`
+        : args.includes("--absolute-git-dir") ? `${gitDir}\n` : "",
       stderr: "",
     }));
     processes.spawn.mockImplementation(() => {
