@@ -41,6 +41,24 @@ describe("a DeepSeek Harness turn that failed on the provider after dsh's own re
   });
 });
 
+describe("a DeepSeek Harness turn whose route cannot serve it", () => {
+  // Exact production messages, each JSON-RPC -32603 (connector log, 2026-11-03).
+  it.each([
+    "Internal error: turn failed: DeepSeek Messages stream ended before message_stop",
+    "Internal error: turn failed: Service is too busy. We advise users to temporarily switch to alternative LLM API service providers. (request_id: c624faa2-4f73-4fb2-a304-62e276657c65)",
+  ])("names the route unavailable, never retried, with a plain sentence: %s", message => {
+    expect(classifyBridgeError(new RequestError(-32603, message))).toEqual({
+      code: -32603, class: "provider_failure", retryable: false, routeUnavailable: "provider_unavailable",
+      message: "The provider DeepSeek Harness uses is too busy or stopped answering. Pick another model or try again shortly.",
+    });
+  });
+
+  it("keeps the duplicate message_start message an internal error", () => {
+    expect(classifyBridgeError(new RequestError(-32603, "Internal error: turn failed: DeepSeek Messages stream: duplicate message_start")))
+      .toMatchObject({ class: "internal", retryable: false });
+  });
+});
+
 describe("OpenCode 2 turn failures (JSON-RPC -32603 with data.errorName)", () => {
   const failed = (safeMessage: string, errorName: string) => new RequestError(-32603, `Internal error: ${safeMessage}`, { service: "session", errorName });
 

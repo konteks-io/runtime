@@ -94,7 +94,9 @@ QA browser, structured results, updates and doctor/support.
   `previews` only from 7.8; workspace checkpoints and their chunk transfer
   only from 7.9; an OpenCode out-of-credit or no-route turn's
   `route_unavailable` terminal reason and `acp_error.routeUnavailable` only
-  from 7.15 (older: `provider_failure`, no field). The
+  from 7.15 (older: `provider_failure`, no field); the
+  `provider_unavailable` cause (the provider is overloaded or cut the stream
+  off) only from 7.16 (older: the 7.15 frame is sent without the cause). The
   `agent_runner` component always advertises `core-contract-version-v1`.
   Supported-agent detection (`NotAddedAgentsDetector`) never runs on the
   heartbeat path.

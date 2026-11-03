@@ -268,6 +268,7 @@ describe("runner event schema", () => {
     const error = { kind: "request_error", acpSessionRef: "acp", requestId: "r1", method: "session/prompt", code: -32603, class: "provider_failure", message: "out of credit", retryable: false };
     expect(RunnerEventSchema.safeParse({ ...error, routeUnavailable: "provider_quota" }).success).toBe(true);
     expect(RunnerEventSchema.safeParse({ ...error, routeUnavailable: "model_not_on_account" }).success).toBe(true);
+    expect(RunnerEventSchema.safeParse({ ...error, routeUnavailable: "provider_unavailable" }).success).toBe(true);
     expect(RunnerEventSchema.safeParse({ ...error, routeUnavailable: "billing" }).success).toBe(false);
   });
 });
