@@ -95,6 +95,15 @@ import {
  * journaled per `acpSessionRef`, and a completion whose id is unknown, already
  * closed, or whose method disagrees is rejected locally.
  */
+/**
+ * A request deadline for an instant on Core's timeline. The HTTP client compares
+ * deadlines with the local clock, so a machine whose clock is ahead of Core's
+ * would otherwise give up early by that much.
+ */
+export function localDeadlineFor(coreInstantMs: number, clock: Pick<Clock, "coreNow">): number {
+  return Date.now() + Math.max(0, coreInstantMs - clock.coreNow());
+}
+
 export interface RelayedSessionDeps {
   clock: Clock;
   journal: SupervisorJournal;
@@ -118,10 +127,10 @@ export interface RelayedSessionDeps {
   instanceId: string;
   /**
    * Redeems/renews one logical `mcpCapabilityTokenRef`; bearer stays in memory.
-   * Without a deadline, a redemption stays bounded by the assignment's expiry
-   * as captured at claim.
+   * `liveUntil` is an instant on Core's timeline. Without one, a redemption
+   * stays bounded by the assignment's expiry as captured at claim.
    */
-  redeemCapabilityToken: (assignment: RemoteWorkAssignment, deadlineAtMs?: number) => Promise<CapabilityTokenIssue>;
+  redeemCapabilityToken: (assignment: RemoteWorkAssignment, liveUntil?: number) => Promise<CapabilityTokenIssue>;
   /** Retained local address/header for the same provider thread, never Core delegation. */
   mcpLocalTransport?: McpLocalTransportIdentity;
   mcpLocalTransportReference?: string;

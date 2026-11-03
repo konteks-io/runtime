@@ -117,7 +117,7 @@ import { NativeCodexAppServerOwner, type NativeCodexAppServerOwnerOptions } from
 import { NativeAgentRetry, startNativeAgents } from "./native/start-native-agents.js";
 import { NotAddedAgentsDetector, SUPPORTED_AGENT_IDS, projectSupportedAgents, type AddedAgentFacts } from "./native/supported-agents.js";
 import { StateMutationGate } from "./state/mutation-gate.js";
-import type { RelayedSessionDeps } from "./session/relayed-session.js";
+import { localDeadlineFor, type RelayedSessionDeps } from "./session/relayed-session.js";
 import { PermissionBroker } from "./session/permissions.js";
 import { EvaluatorPolicyResponder } from "./session/policy-responder.js";
 import { createWorkspaceToolPolicy, DIRECT_SESSION_BASH_BLOCKLIST } from "./session/workspace-tool-policy.js";
@@ -1229,10 +1229,10 @@ export class Supervisor {
         broker: this.broker,
         registerDeferral: (body) => this.core.deferPermission(this.instanceId ?? "", body),
         instanceId: this.instanceId ?? "",
-        redeemCapabilityToken: async (target, deadlineAtMs) => {
+        redeemCapabilityToken: async (target, liveUntil) => {
           // Renewal supplies the execution's live authority; the single first
           // redemption supplies nothing and keeps the claim's expiry bound.
-          const deadline = deadlineAtMs ?? Date.now() + Math.max(0, Date.parse(target.expiresAt) - this.clock.coreNow());
+          const deadline = localDeadlineFor(liveUntil ?? Date.parse(target.expiresAt), this.clock);
           return this.core.redeemCapabilityToken(this.instanceId ?? "", { assignmentId: target.id, attempt: target.attempt, mcpCapabilityTokenRef: target.agentRoute.mcpCapabilityTokenRef ?? "" }, deadline);
         },
         workspaceRoot: native.runners.find(config => config.RUNNER_AGENT_ID === runner.agentId)!.RUNNER_WORKSPACE_DIR,

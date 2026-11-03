@@ -22,7 +22,7 @@ import { SupervisorJournal } from "../state/journal.js";
 import { NativeExecutionGate, NATIVE_EXECUTION_RENEWAL_BUDGET_MS } from "../native/execution-gate.js";
 import { OutputCaptureRefusal, tagDeliveryOutputStage } from "../native/delivery-output-failure.js";
 import { terminalOperationDispositions } from "../state/operation-dispositions.js";
-import { RelayedSession, type RelayedSessionDeps } from "../session/relayed-session.js";
+import { localDeadlineFor, RelayedSession, type RelayedSessionDeps } from "../session/relayed-session.js";
 import type { CapabilityTokenIssue } from "../core/client.js";
 import { PermissionBroker } from "../session/permissions.js";
 import { EvaluatorPolicyResponder } from "../session/policy-responder.js";
@@ -866,6 +866,18 @@ describe("MCP capability renewal bounded by the execution's live authority", () 
 
   const facadeOf = (session: RelayedSession) =>
     (session as unknown as { mcpFacade: { refresh(force: boolean, reason: string): Promise<CapabilityTokenIssue> } }).mcpFacade;
+
+  it("converts a Core-timeline deadline to the local clock, whichever way the clocks differ", () => {
+    const local = Date.now();
+    const remaining = 3_600_000;
+    for (const skew of [-300_000, 0, 300_000]) {
+      const clock = { coreNow: () => local + skew };
+      const deadline = localDeadlineFor(local + skew + remaining, clock);
+      expect(deadline).toBeGreaterThanOrEqual(local + remaining);
+      expect(deadline).toBeLessThan(local + remaining + 5_000);
+    }
+    expect(localDeadlineFor(local - 1_000, { coreNow: () => local })).toBeLessThan(local + 5_000);
+  });
 
   it("renews after the assignment expiry while Core's verified authority is still live", async () => {
     let currentNow = () => Date.parse("2026-09-10T00:00:00Z");
