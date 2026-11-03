@@ -1229,9 +1229,11 @@ export class Supervisor {
         broker: this.broker,
         registerDeferral: (body) => this.core.deferPermission(this.instanceId ?? "", body),
         instanceId: this.instanceId ?? "",
-        redeemCapabilityToken: async (target) => {
-          const deadlineAtMs = Date.now() + Math.max(0, Date.parse(target.expiresAt) - this.clock.coreNow());
-          return this.core.redeemCapabilityToken(this.instanceId ?? "", { assignmentId: target.id, attempt: target.attempt, mcpCapabilityTokenRef: target.agentRoute.mcpCapabilityTokenRef ?? "" }, deadlineAtMs);
+        redeemCapabilityToken: async (target, deadlineAtMs) => {
+          // Renewal supplies the execution's live authority; the single first
+          // redemption supplies nothing and keeps the claim's expiry bound.
+          const deadline = deadlineAtMs ?? Date.now() + Math.max(0, Date.parse(target.expiresAt) - this.clock.coreNow());
+          return this.core.redeemCapabilityToken(this.instanceId ?? "", { assignmentId: target.id, attempt: target.attempt, mcpCapabilityTokenRef: target.agentRoute.mcpCapabilityTokenRef ?? "" }, deadline);
         },
         workspaceRoot: native.runners.find(config => config.RUNNER_AGENT_ID === runner.agentId)!.RUNNER_WORKSPACE_DIR,
         executionAuthority: {

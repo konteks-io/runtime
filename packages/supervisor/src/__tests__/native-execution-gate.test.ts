@@ -23,6 +23,7 @@ import { NativeExecutionGate, NATIVE_EXECUTION_RENEWAL_BUDGET_MS } from "../nati
 import { OutputCaptureRefusal, tagDeliveryOutputStage } from "../native/delivery-output-failure.js";
 import { terminalOperationDispositions } from "../state/operation-dispositions.js";
 import { RelayedSession, type RelayedSessionDeps } from "../session/relayed-session.js";
+import type { CapabilityTokenIssue } from "../core/client.js";
 import { PermissionBroker } from "../session/permissions.js";
 import { EvaluatorPolicyResponder } from "../session/policy-responder.js";
 import type { RunnerPort } from "../runner-port.js";
@@ -833,6 +834,76 @@ describe("DeepSeek coordination under native delivery authority", () => {
       await announceAndAsk(f);
       expect(f.runner.answer).toHaveBeenCalledWith("acp", "dsh-approval", { outcome: { outcome: "cancelled" } });
       expect(f.journal.coordinationInvocations.all()).toEqual([]);
+    } finally { await f.session.close("cancelled"); }
+  });
+});
+
+describe("MCP capability renewal bounded by the execution's live authority", () => {
+  const capabilityWork: RemoteWorkAssignment = { ...deliveryTurn,
+    agentRoute: { ...deliveryTurn.agentRoute, agentId: "codex", mcpCapabilityTokenRef: "platform-capability" } };
+
+  /**
+   * Core's own rule, including the production closure's fallback when the
+   * caller supplies no deadline: a request whose deadline has passed never
+   * leaves the process.
+   */
+  const fakeCore = (now: () => number) => {
+    const attempts: Array<{ deadlineAtMs?: number; reachedCore: boolean }> = [];
+    const redeem = async (target: RemoteWorkAssignment, deadlineAtMs?: number): Promise<CapabilityTokenIssue> => {
+      const at = now();
+      const deadline = deadlineAtMs ?? at + Math.max(0, Date.parse(target.expiresAt) - at);
+      if (deadline <= at) {
+        attempts.push({ deadlineAtMs, reachedCore: false });
+        throw new RemoteInstanceError("temporarily_unavailable", "Core request deadline expired", { retryable: true });
+      }
+      attempts.push({ deadlineAtMs, reachedCore: true });
+      return { mcpServer: { name: "konteks-platform", url: "https://mcp.example/mcp",
+        headers: [{ name: "authorization", value: `Bearer capability-${attempts.length}` }] },
+        expiresAt: new Date(at + 3_600_000).toISOString() };
+    };
+    return { attempts, redeem };
+  };
+
+  const facadeOf = (session: RelayedSession) =>
+    (session as unknown as { mcpFacade: { refresh(force: boolean, reason: string): Promise<CapabilityTokenIssue> } }).mcpFacade;
+
+  it("renews after the assignment expiry while Core's verified authority is still live", async () => {
+    let currentNow = () => Date.parse("2026-09-10T00:00:00Z");
+    const core = fakeCore(() => currentNow());
+    const f = await sessionFixture(capabilityWork, undefined, undefined, {}, { redeemCapabilityToken: core.redeem });
+    try {
+      currentNow = () => f.clock.coreNow();
+      f.advance(2 * 3_600_000);
+      expect(f.clock.coreNow()).toBeGreaterThan(Date.parse(capabilityWork.expiresAt));
+      // Core's verified checks carried the local record past the issued hour.
+      const liveUntil = f.clock.coreNow() + 3_600_000;
+      await f.journal.assignments.put({ ...f.journal.assignments.get("assignment:1")!, expiresAt: new Date(liveUntil).toISOString() });
+      const renewed = await facadeOf(f.session).refresh(true, "timer");
+      // The claim redemption keeps its own expiry bound; renewal uses live authority.
+      expect(core.attempts[0]).toEqual({ deadlineAtMs: undefined, reachedCore: true });
+      expect(core.attempts.at(-1)).toEqual({ deadlineAtMs: liveUntil, reachedCore: true });
+      expect(Date.parse(renewed.expiresAt)).toBeGreaterThan(Date.parse(capabilityWork.expiresAt));
+    } finally { await f.session.close("cancelled"); }
+  });
+
+  it("stops renewal and closes the session once that authority has ended", async () => {
+    let currentNow = () => Date.parse("2026-09-10T00:00:00Z");
+    const core = fakeCore(() => currentNow());
+    const f = await sessionFixture(capabilityWork, undefined, undefined, {}, { redeemCapabilityToken: core.redeem });
+    try {
+      currentNow = () => f.clock.coreNow();
+      f.advance(2 * 3_600_000);
+      const facade = facadeOf(f.session);
+      await expect(facade.refresh(true, "timer")).rejects.toMatchObject({ code: "temporarily_unavailable" });
+      expect(core.attempts).toEqual([
+        { deadlineAtMs: undefined, reachedCore: true },
+        { deadlineAtMs: Date.parse(capabilityWork.expiresAt), reachedCore: false },
+      ]);
+      expect(f.session.isClosed).toBe(true);
+      expect(f.send.mock.calls.at(-1)?.[0].body).toMatchObject({ kind: "session_closed", assignmentId: "assignment", reason: "agent_exited" });
+      // A closed owner never asks Core again.
+      await expect(facade.refresh(true, "timer")).rejects.toMatchObject({ code: "capability_unavailable" });
+      expect(core.attempts).toHaveLength(2);
     } finally { await f.session.close("cancelled"); }
   });
 });

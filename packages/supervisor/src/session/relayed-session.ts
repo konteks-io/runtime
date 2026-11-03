@@ -116,8 +116,12 @@ export interface RelayedSessionDeps {
    */
   registerDeferral?: (body: DeferredPermissionBody) => Promise<PendingPermissionView>;
   instanceId: string;
-  /** Redeems/renews one logical `mcpCapabilityTokenRef`; bearer stays in memory. */
-  redeemCapabilityToken: (assignment: RemoteWorkAssignment) => Promise<CapabilityTokenIssue>;
+  /**
+   * Redeems/renews one logical `mcpCapabilityTokenRef`; bearer stays in memory.
+   * Without a deadline, a redemption stays bounded by the assignment's expiry
+   * as captured at claim.
+   */
+  redeemCapabilityToken: (assignment: RemoteWorkAssignment, deadlineAtMs?: number) => Promise<CapabilityTokenIssue>;
   /** Retained local address/header for the same provider thread, never Core delegation. */
   mcpLocalTransport?: McpLocalTransportIdentity;
   mcpLocalTransportReference?: string;
@@ -561,7 +565,7 @@ export class RelayedSession {
       renew: () => {
         this.deps.assertExecutionOwned?.();
         if (this.closed) throw new RemoteInstanceError("execution_fenced", "The execution session is closed.");
-        return this.deps.redeemCapabilityToken(this.assignment);
+        return this.deps.redeemCapabilityToken(this.assignment, this.liveUntil());
       },
       onUnavailable: () => this.close("agent_exited"),
       coordinationInvocation: (tool, args) => this.coordinationCalls.resolve(tool, args),
