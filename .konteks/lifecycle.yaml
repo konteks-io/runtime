@@ -1,0 +1,19 @@
+version: 1
+
+# Lets a Konteks delivery's independent checks build this repository without
+# asking a person each time. Mirrors CI: the sibling `../packages` links do not
+# exist in a review workspace, so point them at the vendored contracts first.
+# The tests import workspace packages' built output, so this ends with a build.
+installDependencies:
+  - name: vendored-contracts
+    command: node scripts/ci-vendored-contracts.mjs --yes
+    timeout_seconds: 60
+  - name: lockfile
+    command: npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+    timeout_seconds: 400
+  - name: install
+    command: npm ci --ignore-scripts
+    timeout_seconds: 400
+  - name: build
+    command: npm run build
+    timeout_seconds: 400
