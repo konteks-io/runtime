@@ -69,7 +69,10 @@ async function reconnectAgain(s: OnboardSession): Promise<OnboardStep> {
 export async function identityStep(s: OnboardSession): Promise<OnboardStep> {
   const identity = await new SupervisorStore(s.supervisorData).identity().catch(() => null);
   const instanceId = connectedInstanceId(identity);
-  if (instanceId) return alreadyConnected(s, instanceId, identity?.workspaceId);
+  if (instanceId) {
+    await s.assertNotRevoked();
+    return alreadyConnected(s, instanceId, identity?.workspaceId);
+  }
   // Not connected yet: the first response is the first question, not a
   // bare "run again" the agent has to explain.
   await s.save({ step: "email" });

@@ -484,8 +484,27 @@ describe("native Supervisor composition", () => {
     await expect(supervisor.heartbeat.publish()).rejects.toMatchObject({ code: "instance_revoked" });
     expect(supervisor.lease.current()).toBeNull(); expect(await f.store.lease()).toBeNull();
     expect((await supervisor.status()).administrativeStatus).toBe("revoked");
+    expect(await f.store.identity()).toMatchObject({ instanceId: "instance", activationId: "activation", administrativeStatus: "revoked" });
     await expect(supervisor.heartbeat.publish()).rejects.toThrow();
     expect(heartbeat).toHaveBeenCalledTimes(2);
+  });
+  it("records Core's startup revocation refusal instead of reporting an active offline identity", async () => {
+    const f = await fixture();
+    await f.store.saveIdentity({ ...(await f.store.identity())!, administrativeStatus: "active" });
+    const supervisor = new Supervisor(f.config, f.options); supervisors.push(supervisor);
+    const { CoreClient } = await import("../core/client.js");
+    const reconnect = vi.spyOn(CoreClient.prototype, "resolveRuntimeOwner").mockRejectedValue(new RemoteInstanceError("instance_revoked", "revoked"));
+    await supervisor.start();
+    expect(reconnect).toHaveBeenCalledOnce();
+    expect(supervisor.status().administrativeStatus).toBe("revoked");
+    expect(supervisor.lease.current()).toBeNull();
+    expect(await f.store.identity()).toMatchObject({ instanceId: "instance", activationId: "activation", administrativeStatus: "revoked" });
+    await supervisor.stop();
+    reconnect.mockRejectedValue(new RemoteInstanceError("temporarily_unavailable", "offline"));
+    const restarted = new Supervisor(f.config, f.options); supervisors.push(restarted);
+    await restarted.start();
+    expect(restarted.status().administrativeStatus).toBe("revoked");
+    expect(restarted.lease.current()).toBeNull();
   });
   it("wires the production input preparer by default and refuses an unclaimed assignment", async () => {
     const f = await fixture();

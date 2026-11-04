@@ -65,6 +65,8 @@ export interface OnboardDeps {
   personalOpenCode?: () => Promise<boolean>;
   /** Wait for the started service to become active; resolves to the roles it advertises, or null. */
   waitForReady?: (root: string, until?: "ready" | "answering") => Promise<ServiceReadiness | null>;
+  /** One authenticated status snapshot, without waiting for startup or a heartbeat. */
+  runtimeStatus?: (root: string) => Promise<ServiceReadiness | null>;
   /** Graft, injectable for tests. */
   graft?: {
     available?: (root: string) => Promise<boolean>;
@@ -365,6 +367,21 @@ export class OnboardSession {
 
   waitForReady(...until: ["ready" | "answering"] | []): Promise<ServiceReadiness | null> {
     return (this.deps.waitForReady ?? waitForServiceReady)(this.context.root, ...until);
+  }
+
+  /** A retained identity is not proof that Core still accepts this runtime. */
+  async assertNotRevoked(): Promise<void> {
+    const identity = await new SupervisorStore(this.supervisorData).identity();
+    if (identity?.administrativeStatus === "revoked") throw new RemoteInstanceError("permission_denied", OWNER_ACCESS_REVOKED);
+    let status: ServiceReadiness | null;
+    if (this.deps.runtimeStatus) status = await this.deps.runtimeStatus(this.context.root);
+    else {
+      const record = await readNativeRecord(this.context.root).catch(() => null);
+      if (!record) return;
+      const control = new SupervisorControl({ supervisorData: this.supervisorData }, record.controlPort);
+      status = (await probeReady(control, "answering", null)).last;
+    }
+    if (status?.administrativeStatus === "revoked") throw new RemoteInstanceError("permission_denied", OWNER_ACCESS_REVOKED);
   }
 
   inspect(): ReturnType<typeof inspectRepository> {
