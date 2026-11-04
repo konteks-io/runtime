@@ -342,7 +342,7 @@ describe("native shared repository cache", () => {
     const { f, cwd, receiptPath, target, request } = await legacyWorkspace();
     const status = await testGitCommand(f.tool, cwd, ["status", "--porcelain"]);
     const staged = await testGitCommand(f.tool, cwd, ["diff", "--cached", "--binary"]);
-    const destination = phase === "target" ? target : phase === "pointer" ? join(cwd, ".git") : receiptPath;
+    const destination = phase === "target" ? target : phase === "pointer" ? join(cwd, ".git") : await realpath(receiptPath);
     const rename = (await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises")).rename;
     let injected = false;
     const spy = vi.mocked(fsPromises.rename).mockImplementation(async (from, to) => {

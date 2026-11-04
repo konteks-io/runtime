@@ -22,6 +22,7 @@ import { createNativeService } from "../native/service.js";
 import { SupervisorStore } from "../state/store.js";
 import { acquireNativeRootLock } from "../native/root-lock.js";
 import { testGitTool } from "./native-git-fixture.js";
+import { isolateDshDiscovery } from "./native-host-discovery-fixture.js";
 
 let root: string;
 beforeEach(async () => {
@@ -255,6 +256,7 @@ describe("closed native runtime installation", () => {
     await expect(resolveNativeCodexSocket(root, home, `${root}/../foreign/s`)).rejects.toThrow();
   });
   it.runIf(process.platform !== "win32")("runs DeepSeek Harness from the person's own installation, with no bundled artifact", async () => {
+    isolateDshDiscovery(root);
     // A service's environment: no version manager on PATH, no npm prefix. The
     // search must not find whatever this machine has installed.
     vi.stubEnv("PATH", "/usr/bin:/bin");
