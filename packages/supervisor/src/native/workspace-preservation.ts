@@ -1,11 +1,12 @@
 import { privateWorkspaceDirectory, readPrivateWorkspaceFile, writePrivateWorkspaceJson } from "./workspace-storage.js";
-import { mkdir, realpath, lstat } from "node:fs/promises";
+import { mkdir, readdir, realpath, rm, lstat } from "node:fs/promises";
 import { isAbsolute, join, relative } from "node:path";
 import { randomUUID } from "node:crypto";
 import { z } from "zod/v4";
 import { RemoteWorkAssignmentSchema, RemoteWorkspaceAnyCheckpointSchema, sha256Hex,
   type RemoteWorkAssignment, type RemoteWorkspaceAnyCheckpoint, type RemoteWorkspaceCheckpointV2 } from "@konteks/remote-common";
-import type { NativeInputClient } from "./input-client.js";
+import { NativeInputResponseError, type NativeInputClient } from "./input-client.js";
+import { logicalSessionId } from "../work/continued-session.js";
 import { NativeWorkspaceChunkStore, workspaceCheckpointChunks } from "./workspace-chunk-store.js";
 import { captureWorkspaceCheckpoint } from "./workspace-checkpoint.js";
 import { inspectWorkspaceGitControl, WorkspaceGitControlSchema } from "./workspace-git-control.js";
@@ -16,6 +17,8 @@ import { checkpointFailure } from "./workspace-checkpoint-failure.js";
 
 const unavailable = (diagnostic: string) => new NamedRefusal("recovery_required", "The latest unfinished workspace could not be preserved. Its original checkout was kept.", diagnostic);
 const digest = z.string().regex(/^sha256:[a-f0-9]{64}$/);
+/** Long enough for a restart to retry an uncertain upload. Past it, a copy only holds disk; losing one withholds migration, nothing else. */
+const ABANDONED_AFTER_MS = 7 * 24 * 60 * 60_000;
 const RecordSchema = z.object({ version: z.literal(1), assignment: RemoteWorkAssignmentSchema,
   claimId: z.string().min(1).max(255), selectionDigest: digest, checkpointId: z.string().uuid(), cwd: z.string().min(1),
   gitControl: WorkspaceGitControlSchema, format: z.literal("konteks-workspace-checkpoint-v2").optional(),
@@ -65,27 +68,77 @@ export class NativeWorkspaceCheckpointStore {
 
   async seal(admission: Admission, assertCurrent: () => void): Promise<void> {
     assertCurrent();
-    let operation = { stage: "workspace_owner", code: "checkpoint_owner_failed" };
+    const operation = { stage: "workspace_owner", code: "checkpoint_owner_failed" };
+    let owner: { folder: string; record: Record } | null = null;
+    let settled = false;
     try {
-      const owner = await this.loadOwner(admission);
+      owner = await this.loadOwner(admission);
       if (!owner) return;
-      const { folder, record } = owner;
-      operation = { stage: "workspace_capture", code: "checkpoint_capture_failed" };
-      const checkpoint = await this.checkpoint(folder, record, assertCurrent);
-      if (checkpoint.format === "konteks-workspace-checkpoint-v2") {
-        operation = { stage: "workspace_chunk_upload", code: "checkpoint_upload_failed" };
-        await this.uploadChunks(folder, record, checkpoint, assertCurrent);
-      }
-      assertCurrent();
-      operation = { stage: "workspace_seal", code: "checkpoint_seal_failed" };
-      const result = await this.options.client().workspace(record.assignment, "seal", { ...this.request(record), stop: "processes_stopped", checkpoint });
-      assertCurrent();
-      if (!isReceipt(result, record.checkpointId, "sealed") || result.checkpointDigest !== checkpoint.checkpointDigest) throw unavailable("seal_receipt_mismatch");
+      await this.sealOwner(owner.folder, owner.record, operation, assertCurrent);
+      settled = true;
     } catch (error) {
+      settled = isReplaced(error);
+      if (settled) return;
       reportRuntimeFailure(this.options.onRuntimeFailure, checkpointFailure(error, operation),
         { assignmentId: admission.assignmentId, attempt: admission.attempt });
       throw error;
+    } finally {
+      if (owner) await this.tidy(owner.folder, owner.record, settled).catch(() => undefined);
     }
+  }
+
+  private async sealOwner(folder: string, record: Record, operation: { stage: string; code: string }, assertCurrent: () => void): Promise<void> {
+    Object.assign(operation, { stage: "workspace_capture", code: "checkpoint_capture_failed" });
+    const checkpoint = await this.checkpoint(folder, record, assertCurrent);
+    if (checkpoint.format === "konteks-workspace-checkpoint-v2") {
+      Object.assign(operation, { stage: "workspace_chunk_upload", code: "checkpoint_upload_failed" });
+      await this.uploadChunks(folder, record, checkpoint, assertCurrent);
+    }
+    assertCurrent();
+    Object.assign(operation, { stage: "workspace_seal", code: "checkpoint_seal_failed" });
+    const result = await this.options.client().workspace(record.assignment, "seal", { ...this.request(record), stop: "processes_stopped", checkpoint });
+    assertCurrent();
+    if (!isReceipt(result, record.checkpointId, "sealed") || result.checkpointDigest !== checkpoint.checkpointDigest) throw unavailable("seal_receipt_mismatch");
+  }
+
+  /** Local copies this seal has outlived; the original checkouts are never touched. A copy that failed for another reason stays, so a restart can retry it. */
+  private async tidy(folder: string, record: Record, settled: boolean): Promise<void> {
+    const own = `${this.recordKey(record)}.owner.json`;
+    const begun = (await lstat(join(folder, own))).mtimeMs;
+    const session = logicalSessionId(record.assignment.source);
+    for (const name of await readdir(folder)) {
+      if (name !== own && !name.startsWith(`${record.checkpointId}.`)) await this.tidyEntry(folder, name, begun, session);
+    }
+    if (settled) await this.discard(folder, record);
+  }
+
+  private async tidyEntry(folder: string, name: string, begun: number, session: string | undefined): Promise<void> {
+    const changed = (await lstat(join(folder, name)).catch(() => null))?.mtimeMs;
+    if (changed === undefined) return;
+    if (changed < Date.now() - ABANDONED_AFTER_MS) { await rm(join(folder, name), { recursive: true, force: true }); return; }
+    if (session && name.endsWith(".owner.json") && changed < begun) await this.discardIfSameSession(folder, name, session);
+  }
+
+  private async discardIfSameSession(folder: string, name: string, session: string): Promise<void> {
+    const earlier = await this.readRecord(folder, name);
+    if (earlier && logicalSessionId(earlier.assignment.source) === session) await this.discard(folder, earlier);
+  }
+
+  private async discard(folder: string, record: Record): Promise<void> {
+    await rm(join(folder, `${record.checkpointId}.chunks`), { recursive: true, force: true });
+    await rm(join(folder, `${record.checkpointId}.checkpoint.json`), { force: true });
+    await rm(join(folder, `${this.recordKey(record)}.owner.json`), { force: true });
+  }
+
+  private recordKey(record: Record): string {
+    return this.key({ assignmentId: record.assignment.id, attempt: record.assignment.attempt, claimId: record.claimId });
+  }
+
+  private async readRecord(folder: string, name: string): Promise<Record | null> {
+    try {
+      const bytes = await readPrivateWorkspaceFile(join(folder, name), 128 * 1024);
+      return bytes && RecordSchema.parse(JSON.parse(bytes.toString("utf8")));
+    } catch { return null; }
   }
 
   private async loadOwner(admission: Admission): Promise<{ folder: string; record: Record } | null> {
@@ -104,7 +157,11 @@ export class NativeWorkspaceCheckpointStore {
     let retained = await readPrivateWorkspaceFile(snapshot, 90 * 1024 * 1024);
     if (!retained) {
       const options = { cwd: record.cwd, ownerRoot: this.options.root, repositoryCacheRoot: this.options.repositoryCacheRoot, expectedControl: record.gitControl, baselineCommit: record.baselineCommit, tool: record.tool };
-      const checkpoint = record.format ? await captureWorkspaceCheckpoint({ ...options, chunks: new NativeWorkspaceChunkStore(join(folder, `${record.checkpointId}.chunks`)) }) : await captureWorkspaceCheckpoint(options);
+      const chunks = join(folder, `${record.checkpointId}.chunks`);
+      const checkpoint = record.format ? await captureWorkspaceCheckpoint({ ...options, chunks: new NativeWorkspaceChunkStore(chunks) }).catch(async (error: unknown) => {
+        await rm(chunks, { recursive: true, force: true }).catch(() => undefined);
+        throw error;
+      }) : await captureWorkspaceCheckpoint(options);
       assertCurrent();
       await writePrivateWorkspaceJson(folder, snapshot, checkpoint);
       retained = await readPrivateWorkspaceFile(snapshot, 90 * 1024 * 1024);
@@ -130,6 +187,11 @@ export class NativeWorkspaceCheckpointStore {
   private request(record: Record) {
     return { attempt: record.assignment.attempt, claimId: record.claimId, selectionDigest: record.selectionDigest, checkpointId: record.checkpointId, ...(record.format ? { format: record.format } : {}) };
   }
+}
+
+/** 409: a newer attempt on this session holds the checkpoint now, so this copy can never seal. */
+function isReplaced(error: unknown): boolean {
+  return error instanceof NativeInputResponseError && error.status === 409;
 }
 
 function isReceipt(value: unknown, checkpointId: string, state: string): value is { checkpointId: string; state: string; checkpointDigest?: string } {

@@ -1,5 +1,6 @@
 import { RemoteInstanceError } from "@konteks/remote-common";
 import type { RuntimeFailureFact } from "../runtime-failure-types.js";
+import { NativeInputResponseError } from "./input-client.js";
 import { diagnosticIdentifier, filesystemFailure, NamedRefusal, refusalEvidence } from "./named-refusal.js";
 
 /**
@@ -10,11 +11,12 @@ import { diagnosticIdentifier, filesystemFailure, NamedRefusal, refusalEvidence 
 
 /** The Git call a checkpoint refusal came from. */
 export type CheckpointGitStep =
-  | "rev_parse" | "for_each_ref" | "ls_files_stage" | "cat_file" | "init_bare" | "update_ref" | "mktree"
+  | "rev_parse" | "for_each_ref" | "ls_files_stage" | "ls_files_ignored" | "cat_file" | "init_bare" | "update_ref" | "mktree"
   | "commit_tree" | "bundle_create" | "init" | "bundle_verify" | "fetch" | "symbolic_ref" | "config" | "fsck";
 
 /** The named check behind a checkpoint failure, down to the Git step; an OS error by syscall and errno. */
 export function checkpointCause(error: unknown): string | undefined {
+  if (error instanceof NativeInputResponseError) return diagnosticIdentifier(`response_status_${error.status}`);
   if (!(error instanceof RemoteInstanceError)) return filesystemFailure(error)?.diagnostic ?? schemaCause(error);
   const gitStep = error instanceof NamedRefusal ? error.facts.gitStep : undefined;
   return diagnosticIdentifier(gitStep ? `${error.diagnostic}_${gitStep}` : error.diagnostic);

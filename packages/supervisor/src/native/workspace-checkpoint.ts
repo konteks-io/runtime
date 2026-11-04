@@ -21,27 +21,36 @@ type Entry = RemoteWorkspaceAnyCheckpoint["entries"][number];
 type Bytes = RemoteWorkspaceAnyCheckpoint["index"];
 type Git = (cwd: string, step: CheckpointGitStep, args: string[], input?: Buffer | string) => Promise<Buffer>;
 const GIT_CALL_TIMEOUT_MS = 30_000;
+/** Steps whose work grows with the repository; these limits only catch a hung Git. */
+const GIT_LONG_CALL_TIMEOUT_MS = 30 * 60_000;
+const LONG_GIT_STEPS: ReadonlySet<CheckpointGitStep> = new Set(["ls_files_ignored", "bundle_create", "bundle_verify", "fetch", "fsck"]);
 
-/** Which way a Git call failed, and which call; a kill cut short by the shared deadline is `git_deadline`. */
-function gitRefusal(error: ExecFileException, gitStep: CheckpointGitStep, timeout: number): NamedRefusal {
-  const { diagnostic, facts } = gitFailure(error, timeout < GIT_CALL_TIMEOUT_MS ? "git_deadline" : "git_timeout");
+/**
+ * Folders a project's tools rebuild, by name. A folder is skipped only when Git
+ * also reports it ignored and untracked, so anything else ignored (`.env`, a
+ * private draft) still travels.
+ */
+const REBUILDABLE_FOLDERS: ReadonlySet<string> = new Set(["node_modules", "bower_components", "vendor", ".venv", "venv", "__pycache__",
+  "target", "dist", "build", ".next", ".nuxt", ".svelte-kit", ".turbo", ".parcel-cache", ".cache", ".gradle", "Pods", ".terraform"]);
+const NOTHING_SKIPPED: ReadonlySet<string> = new Set();
+
+/** Which way a Git call failed, and which call. */
+function gitRefusal(error: ExecFileException, gitStep: CheckpointGitStep): NamedRefusal {
+  const { diagnostic, facts } = gitFailure(error);
   return unavailable(diagnostic, { ...facts, gitStep });
 }
 
 function gitRunner(tool: NativeGitTool): Git {
-  const deadline = Date.now() + 120_000;
   const env = { PATH: dirname(tool.executable), GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null",
     GIT_ATTR_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0", GIT_ALLOW_PROTOCOL: "file", GIT_NO_REPLACE_OBJECTS: "1", GIT_OPTIONAL_LOCKS: "0",
     GIT_AUTHOR_NAME: "Konteks recovery checkpoint", GIT_AUTHOR_EMAIL: "checkpoint@invalid",
     GIT_COMMITTER_NAME: "Konteks recovery checkpoint", GIT_COMMITTER_EMAIL: "checkpoint@invalid",
     ...(process.platform === "win32" && process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}) };
   return (cwd, step, args, input) => new Promise((resolve, reject) => {
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) { reject(unavailable("git_deadline", { gitStep: step })); return; }
-    const timeout = Math.min(GIT_CALL_TIMEOUT_MS, remaining);
+    const timeout = LONG_GIT_STEPS.has(step) ? GIT_LONG_CALL_TIMEOUT_MS : GIT_CALL_TIMEOUT_MS;
     const child = execFile(tool.executable, ["-c", "core.hooksPath=", "-c", "core.autocrlf=false", "-c", "core.safecrlf=false", "-c", "core.fsmonitor=false", "--no-pager", ...args],
       { cwd, env, timeout, maxBuffer: REMOTE_WORKSPACE_CHECKPOINT_LIMITS.bytes, encoding: "buffer", windowsHide: true },
-      (error, output) => error ? reject(gitRefusal(error, step, timeout)) : resolve(output));
+      (error, output) => error ? reject(gitRefusal(error, step)) : resolve(output));
     child.stdin?.on("error", () => undefined);
     child.stdin?.end(input);
   });
@@ -85,32 +94,40 @@ function transferPath(path: string): void {
   if (path.split("/").some(part => /^\.git(?:$|[ .~])/i.test(part))) throw unavailable("git_path_in_tree");
 }
 
-/** Reads links as links, all ignored files and empty directories; never follows a link. */
-async function workingFiles(root: string, folder: string, entries: Entry[], chunks?: WorkspaceChunkCapture, budget = { bytes: 0 }): Promise<Entry[]> {
+/** Reads links as links, ignored files and empty directories, leaving out only `skipped`; never follows a link. */
+async function workingFiles(root: string, folder: string, entries: Entry[], chunks?: WorkspaceChunkCapture, skipped = NOTHING_SKIPPED, budget = { bytes: 0 }): Promise<Entry[]> {
   const before = await directory(folder);
   for (const name of (await readdir(folder)).sort()) {
     if (folder === root && name === ".git") continue;
     const path = relative(root, join(folder, name)).split("\\").join("/");
+    if (skipped.has(path)) continue;
     transferPath(path);
-    await addWorkingEntry(root, join(folder, name), path, entries, chunks, budget);
+    await addWorkingEntry(root, join(folder, name), path, entries, chunks, skipped, budget);
     checkSize(entries.length, budget.bytes, chunks);
   }
   if (!unchanged(before, await lstat(folder))) throw unavailable("directory_changed");
   return entries;
 }
 
-async function addWorkingEntry(root: string, absolute: string, path: string, entries: Entry[], chunks: WorkspaceChunkCapture | undefined, budget: { bytes: number }): Promise<void> {
+async function addWorkingEntry(root: string, absolute: string, path: string, entries: Entry[], chunks: WorkspaceChunkCapture | undefined, skipped: ReadonlySet<string>, budget: { bytes: number }): Promise<void> {
   const stat = await lstat(absolute);
   if (stat.isSymbolicLink()) { entries.push({ path, kind: "symlink", target: await readlink(absolute) }); return; }
   const mode = stat.mode & 0o777;
   if (stat.isDirectory()) {
     entries.push({ path, kind: "directory", mode });
-    await workingFiles(root, absolute, entries, chunks, budget);
+    await workingFiles(root, absolute, entries, chunks, skipped, budget);
     return;
   }
   checkSize(entries.length + 1, budget.bytes + stat.size, chunks);
   const data = await readCheckpointBytes(absolute, stat, chunks);
   entries.push({ path, kind: "file", mode, ...data }); budget.bytes += data.sizeBytes;
+}
+
+/** The ignored folders that hold nothing tracked and that tools rebuild. Git lists such a folder whole, with a trailing slash. */
+async function rebuildableFolders(git: Git, root: string): Promise<ReadonlySet<string>> {
+  const rows = (await git(root, "ls_files_ignored", ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"])).toString("utf8").split("\0");
+  const folders = rows.filter(row => row.endsWith("/")).map(row => row.slice(0, -1));
+  return new Set(folders.filter(folder => REBUILDABLE_FOLDERS.has(folder.split("/").at(-1)!)));
 }
 
 function ascii(value: Buffer): string { return value.toString("utf8").trim(); }
@@ -187,14 +204,15 @@ export async function captureWorkspaceCheckpoint(options: CaptureOptions & { chu
   await assertSupportedGitMetadata(control);
   await git(root, "cat_file", ["cat-file", "-e", `${options.baselineCommit}^{commit}`]);
   const state = await gitState(git, root, linked, options.chunks);
-  const entries = await workingFiles(root, root, [], options.chunks);
+  const skipped = await rebuildableFolders(git, root);
+  const entries = await workingFiles(root, root, [], options.chunks, skipped);
   const temporary = await mkdtemp(join(dirname(root), ".workspace-checkpoint-"));
   await chmod(temporary, 0o700);
   try {
     const packed = await bundle(git, root, temporary, state, options.baselineCommit, options.chunks);
     assertGitControl(await inspectWorkspaceGitControl(options), control);
     await assertSupportedGitMetadata(control);
-    await assertUnchangedDuringCapture(git, root, { state, entries, before, linked, chunks: options.chunks });
+    await assertUnchangedDuringCapture(git, root, { state, entries, before, linked, chunks: options.chunks, skipped });
     const { indexEntries: _entries, ...metadata } = state;
     const body = { format: options.chunks ? "konteks-workspace-checkpoint-v2" as const : "konteks-workspace-checkpoint-v1" as const, baselineCommit: options.baselineCommit, ...metadata, bundle: packed, entries };
     return RemoteWorkspaceAnyCheckpointSchema.parse({ ...body, checkpointDigest: computeRemoteWorkspaceCheckpointDigest(body) });
@@ -202,9 +220,9 @@ export async function captureWorkspaceCheckpoint(options: CaptureOptions & { chu
 }
 
 /** Nothing moved while the bundle was written: Git state, then working files, then the folder itself. */
-async function assertUnchangedDuringCapture(git: Git, root: string, captured: { state: Awaited<ReturnType<typeof gitState>>; entries: Entry[]; before: Stats; linked: boolean; chunks: WorkspaceChunkCapture | undefined }): Promise<void> {
+async function assertUnchangedDuringCapture(git: Git, root: string, captured: { state: Awaited<ReturnType<typeof gitState>>; entries: Entry[]; before: Stats; linked: boolean; chunks: WorkspaceChunkCapture | undefined; skipped: ReadonlySet<string> }): Promise<void> {
   if (!sameGitState(captured.state, await gitState(git, root, captured.linked, captured.chunks))) throw unavailable("git_state_changed");
-  if (canonicalize(captured.entries as never) !== canonicalize(await workingFiles(root, root, [], captured.chunks) as never)) throw unavailable("workspace_changed");
+  if (canonicalize(captured.entries as never) !== canonicalize(await workingFiles(root, root, [], captured.chunks, captured.skipped) as never)) throw unavailable("workspace_changed");
   if (!unchanged(captured.before, await lstat(root))) throw unavailable("directory_changed");
 }
 
