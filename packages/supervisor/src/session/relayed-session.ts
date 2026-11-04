@@ -15,6 +15,7 @@ import {
   plainRecord,
   createLogger,
   type AcpJsonRpcError,
+  type AcpRouteUnavailable,
   type AgentTurnUsageObservation,
   type Clock,
   type DirectModelSelection,
@@ -162,8 +163,8 @@ export interface RelayedSessionDeps {
     modelSelection?: DirectModelSelection,
   ) => Promise<RemoteExecutionReadyResult>;
   directModelSelectionSupported?: () => boolean;
-  /** Core (and its relay) accept `acp_error.routeUnavailable`; absent, the frame never carries it. */
-  routeUnavailableSupported?: () => boolean;
+  /** Core (and its relay) accept `acp_error.routeUnavailable` for this cause; absent, the frame never carries it. */
+  routeUnavailableSupported?: (cause: AcpRouteUnavailable) => boolean;
   /** Reserve an exclusive local channel after input verification, before bridge bootstrap. */
   reserveChannel?: (channelId: string, session: RelayedSession) => () => void;
   /** Actual WorkOrchestrator retained-admission fence, not a permission grant. */
@@ -1680,7 +1681,7 @@ export class RelayedSession {
   /** The runner's request error as the relay frame carries it; the route cause only to a Core that accepts it. */
   private relayedRequestError(event: RunnerEventOf<"request_error">): AcpJsonRpcError {
     const { code, class: errorClass, message, retryable, routeUnavailable } = event;
-    const named = routeUnavailable !== undefined && this.deps.routeUnavailableSupported?.() === true;
+    const named = routeUnavailable !== undefined && this.deps.routeUnavailableSupported?.(routeUnavailable) === true;
     return { code, class: errorClass, message, retryable, ...(named ? { routeUnavailable } : {}) };
   }
 

@@ -309,6 +309,15 @@ const DSH_KEY_MISSING = /llm-deepseek: (?:no API key for provider route|the API 
  */
 const DSH_PROVIDER_FAILURE = /turn failed: DeepSeek Messages (?:stream idle timeout|transport failed|returned no response body)$/;
 
+/**
+ * DeepSeek Harness's own adapter wording for a provider that cannot serve the
+ * route right now: it is too busy, or it ended the message stream before
+ * `message_stop` (dsh 0.1.7-rc.2 llm-deepseek). The busy sentence carries its
+ * own `(request_id: …)`, so the `$`-anchored DSH_PROVIDER_FAILURE shape above
+ * cannot match it. Another route can take the turn, so neither is retried.
+ */
+const DSH_ROUTE_UNAVAILABLE = /turn failed: (?:DeepSeek Messages stream ended before message_stop|Service is too busy\. We advise users to temporarily switch to alternative LLM API service providers\. \(request_id: [^)]+\))$/;
+
 type BridgeErrorClass = ReturnType<typeof classifyBridgeError>;
 
 /**
@@ -454,6 +463,13 @@ function classifyRequestError(error: RequestError): BridgeErrorClass {
   // dsh already retried these five times; a turn is not idempotent, so name
   // the provider and let the person decide, never retry the whole turn.
   if (DSH_PROVIDER_FAILURE.test(message)) return { code: error.code, class: "provider_failure", message, retryable: false };
+  // The provider itself is unavailable (overloaded, or it cut the stream
+  // off): the route cannot serve this turn, so name the cause for Core and
+  // give the person a plain sentence instead of dsh's "Internal error" text.
+  if (DSH_ROUTE_UNAVAILABLE.test(message)) {
+    return { code: error.code, class: "provider_failure", retryable: false, routeUnavailable: "provider_unavailable",
+      message: "The provider DeepSeek Harness uses is too busy or stopped answering. Pick another model or try again shortly." };
+  }
   const definite = DEFINITE_REQUEST_CODES.get(error.code);
   if (definite) return { code: error.code, class: definite, message, retryable: false };
   return { code: error.code, class: "provider_failure", message, retryable: true };

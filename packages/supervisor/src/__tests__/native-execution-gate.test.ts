@@ -32,7 +32,7 @@ import { dshCoordinationArguments, dshCoordinationCall, dshCoordinationPermissio
 import { RunnerEventBus } from "../../../agent-runner/src/events.js";
 import { SessionManager, InMemorySessionRefStore } from "../../../agent-runner/src/sessions/manager.js";
 import type { BridgeProcess } from "../../../agent-runner/src/bridge/process.js";
-import { WorkOrchestrator } from "../work/orchestrator.js";
+import { WorkOrchestrator, routeUnavailableCauseAccepted } from "../work/orchestrator.js";
 
 let root: string;
 const gates: NativeExecutionGate[] = [];
@@ -1650,15 +1650,22 @@ describe("native session dispatch uses genuine execution admission", () => {
     expect(f.send.mock.calls.map(call => call[0].body)).toContainEqual({ kind: "session_closed", assignmentId: "assignment", reason: "agent_exited" });
   });
 
-  it.each([[true, { routeUnavailable: "provider_quota" }], [false, {}]] as const)("records an unavailable route and names it in the relay frame only to a Core that accepts it (accepts: %s)", async (supported, named) => {
-    const f = await sessionFixture(assignment, undefined, undefined, {}, { routeUnavailableSupported: () => supported });
+  it.each([
+    ["provider_quota", "7.15", { routeUnavailable: "provider_quota" }],
+    ["provider_quota", "7.14", {}],
+    ["model_not_on_account", "7.15", { routeUnavailable: "model_not_on_account" }],
+    ["provider_unavailable", "7.16", { routeUnavailable: "provider_unavailable" }],
+    ["provider_unavailable", "7.15", {}],
+  ] as const)("records an unavailable route and names %s in the relay frame only to a Core at %s", async (cause, version, named) => {
+    const f = await sessionFixture(assignment, undefined, undefined, {}, { routeUnavailableSupported: other => routeUnavailableCauseAccepted(version, other) });
     await f.session.onToRuntime(f.envelope);
     await f.session.onRunnerEvent({ kind: "request_error", acpSessionRef: "acp", requestId: "request", method: "session/prompt",
-      code: -32603, class: "provider_failure", message: "The provider account OpenCode uses is out of credit.", retryable: false, routeUnavailable: "provider_quota" });
+      code: -32603, class: "provider_failure", message: "The provider cannot serve this turn.", retryable: false, routeUnavailable: cause });
+    // The terminal reason carries no cause, so it is already accepted from 7.15.
     expect(f.session.agentFailureReason()).toBe("route_unavailable");
     expect(f.send.mock.calls.map(call => call[0].body)).toEqual([
       { kind: "acp_error", id: "request", method: "session/prompt",
-        error: { code: -32603, class: "provider_failure", message: "The provider account OpenCode uses is out of credit.", retryable: false, ...named } },
+        error: { code: -32603, class: "provider_failure", message: "The provider cannot serve this turn.", retryable: false, ...named } },
       { kind: "session_closed", assignmentId: "assignment", reason: "agent_exited" },
     ]);
   });

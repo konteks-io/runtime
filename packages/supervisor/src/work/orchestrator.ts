@@ -5,6 +5,8 @@ import {
   allEqual,
   coreContractAtLeast,
   REMOTE_ROUTE_UNAVAILABLE_MIN_CORE_CONTRACT_VERSION,
+  REMOTE_PROVIDER_UNAVAILABLE_MIN_CORE_CONTRACT_VERSION,
+  type AcpRouteUnavailable,
   type RemoteAuthorizedOperation,
   type RemoteExecutionOperationPermitClaims,
   type RemoteDeliveryOperationPermitClaims,
@@ -963,7 +965,7 @@ export class WorkOrchestrator {
       ...(assignment.kind === "planning" ? this.planningDeps(dispatch) : {}),
       ...(restoreReference !== undefined ? { restoreReference } : {}),
       activateExecution: () => this.activateExecution(dispatch),
-      routeUnavailableSupported: () => routeUnavailableAccepted(this.coreContractVersion()),
+      routeUnavailableSupported: cause => routeUnavailableCauseAccepted(this.coreContractVersion(), cause),
       ...this.executionRecordDeps(dispatch),
       reserveChannel: (channelId, owner) => this.reserveChannel(channelId, owner),
       onUsage: this.deps.onUsage,
@@ -2928,6 +2930,18 @@ const UNCOMPLETED_CLOSES = {
 /** An older Core's closed enum knows no `route_unavailable`, so it gets `provider_failure`. */
 function routeUnavailableAccepted(coreContractVersion: string | undefined): boolean {
   return coreContractAtLeast(coreContractVersion, REMOTE_ROUTE_UNAVAILABLE_MIN_CORE_CONTRACT_VERSION);
+}
+
+/** The lowest Core contract version that accepts each `routeUnavailable` cause. */
+const ROUTE_UNAVAILABLE_CAUSE_MIN_CORE_CONTRACT_VERSION: Readonly<Record<AcpRouteUnavailable, string>> = {
+  provider_quota: REMOTE_ROUTE_UNAVAILABLE_MIN_CORE_CONTRACT_VERSION,
+  model_not_on_account: REMOTE_ROUTE_UNAVAILABLE_MIN_CORE_CONTRACT_VERSION,
+  provider_unavailable: REMOTE_PROVIDER_UNAVAILABLE_MIN_CORE_CONTRACT_VERSION,
+};
+
+/** An older Core's closed cause enum would refuse the whole error, so it gets no cause. */
+export function routeUnavailableCauseAccepted(coreContractVersion: string | undefined, cause: AcpRouteUnavailable): boolean {
+  return coreContractAtLeast(coreContractVersion, ROUTE_UNAVAILABLE_CAUSE_MIN_CORE_CONTRACT_VERSION[cause]);
 }
 
 export function closedSessionResult(session: Pick<RelayedSession, "agentFailureReason" | "deliveryAcceptanceReceipt" | "acpSessionRef">, reason: SessionClosedReason, coreContractVersion?: string) {
