@@ -96,6 +96,15 @@ import {
  * journaled per `acpSessionRef`, and a completion whose id is unknown, already
  * closed, or whose method disagrees is rejected locally.
  */
+/**
+ * A request deadline for an instant on Core's timeline. The HTTP client compares
+ * deadlines with the local clock, so a machine whose clock is ahead of Core's
+ * would otherwise give up early by that much.
+ */
+export function localDeadlineFor(coreInstantMs: number, clock: Pick<Clock, "coreNow">): number {
+  return Date.now() + Math.max(0, coreInstantMs - clock.coreNow());
+}
+
 export interface RelayedSessionDeps {
   clock: Clock;
   journal: SupervisorJournal;
@@ -117,8 +126,12 @@ export interface RelayedSessionDeps {
    */
   registerDeferral?: (body: DeferredPermissionBody) => Promise<PendingPermissionView>;
   instanceId: string;
-  /** Redeems/renews one logical `mcpCapabilityTokenRef`; bearer stays in memory. */
-  redeemCapabilityToken: (assignment: RemoteWorkAssignment) => Promise<CapabilityTokenIssue>;
+  /**
+   * Redeems/renews one logical `mcpCapabilityTokenRef`; bearer stays in memory.
+   * `liveUntil` is an instant on Core's timeline. Without one, a redemption
+   * stays bounded by the assignment's expiry as captured at claim.
+   */
+  redeemCapabilityToken: (assignment: RemoteWorkAssignment, liveUntil?: number) => Promise<CapabilityTokenIssue>;
   /** Retained local address/header for the same provider thread, never Core delegation. */
   mcpLocalTransport?: McpLocalTransportIdentity;
   mcpLocalTransportReference?: string;
@@ -562,7 +575,7 @@ export class RelayedSession {
       renew: () => {
         this.deps.assertExecutionOwned?.();
         if (this.closed) throw new RemoteInstanceError("execution_fenced", "The execution session is closed.");
-        return this.deps.redeemCapabilityToken(this.assignment);
+        return this.deps.redeemCapabilityToken(this.assignment, this.liveUntil());
       },
       onUnavailable: () => this.close("agent_exited"),
       coordinationInvocation: (tool, args) => this.coordinationCalls.resolve(tool, args),
