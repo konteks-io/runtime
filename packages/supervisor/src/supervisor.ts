@@ -1,4 +1,5 @@
 import { NativeWorkspaceCheckpointStore } from "./native/workspace-preservation.js";
+import { checkpointCause } from "./native/workspace-checkpoint-failure.js";
 import { logicalSessionId } from "./work/continued-session.js";
 import { ObservationDelivery } from "./control/observation-delivery.js";
 import { RuntimeFailureDelivery } from "./control/runtime-failure-delivery.js";
@@ -1150,15 +1151,20 @@ export class Supervisor {
         const sessionId = assignment && logicalSessionId(assignment.source);
         if (sessionId) await this.previews.stop(sessionId, "workspace_checkpoint");
         assertCurrent();
-        await new NativeWorkspaceCheckpointStore({ root: runner.RUNNER_WORKSPACE_DIR, repositoryCacheRoot: native.repositoryCacheRoot,
+        const send = await new NativeWorkspaceCheckpointStore({ root: runner.RUNNER_WORKSPACE_DIR, repositoryCacheRoot: native.repositoryCacheRoot,
           chunksSupported: () => coreContractAtLeast(this.coreContractVersion, REMOTE_WORKSPACE_CHUNK_MIN_CORE_CONTRACT_VERSION),
           onRuntimeFailure: (fact, context) => {
             const entry = this.journal.assignments.get(`${admission.assignmentId}:${admission.attempt}`);
-            if (!assignment || entry?.claimId !== admission.claimId) return;
+            if (this.stopping || !assignment || entry?.claimId !== admission.claimId) return;
             return this.recordRuntimeFailure(assignment, fact, context);
           },
           client: () => new NativeInputClient({ baseUrl: this.config.SUPERVISOR_CORE_URL, roots: this.roots, clock: this.clock,
-            credential: () => this.lease.mode() === "active" ? (this.lease.current()?.lease ?? null) : null }) }).seal(admission, assertCurrent);
+            credential: () => this.lease.mode() === "active" ? (this.lease.current()?.lease ?? null) : null }) }).capture(admission, assertCurrent);
+        // Core checks each upload itself, so the stop's claim needn't outlive it.
+        void send(() => { if (this.stopping) throw new RemoteInstanceError("recovery_required", "The connector is stopping."); }).catch((error: unknown) => {
+          this.logger.warn({ event: "workspace.checkpoint_retained_locally", assignmentId: admission.assignmentId, attempt: admission.attempt, claimId: admission.claimId, cause: checkpointCause(error) },
+            "Sending the unfinished workspace failed; its local copy stays on this runtime and migration remains withheld");
+        });
       },
       onSessionReleased: sessionId => this.releaseSessionPreview(sessionId),
       ...(this.assignmentSender ? { assignmentSender: this.assignmentSender } : {}),
