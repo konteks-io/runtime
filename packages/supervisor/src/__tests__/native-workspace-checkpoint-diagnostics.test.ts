@@ -35,7 +35,7 @@ beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "kr-checkpoint-diag-")); cwd = join(root, "source"); await mkdir(cwd, { mode: 0o700 });
   tool = await testGitTool();
   await testGitCommand(tool, cwd, ["init", "-q"]);
-  await writeFile(join(cwd, ".gitignore"), "node_modules/\n"); await writeFile(join(cwd, "file.txt"), "base");
+  await writeFile(join(cwd, ".gitignore"), "local-store/\n"); await writeFile(join(cwd, "file.txt"), "base");
   await testGitCommand(tool, cwd, ["add", "."]);
   await testGitCommand(tool, cwd, ["-c", "user.name=Test", "-c", "user.email=test@invalid", "commit", "-qm", "base"]);
   baseline = (await testGitCommand(tool, cwd, ["rev-parse", "HEAD"])).trim();
@@ -52,8 +52,8 @@ const captured = () => captureWorkspaceCheckpoint({ cwd, baselineCommit: baselin
 
 describe("named recovery checkpoint refusals", () => {
   it("names an ignored file hard-linked from outside the workspace", async () => {
-    await mkdir(join(cwd, "node_modules")); await writeFile(join(root, "store-file"), "shared");
-    await link(join(root, "store-file"), join(cwd, "node_modules", "package.js"));
+    await mkdir(join(cwd, "local-store")); await writeFile(join(root, "store-file"), "shared");
+    await link(join(root, "store-file"), join(cwd, "local-store", "package.js"));
     const error = await refusal(captured());
     expect(error).toMatchObject({ code: "recovery_required", diagnostic: "file_hardlinked" });
     expect(error.message).toBe("The unfinished workspace bytes could not be preserved or verified. Existing work was kept.");
@@ -75,7 +75,7 @@ describe("named recovery checkpoint refusals", () => {
   });
 
   it("names a workspace past the file-count limit", async () => {
-    const folder = join(cwd, "node_modules"); await mkdir(folder);
+    const folder = join(cwd, "local-store"); await mkdir(folder);
     for (let start = 0; start <= 10_000; start += 500) {
       await Promise.all(Array.from({ length: 500 }, (_, n) => writeFile(join(folder, `f${start + n}`), "")));
     }
@@ -120,8 +120,8 @@ it("reports the refusal behind a failed seal as its stage and keeps the edits", 
       latestResumeAt: "2026-10-13T02:00:00Z", permissionResponderDeadlineSeconds: 30, humanDeferralAllowed: false } };
   await store.begin({ assignment, claimId: "claim", selectionDigest: `sha256:${"a".repeat(64)}`, cwd, baselineCommit: baseline, tool });
   await writeFile(join(cwd, "file.txt"), "unfinished edits");
-  await mkdir(join(cwd, "node_modules")); await writeFile(join(root, "store-file"), "shared");
-  await link(join(root, "store-file"), join(cwd, "node_modules", "package.js"));
+  await mkdir(join(cwd, "local-store")); await writeFile(join(root, "store-file"), "shared");
+  await link(join(root, "store-file"), join(cwd, "local-store", "package.js"));
 
   await expect(store.seal({ assignmentId: "assignment", attempt: 1, claimId: "claim" }, () => undefined))
     .rejects.toMatchObject({ code: "recovery_required", diagnostic: "file_hardlinked" });
