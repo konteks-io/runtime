@@ -1,14 +1,14 @@
 import { testGitTool, testGitCommand } from './native-git-fixture.js';
-import { mkdtemp, mkdir, readFile, rm, symlink, unlink, writeFile } from 'node:fs/promises';
+import { link, mkdtemp, mkdir, readdir, readFile, rm, symlink, unlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NativeWorkspaceCheckpointStore } from '../native/workspace-preservation.js';
 import { NativeRecoveredWorkspaceStore } from '../native/workspace-recovery.js';
 import { captureWorkspaceCheckpoint } from '../native/workspace-checkpoint.js';
 import { RemoteWorkspaceBeginRequestSchema, RemoteWorkspaceSealRequestSchema, RemoteWorkspaceAnySealRequestSchema, RemoteWorkspaceChunkWriteRequestSchema, computeRemoteFileTreeDigest, computeRemoteSkillCatalogDigest,
   type RemoteWorkAssignment, type RemoteAssignmentInputsEnvelope } from '@konteks/remote-common';
-import type { NativeInputClient } from '../native/input-client.js';
+import { NativeInputResponseError, type NativeInputClient } from '../native/input-client.js';
 import type { RuntimeFailureReporter } from '../runtime-failure-types.js';
 let root: string; let cwd: string; let baseline: string;
 let tool: Awaited<ReturnType<typeof testGitTool>>;
@@ -192,4 +192,112 @@ it('replays the same durable chunks after an uncertain upload and a restart with
   if (request.checkpoint.format !== 'konteks-workspace-checkpoint-v2' || file?.kind !== 'file' || !('chunks' in file)) throw new Error('Expected chunked work');
   expect(Buffer.from(saved.get(file.chunks[0]!.digest)!, 'base64').toString()).toBe('keep this unfinished work');
   expect(onRuntimeFailure).toHaveBeenCalledOnce();
+});
+
+describe('what a checkpoint carries and how long its local copy stays', () => {
+  const v2 = { format: 'konteks-workspace-checkpoint-v2' as const };
+  const recovery = () => readdir(join(root, '.workspace-recovery'));
+  function chunkClient(refuse?: () => Error | null) {
+    const sealed: unknown[] = [];
+    const api = { workspace: vi.fn(async (...[_assignment, operation, raw]: Parameters<NativeInputClient['workspace']>) => {
+      if (operation === 'begin') return { checkpointId: RemoteWorkspaceBeginRequestSchema.parse(raw).checkpointId, state: 'writing' };
+      const failure = refuse?.();
+      if (failure) throw failure;
+      if (operation === 'write-chunk') {
+        const request = RemoteWorkspaceChunkWriteRequestSchema.parse(raw);
+        return { checkpointId: request.checkpointId, chunkDigest: request.chunk.digest, sizeBytes: request.chunk.sizeBytes, state: 'stored' };
+      }
+      const request = RemoteWorkspaceAnySealRequestSchema.parse(raw); sealed.push(request.checkpoint);
+      return { checkpointId: request.checkpointId, checkpointDigest: request.checkpoint.checkpointDigest, state: 'sealed' };
+    }) };
+    return { api, sealed };
+  }
+  const paths = (checkpoint: unknown) => (checkpoint as { entries: Array<{ path: string }> }).entries.map(entry => entry.path);
+
+  it('leaves out ignored folders tools rebuild and keeps everything else, including what is ignored', async () => {
+    await writeFile(join(cwd, '.gitignore'), 'node_modules/\n.env\nprivate/\nbuild/\n');
+    await mkdir(join(cwd, 'tracked', 'vendor'), { recursive: true }); await writeFile(join(cwd, 'tracked', 'vendor', 'lib.js'), 'tracked');
+    await testGitCommand(tool, cwd, ['add', '.']);
+    await testGitCommand(tool, cwd, ['-c', 'user.name=Test', '-c', 'user.email=test@invalid', 'commit', '-qm', 'more']);
+    baseline = (await testGitCommand(tool, cwd, ['rev-parse', 'HEAD'])).trim();
+    await mkdir(join(cwd, 'node_modules')); await writeFile(join(root, 'store-file'), 'shared');
+    await link(join(root, 'store-file'), join(cwd, 'node_modules', 'hardlinked.js'));
+    await mkdir(join(cwd, 'packages', 'a', 'node_modules'), { recursive: true }); await writeFile(join(cwd, 'packages', 'a', 'node_modules', 'x.js'), 'x');
+    await mkdir(join(cwd, 'build')); await writeFile(join(cwd, 'build', 'out.js'), 'x');
+    await writeFile(join(cwd, '.env'), 'LOCAL=1'); await mkdir(join(cwd, 'private')); await writeFile(join(cwd, 'private', 'draft.txt'), 'draft');
+    await mkdir(join(cwd, 'dist')); await writeFile(join(cwd, 'dist', 'not-ignored.js'), 'agent wrote this');
+    const checkpoint = await captureWorkspaceCheckpoint({ cwd, ownerRoot: root, baselineCommit: baseline, tool, chunks: {} });
+    const carried = paths(checkpoint);
+    expect(carried).toEqual(expect.arrayContaining(['.env', 'private/draft.txt', 'tracked/vendor/lib.js', 'dist/not-ignored.js', 'file.txt']));
+    expect(carried.filter(path => /node_modules|^build/.test(path))).toEqual([]);
+  });
+
+  it('keeps going when the walk before Git takes longer than two minutes', async () => {
+    const real = Date.now(); let calls = 0;
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => real + (calls++ ? 10 * 60_000 : 0));
+    try { await expect(captureWorkspaceCheckpoint({ cwd, ownerRoot: root, baselineCommit: baseline, tool })).resolves.toMatchObject({ baselineCommit: baseline }); }
+    finally { clock.mockRestore(); }
+  });
+
+  it('removes its local copy once Core holds it', async () => {
+    const { api, sealed } = chunkClient();
+    const store = new NativeWorkspaceCheckpointStore({ root, client: () => api, chunksSupported: () => true });
+    await store.begin({ assignment, claimId: 'claim', selectionDigest, cwd, baselineCommit: baseline, tool, ...v2 });
+    await store.seal(admission, () => undefined);
+    expect(sealed).toHaveLength(1);
+    expect(await recovery()).toEqual([]);
+    await expect(store.seal(admission, () => undefined)).resolves.toBeUndefined();
+    expect(sealed).toHaveLength(1);
+  });
+
+  it('drops a copy a newer attempt replaced, without calling it a failure', async () => {
+    const { api } = chunkClient(() => new NativeInputResponseError(new Response(null, { status: 409 })));
+    const onRuntimeFailure = vi.fn<RuntimeFailureReporter>();
+    const store = new NativeWorkspaceCheckpointStore({ root, client: () => api, chunksSupported: () => true, onRuntimeFailure });
+    await store.begin({ assignment, claimId: 'claim', selectionDigest, cwd, baselineCommit: baseline, tool, ...v2 });
+    await writeFile(join(cwd, 'file.txt'), 'edits');
+    await store.seal(admission, () => undefined);
+    expect(onRuntimeFailure).not.toHaveBeenCalled();
+    expect(await recovery()).toEqual([]);
+    expect(await readFile(join(cwd, 'file.txt'), 'utf8')).toBe('edits');
+  });
+
+  it('keeps the copy and names the status when Core refuses for another reason', async () => {
+    const { api } = chunkClient(() => new NativeInputResponseError(new Response(null, { status: 403 })));
+    const onRuntimeFailure = vi.fn<RuntimeFailureReporter>();
+    const store = new NativeWorkspaceCheckpointStore({ root, client: () => api, chunksSupported: () => true, onRuntimeFailure });
+    await store.begin({ assignment, claimId: 'claim', selectionDigest, cwd, baselineCommit: baseline, tool, ...v2 });
+    await expect(store.seal(admission, () => undefined)).rejects.toBeInstanceOf(NativeInputResponseError);
+    expect(onRuntimeFailure.mock.calls[0]![0].stage).toBe('workspace_chunk_upload_response_status_403');
+    expect((await recovery()).some(name => name.endsWith('.chunks'))).toBe(true);
+  });
+
+  it('removes what a failed capture wrote, and keeps its record so a restart can try again', async () => {
+    const { api } = chunkClient();
+    const store = new NativeWorkspaceCheckpointStore({ root, client: () => api, chunksSupported: () => true });
+    await store.begin({ assignment, claimId: 'claim', selectionDigest, cwd, baselineCommit: baseline, tool, ...v2 });
+    await writeFile(join(root, 'store-file'), 'shared'); await link(join(root, 'store-file'), join(cwd, 'hardlinked.txt'));
+    await expect(store.seal(admission, () => undefined)).rejects.toMatchObject({ diagnostic: 'file_hardlinked' });
+    const left = await recovery();
+    expect(left.filter(name => name.endsWith('.chunks'))).toEqual([]);
+    expect(left.filter(name => name.endsWith('.owner.json'))).toHaveLength(1);
+  });
+
+  it('clears earlier copies of the same session and abandoned ones, but not a recent copy of another session', async () => {
+    const { api } = chunkClient();
+    const store = new NativeWorkspaceCheckpointStore({ root, client: () => api, chunksSupported: () => true });
+    const session = (id: string) => ({ ...assignment, id, source: { ...assignment.source, sessionId: id === 'other' ? 'session-other' : 'session-same' } }) as RemoteWorkAssignment;
+    const same = (id: string) => ({ assignment: session(id), claimId: 'claim', selectionDigest, cwd, baselineCommit: baseline, tool, ...v2 });
+    await store.begin(same('earlier')); await store.begin(same('other'));
+    const folder = join(root, '.workspace-recovery');
+    await writeFile(join(folder, 'abandoned.chunks'), 'old'); const old = new Date(Date.now() - 8 * 24 * 60 * 60_000);
+    await utimes(join(folder, 'abandoned.chunks'), old, old);
+    const earlierTime = new Date(Date.now() - 60_000);
+    for (const name of await recovery()) if (name.endsWith('.owner.json')) await utimes(join(folder, name), earlierTime, earlierTime);
+    await store.begin(same('latest'));
+    await store.seal({ assignmentId: 'latest', attempt: assignment.attempt, claimId: 'claim' }, () => undefined);
+    const left = await recovery();
+    expect(left).not.toContain('abandoned.chunks');
+    expect(left.filter(name => name.endsWith('.owner.json'))).toHaveLength(1);
+  });
 });
