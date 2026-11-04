@@ -78,6 +78,24 @@ async function personOpenCode(root: string, version = "2.0.18", name = "@opencod
 }
 
 describe("native install composition", () => {
+  it("refreshes an already listed Claude pin without changing release, identity or credentials", async () => {
+    const f = await fixture();
+    const executable = join(f.root, "claude-current");
+    await writeFile(executable, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    vi.stubEnv("CLAUDE_CODE_EXECUTABLE", executable);
+    const installed = await installNative({ ...f.options, agents: ["claude-code"] } as never);
+    const stale = { ...installed, claudeExecutable: join(f.root, "claude-removed") };
+    await writeSecretFile(join(f.root, "native-runtime.json"), JSON.stringify(stale));
+    const identity = await readFile(join(f.root, "supervisor", "identity.json"), "utf8");
+    const credential = join(f.root, "credentials", "claude-code", "keep");
+    await writeSecretFile(credential, "retained-private-state");
+    const repaired = await addNativeAgent({ root: f.root, agentId: "claude-code", output: f.options.output, deps: { roots: f.trust, platform: f.platform } });
+    expect(repaired).toEqual(installed);
+    expect(await readNativeRecord(f.root)).toEqual(installed);
+    expect(await readFile(join(f.root, "supervisor", "identity.json"), "utf8")).toBe(identity);
+    expect(await readFile(credential, "utf8")).toBe("retained-private-state");
+  });
+
   it("presents an Indonesian signed install while keeping its native record language-independent", async () => {
     const f = await fixture();
     vi.stubEnv("KONTEKS_SETUP_LOCALE", "id");

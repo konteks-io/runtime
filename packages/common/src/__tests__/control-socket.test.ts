@@ -211,7 +211,7 @@ describe("loopback control socket", () => {
 
   it("the protocol is closed: no exec or free-form config field parses", () => {
     expect(ControlRequestSchema.safeParse({ op: "exec", command: "rm -rf /" }).success).toBe(false);
-    for (const op of ["update.check", "update.apply", "update.status", "drain.cancel"]) {
+    for (const op of ["update.check", "update.apply", "update.status", "drain.cancel", "identity.status", "release.accepted-target"]) {
       expect(ControlRequestSchema.safeParse({ op }).success).toBe(true);
       expect(ControlRequestSchema.safeParse({ op, url: "https://evil.example/manifest.json" }).success).toBe(false);
     }

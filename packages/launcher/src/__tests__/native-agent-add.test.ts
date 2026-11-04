@@ -52,6 +52,33 @@ async function fixture() {
 }
 
 describe("native agent-add ownership lifecycle", () => {
+  it("revalidates a listed Claude executable and repairs a changed pin through the owned lifecycle", async () => {
+    const f = await fixture();
+    f.owner.release();
+    const listed = { instanceId: "instance", releaseId: "release-one", controlPort: 41800, agents: ["claude-code"], claudeExecutable: "/old/claude" } as never;
+    const resolveClaude = vi.fn(async () => "/new/claude");
+    await runNativeAgentAdd({ root: f.root, agent: "claude-code", output: createOutput({ json: true }) }, {
+      ...f.deps, readRecord: async () => listed, resolveClaude, closeAgents: async () => undefined,
+    } as never);
+    expect(resolveClaude).toHaveBeenCalledWith(undefined, undefined, undefined, "/old/claude");
+    expect(f.calls).toEqual(expect.arrayContaining(["drain", "stop", "add", "start"]));
+  });
+
+  it("leaves a verified listed Claude running and reports an invalid executable before stopping anything", async () => {
+    const f = await fixture();
+    f.owner.release();
+    const listed = { agents: ["claude-code"], claudeExecutable: "/current/claude" } as never;
+    const resolveClaude = vi.fn(async () => "/current/claude");
+    const input = { root: f.root, agent: "claude-code", output: createOutput({ json: true }) };
+    const deps = { ...f.deps, readRecord: async () => listed, resolveClaude };
+    await runNativeAgentAdd(input, deps as never);
+    expect(resolveClaude).toHaveBeenCalledOnce();
+    expect(f.calls).toEqual([]);
+    resolveClaude.mockRejectedValueOnce(new Error("Claude executable is unavailable"));
+    await expect(runNativeAgentAdd(input, deps as never)).rejects.toThrow("Claude executable is unavailable");
+    expect(f.calls).toEqual([]);
+  });
+
   it.each([0, 1])("uses the shared Windows connector stop before adding an agent while the task status is %s", async statusCode => {
     const f = await fixture();
     const stop = vi.fn(async () => { f.calls.push("owned-stop"); f.owner.release(); });

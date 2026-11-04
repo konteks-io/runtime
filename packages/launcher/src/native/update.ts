@@ -1,13 +1,16 @@
 import { lstat, mkdir, readFile, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join, parse, resolve } from "node:path";
-import { NATIVE_UPDATE_TARGET_ENV, NativeUpdateTargetSchema, writeSecretFile } from "@konteks/remote-common";
-import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, installOfflineAgentPackage, isHostAgentId, nativeServiceExecutable, readCodeIdentity, resolveNativeConnectorExecutable, selectNativeArtifacts, stageNativeRelease, verifyNativeRelease, type CodeIdentity, type EmbeddedReleaseRoot, type VerifiedNativeRelease } from "@konteks/remote-release";
+import { NATIVE_UPDATE_TARGET_ENV, NativeUpdateTargetSchema, ReleaseAcceptedTargetSchema, writeSecretFile } from "@konteks/remote-common";
+import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, installOfflineAgentPackage, isHostAgentId, nativeManifestUrlForVersion, nativeServiceExecutable, readCodeIdentity, resolveNativeConnectorExecutable, selectNativeArtifacts, stageNativeRelease, verifyNativeRelease, type CodeIdentity, type EmbeddedReleaseRoot, type VerifiedNativeRelease } from "@konteks/remote-release";
 import { acquireNativeRootLock, compareSemver, loadNativeInstallation, NativeRuntimeRecordSchema, ownedByAnotherConnector, verifyInstalledNativeConnector, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import type { Output } from "../output.js";
 import { setupDetail, setupError, setupLocale, setupProgress } from "../setup-locale.js";
 import { nativePlatform, type NativePlatform } from "./service.js";
 import { moveRecordAndManifest, withRuntimeLocks } from "./install.js";
+import { SupervisorControl } from "../control.js";
+
+type UpdateTarget = ReturnType<typeof NativeUpdateTargetSchema.parse>;
 
 export interface NativeUpdateDeps {
   roots?: readonly EmbeddedReleaseRoot[];
@@ -18,6 +21,7 @@ export interface NativeUpdateDeps {
   retryDelayMs?: number;
   /** Reads a connector's publisher identity; the OS's own tools by default. */
   codeIdentity?: (file: string, os: NativePlatform["os"]) => Promise<CodeIdentity>;
+  acceptedTarget?: () => Promise<UpdateTarget | null>;
 }
 
 const retryDelayOf = (deps: NativeUpdateDeps | undefined) => deps?.retryDelayMs === undefined ? {} : { retryDelayMs: deps.retryDelayMs };
@@ -33,9 +37,33 @@ export async function checkNativeUpdate(options: { root: string; deps?: NativeUp
   const roots = options.deps?.roots ?? EMBEDDED_RELEASE_ROOTS;
   const root = validRoot(options.root);
   const current = await loadNativeInstallation(root, { roots, platform });
-  const release = verifyNativeRelease(await channelManifest(options.deps), roots);
+  const offered = verifyNativeRelease(await channelManifest(options.deps), roots);
+  const release = await acceptedUpdate(root, current.record, offered, options.deps);
   if (compareSemver(release.manifest.bundleVersion, current.record.bundleVersion) <= 0) return { status: "current", current: current.record, bundleVersion: current.record.bundleVersion };
   return { status: "available", current: current.record, release };
+}
+
+async function acceptedUpdate(root: string, current: NativeRuntimeRecord, offered: VerifiedNativeRelease, deps: NativeUpdateDeps | undefined): Promise<VerifiedNativeRelease> {
+  const accepted = await (deps?.acceptedTarget ?? (() => localAcceptedTarget(root, current)))();
+  if (!accepted || compareSemver(accepted.bundleVersion, current.bundleVersion) <= 0 || compareSemver(accepted.bundleVersion, offered.manifest.bundleVersion) > 0) return offered;
+  if (accepted.bundleVersion === offered.manifest.bundleVersion) {
+    if (accepted.manifestDigest !== offered.manifest.digest) throw setupError("bundle_untrusted", "updateTargetChanged");
+    return offered;
+  }
+  return releaseForTarget(accepted, deps);
+}
+
+async function localAcceptedTarget(root: string, record: NativeRuntimeRecord): Promise<UpdateTarget | null> {
+  const control = new SupervisorControl({ supervisorData: join(root, "supervisor") }, record.controlPort);
+  const response = await control.call({ op: "release.accepted-target" }, ReleaseAcceptedTargetSchema, { timeoutMs: 10_000 }).catch(() => null);
+  return response?.target ?? null;
+}
+
+async function releaseForTarget(target: UpdateTarget, deps: NativeUpdateDeps | undefined): Promise<VerifiedNativeRelease> {
+  const payload = await fetchNativeReleaseManifest(deps?.fetchFn ?? fetch, nativeManifestUrlForVersion(target.bundleVersion));
+  const verified = verifyNativeRelease(payload, deps?.roots ?? EMBEDDED_RELEASE_ROOTS);
+  if (verified.manifest.bundleVersion !== target.bundleVersion || verified.manifest.digest !== target.manifestDigest) throw setupError("bundle_untrusted", "updateTargetChanged");
+  return verified;
 }
 
 /** The manifest the deps hold, else the one the release channel serves. */
@@ -105,13 +133,18 @@ async function frozenUpdateDeps(root: string, deps: NativeUpdateDeps | undefined
   const serialized = process.env[NATIVE_UPDATE_TARGET_ENV];
   if (serialized === undefined) return deps;
   const target = NativeUpdateTargetSchema.parse(JSON.parse(serialized));
-  const manifest = await channelManifest(deps);
+  const manifest = await frozenManifest(target, deps);
   const pinned = { ...deps, manifest };
   const check = await checkNativeUpdate({ root, deps: pinned });
   if (check.status !== "available" || check.release.manifest.bundleVersion !== target.bundleVersion || check.release.manifest.digest !== target.manifestDigest) {
     throw setupError("update_required", "updateTargetChanged");
   }
   return { ...deps, manifest: check.release.manifest };
+}
+
+async function frozenManifest(target: UpdateTarget, deps: NativeUpdateDeps | undefined): Promise<VerifiedNativeRelease["manifest"]> {
+  const offered = verifyNativeRelease(await channelManifest(deps), deps?.roots ?? EMBEDDED_RELEASE_ROOTS);
+  return compareSemver(target.bundleVersion, offered.manifest.bundleVersion) < 0 ? (await releaseForTarget(target, deps)).manifest : offered.manifest;
 }
 
 type SelectedArtifact = ReturnType<typeof selectNativeArtifacts>[number];

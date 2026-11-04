@@ -5,6 +5,7 @@ import { z } from "zod";
 import { RemoteInstanceError, type RecoveryAction } from "./errors.js";
 import { constantTimeEquals } from "./digest.js";
 import { RuntimeRoleSchema } from "./contracts.js";
+import { NativeUpdateTargetSchema } from "./native-update-target.js";
 
 /**
  * The launcher ↔ supervisor loopback control protocol. It is the ONLY way the
@@ -25,6 +26,8 @@ const methodIdSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/);
 
 export const ControlRequestSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("status") }).strict(),
+  /** Non-secret enrollment identity, separate from the legacy strict status response. */
+  z.object({ op: z.literal("identity.status") }).strict(),
   z.object({ op: z.literal("agents") }).strict(),
   z.object({ op: z.literal("auth.status"), agentId: agentIdSchema.optional() }).strict(),
   z
@@ -75,6 +78,7 @@ export const ControlRequestSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("git.choice") }).strict(),
   /** The release Konteks accepts for this machine, asked with this machine's lease. */
   z.object({ op: z.literal("release.accepted") }).strict(),
+  z.object({ op: z.literal("release.accepted-target") }).strict(),
   z
     .object({ op: z.literal("logs"), sinceSeconds: z.number().int().min(1).max(86_400 * 7) })
     .strict(),
@@ -88,8 +92,11 @@ export const ControlRequestSchema = z.discriminatedUnion("op", [
 ]);
 export type ControlRequest = z.infer<typeof ControlRequestSchema>;
 
+export const ActivationIdentityReportSchema = z.object({ activationId: z.string().min(1).nullable() }).strict();
+
 /** `release.accepted`: the version Konteks accepts, or null where it does not say. */
 export const ReleaseAcceptedSchema = z.object({ bundleVersion: z.string().min(1).nullable() }).strict();
+export const ReleaseAcceptedTargetSchema = z.object({ target: NativeUpdateTargetSchema.nullable() }).strict();
 
 /** Native update coordination as reported over the loopback control socket. */
 export const NativeUpdateStatusSchema = z

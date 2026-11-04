@@ -71,6 +71,14 @@ async function fixture() {
 }
 
 describe("native Supervisor composition", () => {
+  it("exposes only the non-secret activation id through a separate identity operation", async () => {
+    const f = await fixture();
+    const supervisor = new Supervisor(f.config, f.options);
+    const identity = await supervisor.controlHandler()({ op: "identity.status" } as never, { event: () => undefined } as never);
+    expect(identity).toEqual({ activationId: "activation" });
+    expect(supervisor.status()).not.toHaveProperty("activationId");
+  });
+
   it("publishes late runtime update readiness into local status from the same fresh inventory as Core", async () => {
     const f = await fixture();
     const supervisor = new Supervisor(f.config, {
@@ -952,6 +960,10 @@ describe("native Supervisor composition", () => {
     expect(await supervisor.controlHandler()({ op: "release.accepted" }, { event: () => undefined } as never)).toEqual({ bundleVersion: "0.6.6-e2e.1" });
     expect(await supervisor.controlHandler()({ op: "release.accepted" }, { event: () => undefined } as never)).toEqual({ bundleVersion: null });
     expect(asked).toHaveBeenCalledTimes(2);
+    const target = { bundleVersion: "0.6.6-e2e.1", manifestDigest: "a".repeat(43) };
+    asked.mockResolvedValue(target);
+    expect(await supervisor.controlHandler()({ op: "release.accepted-target" }, { event: () => undefined } as never)).toEqual({ target });
+    expect(asked).toHaveBeenLastCalledWith("instance");
     await supervisor.stop();
   });
 

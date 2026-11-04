@@ -662,6 +662,7 @@ export async function addNativeAgent(options: NativeAgentAddOptions): Promise<Na
     runtimeLock = acquireNativeRootLock(join(root, "supervisor"));
     const current = await loadNativeInstallation(root, load);
     if (current.record.agents.includes(options.agentId)) {
+      if (options.agentId === "claude-code") return await refreshClaudeProfile(root, current.record, lock, load);
       // A fetched agent whose copy no longer verifies (or an update's new
       // copy just fetched) is recorded again from the verified folder.
       if (await fetchedAgentStale(root, current.record, options.agentId)) return await addHostAgent(root, current.record, options, load, lock);
@@ -674,6 +675,15 @@ export async function addNativeAgent(options: NativeAgentAddOptions): Promise<Na
     runtimeLock?.release();
     lock.release();
   }
+}
+
+/** Refresh a rediscovered personal executable under both installation locks, retaining the release and identity. */
+async function refreshClaudeProfile(root: string, previous: NativeRuntimeRecord, lock: RootLock, load: ReturnType<typeof releaseContext>): Promise<NativeRuntimeRecord> {
+  const claudeExecutable = await resolveNativeClaudeExecutable(undefined, undefined, undefined, previous.claudeExecutable);
+  if (claudeExecutable === previous.claudeExecutable) return previous;
+  const successor = NativeRuntimeRecordSchema.parse({ ...previous, claudeExecutable });
+  await commitRecord(root, lock, { previous, successor }, () => loadNativeInstallation(root, load));
+  return successor;
 }
 
 /**
