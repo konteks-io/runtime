@@ -270,6 +270,16 @@ export class SupervisorStore {
     return this.writeJson("activation-attempt.json", ActivationAttemptSchema.parse(attempt));
   }
 
+  /** Called after Core confirms activation or reconnect, never because an attempt is old. */
+  clearCompletedActivationAttempt(): Promise<void> {
+    return this.mutate(async () => {
+      const [identity, attempt] = await Promise.all([this.identity(), this.activationAttempt()]);
+      if (!identity || !attempt || identity.administrativeStatus !== "active") return;
+      if (identity.activationId !== attempt.activationId || identity.exchangeNonce !== attempt.nonce) return;
+      await rm(this.path("activation-attempt.json"), { force: true });
+    });
+  }
+
   provisioning(): Promise<Provisioning | null> {
     return this.readJson("provisioning.json", ProvisioningSchema);
   }

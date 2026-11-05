@@ -90,7 +90,7 @@ import { PreviewChannel } from "./preview/preview-channel.js";
 import { PreviewProcessManager, PreviewProcessRegistry, type AgentPreviewActivity } from "./preview/process-manager.js";
 import { PreviewViewerStarts } from "./preview/viewer-start.js";
 import type { SessionPreviewAccess } from "./preview/mcp-server.js";
-import { provisioningCredentialIsExpired, refreshProvisioningCredential, submitReadiness } from "./provisioning/activation.js";
+import { finishActivationAttempt, provisioningCredentialIsExpired, refreshProvisioningCredential, submitReadiness } from "./provisioning/activation.js";
 import { Reconciliation } from "./reconnect/reconciliation.js";
 import { ChannelMux } from "./relay/channel-mux.js";
 import { RelayClient, type ControlDeliveryOutcome, type RelayClientOptions } from "./relay/relay-client.js";
@@ -1862,6 +1862,8 @@ export class Supervisor {
     if (this.instanceId) this.openCoreChannels(this.instanceId);
     await this.refreshConfiguration();
     if (this.stopping) return;
+    this.requireRecoveryAuthority();
+    await finishActivationAttempt(this.store, this.logger);
     this.requireRecoveryAuthority();
     await this.startOrdinaryLoops();
     if (this.stopping) return;

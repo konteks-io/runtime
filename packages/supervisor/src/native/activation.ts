@@ -43,6 +43,10 @@ export async function runNativeActivationExchange(args: NativeActivationArgs): P
     await store.init();
     const journal = new SupervisorJournal(store.path("journal"), mutations.run); await journal.load();
     const prior = await priorActivation(store, journal);
+    // An unstarted install has no exchange to resume. Obtain its input before
+    // writing a key, nonce or enrollment lineage that a failed prompt would strand.
+    const firstCode = needsFirstCode(prior, journal) ? await args.readActivationCode() : undefined;
+    owner.assertOwned();
     const key = await store.loadOrCreateInstanceKey();
     const enrollment = await enrollmentLineage(journal, args, { fresh, prior, keyDigest: jcsDigest(key.publicKeyJwk as never) });
     const core = new CoreClient({ baseUrl: args.coreUrl, clock: args.clock, key: () => key, credential: () => null, ...(args.fetchFn ? { fetchFn: args.fetchFn } : {}) });
@@ -51,7 +55,7 @@ export async function runNativeActivationExchange(args: NativeActivationArgs): P
       // and a JSON log line in between read as noise. Warnings stay.
       logger: createLogger({ name: "provisioning", level: "warn" }),
       readActivationCode: async () => {
-      const code = await args.readActivationCode();
+      const code = firstCode ?? await args.readActivationCode();
       owner.assertOwned();
       return code;
     } }), () => forgetRefusedAttempt(args.dataDir, owner, prior.identity));
@@ -62,6 +66,10 @@ export async function runNativeActivationExchange(args: NativeActivationArgs): P
     await mutations.close();
     owner.release();
   }
+}
+
+function needsFirstCode(prior: PriorActivation, journal: SupervisorJournal): boolean {
+  return !prior.attempt && !prior.identity && !journal.execution.enrollment();
 }
 
 function verifiedActivationTarget(args: NativeActivationArgs): { platform: ReturnType<typeof RemotePlatformSchema.parse>; release: VerifiedNativeRelease } {

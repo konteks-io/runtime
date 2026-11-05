@@ -56,6 +56,19 @@ describe("native activation and resumable exchange", () => {
     expect(journal.execution.coverage("instance-native", "tenant-native")).toBe("legacy_unknown");
   });
 
+  it("does not seed permanent enrollment lineage when a fresh code read fails before any request", async () => {
+    const f = fixture(); f.args.dataDir = join(dir, "fresh");
+    f.args.readActivationCode.mockRejectedValueOnce(new RemoteInstanceError("prerequisite_missing", "no input terminal"));
+    await expect(runNativeActivationExchange(f.args)).rejects.toMatchObject({ code: "prerequisite_missing" });
+    const store = new SupervisorStore(f.args.dataDir);
+    expect(await store.activationAttempt()).toBeNull();
+    expect(await store.loadInstanceKey()).toBeNull();
+    const journal = new SupervisorJournal(store.path("journal")); await journal.load();
+    expect(journal.execution.enrollment()).toBeUndefined();
+    expect(f.args.fetchFn).not.toHaveBeenCalled();
+    await expect(runNativeActivationExchange({ ...f.args, activationId: "replacement-activation" })).resolves.toMatchObject({ instanceId: "instance-native" });
+  });
+
   it("retains the same enrollment seed through an uncertain fresh activation response", async () => {
     const f = fixture(); f.args.dataDir = join(dir, "fresh");
     f.args.fetchFn.mockRejectedValueOnce(new Error("lost response"))
@@ -139,11 +152,13 @@ describe("native activation and resumable exchange", () => {
     expect(f.args.fetchFn).not.toHaveBeenCalled();
   });
 
-  it("does not consume the code if the retry record cannot be persisted", async () => {
+  it("does not exchange the code if the retry record cannot be persisted", async () => {
     const f = fixture();
     vi.spyOn(SupervisorStore.prototype, "saveActivationAttempt").mockRejectedValueOnce(new Error("disk unavailable"));
     await expect(runNativeActivationExchange(f.args)).rejects.toThrow("disk unavailable");
-    expect(f.args.readActivationCode).not.toHaveBeenCalled();
+    // Reading the local input does not consume an activation; no request may
+    // reach Core until its retry record is durable.
+    expect(f.args.readActivationCode).toHaveBeenCalledOnce();
     expect(f.args.fetchFn).not.toHaveBeenCalled();
   });
 

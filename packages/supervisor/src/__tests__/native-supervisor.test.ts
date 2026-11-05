@@ -994,6 +994,43 @@ describe("native Supervisor composition", () => {
     expect(f.spawn).not.toHaveBeenCalled();
   });
 
+  it("forgets only the completed activation attempt after Core accepts readiness", async () => {
+    const f = await fixture();
+    const attempt = { activationId: "activation", nonce: "exchange", keyDigest: "key", platformDigest: "platform", manifestDigest: f.manifest.digest, createdAt: new Date().toISOString() };
+    await f.store.saveActivationAttempt(attempt);
+    const identity = await f.store.identity();
+    const submit = vi.fn(async () => ({ lease: "issued", leaseExpiresAt: "2027-01-01T00:00:00Z" }));
+    await submitReadiness({ store: f.store, core: { submitReadiness: submit } as unknown as CoreClient, clock: new SystemClock(), protocolVersion: "1.0", bundleVersion: "1.0.0", components: [{ kind: "agent_runner", version: "1.0.0", capabilities: [], health: "healthy" }] });
+    expect(await f.store.activationAttempt()).toBeNull();
+    expect(await f.store.identity()).toEqual({ ...identity, administrativeStatus: "active" });
+  });
+
+  it.each(["activationId", "nonce"])("keeps an attempt whose %s differs from the established identity", async field => {
+    const f = await fixture();
+    const attempt = { activationId: "activation", nonce: "exchange", keyDigest: "key", platformDigest: "platform", manifestDigest: f.manifest.digest, createdAt: new Date().toISOString(), [field]: "different" };
+    await f.store.saveActivationAttempt(attempt);
+    const submit = vi.fn(async () => ({ lease: "issued", leaseExpiresAt: "2027-01-01T00:00:00Z" }));
+    await submitReadiness({ store: f.store, core: { submitReadiness: submit } as unknown as CoreClient, clock: new SystemClock(), protocolVersion: "1.0", bundleVersion: "1.0.0", components: [] });
+    expect(await f.store.activationAttempt()).toEqual(attempt);
+  });
+
+  it("does not block accepted readiness on an unreadable obsolete attempt", async () => {
+    const f = await fixture();
+    await writeSecretFile(f.store.path("activation-attempt.json"), "malformed obsolete attempt");
+    const submit = vi.fn(async () => ({ lease: "issued", leaseExpiresAt: "2027-01-01T00:00:00Z" }));
+    await expect(submitReadiness({ store: f.store, core: { submitReadiness: submit } as unknown as CoreClient, clock: new SystemClock(), protocolVersion: "1.0", bundleVersion: "1.0.0", components: [] })).resolves.toMatchObject({ lease: "issued" });
+    expect((await f.store.identity())?.administrativeStatus).toBe("active");
+  });
+
+  it("keeps an unresolved activation attempt when readiness is refused", async () => {
+    const f = await fixture();
+    const attempt = { activationId: "activation", nonce: "exchange", keyDigest: "key", platformDigest: "platform", manifestDigest: f.manifest.digest, createdAt: "2020-01-01T00:00:00Z" };
+    await f.store.saveActivationAttempt(attempt);
+    const submit = vi.fn(async () => { throw new RemoteInstanceError("temporarily_unavailable", "response lost"); });
+    await expect(submitReadiness({ store: f.store, core: { submitReadiness: submit } as unknown as CoreClient, clock: new SystemClock(), protocolVersion: "1.0", bundleVersion: "1.0.0", components: [] })).rejects.toThrow();
+    expect(await f.store.activationAttempt()).toEqual(attempt);
+  });
+
   it("submits native readiness with its explicit topology rather than an appliance-shaped body", async () => {
     const f = await fixture();
     const submit = vi.fn(async () => ({ lease: "issued", leaseExpiresAt: "2027-01-01T00:00:00Z" }));

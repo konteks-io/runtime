@@ -248,6 +248,13 @@ export async function submitReadiness(args: {
   });
   await args.store.saveIdentity({ ...identity, administrativeStatus: "active" });
   await args.store.clearProvisioning();
+  await finishActivationAttempt(args.store, logger);
   logger.info({ instanceId: identity.instanceId }, "readiness accepted; instance is active");
   return { lease: result.lease, leaseExpiresAt: result.leaseExpiresAt };
+}
+
+/** Obsolete local bookkeeping must never undo Core's accepted readiness or reconnect. */
+export async function finishActivationAttempt(store: SupervisorStore, logger: Logger): Promise<void> {
+  try { await store.clearCompletedActivationAttempt(); }
+  catch { logger.warn({ stage: "activation_cleanup", code: "local_io_failure" }, "Completed activation attempt cleanup deferred; identity and local state are preserved"); }
 }
