@@ -54,8 +54,18 @@ export function boundPublicToolTitle(value: unknown, workspaceRoot?: string): un
   return title === update.title ? value : { ...update, title };
 }
 
-function boundTitle(title: string): string {
-  return title.length <= PUBLIC_TOOL_TITLE_MAX ? title : `${[...title].slice(0, PUBLIC_TOOL_TITLE_MAX - 1).join("").trimEnd()}…`;
+/** Cut a display title to `max` code points and UTF-16 units, marking the cut with `…`. */
+export function boundTitle(title: string, max = PUBLIC_TOOL_TITLE_MAX): string {
+  const points = [...title];
+  if (points.length <= max && title.length <= max) return title;
+  const kept: string[] = [];
+  let units = 0;
+  for (const point of points.slice(0, max - 1)) {
+    if (units + point.length > max - 1) break;
+    kept.push(point);
+    units += point.length;
+  }
+  return `${kept.join("").trimEnd()}…`;
 }
 
 /** An absolute path in a command, as the redaction below would otherwise mask it whole. */
