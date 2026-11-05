@@ -22,10 +22,9 @@ export async function keepConnectorLogSmall(file: string, maxBytes = CONNECTOR_L
 
 /**
  * Checks the log now and every hour while the connector runs; returns a stop.
- * Not on Windows: there cmd holds the log with a handle that writes at its own
- * offset rather than appending, so emptying it in place would leave a gap of
- * zeros as long as the old log; the task's host keeps it small before each
- * start instead (launcher service.ts).
+ * Not on Windows: the login host consumes the child's output pipe and owns
+ * bounded log writes, including rotation. A second writer must not truncate
+ * the file behind that host's retained stream position.
  */
 export function startConnectorLogKeeper(root: string, onError: (error: unknown) => void = () => undefined, platform: NodeJS.Platform = process.platform): () => void {
   if (platform === "win32") return () => undefined;

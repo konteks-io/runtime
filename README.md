@@ -498,7 +498,10 @@ after `npm run build`).
 ## Troubleshooting
 
 - **Logs.** macOS and Windows: `logs/connector.log` in the connector's folder
-  (on Windows kept under 20 MB at each start). Linux: the user journal. When
+  (Windows rotates the running log at 20 MB and limits each new backup to
+  20 MB). Linked log paths are preserved. If storage blocks Windows logging,
+  the connector continues and reports discarded bytes when writing resumes.
+  Linux: the user journal. When
   the connector is not running, `doctor` and `support` show the last failed
   start and the log's last lines.
 - **Process names.** The service shows as `konteks-connector` (Linux:

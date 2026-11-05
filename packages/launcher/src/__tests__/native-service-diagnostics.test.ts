@@ -81,7 +81,7 @@ describe("the Windows background host keeps a connector log, like launchd's", ()
     return Buffer.from(encoded, "base64").toString("utf16le");
   };
 
-  it("appends the connector's stdout and stderr to <root>\\logs\\connector.log through cmd, paths only through the environment", () => {
+  it("merges the connector's stdout and stderr through cmd, paths only through the environment", () => {
     const root = "C:\\Users\\Test User\\literal %PATH% & O'Brien\\remote";
     const executable = `${root}\\releases\\next\\konteks-connector.exe`;
     const service = nativeServiceDefinition({ os: "windows", home: "C:\\Users\\Test User", root, executable, userId: "S-1-5-21-1-2-3-1001" });
@@ -92,19 +92,20 @@ describe("the Windows background host keeps a connector log, like launchd's", ()
     expect(text).toContain(`$env:KONTEKS_SERVICE_ROOT = ${literal(root)}`);
     // cmd expands each variable once and never re-reads its value, so a path's
     // own percent signs, ampersands and apostrophes stay literal.
-    expect(text).toContain(`'/d /v:off /s /c ""%KONTEKS_SERVICE_PROGRAM%" serve --root "%KONTEKS_SERVICE_ROOT%" >> "%KONTEKS_SERVICE_LOG%" 2>&1"'`);
+    expect(text).toContain(`'/d /v:off /s /c ""%KONTEKS_SERVICE_PROGRAM%" serve --root "%KONTEKS_SERVICE_ROOT%" 2>&1"'`);
     expect(text).not.toContain(`& '${executable}'`);
     expect(text).toContain("if ($child.ExitCode -eq 0) { break }");
     // A start that fails before the connector runs is written to the log too.
-    expect(text).toMatch(/catch \{[\s\S]*AppendAllText\(\$log/);
+    expect(text).toMatch(/catch \{[\s\S]*Write-ConnectorLogEntry \$entry/);
     // The `${name}:` rule: a variable followed by a colon inside double quotes breaks the script.
     expect(text).not.toMatch(/"[^"\n]*\$[A-Za-z_]+:[^"\n]*"/);
   });
 
-  it("keeps the log small at start, where the scheduler's appending handle is not yet open", () => {
+  it("initializes retention before the connector starts", () => {
     const text = script(windows());
     expect(text).toContain("20971520");
-    expect(text).toContain("[IO.File]::Move($log, $log + '.1')");
+    expect(text).toContain("Initialize-ConnectorLog");
+    expect(text).toContain("$stream.CopyTo($backup)");
   });
 
   it("caps crash backoff without periodically launching a scheduled task", () => {
