@@ -520,8 +520,20 @@ class AuthorizedInputs {
 
   async authorize(): Promise<void> {
     if (this.options.claimId(this.current) !== this.claimId) throw unavailable();
-    this.envelope = await this.client.prepare(this.current, this.claimId, this.digest);
+    if (this.stampsCurrent()) this.envelope = await this.client.prepare(this.current, this.claimId, this.digest);
+    else await this.client.recheck(this.current, this.claimId, this.digest);
     if (this.options.claimId(this.current) !== this.claimId) throw unavailable();
+  }
+
+  /**
+   * Whether Core can still sign an envelope: the contract caps one at every expiry
+   * pinned in the selection, and those stay at the assignment's issued hour. A turn
+   * Core renewed past them gets the same checks through `recheck`, and no new bytes.
+   */
+  private stampsCurrent(): boolean {
+    const { source, skills, repository } = this.selection;
+    const stamps = [source, ...skills.skills.map(skill => skill.transfer), ...(repository ? [repository] : [])];
+    return Math.min(...stamps.map(stamp => Date.parse(stamp.expiresAt))) > this.options.clock.coreNow();
   }
 
   read(transferId: string): Promise<FetchedTree> {

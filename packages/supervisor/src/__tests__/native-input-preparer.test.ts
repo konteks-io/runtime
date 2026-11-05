@@ -256,6 +256,41 @@ describe("repository session continuity inputs", () => {
       expect(await testGitCommand(f.git, prepared.cwd, ["status", "--porcelain"])).toBe("");
       await prepared.beforePrompt();
     });
+  it("hands in a renewed turn's output past its pinned stamps through the recheck, not a new envelope", async () => {
+    const f = await repositoryFixture(continuityFiles);
+    const client = f.options.client();
+    const prepare = vi.spyOn(client, "prepare");
+    const recheck = vi.spyOn(client, "recheck").mockResolvedValue(undefined);
+    const accept = vi.fn(async (_current: unknown, candidate: { invocationRef: string; binding: unknown; claimId: string; resultId: string; resultDigest: string; inputSelectionDigest: string; baseRevision: string }) => ({
+      version: 1, acceptanceId: "acceptance", invocationRef: candidate.invocationRef, binding: candidate.binding, claimId: candidate.claimId,
+      resultId: candidate.resultId, resultDigest: candidate.resultDigest, inputSelectionDigest: candidate.inputSelectionDigest,
+      baseRevision: candidate.baseRevision, acceptedAt: new Date(f.clock.now()).toISOString() }));
+    const prepared = await createNativeInputPreparer({ ...f.options, git: f.git, client: () => client, repositoryCacheRoot: join(f.root, "cache"),
+      outputClient: () => ({ accept }) as never })(nativeRepositoryAssignment());
+    await writeFile(join(prepared.cwd, "app.txt"), "finished work\n");
+    prepare.mockClear();
+    f.clock.advance(Date.parse(f.selection.source.expiresAt) - f.clock.now() + 1);
+    const completion = { kind: "acp_result" as const, id: "request", method: "session/prompt" as const, result: { stopReason: "end_turn" } };
+    const handIn = { claimId: "claim", invocationRef: "invocation", completion };
+    await expect(prepared.acceptDeliveryOutput!(handIn)).resolves.toMatchObject({ acceptanceId: "acceptance" });
+    expect(prepare).not.toHaveBeenCalled();
+    expect(recheck).toHaveBeenCalledWith(expect.objectContaining({ id: "assignment" }), "claim", expect.stringMatching(/^sha256:/));
+    expect(accept).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not hand in output past its pinned stamps when Core refuses the recheck", async () => {
+    const f = await repositoryFixture(continuityFiles);
+    const client = f.options.client();
+    vi.spyOn(client, "recheck").mockRejectedValue(new RemoteInstanceError("capability_unavailable", "refused"));
+    const accept = vi.fn();
+    const prepared = await createNativeInputPreparer({ ...f.options, git: f.git, client: () => client, repositoryCacheRoot: join(f.root, "cache"),
+      outputClient: () => ({ accept }) as never })(nativeRepositoryAssignment());
+    f.clock.advance(Date.parse(f.selection.source.expiresAt) - f.clock.now() + 1);
+    const completion = { kind: "acp_result" as const, id: "request", method: "session/prompt" as const, result: { stopReason: "end_turn" } };
+    await expect(prepared.acceptDeliveryOutput!({ claimId: "claim", invocationRef: "invocation", completion })).rejects.toMatchObject({ code: "capability_unavailable" });
+    expect(accept).not.toHaveBeenCalled();
+  });
+
   it("refreshes context on a later claim while retaining committed, staged, unstaged and untracked work", async () => {
     const f = await repositoryFixture(continuityFiles);
     const options = { ...f.options, git: f.git, repositoryCacheRoot: join(f.root, "cache") };
