@@ -130,6 +130,46 @@ function fixture() {
 }
 
 describe("native claim-scoped input client", () => {
+  describe("recheck past the selection's stamps", () => {
+    const digest = `sha256:${"a".repeat(64)}`;
+    const answer = (changes: Record<string, unknown> = {}) => ({ type: "assignment_inputs_recheck", claimId: "claim", selectionDigest: digest,
+      expiresAt: "2026-09-06T01:05:00Z", ...changes });
+    const recheck = (f: ReturnType<typeof fixture>) => new NativeInputClient(f.options).recheck(assignment, "claim", digest);
+
+    it("posts the claim and pinned digest to its own endpoint and accepts Core's answer", async () => {
+      const f = fixture();
+      f.fetchFn.mockResolvedValueOnce(f.response(answer()));
+      await expect(recheck(f)).resolves.toBeUndefined();
+      const [url, init] = f.fetchFn.mock.calls[0];
+      expect(String(url)).toBe("https://core.example/api/remote-instances/internal/remote-instances/instance/assignments/assignment/inputs/recheck");
+      expect(JSON.parse(String(init?.body))).toEqual({ attempt: 1, claimId: "claim", selectionDigest: digest });
+    });
+
+    it("keeps Core's refusal a refusal", async () => {
+      const f = fixture();
+      f.fetchFn.mockResolvedValueOnce(new Response("{}", { status: 422, headers: { "content-type": "application/json" } }));
+      await expect(recheck(f)).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "response_status_invalid" });
+    });
+
+    it("retries a passing 503 and then says it stayed unavailable", async () => {
+      const f = fixture();
+      f.fetchFn.mockImplementation(async () => new Response("{}", { status: 503, headers: { "content-type": "application/json" } }));
+      await expect(recheck(f)).rejects.toMatchObject({ code: "temporarily_unavailable", diagnostic: "response_transient_503" });
+      expect(f.fetchFn.mock.calls.length).toBeGreaterThan(1);
+    });
+
+    it.each([
+      ["an answer about another claim", () => answer({ claimId: "other" }), "recheck_binding_mismatch"],
+      ["an answer about another selection", () => answer({ selectionDigest: `sha256:${"b".repeat(64)}` }), "recheck_binding_mismatch"],
+      ["an expired answer", () => answer({ expiresAt: "2026-09-06T00:59:59Z" }), "recheck_window_invalid"],
+      ["an envelope in its place", (f: ReturnType<typeof fixture>) => f.envelope, "recheck_schema_invalid"],
+    ])("refuses %s", async (_label, body, diagnostic) => {
+      const f = fixture();
+      f.fetchFn.mockResolvedValueOnce(f.response(body(f)));
+      await expect(recheck(f)).rejects.toMatchObject({ code: "capability_unavailable", diagnostic });
+    });
+  });
+
   it("keeps unfinished workspace transport on its own private claim-bound endpoint", async () => {
     const f = fixture();
     const body = { attempt: 1, claimId: "claim", selectionDigest: f.envelope.selectionDigest, checkpointId: "00000000-0000-4000-8000-000000000001" };

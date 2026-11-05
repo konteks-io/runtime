@@ -1,3 +1,4 @@
+import { z } from "zod";
 import {
   RemoteAssignmentInputsEnvelopeSchema,
   RemoteAssignmentInputsPrepareRequestSchema,
@@ -47,6 +48,11 @@ interface NativeInputClientOptions {
 // second. Accept only that quantization uncertainty for a freshly issued
 // envelope; expiry and assignment deadlines remain exact.
 const CORE_HTTP_DATE_UNCERTAINTY_MS = 1_000;
+
+/** Local to this exchange: the contract package does not carry it. */
+const RecheckAnswerSchema = z.object({
+  type: z.literal("assignment_inputs_recheck"), claimId: z.string(), selectionDigest: z.string(), expiresAt: z.string().datetime({ offset: true }),
+}).strict();
 
 type InputResponseFault = "response_status_invalid" | "response_content_type_invalid" | "response_body_missing";
 
@@ -113,6 +119,24 @@ export class NativeInputClient {
       if (selectionDigest !== undefined && envelope.selectionDigest !== selectionDigest)
         throw unavailable("selection_digest_mismatch");
       return envelope;
+    });
+  }
+
+  /**
+   * Core's word that a pinned selection still stands, for a delivery turn renewed
+   * past that selection's stamps. It grants no bytes and replaces no envelope, and
+   * Core's output endpoints authorize the acceptance themselves, so it is not a
+   * signed control body (those are a closed set in the contract).
+   */
+  async recheck(assignment: RemoteWorkAssignment, claimId: string, selectionDigest: string): Promise<void> {
+    return this.exclusive(async () => {
+      const current = RemoteWorkAssignmentSchema.parse(assignment);
+      const request = RemoteAssignmentInputsPrepareRequestSchema.parse({ attempt: current.attempt, claimId, selectionDigest });
+      const answer = RecheckAnswerSchema.safeParse(await this.withTransientRetry("input.recheck", () =>
+        this.requestAttempt(current, "recheck", request, REMOTE_INPUT_METADATA_MAX_BYTES)));
+      if (!answer.success) throw unavailable("recheck_schema_invalid");
+      if (answer.data.claimId !== claimId || answer.data.selectionDigest !== selectionDigest) throw unavailable("recheck_binding_mismatch");
+      if (Date.parse(answer.data.expiresAt) <= this.options.clock.coreNow()) throw unavailable("recheck_window_invalid");
     });
   }
 

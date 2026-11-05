@@ -315,6 +315,10 @@ export class RelayedSession {
   private preparedInputs: PreparedSessionInputs | null = null;
   private readOnlyRoots: readonly string[] = Object.freeze([]);
   private readonly executionGate: NativeExecutionGate | null;
+  /** A finished turn's output is on its way to Core. */
+  private handingInOutput = false;
+  /** The platform tools ended while it was; the session closes once that attempt ends. */
+  private capabilityOwnerEnded = false;
   /** Durable key of the last prompt admitted on this session (see promptBusy). */
   private promptReservation: string | null = null;
   private lastPromptCompletion: { usage: AgentTurnUsageObservation | null } = { usage: null };
@@ -577,7 +581,7 @@ export class RelayedSession {
         if (this.closed) throw new RemoteInstanceError("execution_fenced", "The execution session is closed.");
         return this.deps.redeemCapabilityToken(this.assignment, this.liveUntil());
       },
-      onUnavailable: () => this.close("agent_exited"),
+      onUnavailable: () => this.capabilityOwnerStopped(),
       coordinationInvocation: (tool, args) => this.coordinationCalls.resolve(tool, args),
       // Core's answer to environment_open is the only thing that widens
       // this session's browser, and only to what Core named.
@@ -980,10 +984,32 @@ export class RelayedSession {
     }
   }
 
+  /**
+   * The platform tools have ended. A finished turn no longer needs them, while its
+   * frozen output still has to reach Core: closing here ended the retries of a
+   * turn that had finished (11-05), so the session closes once they end instead.
+   */
+  private async capabilityOwnerStopped(): Promise<void> {
+    if (!this.handingInOutput) return this.close("agent_exited");
+    this.capabilityOwnerEnded = true;
+    this.logger.warn({ event: "mcp_capability.owner_stop_deferred", assignmentId: this.assignment.id, attempt: this.assignment.attempt },
+      "MCP capability owner stopped; the session stays open while its finished output is handed in");
+  }
+
   /** Keep the original terminal handler alive across bounded transport attempts.
    * The candidate and completion are frozen locally before the first wait, so
    * retries and restart recovery cannot recapture different bytes. */
   private async completeDeliveryOutput(requestId: string, completion?: SessionToCoreMessage, resumeOnly = false): Promise<void> {
+    this.handingInOutput = true;
+    try {
+      await this.retryDeliveryOutput(requestId, completion, resumeOnly);
+    } finally {
+      this.handingInOutput = false;
+      if (this.capabilityOwnerEnded) await this.close("agent_exited");
+    }
+  }
+
+  private async retryDeliveryOutput(requestId: string, completion: SessionToCoreMessage | undefined, resumeOnly: boolean): Promise<void> {
     let attempt = 0;
     while (!this.closed) {
       this.assertDeliveryLive();

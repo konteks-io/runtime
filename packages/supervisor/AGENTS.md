@@ -161,6 +161,13 @@ QA browser, structured results, updates and doctor/support.
 - A repository role session whose turn ended unfinished is retired after its
   process is proven gone (`retireAfterClose` in `work/orchestrator.ts`);
   generated changes in the working copy are kept.
+- A delivery turn renewed past its issued hour hands in its output through
+  `NativeInputClient.recheck`, not `prepare`: Core cannot sign an envelope past
+  the selection's pinned stamps (the contract caps it at them), so it answers
+  `assignment_inputs_recheck` after the same checks. That answer grants nothing:
+  Core's output endpoints authorize the acceptance, and reads keep honouring the
+  stamps. Once a turn's output is on its way, the MCP owner stopping
+  no longer closes the session (`capabilityOwnerStopped`).
 - The delivery-output path names every refusal: capture throws
   `OutputCaptureRefusal` with a diagnostic and Git step, and `DeliveryOutput`
   tags each step (`native/delivery-output-failure.ts`). A retained retry
