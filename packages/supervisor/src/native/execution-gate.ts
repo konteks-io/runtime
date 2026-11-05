@@ -66,6 +66,12 @@ const signedOperationKeyId = (permit: string): string | undefined => {
 };
 /** The whole trust fetch and signed check exchange share this one budget. */
 export const NATIVE_EXECUTION_RENEWAL_BUDGET_MS = 12_000;
+/**
+ * How far past that budget a renewal may still be pending before it is abandoned.
+ * The exchange's own deadline normally ends it first; this only catches one that
+ * never settles.
+ */
+const RENEWAL_SETTLE_GRACE_MS = 3_000;
 
 /**
  * An unanswered renewal, like the first check before a prompt is dispatched,
@@ -470,7 +476,7 @@ export class NativeExecutionGate {
         claimId: authority.claimId, executionId: authority.executionId, executionRevision: authority.executionRevision },
     };
     try {
-      await this.renew(authority, renewal);
+      await this.renewWithinBudget(authority, renewal);
     } catch (error) {
       this.logger.warn({ event: "execution.renewal_failed", ...renewal.context, stage: renewal.stage,
         elapsedMs: this.monotonic() - renewal.startedAt, keysElapsedMs: renewal.keysElapsedMs,
@@ -482,12 +488,34 @@ export class NativeExecutionGate {
     }
   }
 
+  /**
+   * One renewal, abandoned if it outlives its budget. While one is pending no
+   * other starts, so an exchange that never settles (11-05, after a 10 s event-loop
+   * hold on a memory-starved host: Core answered 200, the connector never heard)
+   * ended every later check with no line in the log. The lease lapsed locally and
+   * the turn's lifetime stopped following Core's renewals, so its capability refresh
+   * was refused locally 56 minutes later. A late answer is not adopted.
+   */
+  private renewWithinBudget(authority: Authority, renewal: Renewal): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const unsettled = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        renewal.abandoned = true;
+        reject(new RemoteInstanceError("execution_authority_unavailable", "Core's check did not settle within its budget.",
+          { diagnostic: "renewal_unsettled", retryable: true }));
+      }, NATIVE_EXECUTION_RENEWAL_BUDGET_MS + RENEWAL_SETTLE_GRACE_MS);
+      timer.unref?.();
+    });
+    return Promise.race([this.renew(authority, renewal), unsettled]).finally(() => clearTimeout(timer));
+  }
+
   private async renew(authority: Authority, renewal: Renewal): Promise<void> {
     const keys = await this.options.client.executionSigningKeys(renewal.deadlineAtMs);
     renewal.keysElapsedMs = this.monotonic() - renewal.startedAt;
     renewal.stage = "check";
     this.localAuthority(authority, false, false);
     const result = await this.check(authority, renewal.deadlineAtMs);
+    if (renewal.abandoned) return;
     this.localAuthority(authority, false, false);
     renewal.stage = "verification";
     const lapsedMs = this.monotonicDeadline > 0 ? Math.max(0, this.monotonic() - this.monotonicDeadline) : 0;
@@ -496,7 +524,7 @@ export class NativeExecutionGate {
     this.keys = keys;
     this.checkId = claims.checkId;
     await this.followRenewedTurn(authority, claims);
-    this.acceptLease(claims, renewal, lapsedMs);
+    if (!renewal.abandoned) this.acceptLease(claims, renewal, lapsedMs);
   }
 
   private check(authority: Authority, deadlineAtMs: number) {
@@ -646,6 +674,8 @@ interface Renewal {
   startedAt: number;
   stage: string;
   keysElapsedMs: number;
+  /** It outlived its budget; whatever it learns later is not adopted. */
+  abandoned?: boolean;
   context: { assignmentId: string; attempt: number; claimId: string; executionId: string; executionRevision: number };
 }
 
