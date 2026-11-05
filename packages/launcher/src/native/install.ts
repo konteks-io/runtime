@@ -153,6 +153,7 @@ async function installNew(install: InstallContext, agents: string[]): Promise<Na
   install.lock.assertOwned();
   await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify(record));
   await loadNativeInstallation(root, { roots, platform });
+  await publishInstalledEnrollment(root, record, release.manifest);
   setupLine(options.output, "installComplete");
   return record;
 }
@@ -548,6 +549,26 @@ const NativeEnrollmentRecordSchema = z.object({
   controlPort: z.number().int().positive(),
 }).strict();
 type NativeEnrollmentRecord = z.infer<typeof NativeEnrollmentRecordSchema>;
+
+/** Keep the verified installed release ready for a new, independently authenticated enrollment. */
+async function publishInstalledEnrollment(root: string, record: NativeRuntimeRecord, manifest: unknown): Promise<void> {
+  const { coreUrl, relayUrl, agents, releaseId, bundleVersion, manifestDigest, controlPort } = record;
+  const prepared = NativeEnrollmentRecordSchema.parse({ schemaVersion: 1, coreUrl, relayUrl, agents, releaseId, bundleVersion, manifestDigest, controlPort });
+  await writeSecretFile(join(root, "installer", ENROLLMENT_MANIFEST), JSON.stringify(manifest));
+  await writeSecretFile(join(root, "native-enrollment.json"), JSON.stringify(prepared));
+}
+
+/** Backfill older App installations before their confirmed-retired identity is moved aside. */
+export async function prepareNativeReenrollment(root: string, instanceId: string, deps: NativeInstallOptions["deps"] = {}): Promise<void> {
+  root = installRoot(root);
+  await withRuntimeLocks(root, async ({ installer, supervisor }) => {
+    const current = await loadNativeInstallation(root, releaseContext(deps));
+    if (current.record.instanceId !== instanceId) throw invalid();
+    installer.assertOwned();
+    supervisor.assertOwned();
+    await publishInstalledEnrollment(root, current.record, current.release.manifest);
+  });
+}
 
 export async function readNativeEnrollment(root: string): Promise<NativeEnrollmentRecord> {
   const path = join(resolve(root), "native-enrollment.json");

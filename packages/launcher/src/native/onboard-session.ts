@@ -5,7 +5,7 @@ import { NativeEnrollment, SupervisorStore } from "@konteks/remote-supervisor";
 import type { Output } from "../output.js";
 import { SupervisorControl } from "../control.js";
 import { CLI_NAME, cliCommand, cliExecutable, commandHintText } from "../cli-command.js";
-import { readNativeRecord, type completeNativeEnrollment } from "./install.js";
+import { prepareNativeReenrollment, readNativeRecord, type completeNativeEnrollment } from "./install.js";
 import { inspectRepository, type commitFirstFiles, type initializeRepository, type planFirstCommit, type pushToManagedRemote } from "./repository-inspect.js";
 import type { StagingStatus } from "./enrollment-staging.js";
 import { readOnboardState, writeOnboardState, type OnboardState } from "./onboard-state.js";
@@ -204,6 +204,11 @@ export async function lostMachineKey(supervisorData: string): Promise<{ instance
  * for it any more. The machine then enrolls from an empty supervisor.
  */
 export async function setAsideLostIdentity(root: string, instanceId: string): Promise<void> {
+  const installed = await readNativeRecord(root).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (installed) await prepareNativeReenrollment(root, instanceId);
   const aside = join(root, "retired", `${instanceId}-${Date.now()}`);
   await mkdir(aside, { recursive: true, mode: 0o700 });
   await rename(join(root, "supervisor"), join(aside, "supervisor"));
