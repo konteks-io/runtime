@@ -1,4 +1,4 @@
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { lstat, mkdir, readFile, rm } from "node:fs/promises";
 import type { SchemaParser } from "@konteks/remote-common";
 import { join } from "node:path";
 import { z } from "zod";
@@ -12,6 +12,7 @@ import {
   generateInstanceKey,
   instanceKeyFromPrivateJwk,
   isFsErrorWithCode,
+  RemoteInstanceError,
   readOrCreateSecretFile,
   writeSecretFile,
   type InstanceKeyPair,
@@ -63,6 +64,19 @@ const ActivationAttemptSchema = z.object({
   platformDigest: z.string().min(1), createdAt: z.string().datetime(),
 }).strict();
 type ActivationAttempt = z.infer<typeof ActivationAttemptSchema>;
+
+const ServingReleaseSchema = z.object({
+  releaseId: z.string().regex(/^release-[A-Za-z0-9_-]+$/),
+  bundleVersion: z.string().min(1).max(128), manifestDigest: z.string().min(1).max(128),
+}).strict();
+export type NativeServingRelease = z.infer<typeof ServingReleaseSchema>;
+const ServingReleaseHistorySchema = z.object({
+  schemaVersion: z.literal(1), instanceId: z.string().min(1), workspaceId: z.string().min(1),
+  current: ServingReleaseSchema, previous: ServingReleaseSchema.nullable(),
+}).strict().refine(history => !history.previous || (!sameServingBundle(history.current, history.previous) && history.current.releaseId !== history.previous.releaseId), "serving history requires distinct immutable releases and Core bundles");
+type ServingReleaseHistory = z.infer<typeof ServingReleaseHistorySchema>;
+type ServingReleaseConfirmation = { instanceId: string; workspaceId: string; release: NativeServingRelease };
+const SERVING_RELEASES_FILE = "serving-releases.json";
 
 const ProvisioningSchema = z
   .object({
@@ -270,6 +284,32 @@ export class SupervisorStore {
     return this.writeJson("activation-attempt.json", ActivationAttemptSchema.parse(attempt));
   }
 
+  async servingReleaseHistory(): Promise<ServingReleaseHistory | null> {
+    const path = this.path(SERVING_RELEASES_FILE);
+    const info = await lstat(path).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return null; throw error; });
+    if (!info) return null;
+    if (!info.isFile() || info.nlink !== 1 || info.size > 1024 * 1024) throw new Error("Unverified serving release history");
+    await assertRestrictedMode(path);
+    return this.readJson(SERVING_RELEASES_FILE, ServingReleaseHistorySchema);
+  }
+
+  /** Only a fresh accepted Core recovery may confirm a serving release; an offline commit cannot. */
+  confirmServingRelease(input: ServingReleaseConfirmation, assertAccepted: () => void): Promise<void> {
+    return this.mutate(async () => {
+      assertAccepted();
+      const identity = await this.identity();
+      const history = await this.servingReleaseHistory();
+      assertAccepted();
+      assertServingOwner(identity, history, input);
+      const release = ServingReleaseSchema.parse(input.release);
+      const previous = history && sameServingBundle(history.current, release) ? history.previous : history?.current ?? null;
+      const next = ServingReleaseHistorySchema.parse({ schemaVersion: 1, instanceId: input.instanceId, workspaceId: input.workspaceId, current: release, previous });
+      assertAccepted();
+      await writeSecretFile(this.path(SERVING_RELEASES_FILE), JSON.stringify(next));
+      assertAccepted();
+    });
+  }
+
   /** Called after Core confirms activation or reconnect, never because an attempt is old. */
   clearCompletedActivationAttempt(): Promise<void> {
     return this.mutate(async () => {
@@ -405,3 +445,16 @@ export class SupervisorStore {
 }
 
 type JsonWebKey = import("node:crypto").JsonWebKey;
+
+function sameServingBundle(first: NativeServingRelease, second: NativeServingRelease): boolean {
+  return first.bundleVersion === second.bundleVersion && first.manifestDigest === second.manifestDigest;
+}
+
+function servingOwnerMatches(owner: { instanceId: string; workspaceId: string | null }, input: ServingReleaseConfirmation): boolean {
+  return owner.instanceId === input.instanceId && owner.workspaceId === input.workspaceId;
+}
+
+function assertServingOwner(identity: Identity | null, history: ServingReleaseHistory | null, input: ServingReleaseConfirmation): void {
+  if (!identity || identity.administrativeStatus !== "active" || !servingOwnerMatches(identity, input)) throw new RemoteInstanceError("registration_mismatch", "Serving release identity differs from this runtime.");
+  if (history && !servingOwnerMatches(history, input)) throw new RemoteInstanceError("registration_mismatch", "Serving release history belongs to another runtime.");
+}

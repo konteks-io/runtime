@@ -71,6 +71,7 @@ function nativeSupervisorOptions(options: NativeServiceOptions, installation: Na
     ...(update ? { update } : {}),
     // An update still checking this release keeps it from taking work.
     updateProbation: { releaseId: installation.record.releaseId, readLedger: () => readNativeUpdateLedger(options.root) },
+    servingRelease: { releaseId: installation.record.releaseId, bundleVersion: installation.record.bundleVersion, manifestDigest: installation.record.manifestDigest },
     ...(installation.record.git ? { git: installation.record.git } : {}),
     ...(options.prepareInputs ? { prepareInputs: options.prepareInputs } : {}),
     ...(options.prepareRepositoryWorktree ? { prepareRepositoryWorktree: options.prepareRepositoryWorktree } : {}),

@@ -452,6 +452,18 @@ rules, privacy grants on a signed connector). Each release folder keeps its
 copy only to roll back to. A release that is being checked takes no new work. Konteks can also
 require an update when a release is below its minimum.
 
+During a stopped update, cleanup removes obsolete folders from completed
+update attempts. It keeps the current release, the candidate, the last two
+installed releases, both releases most recently confirmed by Core, and every
+release still named by enrollment, retired identity or in-progress update
+state. Offline installs never count as Core confirmation; cleanup waits until
+two distinct serving bundles have been confirmed for this runtime. A process or open-file reference keeps
+its release too. An unreadable reference, unavailable process query or locked
+file defers cleanup instead of risking a working installation. The bounded
+receipt is `logs/release-cleanup.json`; `--verbose` also prints its counts.
+Deferred folders are checked at the next update. Agent credentials, working
+copies and retired identity records are preserved.
+
 On a connected runtime's page, choose **Update this computer** to request the
 signed release Konteks accepts. The computer must remain on and connected;
 the update waits for active work and may briefly disconnect it. The app shows
