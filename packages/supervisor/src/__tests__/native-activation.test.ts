@@ -3,7 +3,7 @@ import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { FixedClock, bundleManifestSigningBytes, computeBundleManifestDigest, type RemoteInstanceActivationExchangeRequest } from "@konteks/remote-common";
+import { FixedClock, RemoteInstanceError, bundleManifestSigningBytes, computeBundleManifestDigest, type RemoteInstanceActivationExchangeRequest } from "@konteks/remote-common";
 import { buildReleaseFixture, verifyNativeRelease } from "@konteks/remote-release";
 import { runNativeActivationExchange } from "../native/activation.js";
 import { SupervisorStore } from "../state/store.js";
@@ -170,6 +170,23 @@ describe("native activation and resumable exchange", () => {
     f.args.readActivationCode.mockClear();
     await expect(runNativeActivationExchange({ ...f.args, activationId: "different" })).rejects.toMatchObject({ code: "registration_mismatch" });
     expect(f.args.readActivationCode).not.toHaveBeenCalled();
+  });
+
+  it("retains an uncertain exchange when a later local code read fails", async () => {
+    const f = fixture(); f.args.dataDir = join(dir, "fresh");
+    f.args.fetchFn.mockRejectedValue(new Error("response lost after Core commit"));
+    await expect(runNativeActivationExchange(f.args)).rejects.toMatchObject({ code: "temporarily_unavailable" });
+    const store = new SupervisorStore(f.args.dataDir);
+    const attempt = await store.activationAttempt();
+    const key = await readFile(store.path("instance-key.jwk"), "utf8");
+    const journal = new SupervisorJournal(store.path("journal")); await journal.load();
+    const seed = journal.execution.enrollment();
+    f.args.readActivationCode.mockRejectedValueOnce(new RemoteInstanceError("activation_invalid", "input pipe closed"));
+    await expect(runNativeActivationExchange(f.args)).rejects.toMatchObject({ code: "activation_invalid" });
+    expect(await store.activationAttempt()).toEqual(attempt);
+    expect(await readFile(store.path("instance-key.jwk"), "utf8")).toBe(key);
+    const reloaded = new SupervisorJournal(store.path("journal")); await reloaded.load();
+    expect(reloaded.execution.enrollment()).toEqual(seed);
   });
 
   it("forgets a code Konteks refused, so a new code from the site connects this machine", async () => {

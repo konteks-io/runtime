@@ -20,9 +20,10 @@ import { promptSecret } from "../prompt.js";
 import { nativePlatform, type NativePlatform } from "./service.js";
 import { releaseStaged, writeStagingProgress } from "./enrollment-staging.js";
 import type { FetchConsent } from "./consent.js";
+import { readActivationCodePipe } from "./activation-input.js";
 
 interface NativeInstallOptions {
-  root: string; activationId: string; coreUrl: string; relayUrl: string;
+  root: string; activationId: string; activationCodeStdin?: boolean; coreUrl: string; relayUrl: string;
   agents?: string[]; controlPort?: number; output: Output;
   deps?: {
     roots?: readonly EmbeddedReleaseRoot[]; platform?: NativePlatform;
@@ -186,11 +187,17 @@ function assertOfflinePackages(artifacts: ReturnType<typeof selectNativeArtifact
 async function activate(install: InstallContext, release: ReturnType<typeof verifyNativeRelease>, fetchFn: typeof fetch) {
   const { options, root, roots, platform, draft } = install;
   setupLine(options.output, "installConnecting");
-  const activated = await (options.deps?.activate ?? runNativeActivationExchange)({ dataDir: join(root, "supervisor"), coreUrl: draft.coreUrl, activationId: options.activationId, platform, release, roots, clock: new SystemClock(), readActivationCode: options.deps?.readActivationCode ?? (() => promptSecret({ label: "One-time code", labelKey: "oneTimeCode", locale: outputLocale(options.output), minLength: 8 })), fetchFn });
+  const readActivationCode = activationCodeReader(options);
+  const activated = await (options.deps?.activate ?? runNativeActivationExchange)({ dataDir: join(root, "supervisor"), coreUrl: draft.coreUrl, activationId: options.activationId, platform, release, roots, clock: new SystemClock(), readActivationCode, fetchFn });
   install.lock.assertOwned();
   const identity = await new SupervisorStore(join(root, "supervisor")).identity();
   if (!identity || identity.instanceId !== activated.instanceId || activated.manifestDigest !== release.manifest.digest) throw invalid();
   return identity;
+}
+
+function activationCodeReader(options: NativeInstallOptions): () => Promise<string> {
+  if (options.deps?.readActivationCode) return options.deps.readActivationCode;
+  return options.activationCodeStdin ? () => readActivationCodePipe() : () => promptSecret({ label: "One-time code", labelKey: "oneTimeCode", locale: outputLocale(options.output), minLength: 8 });
 }
 
 

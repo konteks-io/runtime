@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, readdir, rm } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
-import { createLogger, isFsErrorWithCode, jcsDigest, RemoteInstanceError, RemotePlatformSchema, type Clock, type FetchFn } from "@konteks/remote-common";
+import { CoreResponseError, createLogger, isFsErrorWithCode, jcsDigest, RemoteInstanceError, RemotePlatformSchema, type Clock, type FetchFn } from "@konteks/remote-common";
 import { selectNativeArtifacts, verifyNativeRelease, type EmbeddedReleaseRoot, type VerifiedNativeRelease } from "@konteks/remote-release";
 import { CoreClient } from "../core/client.js";
 import { runActivationExchange, type ActivationExchangeOutcome } from "../provisioning/activation.js";
@@ -148,7 +148,13 @@ async function exchangeOrForget<T>(exchange: () => Promise<T>, forget: () => Pro
   try {
     return await exchange();
   } catch (error) {
-    if (error instanceof RemoteInstanceError && REFUSED.has(error.code)) await forget().catch(() => undefined);
+    // A local input error says nothing about an earlier exchange's outcome.
+    if (definitivelyRefused(error)) await forget().catch(() => undefined);
     throw error;
   }
+}
+
+function definitivelyRefused(error: unknown): boolean {
+  const response = error instanceof RemoteInstanceError ? error.cause : null;
+  return response instanceof CoreResponseError && !response.retryable && response.status >= 400 && response.status < 500 && REFUSED.has(response.wireCode);
 }

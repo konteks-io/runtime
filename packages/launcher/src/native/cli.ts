@@ -19,7 +19,7 @@ type NativeAgentId = (typeof NATIVE_AGENT_IDS)[number];
 
 export interface NativeCommandContext { root: string; output: Output }
 export interface NativeCliActions {
-  install(input: NativeCommandContext & { activationId?: string; enroll?: boolean; coreUrl: string; relayUrl: string; agents?: string[] }): Promise<void>;
+  install(input: NativeCommandContext & { activationId?: string; activationCodeStdin?: boolean; enroll?: boolean; coreUrl: string; relayUrl: string; agents?: string[] }): Promise<void>;
   onboard(input: NativeCommandContext & { answer?: string; cwd?: string }): Promise<void>;
   stageEnrollment(input: NativeCommandContext): Promise<void>;
   addAgent(input: NativeCommandContext & { agent: NativeAgentId; yes?: boolean }): Promise<void>;
@@ -80,15 +80,17 @@ export function createNativeProgram(actions: NativeCliActions): Command {
   };
   program.command("install").description("install the connector with a one-time code from Konteks, then start it")
     .option("--activation-id <id>", "non-secret activation id from App or MCP", id)
+    .option("--activation-code-stdin", "read one activation code from a closed input pipe instead of the hidden terminal prompt; never pass the code in arguments", false)
     // Agent-first onboarding: no activation, no
     // prompt, no TTY. The install stops short of an identity; `onboard` binds.
     .option("--enroll", "prepare this machine for `konteks-remote onboard` instead of consuming an activation", false)
     .option("--core-url <url>", "Core HTTPS endpoint", process.env.KONTEKS_CORE_URL ?? "https://api.konteks.io")
     .option("--relay-url <url>", "relay WSS endpoint", process.env.KONTEKS_RELAY_URL ?? "wss://relay.konteks.io/relay/runtime")
     .option("--agents <ids>", "only these agents, each required: claude-code, codex, dsh, opencode, antigravity (default: the ones found here, offering Claude Code and Codex when missing; antigravity asks before downloading Google Antigravity from Google)", value => value.split(",").map(part => agent(part.trim())))
-    .action(async (options: { activationId?: string; enroll: boolean; coreUrl: string; relayUrl: string; agents?: string[] }) => {
+    .action(async (options: { activationId?: string; activationCodeStdin: boolean; enroll: boolean; coreUrl: string; relayUrl: string; agents?: string[] }) => {
       if (!options.activationId && !options.enroll) throw new InvalidArgumentError("install needs either --activation-id or --enroll");
       if (options.activationId && options.enroll) throw new InvalidArgumentError("an activation install and an enrollment install are different doors; choose one");
+      if (options.activationCodeStdin && !options.activationId) throw new InvalidArgumentError("--activation-code-stdin requires --activation-id");
       await actions.install({ ...context("install"), ...options });
     },
     );

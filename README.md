@@ -95,6 +95,16 @@ shown in the app. These are the terminal entry points:
 curl -fsSL https://github.com/konteks-io/runtime/releases/latest/download/install.sh | sh -s -- --activation-id <id>
 ```
 
+For an agent-controlled activation, the installed connector also accepts
+`konteks-remote install --activation-id <id> --activation-code-stdin`. Give its
+standard input exactly one code, optionally followed by a newline, then close
+the pipe. The input is bounded to 4,098 bytes and 60 seconds; a terminal,
+multiple lines, or incomplete input is refused. Feed it directly from the
+trusted caller's memory. Keep the code out of shell command text, arguments,
+environment variables, files and logs. Without this option, activation still
+uses the hidden terminal prompt. `install --enroll` uses email onboarding and
+does not consume an activation code.
+
 On Windows, run this line in either Command Prompt or PowerShell (including
 Windows PowerShell 5.1 and PowerShell 7):
 
