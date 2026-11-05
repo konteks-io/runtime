@@ -79,6 +79,7 @@ async function fixture(options: {
     lease: { canPullNewWork: () => true }, reconciliationComplete: () => true, draining: () => false, headroom: () => 2, maxPullItems: 4,
     agents: () => [readyAgent], roleBindings: () => [{ role: "assistant", agentPreference: ["claude-code"] }],
     advertisedRoles: () => ["assistant"], acceptedKinds: () => ["assistant_execution", "delivery"], instanceEvidencePolicy: () => "structured_only",
+    verifyCancellation: () => true,
     logger, ...(options.preserveStoppedWorkspace ? { preserveStoppedWorkspace: options.preserveStoppedWorkspace } : {}) } as never);
   const internal = orchestrator as unknown as { channelOwners: Map<string, unknown>; sessions: Map<string, unknown>;
     takeOverCompletedChannel(assignment: RemoteWorkAssignment, admission: LocalAdmission, assertCurrent: () => void): Promise<{ reference: string; mode: "live" | "restore" } | undefined> };
@@ -97,6 +98,49 @@ function heldCheckpoint() {
   const held = new Promise<void>(resolve => { release = resolve; });
   const preserve = vi.fn(async () => { markStarted(); await held; });
   return { started, release, preserve };
+}
+
+/** A settled repository-role delivery head the reaper releases, and its exact successor turn. */
+async function harnessReleaseWindow(preserveStoppedWorkspace: (admission: LocalAdmission, assertCurrent: () => void) => Promise<void>) {
+  const journal = new SupervisorJournal(dir); await journal.load();
+  const outbox = new DurableOutbox(dir); await outbox.load();
+  const previous = delivery(prior, "generate-1");
+  const successor = delivery(next, "generate-2");
+  for (const [identity, assignment] of [[prior, previous], [next, successor]] as const) {
+    await journal.execution.beginAdmission({ schemaVersion: 1, mandatoryOpenVersion: 1, admission: identity, assignment,
+      evidenceUpload: "structured_only", projectionCreatedAt: identity.openedAt, claimCreatedAt: identity.openedAt }, current);
+    await journal.execution.reserveAllocation(identity, current);
+  }
+  await journal.execution.open(prior, current, prior.openedAt);
+  await journal.execution.bindReference(prior, "generator-ref", current);
+  await journal.execution.bindProcessOwner(prior, processOwner, current);
+  await journal.execution.markCompletedTurnSettled(prior, "generator-ref", "2026-09-06T00:00:01.000Z", current);
+  await journal.assignments.put({ assignmentId: "prior", attempt: 1, claimId: "prior-claim", kind: "delivery",
+    placementId: previous.placementId, workspaceId: "workspace", agentId: "claude-code", state: "completed", recoveryEpoch: 0,
+    terminalResultHash: "s".repeat(43),
+    reports: { nextSequence: 2, durableWatermark: 1, terminalSequence: 1,
+      terminalAck: { assignmentId: "prior", attempt: 1, claimId: "prior-claim",
+        acknowledged: { reportId: "report-prior", reportSequence: 1 }, durableWatermark: 1, terminalSequence: 1, outcome: "accepted" } },
+    evidenceUpload: "structured_only", expiresAt: "2026-09-06T01:00:00.000Z", latestResumeAt: "2026-09-06T01:00:00.000Z", updatedAt: clock.nowIso() });
+  const runner = { stopForRecovery: vi.fn(async () => undefined), releaseSealedSession: vi.fn(async () => undefined), stopRetainedExecution: vi.fn(async () => undefined) };
+  const warn = vi.fn();
+  const logger = { warn, info: vi.fn(), debug: vi.fn(), error: vi.fn(), child: () => logger } as never;
+  const orchestrator = new WorkOrchestrator({ journal, outbox, transport: {}, clock, runners: new Map([["claude-code", runner]]),
+    sessionDeps: () => ({}), onUsage: async () => undefined, instanceId: () => "instance", workspaceId: () => "workspace", runnerIncarnation: () => "process",
+    assertOwned: () => undefined, recoveryAuthority: () => "accepted", reportDeliveryAllowed: () => false,
+    lease: { canPullNewWork: () => true }, reconciliationComplete: () => true, draining: () => false, headroom: () => 2, maxPullItems: 4,
+    agents: () => [readyAgent], roleBindings: () => [{ role: "generator", agentPreference: ["claude-code"] }],
+    advertisedRoles: () => ["generator"], acceptedKinds: () => ["delivery"], instanceEvidencePolicy: () => "structured_only",
+    logger, preserveStoppedWorkspace } as never);
+  const internal = orchestrator as unknown as { channelOwners: Map<string, unknown>; sessions: Map<string, unknown>;
+    reapIdleCompletedSessions(idleMs: number): Promise<number>;
+    takeOverCompletedChannel(assignment: RemoteWorkAssignment, admission: LocalAdmission, assertCurrent: () => void): Promise<{ reference: string; mode: "live" | "restore" } | undefined> };
+  const channel = "session:repository-generator-session";
+  const owner = { assignment: previous, acpSessionRef: "generator-ref", isClosed: true,
+    releaseCompletedChannel: vi.fn(() => { internal.channelOwners.delete(channel); }) };
+  internal.channelOwners.set(channel, owner);
+  internal.sessions.set("prior:1", owner);
+  return { journal, runner, orchestrator, internal, owner, channel, successor, warn };
 }
 
 it("stops a conversation's idle completed session before a fresh turn takes its channel", async () => {
@@ -465,49 +509,101 @@ it("releases a completed session idle past the reaper window and keeps a recent 
   expect(f.internal.channelOwners.has("session:session")).toBe(false);
 });
 
-// TKT-1: while the reaper holds a settled turn for its checkpoint upload, a
-// successor placement used to see process_stopped and be refused as
-// predecessor_recovery_unqualified, spending an attempt. It must wait for that
-// deliberate release and then run, with no terminal report.
-it("waits for a deliberate idle release before dispatching the successor", async () => {
+// TKT-1: a claim reply is handled on the assignment channel's one-at-a-time
+// lane. Waiting for the deliberate release there would hold every later claim,
+// report ack and cancel, so the dispatch itself must be handed off-lane.
+it("returns the claim lane while a deliberate release is still in flight", async () => {
   const checkpoint = heldCheckpoint();
   const f = await fixture({ preserveStoppedWorkspace: checkpoint.preserve });
   await f.journal.assignments.put({ assignmentId: "next", attempt: 1, claimId: "next-claim", kind: "assistant_execution",
     placementId: "placement-next", workspaceId: "workspace", agentId: "claude-code", state: "claimed", recoveryEpoch: 0,
     reports: { nextSequence: 1, durableWatermark: 0 }, evidenceUpload: "structured_only",
     expiresAt: "2026-09-06T01:00:00.000Z", latestResumeAt: "2026-09-06T01:00:00.000Z", updatedAt: clock.nowIso() });
+  await f.journal.assignments.put({ assignmentId: "other", attempt: 1, claimId: "other-claim", kind: "delivery",
+    placementId: "placement-other", workspaceId: "workspace", agentId: "claude-code", state: "running", recoveryEpoch: 0,
+    reports: { nextSequence: 1, durableWatermark: 0 }, evidenceUpload: "structured_only",
+    expiresAt: "2026-09-06T01:00:00.000Z", latestResumeAt: "2026-09-06T01:00:00.000Z", updatedAt: clock.nowIso() });
   const internal = f.internal as unknown as {
     reapIdleCompletedSessions(idleMs: number): Promise<number>;
-    dispatch(assignment: RemoteWorkAssignment, entry: JournalEntry, assertAuthority: () => void): Promise<void>;
+    dispatchClaimed(claimed: { key: string; assignment: RemoteWorkAssignment; entry: JournalEntry; assertAuthority: () => void }): Promise<void>;
+    onAssignmentMessage(body: unknown): Promise<void>;
+    dispatching: Map<string, Promise<void>>;
     bootstrapRelayedSession(session: RelayedSession): Promise<void>;
-    handleDispatchFailure(...args: unknown[]): Promise<void>;
   };
   const submit = vi.spyOn(f.orchestrator.reports, "submit");
-  const failure = vi.spyOn(internal, "handleDispatchFailure");
   const bootstrap = vi.spyOn(internal, "bootstrapRelayedSession").mockResolvedValue(undefined);
   const reaping = internal.reapIdleCompletedSessions(1_000);
   await checkpoint.started;
-  // The reaper has proven the process gone and holds the channel for the checkpoint upload.
+
+  let claimLaneReturned = false;
+  const claim = internal.dispatchClaimed({ key: "next:1", assignment: work(next), entry: f.journal.assignments.get("next:1")!, assertAuthority: current })
+    .then(() => { claimLaneReturned = true; });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  expect(claimLaneReturned).toBe(true);
+
+  // A later assignment-channel frame is processed while the release is still held.
+  await internal.onAssignmentMessage({ assignmentId: "other", attempt: 1, reason: "user_cancelled",
+    issuedAt: clock.nowIso(), signature: "A".repeat(43) });
+  expect(submit).toHaveBeenCalledWith(expect.objectContaining({ assignmentId: "other",
+    draft: expect.objectContaining({ terminal: true, result: expect.objectContaining({ class: "cancelled" }) }) }));
+
+  checkpoint.release();
+  await expect(reaping).resolves.toBe(1);
+  await claim;
+  await vi.waitFor(() => expect(bootstrap).toHaveBeenCalledOnce());
+  await vi.waitFor(() => expect(internal.dispatching.has("next:1")).toBe(false));
+  expect(f.journal.assignments.get("next:1")?.reports.terminalSequence).toBeUndefined();
+});
+
+// TKT-1: the successor takes the real post-release path rather than a mocked
+// bootstrap: takeOverCompletedChannel -> takeOverHarnessHead ->
+// canStartFreshAfterSettledHarnessPredecessor, with no refusal and no terminal.
+it("starts the repository-role successor through the real post-release path", async () => {
+  const checkpoint = heldCheckpoint();
+  const f = await harnessReleaseWindow(checkpoint.preserve);
+  const submit = vi.spyOn(f.orchestrator.reports, "submit");
+  const order: string[] = [];
+  f.owner.releaseCompletedChannel.mockImplementationOnce(() => {
+    order.push("released");
+    f.internal.channelOwners.delete(f.channel);
+  });
+  const reaping = f.internal.reapIdleCompletedSessions(1_000);
+  await checkpoint.started;
   expect(f.journal.execution.execution(prior)).toMatchObject({ phase: "process_stopped" });
 
-  let settled = false;
-  const placement = internal.dispatch(work(next), f.journal.assignments.get("next:1")!, current)
-    .then(() => { settled = true; return "resolved" as const; }, error => { settled = true; return { error }; });
+  const handoff = f.internal.takeOverCompletedChannel(f.successor, next, current)
+    .then(() => { order.push("successor"); return "resolved" as const; }, error => ({ error }));
   await new Promise<void>(resolve => setImmediate(resolve));
-  expect(settled).toBe(false);
+  expect(order).toEqual([]);
   checkpoint.release();
 
-  await expect(placement).resolves.toBe("resolved");
+  await expect(handoff).resolves.toBe("resolved");
   await expect(reaping).resolves.toBe(1);
-  expect(checkpoint.preserve).toHaveBeenCalledOnce();
-  expect(failure).not.toHaveBeenCalled();
-  expect(bootstrap).toHaveBeenCalledOnce();
-  expect(submit).not.toHaveBeenCalled();
-  const successor = f.journal.assignments.get("next:1");
-  expect(successor?.reports.terminalSequence).toBeUndefined();
-  expect(successor?.terminalResultHash).toBeUndefined();
+  expect(order).toEqual(["released", "successor"]);
   expect(f.journal.execution.execution(prior)).toMatchObject({ phase: "acp_settled" });
-  expect(f.internal.channelOwners.has("session:session")).toBe(false);
+  expect(f.internal.channelOwners.has(f.channel)).toBe(false);
+  expect(submit).not.toHaveBeenCalled();
+  expect(f.warn.mock.calls.some(([fields]) => fields?.outcome === "fresh_after_settled_predecessor")).toBe(true);
+});
+
+it("refuses a placement whose window expired while it waited for the release", async () => {
+  const checkpoint = heldCheckpoint();
+  const f = await fixture({ preserveStoppedWorkspace: checkpoint.preserve });
+  const internal = f.internal as unknown as { reapIdleCompletedSessions(idleMs: number): Promise<number> };
+  const reaping = internal.reapIdleCompletedSessions(1_000);
+  await checkpoint.started;
+  // The assignment was admitted under a 01:00 deadline; the wait carries it past that.
+  clock.advance(2 * 60 * 60_000);
+  try {
+    const outcome = f.internal.takeOverCompletedChannel(work(next), next, current)
+      .then(() => null, (error: unknown) => error);
+    checkpoint.release();
+    expect(await outcome).toMatchObject({ code: "recovery_required", diagnostic: "assignment_expired_while_releasing" });
+  } finally {
+    clock.advance(-2 * 60 * 60_000);
+    checkpoint.release();
+    await reaping;
+  }
 });
 
 it("does not claim an offer while its session's deliberate release is in flight", async () => {

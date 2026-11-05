@@ -54,8 +54,12 @@ const reports = (sent: OutboundMessage[]): AssignmentReport[] => sent.map((messa
 // its asynchronous bootstrap (including failure handling) before asserting the
 // resulting session or deleting the fixture's journals.
 async function settleBootstrap(work: WorkOrchestrator, id: string): Promise<void> {
-  const internal = work as unknown as { bootstrapping: Map<string, Promise<void>> };
-  await vi.waitFor(() => expect(internal.bootstrapping.has(`${id}:1`)).toBe(false));
+  const internal = work as unknown as { bootstrapping: Map<string, Promise<void>>; dispatching: Map<string, Promise<void>> };
+  const key = `${id}:1`;
+  // The claim reply now hands its whole dispatch off-lane, so the dispatch is
+  // owned before everything after it (session construction, bootstrap) exists.
+  await vi.waitFor(() => expect(internal.dispatching.has(key) || internal.bootstrapping.has(key)).toBe(true));
+  await vi.waitFor(() => expect(internal.dispatching.has(key) || internal.bootstrapping.has(key)).toBe(false));
 }
 
 describe("report sender state machine", () => {

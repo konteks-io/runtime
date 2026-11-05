@@ -149,15 +149,6 @@ interface OrchestratorDeps {
   logger?: Logger;
 }
 
-/** Work whose dispatch only returns at its terminal report (integration, onboarding). */
-function runsToCompletionInDispatch(
-  assignment: RemoteWorkAssignment,
-  deps: Pick<OrchestratorDeps, "integrationCarrier" | "onboardCarrier">,
-): boolean {
-  return Boolean(deps.integrationCarrier && isIntegrationWorkAssignment(assignment)) ||
-    Boolean(deps.onboardCarrier && isOnboardWorkAssignment(assignment));
-}
-
 /** How often a held pull is said again for the same reason. */
 const HELD_PULL_LOG_MS = 5 * 60_000;
 /** A prepared pull older than this no longer holds later pulls back. */
@@ -386,6 +377,16 @@ export class WorkOrchestrator {
   private sessionChannelId(assignment: RemoteWorkAssignment): string | undefined {
     const sessionId = logicalSessionId(assignment.source);
     return sessionId === undefined ? undefined : `session:${sessionId}`;
+  }
+
+  /** A wait must not carry a claimed placement past the clock window it was admitted under. */
+  private assertPlacementWindow(assignment: RemoteWorkAssignment): void {
+    const now = this.deps.clock.coreNow();
+    if (parseRfc3339(assignment.expiresAt) <= now || parseRfc3339(assignment.policy.latestResumeAt) <= now) {
+      throw new RemoteInstanceError("recovery_required",
+        "The placement expired while it waited for the previous session's deliberate release.",
+        { diagnostic: "assignment_expired_while_releasing" });
+    }
   }
 
   /** A later attempt exists, or this attempt is already live here. */
@@ -723,19 +724,16 @@ export class WorkOrchestrator {
     // acquire prompt authority.
     if (isSearchAssignment(assignment)) await this.acceptSearchClaim(assignment);
     // A claim reply is handled in the assignment channel's one-at-a-time
-    // lane, and its ack waits for this handler. Integration and onboarding
-    // work run to their terminal report inside dispatch, so awaiting them
-    // here held every later claim, report ack and cancel behind one read
-    // (10-09: three reads claimed at once all finished ~19 min later, as the
-    // planner turn waiting on them expired). Relayed sessions already
-    // bootstrap off-lane; these now do too. `dispatching` keeps them owned
-    // and dispatchImpl reports their failures.
-    if (runsToCompletionInDispatch(assignment, this.deps)) {
-      void this.dispatch(assignment, entry, assertAuthority).catch(error =>
-        this.logger.warn({ err: error, assignmentId: assignment.id, attempt: assignment.attempt }, "off-lane dispatch failed"));
-      return;
-    }
-    await this.dispatch(assignment, entry, assertAuthority);
+    // lane, and its ack waits for this handler. Dispatch can run long:
+    // integration and onboarding run to their terminal report, and a relayed
+    // session may wait for a deliberate idle release while the previous
+    // session's checkpoint uploads. Awaiting any of that here held every later
+    // claim, report ack and cancel behind one read (10-09: three reads claimed
+    // at once all finished ~19 min later, as the planner turn waiting on them
+    // expired). Every dispatch runs off-lane; `dispatching` keeps it owned and
+    // dispatchImpl reports its failures.
+    void this.dispatch(assignment, entry, assertAuthority).catch(error =>
+      this.logger.warn({ err: error, assignmentId: assignment.id, attempt: assignment.attempt }, "off-lane dispatch failed"));
   }
 
   private async acceptSearchClaim(assignment: Parameters<SearchControllerBoundary["acceptClaimed"]>[0]["assignment"]): Promise<void> {
@@ -908,7 +906,7 @@ export class WorkOrchestrator {
     dispatch.assertAdmissionCurrent();
     dispatch.assertExecutionOwned();
     await this.settlePredecessorEvidence(dispatch);
-    await this.awaitReleasingOwner(this.sessionChannelId(assignment), dispatch.assertExecutionOwned);
+    await this.awaitReleasingOwner(this.sessionChannelId(assignment), dispatch.assertExecutionOwned, () => this.assertPlacementWindow(assignment));
     this.assertNoRecoveringPredecessor(assignment);
     const key = `${assignment.id}:${assignment.attempt}`;
     if (this.sessions.has(key)) throw new Error("the assignment already has a local session owner");
@@ -1286,7 +1284,7 @@ export class WorkOrchestrator {
     if (sessionId === undefined) return undefined;
     const channelId = `session:${sessionId}`;
     await this.awaitClosingOwner(channelId, assertCurrent);
-    await this.awaitReleasingOwner(channelId, assertCurrent);
+    await this.awaitReleasingOwner(channelId, assertCurrent, () => this.assertPlacementWindow(assignment));
     this.assertNoRecoveringPredecessor(assignment);
     const predecessor = this.channelOwners.get(channelId);
     if (!predecessor) return this.takeOverWithoutLiveOwner(assignment, admission, sessionId, assertCurrent);
@@ -1314,7 +1312,7 @@ export class WorkOrchestrator {
    * that outlives the deadline is named as its own state, then the ordinary
    * recovery gate decides. The release itself is never shortened or aborted.
    */
-  private async awaitReleasingOwner(channelId: string | undefined, assertCurrent: () => void): Promise<void> {
+  private async awaitReleasingOwner(channelId: string | undefined, assertCurrent: () => void, assertPlacementWindow: () => void): Promise<void> {
     const release = channelId === undefined ? undefined : this.releasingIdle.get(channelId);
     if (!release) return;
     if (!await settlesWithin(release.completion, release.deadlineAt - Date.now())) {
@@ -1324,6 +1322,7 @@ export class WorkOrchestrator {
       return;
     }
     assertCurrent();
+    assertPlacementWindow();
   }
 
   /**
