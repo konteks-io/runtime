@@ -11,7 +11,7 @@ import {
 import { inspectWorkspaceGitControl, type WorkspaceGitControl, type WorkspaceGitScope } from "./workspace-git-control.js";
 import { verifyNativeGitTool, type NativeGitTool } from "./git-workspace.js";
 import { gitFailure, NamedRefusal, type RefusalFacts } from "./named-refusal.js";
-import type { CheckpointGitStep } from "./workspace-checkpoint-failure.js";
+import { transferPathRule, type CheckpointGitStep } from "./workspace-checkpoint-failure.js";
 
 import { readCheckpointBytes, writeCheckpointBytes, workspaceFileUnchanged as unchanged, type WorkspaceChunkCapture, type WorkspaceChunkRead } from "./workspace-checkpoint-bytes.js";
 
@@ -90,7 +90,7 @@ function checkSize(count: number, size: number, chunks?: WorkspaceChunkCapture):
 
 /** A path the transfer contract carries, never inside a nested Git folder. */
 function transferPath(path: string): void {
-  if (!RemoteTransferPathSchema.safeParse(path).success) throw unavailable("path_unsupported");
+  if (!RemoteTransferPathSchema.safeParse(path).success) throw unavailable(`path_unsupported_${transferPathRule(path)}`);
   if (path.split("/").some(part => /^\.git(?:$|[ .~])/i.test(part))) throw unavailable("git_path_in_tree");
 }
 
@@ -151,14 +151,14 @@ async function gitState(git: Git, cwd: string, linked = false, chunks?: Workspac
 function validateIndex(value: Buffer): void {
   for (const row of indexRows(value)) {
     const match = /^(100644|100755|120000) ([a-f0-9]{40}) [0-3]\t(.+)$/u.exec(row);
-    if (!match) throw unavailable("index_unparsable");
+    if (!match) throw unavailable(row.startsWith("160000 ") ? "index_unparsable_gitlink" : "index_unparsable");
     transferPath(match[3]!);
   }
 }
 
 function indexRows(value: Buffer): string[] {
   try { return new TextDecoder("utf-8", { fatal: true }).decode(value).split("\0").filter(Boolean); } catch {
-    throw unavailable("index_unparsable");
+    throw unavailable("index_unparsable_encoding");
   }
 }
 

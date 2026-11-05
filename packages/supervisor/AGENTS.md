@@ -169,3 +169,5 @@ QA browser, structured results, updates and doctor/support.
   The recovery-checkpoint path does the same (`NamedRefusal`, each Git call
   takes a `CheckpointGitStep`); `seal()` reports the cause in the stage, e.g.
   `workspace_capture_file_hardlinked` (`native/workspace-checkpoint-failure.ts`).
+  A stop waits only for `capture()`; sending the copy runs after the stop has
+  settled, because it can take an hour and the next attempt waits on the stop.

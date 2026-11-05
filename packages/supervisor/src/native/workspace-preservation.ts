@@ -26,6 +26,7 @@ const RecordSchema = z.object({ version: z.literal(1), assignment: RemoteWorkAss
 }).strict();
 type Record = z.infer<typeof RecordSchema>;
 type Admission = { assignmentId: string; attempt: number; claimId: string };
+type Owner = { folder: string; record: Record };
 type Begin = { assignment: RemoteWorkAssignment; claimId: string; selectionDigest: string; cwd: string; baselineCommit: string; tool: NativeGitTool; format?: "konteks-workspace-checkpoint-v2" };
 
 /** Private durable outbox. A lost upload answer never causes another capture
@@ -67,29 +68,53 @@ export class NativeWorkspaceCheckpointStore {
   }
 
   async seal(admission: Admission, assertCurrent: () => void): Promise<void> {
+    const send = await this.capture(admission, assertCurrent);
+    await send(assertCurrent);
+  }
+
+  /**
+   * Keeps the stopped workspace on this computer, and only that holds up the
+   * stop: the next attempt may reuse the folder, so it can't wait. Sending the
+   * copy can take an hour and needs nothing from the folder, so the returned
+   * step can run after the stop has settled.
+   */
+  async capture(admission: Admission, assertCurrent: () => void): Promise<(assertCurrent: () => void) => Promise<void>> {
     assertCurrent();
     const operation = { stage: "workspace_owner", code: "checkpoint_owner_failed" };
-    let owner: { folder: string; record: Record } | null = null;
-    let settled = false;
+    let owner: Owner | null = null;
     try {
       owner = await this.loadOwner(admission);
-      if (!owner) return;
-      await this.sealOwner(owner.folder, owner.record, operation, assertCurrent);
+      if (!owner) return async () => undefined;
+      Object.assign(operation, { stage: "workspace_capture", code: "checkpoint_capture_failed" });
+      const checkpoint = await this.checkpoint(owner.folder, owner.record, assertCurrent);
+      const captured = owner;
+      return assertSending => this.send(admission, captured, checkpoint, assertSending);
+    } catch (error) {
+      reportRuntimeFailure(this.options.onRuntimeFailure, checkpointFailure(error, operation),
+        { assignmentId: admission.assignmentId, attempt: admission.attempt });
+      if (owner) await this.tidy(owner.folder, owner.record, false).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private async send(admission: Admission, owner: Owner, checkpoint: RemoteWorkspaceAnyCheckpoint, assertCurrent: () => void): Promise<void> {
+    const operation = { stage: "workspace_seal", code: "checkpoint_seal_failed" };
+    let settled = false;
+    try {
+      await this.sendOwner(owner.folder, owner.record, checkpoint, operation, assertCurrent);
       settled = true;
     } catch (error) {
-      settled = isReplaced(error);
+      settled = isReplaced(error) || await this.discarded(owner);
       if (settled) return;
       reportRuntimeFailure(this.options.onRuntimeFailure, checkpointFailure(error, operation),
         { assignmentId: admission.assignmentId, attempt: admission.attempt });
       throw error;
     } finally {
-      if (owner) await this.tidy(owner.folder, owner.record, settled).catch(() => undefined);
+      await this.tidy(owner.folder, owner.record, settled).catch(() => undefined);
     }
   }
 
-  private async sealOwner(folder: string, record: Record, operation: { stage: string; code: string }, assertCurrent: () => void): Promise<void> {
-    Object.assign(operation, { stage: "workspace_capture", code: "checkpoint_capture_failed" });
-    const checkpoint = await this.checkpoint(folder, record, assertCurrent);
+  private async sendOwner(folder: string, record: Record, checkpoint: RemoteWorkspaceAnyCheckpoint, operation: { stage: string; code: string }, assertCurrent: () => void): Promise<void> {
     if (checkpoint.format === "konteks-workspace-checkpoint-v2") {
       Object.assign(operation, { stage: "workspace_chunk_upload", code: "checkpoint_upload_failed" });
       await this.uploadChunks(folder, record, checkpoint, assertCurrent);
@@ -99,6 +124,11 @@ export class NativeWorkspaceCheckpointStore {
     const result = await this.options.client().workspace(record.assignment, "seal", { ...this.request(record), stop: "processes_stopped", checkpoint });
     assertCurrent();
     if (!isReceipt(result, record.checkpointId, "sealed") || result.checkpointDigest !== checkpoint.checkpointDigest) throw unavailable("seal_receipt_mismatch");
+  }
+
+  /** A later stop in this session removed this copy while it was being sent. */
+  private async discarded(owner: Owner): Promise<boolean> {
+    return !await lstat(join(owner.folder, `${this.recordKey(owner.record)}.owner.json`)).catch(() => null);
   }
 
   /** Local copies this seal has outlived; the original checkouts are never touched. A copy that failed for another reason stays, so a restart can retry it. */
@@ -141,7 +171,7 @@ export class NativeWorkspaceCheckpointStore {
     } catch { return null; }
   }
 
-  private async loadOwner(admission: Admission): Promise<{ folder: string; record: Record } | null> {
+  private async loadOwner(admission: Admission): Promise<Owner | null> {
     if (!await hasRecoveryFolder(this.options.root)) return null;
     const folder = await this.folder();
     const bytes = await readPrivateWorkspaceFile(join(folder, `${this.key(admission)}.owner.json`), 128 * 1024);

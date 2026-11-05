@@ -250,6 +250,44 @@ describe('what a checkpoint carries and how long its local copy stays', () => {
     expect(sealed).toHaveLength(1);
   });
 
+  it('lets a stop settle before the copy is sent, and sends the copy it captured', async () => {
+    const { api, sealed } = chunkClient();
+    const store = new NativeWorkspaceCheckpointStore({ root, client: () => api, chunksSupported: () => true });
+    await store.begin({ assignment, claimId: 'claim', selectionDigest, cwd, baselineCommit: baseline, tool, ...v2 });
+    await writeFile(join(cwd, 'file.txt'), 'edits');
+    api.workspace.mockClear();
+    const send = await store.capture(admission, () => undefined);
+    expect(api.workspace).not.toHaveBeenCalled();
+    await writeFile(join(cwd, 'file.txt'), 'the next attempt');
+    await send(() => undefined);
+    expect(sealed).toHaveLength(1);
+    expect(await recovery()).toEqual([]);
+  });
+
+  it('reports a failed send through its reporter and keeps the copy', async () => {
+    const { api } = chunkClient(() => new Error('upload reply lost'));
+    const onRuntimeFailure = vi.fn<RuntimeFailureReporter>();
+    const store = new NativeWorkspaceCheckpointStore({ root, client: () => api, chunksSupported: () => true, onRuntimeFailure });
+    await store.begin({ assignment, claimId: 'claim', selectionDigest, cwd, baselineCommit: baseline, tool, ...v2 });
+    const send = await store.capture(admission, () => undefined);
+    expect(onRuntimeFailure).not.toHaveBeenCalled();
+    await expect(send(() => undefined)).rejects.toThrow('upload reply lost');
+    expect(onRuntimeFailure).toHaveBeenCalledOnce();
+    expect(onRuntimeFailure.mock.calls[0]![0]).toMatchObject({ stage: 'workspace_chunk_upload', code: 'checkpoint_upload_failed' });
+    expect((await recovery()).some(name => name.endsWith('.owner.json'))).toBe(true);
+  });
+
+  it('stays quiet when a later stop removed the copy while it was being sent', async () => {
+    const { api } = chunkClient(() => new Error('chunk file is gone'));
+    const onRuntimeFailure = vi.fn<RuntimeFailureReporter>();
+    const store = new NativeWorkspaceCheckpointStore({ root, client: () => api, chunksSupported: () => true, onRuntimeFailure });
+    await store.begin({ assignment, claimId: 'claim', selectionDigest, cwd, baselineCommit: baseline, tool, ...v2 });
+    const send = await store.capture(admission, () => undefined);
+    await rm(join(root, '.workspace-recovery'), { recursive: true, force: true });
+    await expect(send(() => undefined)).resolves.toBeUndefined();
+    expect(onRuntimeFailure).not.toHaveBeenCalled();
+  });
+
   it('drops a copy a newer attempt replaced, without calling it a failure', async () => {
     const { api } = chunkClient(() => new NativeInputResponseError(new Response(null, { status: 409 })));
     const onRuntimeFailure = vi.fn<RuntimeFailureReporter>();
