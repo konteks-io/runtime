@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { SessionToCoreMessageSchema } from "@konteks/remote-common";
 import {
   boundPublicToolTitle,
+  boundTitle,
   canonicalizeAcpToolActivity,
   chunkOptions,
   contractIssue,
@@ -277,6 +278,8 @@ describe("a tool whose title is a long command", () => {
     expect(SessionToCoreMessageSchema.safeParse(message(bounded)).success).toBe(true);
     expect(bounded).toMatchObject({ status: "completed", title: expect.stringMatching(/^cat > notes\.md <<'EOF'.*…$/s) });
     expect(bounded.title.length).toBeLessThanOrEqual(600);
+    // Relayed activity keeps its own 600 default now that the card path passes its limit.
+    expect(boundTitle("x".repeat(900))).toHaveLength(600);
     expect(boundPublicToolTitle({ ...update, title: "ls" })).toEqual({ ...update, title: "ls" });
   });
 });

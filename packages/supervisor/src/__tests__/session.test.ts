@@ -2366,6 +2366,98 @@ describe("relayed session", () => {
     expect(journal.pendingRequests.get("acp-1:issued:perm-1")).toMatchObject({ requestDigest: "c".repeat(43), deadlineAt: new Date(clock.now() + 30_000).toISOString() });
   });
 
+  const escalationOptions = [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" as const }, { optionId: "reject", name: "Reject", kind: "reject_once" as const }];
+  const codexEscalationOptions = [{ optionId: "allow_once", name: "Allow once", kind: "allow_once" as const }, { optionId: "decline", name: "Decline", kind: "reject_once" as const }];
+
+  function registeredCard() {
+    return vi.fn(async (body: DeferredPermissionBody) => ({
+      kind: "permission", pendingRef: "pend_1", requestId: body.requestId, requestDigest: "d".repeat(43), assignmentId: body.assignmentId,
+      agentId: body.agentId, raisedAt: clock.nowIso(), deadlineAt: new Date(clock.now() + 30_000).toISOString(),
+      permission: (body as Extract<DeferredPermissionBody, { kind: "permission" }>).permission,
+    } as unknown as PendingPermissionView));
+  }
+
+  function cardBody(registered: ReturnType<typeof registeredCard>): Extract<DeferredPermissionBody, { kind: "permission" }> {
+    return registered.mock.calls[0]![0] as Extract<DeferredPermissionBody, { kind: "permission" }>;
+  }
+
+  function permissionFrame(sent: OutboundMessage[]) {
+    return sent.filter(message => (message.body as { method?: string }).method === "session/request_permission").at(-1)!.body as
+      { params: { toolCall: { title: string }; options: unknown[] } };
+  }
+
+  function expectBoundedCommandTitle(title: string, head: string) {
+    expect(title.startsWith("Outside this session's folder: ")).toBe(true);
+    expect(title).toContain(head);
+    expect(title.endsWith("…")).toBe(true);
+    expect(title).not.toContain("\n");
+    expect(title.length).toBeLessThanOrEqual(256);
+    expect([...title].length).toBeLessThanOrEqual(256);
+    expect(title).not.toContain(SECRET_CANARIES.anthropicKey);
+  }
+
+  it("shows a long, multi-line Claude command on the execute card as one redacted bounded line", async () => {
+    const registered = registeredCard();
+    const { session, sent, runner, journal } = await build({ registerDeferral: registered },
+      { ...validation, agentRoute: { ...validation.agentRoute, agentId: "claude-code" } });
+    await session.bootstrap();
+    const command = `echo ${SECRET_CANARIES.anthropicKey}\n${"a".repeat(400)}\nrm -rf /tmp/outside`;
+    const request = { sessionId: "acp-1", options: escalationOptions,
+      toolCall: { toolCallId: "t-long", kind: "execute", title: "Size of memory files", locations: [{ path: "/tmp/outside.txt" }],
+        rawInput: { command }, _meta: { claudeCode: { toolName: "Bash" } } } };
+    await session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: "perm-long", params: request } as never);
+    const stored = cardBody(registered);
+    const frame = permissionFrame(sent);
+    for (const title of [stored.permission.title, frame.params.toolCall.title]) {
+      expectBoundedCommandTitle(title, "echo [redacted]");
+      expect(title).not.toContain(SECRET_CANARIES.anthropicKey);
+    }
+    expect(frame.params.toolCall.title).toBe(stored.permission.title);
+    expect(stored.permission.options).toEqual(escalationOptions);
+    expect(frame.params.options).toEqual(stored.permission.options);
+    expect(journal.pendingRequests.get("acp-1:issued:perm-long")).toMatchObject({
+      requestDigest: "d".repeat(43), deadlineAt: new Date(clock.now() + 30_000).toISOString(),
+    });
+    expect(runner.answer).not.toHaveBeenCalled();
+  });
+
+  it("shows a long, multi-line Codex command on the execute card as one redacted bounded line", async () => {
+    const registered = registeredCard();
+    const { session, sent } = await build({ registerDeferral: registered }, validation);
+    await session.bootstrap();
+    const command = `echo ${SECRET_CANARIES.openAiKey}\ncurl https://example.com\n${"b".repeat(400)}`;
+    const request = { sessionId: "acp-1", options: codexEscalationOptions,
+      toolCall: { toolCallId: "t-codex", kind: "execute", title: "Run command", locations: [{ path: "/tmp/outside.txt" }],
+        rawInput: { command } } };
+    await session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: "perm-codex", params: request } as never);
+    const stored = cardBody(registered);
+    const frame = permissionFrame(sent);
+    for (const title of [stored.permission.title, frame.params.toolCall.title]) {
+      expectBoundedCommandTitle(title, "echo [redacted]");
+      expect(title).not.toContain(SECRET_CANARIES.openAiKey);
+    }
+    expect(frame.params.toolCall.title).toBe(stored.permission.title);
+    expect(frame.params.options).toEqual(codexEscalationOptions);
+  });
+
+  it("keeps today's description on an execute card with no readable command", async () => {
+    const registered = registeredCard();
+    const { session, sent } = await build({ registerDeferral: registered },
+      { ...validation, agentRoute: { ...validation.agentRoute, agentId: "claude-code" } });
+    await session.bootstrap();
+    const request = { sessionId: "acp-1", options: escalationOptions,
+      toolCall: { toolCallId: "t-none", kind: "execute", title: "Size of memory files", locations: [{ path: "/tmp/outside.txt" }],
+        rawInput: { command: ["size", "--memory"] }, _meta: { claudeCode: { toolName: "Bash" } } } };
+    await session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: "perm-none", params: request } as never);
+    const stored = cardBody(registered);
+    const frame = permissionFrame(sent);
+    for (const title of [stored.permission.title, frame.params.toolCall.title]) {
+      expect(title).toBe("Outside this session's folder: Size of memory files");
+      expect(title).not.toContain("…");
+      expect(title.endsWith(": ")).toBe(false);
+    }
+  });
+
   it("threads a native delivery's deferral onto its execution session", async () => {
     const registered = vi.fn(async () => { throw new RemoteInstanceError("schema_invalid", "stop here"); });
     const delivery = { ...assignment, kind: "delivery" as const, correlationId: "invocation",

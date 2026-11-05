@@ -1,5 +1,6 @@
 import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
-import { plainRecord } from "@konteks/remote-common";
+import { plainRecord, redactText } from "@konteks/remote-common";
+import { boundTitle } from "./activity.js";
 import type { PermissionToolIdentity } from "./permission-tool-identity.js";
 import type { PermissionContext, PolicyDecision } from "./policy-responder.js";
 import { isWithinReadRoots, isWithinWorkspace } from "./workspace-tool-policy.js";
@@ -31,6 +32,9 @@ export function nativePermissionEscalation(
 /** What the person reads on the card, before the agent's own words for the call. */
 const OUTSIDE_FOLDER = "Outside this session's folder";
 const NEEDS_NETWORK = "Needs the network";
+
+/** The permission title's contract limit, counted in code points and UTF-16 units. */
+const TITLE_MAX = 256;
 
 /** A recognizable Codex carrier with a missing kind is malformed, not an
  * ordinary auto-approvable tool. Known MCP calls retain their separate gate. */
@@ -119,5 +123,33 @@ function safeRejectOption(request: RequestPermissionRequest, allowOptionId: stri
 }
 
 function escalationTitle(request: RequestPermissionRequest, prefix: string, fallback: string): string {
-  return `${prefix}: ${request.toolCall.title ?? fallback}`;
+  const head = `${prefix}: `;
+  const command = executeCommand(request);
+  if (command === undefined) return `${head}${request.toolCall.title ?? fallback}`;
+  return `${head}${boundTitle(command, TITLE_MAX - head.length)}`;
+}
+
+/** The exact command an execute call runs, as one redacted line; undefined when it has none. */
+function executeCommand(request: RequestPermissionRequest): string | undefined {
+  if (request.toolCall.kind !== "execute") return undefined;
+  const command = plainRecord(request.toolCall.rawInput)?.command;
+  if (typeof command !== "string" || command.trim().length === 0) return undefined;
+  const line = oneLine(command);
+  return line.length > 0 ? line : undefined;
+}
+
+/** Redact first, then flatten and space out what the card sanitizer drops; the cut runs last. */
+function oneLine(command: string): string {
+  const flattened = redactText(command).replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ");
+  return [...flattened].map(point => droppedByCard(point) ? " " : point).join("").replace(/\s+/g, " ").trim();
+}
+
+/** The code-point ranges `sanitizePermissionRequest`'s `plainText` drops. */
+const CARD_DROPPED_RANGES: ReadonlyArray<readonly [number, number]> = [
+  [0x00, 0x1f], [0x7f, 0x7f], [0x200e, 0x200f], [0x202a, 0x202e], [0x2066, 0x2069],
+];
+
+function droppedByCard(point: string): boolean {
+  const code = point.codePointAt(0) ?? 0;
+  return CARD_DROPPED_RANGES.some(([from, to]) => code >= from && code <= to);
 }
