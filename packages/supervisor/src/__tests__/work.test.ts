@@ -54,8 +54,18 @@ const reports = (sent: OutboundMessage[]): AssignmentReport[] => sent.map((messa
 // its asynchronous bootstrap (including failure handling) before asserting the
 // resulting session or deleting the fixture's journals.
 async function settleBootstrap(work: WorkOrchestrator, id: string): Promise<void> {
-  const internal = work as unknown as { bootstrapping: Map<string, Promise<void>> };
-  await vi.waitFor(() => expect(internal.bootstrapping.has(`${id}:1`)).toBe(false));
+  const internal = work as unknown as { bootstrapping: Map<string, Promise<void>>; dispatching: Map<string, Promise<void>> };
+  const key = `${id}:1`;
+  // The claim reply hands its whole dispatch off-lane. Await whatever owned
+  // work is present now; a dispatch that already settled, or that never
+  // registered because a recovery fence short-circuited it, is already done.
+  // Never require observing the in-flight window.
+  await internal.dispatching.get(key)?.catch(() => undefined);
+  await internal.bootstrapping.get(key)?.catch(() => undefined);
+  // A dispatch may hand its bootstrap off as it settles, and failure handling
+  // may clear the owned entry only after its own IO. Wait on timers rather
+  // than spinning on an already-settled promise.
+  await vi.waitFor(() => expect(internal.dispatching.has(key) || internal.bootstrapping.has(key)).toBe(false));
 }
 
 describe("report sender state machine", () => {
