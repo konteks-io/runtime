@@ -80,6 +80,7 @@ type ClaimRejection =
   | "draining"
   | "lease_invalid"
   | "reconciliation_pending"
+  | "release_in_progress"
   | "no_headroom";
 
 interface OrchestratorDeps {
@@ -161,13 +162,19 @@ function runsToCompletionInDispatch(
 const HELD_PULL_LOG_MS = 5 * 60_000;
 /** A prepared pull older than this no longer holds later pulls back. */
 const STUCK_PULL_MS = 2 * 60_000;
+/**
+ * How long a successor placement waits for a deliberate idle release. The
+ * release itself is never shortened or aborted; a release that outlives this
+ * bound is named and the recovery gate decides instead of waiting forever.
+ */
+export const IDLE_RELEASE_WAIT_MS = 30 * 60_000;
 
 export class WorkOrchestrator {
   readonly reports: ReportSender;
   private readonly sessions = new Map<string, RelayedSession>();
   private readonly channelOwners = new Map<string, RelayedSession>();
-  /** Idle completed channels being released now, so the reaper and a capacity reclaim never release one twice. */
-  private readonly releasingIdle = new Set<string>();
+  /** Deliberate idle releases in flight by channel, so a successor can wait for one and a second reclaim never starts it twice. */
+  private readonly releasingIdle = new Map<string, InFlightIdleRelease>();
   private readonly pendingClaims = new Map<string, RemoteWorkAssignment>();
   private readonly pendingClaimFences = new Map<string, () => void>();
   private readonly admissionSetups = new Map<string, Promise<void>>();
@@ -191,7 +198,7 @@ export class WorkOrchestrator {
   private pullTask: Promise<void> | null = null;
   private pullTaskStartedAt = 0;
   private readonly heldPullLoggedAt = new Map<ClaimRejection, number>();
-  readonly counters: Record<ClaimRejection, number> = { unknown_kind: 0, stale_attempt: 0, workspace_mismatch: 0, instance_mismatch: 0, checkout_owned_elsewhere: 0, role_not_advertised: 0, agent_unavailable: 0, expired: 0, draining: 0, lease_invalid: 0, reconciliation_pending: 0, no_headroom: 0 };
+  readonly counters: Record<ClaimRejection, number> = { unknown_kind: 0, stale_attempt: 0, workspace_mismatch: 0, instance_mismatch: 0, checkout_owned_elsewhere: 0, role_not_advertised: 0, agent_unavailable: 0, expired: 0, draining: 0, lease_invalid: 0, reconciliation_pending: 0, release_in_progress: 0, no_headroom: 0 };
 
   constructor(private readonly deps: OrchestratorDeps) {
     this.logger = deps.logger ?? createLogger({ name: "work" });
@@ -364,7 +371,22 @@ export class WorkOrchestrator {
     [assignment => assignment.source.kind === "harness_task_checkout" && assignment.source.ownerInstanceId !== this.deps.instanceId(), "checkout_owned_elsewhere"],
     [assignment => !this.deps.advertisedRoles().includes(assignment.agentRoute.requiredRole), "role_not_advertised"],
     [assignment => !placedAgentReady(this.deps.agents(), assignment.agentRoute.agentId, assignment.agentRoute.requiredRole, this.roleCapabilityInputs()), "agent_unavailable"],
+    // This exact session channel is being deliberately released: do not claim
+    // the offer, so Core re-offers it after the release without spending an attempt.
+    [assignment => this.deliberateReleaseInFlight(assignment), "release_in_progress"],
   ];
+
+  /** The deliberate idle release holding this turn's exact logical session channel, if any. */
+  private deliberateReleaseInFlight(assignment: RemoteWorkAssignment): boolean {
+    const channelId = this.sessionChannelId(assignment);
+    return channelId !== undefined && this.releasingIdle.has(channelId);
+  }
+
+  /** The logical session channel a turn continues, when it names one. */
+  private sessionChannelId(assignment: RemoteWorkAssignment): string | undefined {
+    const sessionId = logicalSessionId(assignment.source);
+    return sessionId === undefined ? undefined : `session:${sessionId}`;
+  }
 
   /** A later attempt exists, or this attempt is already live here. */
   private staleAttempt(assignment: RemoteWorkAssignment): boolean {
@@ -886,6 +908,7 @@ export class WorkOrchestrator {
     dispatch.assertAdmissionCurrent();
     dispatch.assertExecutionOwned();
     await this.settlePredecessorEvidence(dispatch);
+    await this.awaitReleasingOwner(this.sessionChannelId(assignment), dispatch.assertExecutionOwned);
     this.assertNoRecoveringPredecessor(assignment);
     const key = `${assignment.id}:${assignment.attempt}`;
     if (this.sessions.has(key)) throw new Error("the assignment already has a local session owner");
@@ -1263,6 +1286,7 @@ export class WorkOrchestrator {
     if (sessionId === undefined) return undefined;
     const channelId = `session:${sessionId}`;
     await this.awaitClosingOwner(channelId, assertCurrent);
+    await this.awaitReleasingOwner(channelId, assertCurrent);
     this.assertNoRecoveringPredecessor(assignment);
     const predecessor = this.channelOwners.get(channelId);
     if (!predecessor) return this.takeOverWithoutLiveOwner(assignment, admission, sessionId, assertCurrent);
@@ -1279,6 +1303,26 @@ export class WorkOrchestrator {
     const retiring = closingAdmission && this.executionRetirements.get(closingAdmission.executionGeneration);
     if (!retiring) return;
     await retiring.catch(() => undefined);
+    assertCurrent();
+  }
+
+  /**
+   * The channel may be held by a deliberate idle release (the reaper or a
+   * capacity reclaim) while its workspace checkpoint uploads. Wait for that
+   * exact release, bounded by its own deadline, so this placement runs once it
+   * finishes instead of being refused as an unqualified recovery. A release
+   * that outlives the deadline is named as its own state, then the ordinary
+   * recovery gate decides. The release itself is never shortened or aborted.
+   */
+  private async awaitReleasingOwner(channelId: string | undefined, assertCurrent: () => void): Promise<void> {
+    const release = channelId === undefined ? undefined : this.releasingIdle.get(channelId);
+    if (!release) return;
+    if (!await settlesWithin(release.completion, release.deadlineAt - Date.now())) {
+      this.logger.warn({ event: "execution.deliberate_release_stalled", channelId, stage: release.stage,
+        diagnostic: "deliberate_release_stalled", deadlineAt: new Date(release.deadlineAt).toISOString() },
+      "a deliberate idle release outlived the placement's wait; the recovery gate decides");
+      return;
+    }
     assertCurrent();
   }
 
@@ -1915,9 +1959,13 @@ export class WorkOrchestrator {
 
   private async releaseIdleSession(channelId: string, owner: RelayedSession, idle: IdleCompletedSession, now: number, stage: "idle_reaper" | "capacity_reclaim"): Promise<boolean> {
     if (this.releasingIdle.has(channelId)) return false;
-    this.releasingIdle.add(channelId);
-    try { return await this.releaseIdleSessionOnce(channelId, owner, idle, now, stage); }
-    finally { this.releasingIdle.delete(channelId); }
+    // Registered before the first await inside the release, so a placement that
+    // arrives during the checkpoint upload can await this exact deliberate release.
+    const completion = this.releaseIdleSessionOnce(channelId, owner, idle, now, stage);
+    const release: InFlightIdleRelease = { completion, deadlineAt: Date.now() + IDLE_RELEASE_WAIT_MS, stage };
+    this.releasingIdle.set(channelId, release);
+    try { return await completion; }
+    finally { if (this.releasingIdle.get(channelId) === release) this.releasingIdle.delete(channelId); }
   }
 
   private async releaseIdleSessionOnce(channelId: string, owner: RelayedSession, idle: IdleCompletedSession, now: number, stage: "idle_reaper" | "capacity_reclaim"): Promise<boolean> {
@@ -3082,6 +3130,15 @@ interface IdleCompletedSession {
   readonly settledAt: number;
 }
 
+/** A deliberate idle release in flight: awaitable, and bounded by the deadline it was registered with. */
+interface InFlightIdleRelease {
+  readonly completion: Promise<boolean>;
+  /** Host clock instant this wait ends if the release has not settled. */
+  readonly deadlineAt: number;
+  /** Which deliberate path started it: the idle reaper or a capacity reclaim. */
+  readonly stage: "idle_reaper" | "capacity_reclaim";
+}
+
 /** A failure's code, diagnostic and bounded reason for a log line; an unexpected error shows only its identity. */
 function recoveryFailureFields(error: unknown): Record<string, unknown> {
   if (!(error instanceof RemoteInstanceError)) return { code: "unexpected_error", ...dispatchErrorIdentity(error) };
@@ -3102,6 +3159,15 @@ interface LostAuthoritySettlement {
   running: Promise<void> | null;
   /** Core's durable stop directive arrived meanwhile: the claim ends cancelled. */
   cancelReason?: CancelDirective["reason"];
+}
+
+/** True when `task` settles before `ms` elapses; the timer never outlives the wait. */
+function settlesWithin(task: Promise<unknown>, ms: number): Promise<boolean> {
+  return new Promise(resolve => {
+    const timer = setTimeout(() => resolve(false), Math.max(0, ms));
+    timer.unref?.();
+    void task.then(() => true, () => false).then(settled => { clearTimeout(timer); resolve(settled); });
+  });
 }
 
 /** Backoff between settlement attempts of a fenced execution: 5 s doubling to a 60 s ceiling, never giving up. */

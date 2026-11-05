@@ -4,9 +4,9 @@ import { join } from "node:path";
 import { createServer } from "node:net";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { FixedClock, RemoteInstanceError, type RemoteWorkAssignment } from "@konteks/remote-common";
-import { SupervisorJournal } from "../state/journal.js";
+import { SupervisorJournal, type JournalEntry } from "../state/journal.js";
 import { DurableOutbox } from "../state/outbox.js";
-import { WorkOrchestrator } from "../work/orchestrator.js";
+import { IDLE_RELEASE_WAIT_MS, WorkOrchestrator } from "../work/orchestrator.js";
 import type { LocalAdmission } from "../state/local-admission.js";
 import { PermissionBroker } from "../session/permissions.js";
 import { EvaluatorPolicyResponder } from "../session/policy-responder.js";
@@ -46,7 +46,16 @@ const delivery = (identity: LocalAdmission, invocationId: string, includePredece
     latestResumeAt: "2026-09-06T01:00:00.000Z", permissionResponderDeadlineSeconds: 60, humanDeferralAllowed: true },
 });
 
-async function fixture(options: { terminal?: boolean; closed?: boolean; priorRequestedRef?: string } = {}) {
+const readyAgent = { agentId: "claude-code", displayName: "Claude Code", connectionState: "ready" as const,
+  authMode: "agent_local_subscription" as const, accountScope: "personal" as const, readiness: "ready" as const,
+  tokenUsageObservable: true, acpCapabilities: { sessionResume: true, forkSession: false, structuredOutputShim: true, toolControl: "approve" as const } };
+
+async function fixture(options: {
+  terminal?: boolean;
+  closed?: boolean;
+  priorRequestedRef?: string;
+  preserveStoppedWorkspace?: (admission: LocalAdmission, assertCurrent: () => void) => Promise<void>;
+} = {}) {
   const journal = new SupervisorJournal(dir); await journal.load();
   const outbox = new DurableOutbox(dir); await outbox.load();
   for (const [identity, assignment] of [[prior, work(prior, options.priorRequestedRef)], [next, work(next, "ref")]] as const) {
@@ -62,16 +71,32 @@ async function fixture(options: { terminal?: boolean; closed?: boolean; priorReq
     agentId: "claude-code", state: "running", recoveryEpoch: 0, reports: { nextSequence: 2, durableWatermark: 0, ...(options.terminal === false ? {} : { terminalSequence: 1 }) },
     evidenceUpload: "structured_only", expiresAt: "2026-09-06T01:00:00.000Z", latestResumeAt: "2026-09-06T01:00:00.000Z", updatedAt: clock.nowIso() });
   const runner = { stopForRecovery: vi.fn(async () => undefined), releaseSealedSession: vi.fn(async () => undefined), stopRetainedExecution: vi.fn(async () => undefined) };
+  const warn = vi.fn();
+  const logger = { warn, info: vi.fn(), debug: vi.fn(), error: vi.fn(), child: () => logger } as never;
   const orchestrator = new WorkOrchestrator({ journal, outbox, transport: {}, clock, runners: new Map([["claude-code", runner]]),
     sessionDeps: () => ({}), onUsage: async () => undefined, instanceId: () => "instance", workspaceId: () => "workspace", runnerIncarnation: () => "process",
-    assertOwned: () => undefined, recoveryAuthority: () => "accepted", reportDeliveryAllowed: () => false } as never);
+    assertOwned: () => undefined, recoveryAuthority: () => "accepted", reportDeliveryAllowed: () => false,
+    lease: { canPullNewWork: () => true }, reconciliationComplete: () => true, draining: () => false, headroom: () => 2, maxPullItems: 4,
+    agents: () => [readyAgent], roleBindings: () => [{ role: "assistant", agentPreference: ["claude-code"] }],
+    advertisedRoles: () => ["assistant"], acceptedKinds: () => ["assistant_execution", "delivery"], instanceEvidencePolicy: () => "structured_only",
+    logger, ...(options.preserveStoppedWorkspace ? { preserveStoppedWorkspace: options.preserveStoppedWorkspace } : {}) } as never);
   const internal = orchestrator as unknown as { channelOwners: Map<string, unknown>; sessions: Map<string, unknown>;
     takeOverCompletedChannel(assignment: RemoteWorkAssignment, admission: LocalAdmission, assertCurrent: () => void): Promise<{ reference: string; mode: "live" | "restore" } | undefined> };
   const predecessor = { assignment: work(prior), acpSessionRef: "ref", isClosed: options.closed ?? true,
     releaseCompletedChannel: vi.fn(() => { internal.channelOwners.delete("session:session"); }) };
   internal.channelOwners.set("session:session", predecessor);
   internal.sessions.set("prior:1", predecessor);
-  return { journal, runner, internal, predecessor };
+  return { journal, runner, orchestrator, internal, predecessor, warn };
+}
+
+/** A checkpoint upload the test holds open, so the reaper is inside the deliberate release window. */
+function heldCheckpoint() {
+  let markStarted!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>(resolve => { markStarted = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const preserve = vi.fn(async () => { markStarted(); await held; });
+  return { started, release, preserve };
 }
 
 it("stops a conversation's idle completed session before a fresh turn takes its channel", async () => {
@@ -438,6 +463,92 @@ it("releases a completed session idle past the reaper window and keeps a recent 
   expect(f.runner.releaseSealedSession).toHaveBeenCalledWith("ref");
   expect(f.journal.execution.execution(prior)).toMatchObject({ phase: "acp_settled" });
   expect(f.internal.channelOwners.has("session:session")).toBe(false);
+});
+
+// TKT-1: while the reaper holds a settled turn for its checkpoint upload, a
+// successor placement used to see process_stopped and be refused as
+// predecessor_recovery_unqualified, spending an attempt. It must wait for that
+// deliberate release and then run, with no terminal report.
+it("waits for a deliberate idle release before dispatching the successor", async () => {
+  const checkpoint = heldCheckpoint();
+  const f = await fixture({ preserveStoppedWorkspace: checkpoint.preserve });
+  await f.journal.assignments.put({ assignmentId: "next", attempt: 1, claimId: "next-claim", kind: "assistant_execution",
+    placementId: "placement-next", workspaceId: "workspace", agentId: "claude-code", state: "claimed", recoveryEpoch: 0,
+    reports: { nextSequence: 1, durableWatermark: 0 }, evidenceUpload: "structured_only",
+    expiresAt: "2026-09-06T01:00:00.000Z", latestResumeAt: "2026-09-06T01:00:00.000Z", updatedAt: clock.nowIso() });
+  const internal = f.internal as unknown as {
+    reapIdleCompletedSessions(idleMs: number): Promise<number>;
+    dispatch(assignment: RemoteWorkAssignment, entry: JournalEntry, assertAuthority: () => void): Promise<void>;
+    bootstrapRelayedSession(session: RelayedSession): Promise<void>;
+    handleDispatchFailure(...args: unknown[]): Promise<void>;
+  };
+  const submit = vi.spyOn(f.orchestrator.reports, "submit");
+  const failure = vi.spyOn(internal, "handleDispatchFailure");
+  const bootstrap = vi.spyOn(internal, "bootstrapRelayedSession").mockResolvedValue(undefined);
+  const reaping = internal.reapIdleCompletedSessions(1_000);
+  await checkpoint.started;
+  // The reaper has proven the process gone and holds the channel for the checkpoint upload.
+  expect(f.journal.execution.execution(prior)).toMatchObject({ phase: "process_stopped" });
+
+  let settled = false;
+  const placement = internal.dispatch(work(next), f.journal.assignments.get("next:1")!, current)
+    .then(() => { settled = true; return "resolved" as const; }, error => { settled = true; return { error }; });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  expect(settled).toBe(false);
+  checkpoint.release();
+
+  await expect(placement).resolves.toBe("resolved");
+  await expect(reaping).resolves.toBe(1);
+  expect(checkpoint.preserve).toHaveBeenCalledOnce();
+  expect(failure).not.toHaveBeenCalled();
+  expect(bootstrap).toHaveBeenCalledOnce();
+  expect(submit).not.toHaveBeenCalled();
+  const successor = f.journal.assignments.get("next:1");
+  expect(successor?.reports.terminalSequence).toBeUndefined();
+  expect(successor?.terminalResultHash).toBeUndefined();
+  expect(f.journal.execution.execution(prior)).toMatchObject({ phase: "acp_settled" });
+  expect(f.internal.channelOwners.has("session:session")).toBe(false);
+});
+
+it("does not claim an offer while its session's deliberate release is in flight", async () => {
+  const checkpoint = heldCheckpoint();
+  const f = await fixture({ preserveStoppedWorkspace: checkpoint.preserve });
+  const internal = f.internal as unknown as {
+    reapIdleCompletedSessions(idleMs: number): Promise<number>;
+    admitOffered(raw: unknown): Promise<void>;
+  };
+  const reaping = internal.reapIdleCompletedSessions(1_000);
+  await checkpoint.started;
+  const offered = { ...next, assignmentId: "offered", claimId: "offered-claim", executionGeneration: "offered-generation" };
+  await internal.admitOffered(work(offered)).catch(() => undefined);
+  expect(f.orchestrator.counters.release_in_progress).toBe(1);
+  expect(f.journal.execution.start("offered", 1)).toBeUndefined();
+  checkpoint.release();
+  await expect(reaping).resolves.toBe(1);
+});
+
+it("names a deliberate release that outlives its deadline and leaves the recovery gate in charge", async () => {
+  const checkpoint = heldCheckpoint();
+  const f = await fixture({ preserveStoppedWorkspace: checkpoint.preserve });
+  const internal = f.internal as unknown as { reapIdleCompletedSessions(idleMs: number): Promise<number> };
+  vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+  let reaping: Promise<number> | undefined;
+  try {
+    reaping = internal.reapIdleCompletedSessions(1_000);
+    await checkpoint.started;
+    const outcome = f.internal.takeOverCompletedChannel(work(next), next, current)
+      .then(() => null, (error: unknown) => error);
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(IDLE_RELEASE_WAIT_MS);
+    expect(await outcome).toMatchObject({ code: "recovery_required", diagnostic: "predecessor_recovery_unqualified" });
+    const stalled = f.warn.mock.calls.filter(([fields]) => fields?.event === "execution.deliberate_release_stalled");
+    expect(stalled).toHaveLength(1);
+    expect(stalled[0]![0]).toMatchObject({ diagnostic: "deliberate_release_stalled", channelId: "session:session" });
+  } finally {
+    vi.useRealTimers();
+    checkpoint.release();
+    await reaping;
+  }
 });
 
 // D62: parallel deliveries' reviews were refused while finished sessions
