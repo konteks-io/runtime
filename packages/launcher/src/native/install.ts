@@ -153,6 +153,7 @@ async function installNew(install: InstallContext, agents: string[]): Promise<Na
   install.lock.assertOwned();
   await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify(record));
   await loadNativeInstallation(root, { roots, platform });
+  await publishInstalledEnrollment(root, record, release.manifest);
   setupLine(options.output, "installComplete");
   return record;
 }
@@ -549,6 +550,26 @@ const NativeEnrollmentRecordSchema = z.object({
 }).strict();
 type NativeEnrollmentRecord = z.infer<typeof NativeEnrollmentRecordSchema>;
 
+/** Keep the verified installed release ready for a new, independently authenticated enrollment. */
+async function publishInstalledEnrollment(root: string, record: NativeRuntimeRecord, manifest: unknown): Promise<void> {
+  const { coreUrl, relayUrl, agents, releaseId, bundleVersion, manifestDigest, controlPort } = record;
+  const prepared = NativeEnrollmentRecordSchema.parse({ schemaVersion: 1, coreUrl, relayUrl, agents, releaseId, bundleVersion, manifestDigest, controlPort });
+  await writeSecretFile(join(root, "installer", ENROLLMENT_MANIFEST), JSON.stringify(manifest));
+  await writeSecretFile(join(root, "native-enrollment.json"), JSON.stringify(prepared));
+}
+
+/** Backfill older App installations before their confirmed-retired identity is moved aside. */
+export async function prepareNativeReenrollment(root: string, instanceId: string, deps: NativeInstallOptions["deps"] = {}): Promise<void> {
+  root = installRoot(root);
+  await withRuntimeLocks(root, async ({ installer, supervisor }) => {
+    const current = await loadNativeInstallation(root, releaseContext(deps));
+    if (current.record.instanceId !== instanceId) throw invalid();
+    installer.assertOwned();
+    supervisor.assertOwned();
+    await publishInstalledEnrollment(root, current.record, current.release.manifest);
+  });
+}
+
 export async function readNativeEnrollment(root: string): Promise<NativeEnrollmentRecord> {
   const path = join(resolve(root), "native-enrollment.json");
   const info = await lstat(path);
@@ -662,6 +683,7 @@ export async function addNativeAgent(options: NativeAgentAddOptions): Promise<Na
     runtimeLock = acquireNativeRootLock(join(root, "supervisor"));
     const current = await loadNativeInstallation(root, load);
     if (current.record.agents.includes(options.agentId)) {
+      if (options.agentId === "claude-code") return await refreshClaudeProfile(root, current.record, lock, load);
       // A fetched agent whose copy no longer verifies (or an update's new
       // copy just fetched) is recorded again from the verified folder.
       if (await fetchedAgentStale(root, current.record, options.agentId)) return await addHostAgent(root, current.record, options, load, lock);
@@ -674,6 +696,15 @@ export async function addNativeAgent(options: NativeAgentAddOptions): Promise<Na
     runtimeLock?.release();
     lock.release();
   }
+}
+
+/** Refresh a rediscovered personal executable under both installation locks, retaining the release and identity. */
+async function refreshClaudeProfile(root: string, previous: NativeRuntimeRecord, lock: RootLock, load: ReturnType<typeof releaseContext>): Promise<NativeRuntimeRecord> {
+  const claudeExecutable = await resolveNativeClaudeExecutable(undefined, undefined, undefined, previous.claudeExecutable);
+  if (claudeExecutable === previous.claudeExecutable) return previous;
+  const successor = NativeRuntimeRecordSchema.parse({ ...previous, claudeExecutable });
+  await commitRecord(root, lock, { previous, successor }, () => loadNativeInstallation(root, load));
+  return successor;
 }
 
 /**

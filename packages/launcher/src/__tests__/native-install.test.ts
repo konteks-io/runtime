@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { bundleManifestSigningBytes, computeBundleManifestDigest, writeSecretFile } from "@konteks/remote-common";
 import { buildReleaseFixture } from "@konteks/remote-release";
 import { acquireNativeRootLock, hostAgentInstallAdapter, loadNativeInstallation, OPENCODE_MIN_BINARY_BYTES, SupervisorStore, verifyInstalledNativeConnector } from "@konteks/remote-supervisor";
-import { addNativeAgent, installNative, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, removeNativeAgent, restoreNativeRecord } from "../native/install.js";
+import { addNativeAgent, installNative, prepareNativeReenrollment, readNativeEnrollment, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, removeNativeAgent, restoreNativeRecord } from "../native/install.js";
 import { startNativeConnector } from "../native/commands.js";
 import { createOutput } from "../output.js";
 import { terminalFetchConsent } from "../native/consent.js";
@@ -78,6 +78,52 @@ async function personOpenCode(root: string, version = "2.0.18", name = "@opencod
 }
 
 describe("native install composition", () => {
+  it("records the verified installed release for later recovery of an App-activated runtime", async () => {
+    const f = await fixture();
+    const record = await installNative(f.options as never);
+    expect(await readNativeEnrollment(f.root)).toEqual({
+      schemaVersion: 1, coreUrl: record.coreUrl, relayUrl: record.relayUrl,
+      agents: record.agents, releaseId: record.releaseId, bundleVersion: record.bundleVersion,
+      manifestDigest: record.manifestDigest, controlPort: record.controlPort,
+    });
+    expect(JSON.parse(await readFile(join(f.root, "installer", "enrollment-manifest.json"), "utf8"))).toEqual(f.manifest);
+  });
+  it("backfills a legacy installation only while stopped, retaining identity, credentials and release", async () => {
+    const f = await fixture();
+    const record = await installNative(f.options as never);
+    await rm(join(f.root, "native-enrollment.json"));
+    const identity = await readFile(join(f.root, "supervisor", "identity.json"), "utf8");
+    const credential = join(f.root, "credentials", "codex", "retained");
+    await writeSecretFile(credential, "retained-agent-state");
+    const owner = acquireNativeRootLock(join(f.root, "supervisor"));
+    try { await expect(prepareNativeReenrollment(f.root, record.instanceId, f.options.deps)).rejects.toThrow(); }
+    finally { owner.release(); }
+    await expect(readNativeEnrollment(f.root)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(prepareNativeReenrollment(f.root, "another-instance", f.options.deps)).rejects.toMatchObject({ code: "install_state_corrupt" });
+    await prepareNativeReenrollment(f.root, record.instanceId, f.options.deps);
+    expect(await readNativeEnrollment(f.root)).toMatchObject({ releaseId: record.releaseId, agents: record.agents, manifestDigest: record.manifestDigest });
+    expect(await readNativeRecord(f.root)).toEqual(record);
+    expect(await readFile(join(f.root, "supervisor", "identity.json"), "utf8")).toBe(identity);
+    expect(await readFile(credential, "utf8")).toBe("retained-agent-state");
+  });
+  it("refreshes an already listed Claude pin without changing release, identity or credentials", async () => {
+    const f = await fixture();
+    const executable = join(f.root, "claude-current");
+    await writeFile(executable, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    vi.stubEnv("CLAUDE_CODE_EXECUTABLE", executable);
+    const installed = await installNative({ ...f.options, agents: ["claude-code"] } as never);
+    const stale = { ...installed, claudeExecutable: join(f.root, "claude-removed") };
+    await writeSecretFile(join(f.root, "native-runtime.json"), JSON.stringify(stale));
+    const identity = await readFile(join(f.root, "supervisor", "identity.json"), "utf8");
+    const credential = join(f.root, "credentials", "claude-code", "keep");
+    await writeSecretFile(credential, "retained-private-state");
+    const repaired = await addNativeAgent({ root: f.root, agentId: "claude-code", output: f.options.output, deps: { roots: f.trust, platform: f.platform } });
+    expect(repaired).toEqual(installed);
+    expect(await readNativeRecord(f.root)).toEqual(installed);
+    expect(await readFile(join(f.root, "supervisor", "identity.json"), "utf8")).toBe(identity);
+    expect(await readFile(credential, "utf8")).toBe("retained-private-state");
+  });
+
   it("presents an Indonesian signed install while keeping its native record language-independent", async () => {
     const f = await fixture();
     vi.stubEnv("KONTEKS_SETUP_LOCALE", "id");

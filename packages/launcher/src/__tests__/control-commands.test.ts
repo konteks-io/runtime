@@ -30,6 +30,7 @@ const PREVIEWS = {
 /** The running supervisor's answer to one control request; a login streams its events through `emit`. */
 function fakeReply(request: ControlRequest, emit: (event: unknown) => void, loginFailure: boolean | undefined): unknown {
   if (request.op === "status") return supervisorStatus;
+  if ((request.op as string) === "identity.status") return { activationId: "activation-original" };
   if (request.op === "preview.status") return PREVIEWS;
   if (request.op !== "auth.login") return {};
   emit({ kind: "started", loginId: "l1", agentId: request.agentId });
@@ -81,6 +82,23 @@ function fake(options: { json?: boolean; confirm?: boolean; loginFailure?: boole
 }
 
 describe("native control commands", () => {
+  it("shows the activation identity in human and JSON status without requiring it from older connectors", async () => {
+    const human = fake();
+    await status(human.context);
+    expect(human.text()).toContain("activation-original");
+    const json = fake({ json: true });
+    await status(json.context);
+    expect(JSON.parse(json.text())).toHaveProperty("activationId", "activation-original");
+    const old = fake({ json: true });
+    const call = old.context.control.call;
+    old.context.control.call = (async (request, schema, options) => {
+      if ((request.op as string) === "identity.status") throw new Error("unsupported operation");
+      return call(request, schema, options);
+    }) as typeof call;
+    await status(old.context);
+    expect(JSON.parse(old.text())).not.toHaveProperty("activationId");
+  });
+
   it("shows Claude sign-in guidance in the selected Indonesian locale", async () => {
     const f = fake();
     f.context.output = { ...f.context.output, setupLocale: "id" };

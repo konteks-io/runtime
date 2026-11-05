@@ -14,6 +14,8 @@ export interface NativeUpdateCoordinatorOptions {
   /** Embedded in the verified executable; a manifest that fails them is not an update. */
   trustedRoots: readonly EmbeddedReleaseRoot[];
   fetchManifest: () => Promise<unknown>;
+  /** Read a specific published release; it is independently verified against the accepted digest. */
+  fetchManifestForTarget?: (target: NativeUpdateTarget) => Promise<unknown>;
   /** Starts the launcher transaction out of process; it drains, stops and restarts this service itself. */
   launch: (target: NativeUpdateTarget & { reason: NativeUpdateReason; assertCurrent?: () => void }) => Promise<{ pid: number | null; launchId?: string; onExit?: (listener: NativeUpdaterExitListener) => void }>;
   readLedger: () => Promise<NativeUpdateLedger>;
@@ -252,6 +254,10 @@ export class NativeUpdateCoordinator {
     this.awaitingAcceptance = null;
     if (this.stopped) return this.refuse(target ? "busy" : "supervisor is stopping");
     await this.check();
+    await this.selectAcceptedIntermediate().catch(() => {
+      this.available = null;
+      this.channelError = this.lastError = "accepted release could not be independently verified";
+    });
     const available = this.available;
     if (!available) return this.refuse(this.unavailableReason(target));
     if (target && !sameUpdateTarget(target, available)) return this.refuse("stale_target");
@@ -259,6 +265,18 @@ export class NativeUpdateCoordinator {
     if (refusal) return this.refuse(refusal);
     assertCurrent?.();
     return this.launch(reason, available, assertCurrent);
+  }
+
+  private async selectAcceptedIntermediate(): Promise<void> {
+    const fetchTarget = this.options.fetchManifestForTarget;
+    if (!this.available || !fetchTarget || !this.options.acceptedRelease) return;
+    const accepted = await this.options.acceptedRelease().catch(() => null);
+    if (!acceptedIntermediate(accepted, this.options.currentBundleVersion, this.available.bundleVersion)) return;
+    const release = verifyNativeRelease(await fetchTarget(accepted), this.options.trustedRoots, this.now());
+    if (!sameUpdateTarget(accepted, { bundleVersion: release.manifest.bundleVersion, manifestDigest: release.manifest.digest })) {
+      throw new RemoteInstanceError("bundle_untrusted", "The accepted release differs from its independently verified manifest.");
+    }
+    this.available = { ...accepted };
   }
 
   /** Also marks an unattended check whose channel read failed for an early re-check. */
@@ -296,7 +314,7 @@ export class NativeUpdateCoordinator {
     if (frozen) return frozenAcceptedReleaseRefusal(accepted, available);
     if (accepted === undefined) return this.unansweredAcceptedRelease(reason, available);
     if (accepted === null) return "this Konteks does not say which release it accepts; update by hand with `konteks-remote update`";
-    if (accepted.bundleVersion === available.bundleVersion) return null;
+    if (accepted.bundleVersion === available.bundleVersion && (accepted.manifestDigest === undefined || accepted.manifestDigest === available.manifestDigest)) return null;
     this.awaitingAcceptance = { reason: "accepted_mismatch", accepted: accepted.bundleVersion, available: available.bundleVersion };
     return `Konteks accepts ${accepted.bundleVersion}, not ${available.bundleVersion} yet; staying on this one until it does`;
   }
@@ -372,6 +390,11 @@ export class NativeUpdateCoordinator {
     if (last && last.manifestDigest === inFlight.manifestDigest && last.outcome !== "in_progress" && Date.parse(last.startedAt) >= Date.parse(inFlight.startedAt) - 60_000) return true;
     return this.now() - Date.parse(inFlight.startedAt) > (this.options.staleAttemptMs ?? DEFAULT_STALE_ATTEMPT_MS);
   }
+}
+
+function acceptedIntermediate(accepted: { bundleVersion: string; manifestDigest?: string } | null, current: string, latest: string): accepted is NativeUpdateTarget {
+  if (!accepted?.manifestDigest) return false;
+  return compareSemver(accepted.bundleVersion, current) > 0 && compareSemver(accepted.bundleVersion, latest) < 0;
 }
 
 function sameUpdateTarget(a: { bundleVersion: string; manifestDigest?: string }, b: NativeUpdateTarget): boolean {

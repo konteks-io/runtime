@@ -23,7 +23,7 @@ function manifests() {
     return { ...unsigned, signature: { algorithm: "Ed25519", keyId: keys.keyId, value: sign(null, bundleManifestSigningBytes(unsigned as never), keys.privateKey).toString("base64url") } };
   };
   const trust = [{ ...keys.root, coreControlKeys: [{ keyId: keys.keyId, publicKeyJwk: keys.root.publicKeyJwk }] }];
-  return { trust, same: signed("1.0.0"), newer: signed("1.1.0") };
+  return { trust, same: signed("1.0.0"), newer: signed("1.1.0"), future: signed("1.2.0") };
 }
 
 function coordinator(input: { manifest?: "same" | "newer"; ledger?: NativeUpdateLedger; canApply?: boolean; trust?: unknown[]; now?: () => number; acceptedRelease?: () => Promise<{ bundleVersion: string; manifestDigest?: string } | null>; logger?: ReturnType<typeof createLogger> }) {
@@ -43,6 +43,44 @@ function coordinator(input: { manifest?: "same" | "newer"; ledger?: NativeUpdate
 const attempt = (over: Partial<NativeUpdateAttempt>): NativeUpdateAttempt => ({ id: `a-${Math.random()}`, bundleVersion: "1.1.0", manifestDigest: "d", releaseId: "release-x", reason: "unattended", startedAt: "2026-09-15T11:00:00Z", finishedAt: "2026-09-15T11:05:00Z", outcome: "rolled_back", detail: null, ...over });
 
 describe("native update coordinator", () => {
+  it("refuses an unattended update when Core accepts another digest of the same version", async () => {
+    const f = coordinator({ acceptedRelease: async () => ({ bundleVersion: "1.1.0", manifestDigest: "another-manifest" }) });
+    expect(await f.c.apply("periodic")).toMatchObject({ started: false });
+    expect(f.launch).not.toHaveBeenCalled();
+  });
+
+  it("installs an independently verified accepted intermediate release when publication has moved ahead", async () => {
+    const m = manifests();
+    const accepted = { bundleVersion: m.newer.bundleVersion, manifestDigest: m.newer.digest };
+    const launch = vi.fn(async () => ({ pid: 42 }));
+    const fetchManifestForTarget = vi.fn(async () => m.newer);
+    const c = new NativeUpdateCoordinator({
+      currentBundleVersion: "1.0.0", trustedRoots: m.trust, fetchManifest: async () => m.future,
+      fetchManifestForTarget, launch, readLedger: async () => ({ schemaVersion: 1, attempts: [] }),
+      canApply: () => ({ ok: true }), logger: createLogger({ name: "test" }), acceptedRelease: async () => accepted,
+    } as never);
+    expect(await c.apply("periodic")).toMatchObject({ started: true });
+    expect(fetchManifestForTarget).toHaveBeenCalledWith(accepted);
+    expect(launch).toHaveBeenCalledWith(expect.objectContaining(accepted));
+  });
+
+  it("does not launch a substituted accepted manifest or a changed Core acceptance", async () => {
+    for (const changed of [false, true]) {
+      const m = manifests();
+      const accepted = { bundleVersion: m.newer.bundleVersion, manifestDigest: m.newer.digest };
+      const launch = vi.fn(async () => ({ pid: 42 }));
+      let reads = 0;
+      const c = new NativeUpdateCoordinator({
+        currentBundleVersion: "1.0.0", trustedRoots: m.trust, fetchManifest: async () => m.future,
+        fetchManifestForTarget: async () => changed ? m.newer : m.future, launch,
+        readLedger: async () => ({ schemaVersion: 1, attempts: [] }), canApply: () => ({ ok: true }),
+        logger: createLogger({ name: "test" }), acceptedRelease: async () => ++reads === 1 ? accepted : { bundleVersion: "1.0.0" },
+      } as never);
+      expect(await c.apply("periodic")).toMatchObject({ started: false });
+      expect(launch).not.toHaveBeenCalled();
+    }
+  });
+
   it("refuses a site update when the verified channel no longer names its frozen target", async () => {
     const f = coordinator({ acceptedRelease: async () => ({ bundleVersion: "1.1.0", manifestDigest: "another-manifest" }) });
     expect(await f.c.apply("operator", { bundleVersion: "1.1.0", manifestDigest: "another-manifest" })).toMatchObject({ started: false, reason: "stale_target" });

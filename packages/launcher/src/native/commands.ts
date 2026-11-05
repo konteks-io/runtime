@@ -5,7 +5,7 @@ import { mkdir, open, readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { z } from "zod";
 import { EMBEDDED_RELEASE_ROOTS, findAgentBridge, nativeServiceExecutable, verifyNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
-import { createNativeService, hostAgentInstallAdapter, loadNativeInstallation, ownedByAnotherConnector, readNativeUpdateLedger, verifyInstalledNativeConnector, NATIVE_SHUTDOWN_RECEIPT_FILE, type HostAgentInstallAdapter, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
+import { createNativeService, hostAgentInstallAdapter, loadNativeInstallation, ownedByAnotherConnector, readNativeUpdateLedger, resolveNativeClaudeExecutable, verifyInstalledNativeConnector, NATIVE_SHUTDOWN_RECEIPT_FILE, type HostAgentInstallAdapter, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { ReleaseAcceptedSchema, RemoteInstanceError, SupervisorStatusSchema, runCommand, sanitizeInheritedChildProcessEnv, writeSecretFile } from "@konteks/remote-common";
 import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyList, gitKeyRemove, previewStatus, status, supportBundle, type ControlContext } from "./control-commands.js";
 import { SupervisorControl } from "../control.js";
@@ -798,6 +798,7 @@ interface NativeAgentAddDeps {
   pollMs?: number;
   /** Claude Code or Codex found here, or set up now on the person's yes, before anything is stopped. */
   ensurePersonal?: typeof ensurePersonalAgent;
+  resolveClaude?: typeof resolveNativeClaudeExecutable;
   /** After the restart: sign the agent in and say whether it is ready. */
   closeAgents?: (input: Parameters<typeof closeAgentSetup>[0]) => Promise<void>;
   stop?: (input: NativeCommandContext) => Promise<void>;
@@ -831,7 +832,7 @@ export async function runNativeAgentAdd(input: NativeCommandContext & { agent: s
   const previous = await deps.readRecord(input.root);
   const host = hostAgentInstallAdapter(input.agent);
   const listed = previous.agents.includes(input.agent as NativeRuntimeRecord["agents"][number]);
-  if (await alreadyInstalled(input.root, previous, host, listed)) {
+  if (await alreadyInstalled(input, previous, host, deps)) {
     setupLine(input.output, "agentNoRestart", { name: findAgentBridge(input.agent)?.displayName ?? input.agent });
     return;
   }
@@ -860,11 +861,14 @@ function runsInTerminal(deps: NativeAgentAddDeps, root: string, previous: Native
   return deps.control(root, previous).call({ op: "drain.status" }, DrainStatusSchema, { timeoutMs: 2_000 }).then(() => true, () => false);
 }
 
-/** A listed fetched agent is fetched again only when its recorded copy no longer verifies. */
-async function alreadyInstalled(root: string, previous: NativeRuntimeRecord, host: HostAgentInstallAdapter | undefined, listed: boolean): Promise<boolean> {
-  if (!listed) return false;
+/** A listed Claude pin or fetched copy must still resolve before addition is a no-op. */
+async function alreadyInstalled(input: NativeCommandContext & { agent: string }, previous: NativeRuntimeRecord, host: HostAgentInstallAdapter | undefined, deps: NativeAgentAddDeps): Promise<boolean> {
+  if (!previous.agents.includes(input.agent as NativeRuntimeRecord["agents"][number])) return false;
+  if (input.agent === "claude-code") {
+    return await (deps.resolveClaude ?? resolveNativeClaudeExecutable)(undefined, undefined, undefined, previous.claudeExecutable) === previous.claudeExecutable;
+  }
   if (host?.fetch === undefined) return true;
-  return host.runnerSettings(previous, { root }).then(() => true, () => false);
+  return host.runnerSettings(previous, { root: input.root }).then(() => true, () => false);
 }
 
 /**

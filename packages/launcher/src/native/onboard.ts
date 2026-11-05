@@ -51,6 +51,8 @@ const SLOW_STEPS: ReadonlySet<string> = new Set(["start", "graft_setup"]);
 const ASKED_AGAIN_STEPS: ReadonlySet<string> = new Set(["email", "code", "workspace", "first_task"]);
 /** Steps that can meet a workspace that is still being made. */
 const WORKSPACE_STEPS: ReadonlySet<string> = new Set(["code", "start", "workspace"]);
+/** Identity checks itself; these other steps prove the owner before reconnecting. */
+const CONNECTING_STEPS: ReadonlySet<string> = new Set(["identity", "reconnect", "email", "code", "workspace", "start"]);
 
 const isAgain = (run: OnboardStep["run"]) =>
   Boolean(run && run.argv.length === AGAIN.argv.length && run.argv.every((part, index) => part === AGAIN.argv[index]));
@@ -116,6 +118,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
   // takes the old one's place.
   const lost = await lostMachineKey(session.supervisorData);
   if (lost) return reconnectLostMachine(session, lost.instanceId);
+  if (!CONNECTING_STEPS.has(session.state.step)) await session.assertNotRevoked();
   return (STEPS[session.state.step] ?? closingStep)(session);
 }
 

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { DoctorReportSchema, GitChoiceReportSchema, PreviewStatusReportSchema, RemoteInstanceError, SupervisorStatusSchema, UpdateChannelReportSchema, type ControlLoginEvent, type GitChoiceReport, type UpdateChannelReport } from "@konteks/remote-common";
+import { ActivationIdentityReportSchema, DoctorReportSchema, GitChoiceReportSchema, PreviewStatusReportSchema, RemoteInstanceError, SupervisorStatusSchema, UpdateChannelReportSchema, type ControlLoginEvent, type GitChoiceReport, type UpdateChannelReport } from "@konteks/remote-common";
 import type { SupervisorControl } from "../control.js";
 import { isHostAgentId } from "@konteks/remote-release";
 import { AlreadyToldError, type Output } from "../output.js";
@@ -37,15 +37,17 @@ function releaseChannelLine(channel: NonNullable<UpdateChannelReport>): string {
 
 export async function status(context: ControlContext): Promise<void> {
   const value = await context.control.call({ op: "status" }, SupervisorStatusSchema);
+  const identity = await context.control.call({ op: "identity.status" }, ActivationIdentityReportSchema).catch(() => null);
   // A connector from before `update.channel` refuses the op: the line is simply left out.
   const channel = await context.control.call({ op: "update.channel" }, UpdateChannelReportSchema).catch(() => null);
   // Likewise `git.choice`, from a connector before it.
   const git = await context.control.call({ op: "git.choice" }, GitChoiceReportSchema).catch(() => null);
   // `lease` is intentionally bearer-redacted by generic output. Publish a
   // separate, explicit public summary; never exempt bearer fields from redaction.
-  context.output.result({ ...value, leaseStatus: { mode: value.lease.mode, expiresAt: value.lease.expiresAt, drainDeadline: value.lease.drainDeadline } });
+  context.output.result({ ...value, ...identity, leaseStatus: { mode: value.lease.mode, expiresAt: value.lease.expiresAt, drainDeadline: value.lease.drainDeadline } });
   context.output.table([
     ["instance", value.instanceId ?? "(not activated)"],
+    ...(identity ? [["activation", identity.activationId ?? "(not activated)"] as [string, string]] : []),
     ["status", value.administrativeStatus],
     ["connectivity", connectivityLine(value.connectivity)],
     ["lease", `${value.lease.mode}${value.lease.expiresAt ? `, expires ${value.lease.expiresAt}` : ""}`],

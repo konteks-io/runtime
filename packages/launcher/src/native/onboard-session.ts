@@ -5,7 +5,7 @@ import { NativeEnrollment, SupervisorStore } from "@konteks/remote-supervisor";
 import type { Output } from "../output.js";
 import { SupervisorControl } from "../control.js";
 import { CLI_NAME, cliCommand, cliExecutable, commandHintText } from "../cli-command.js";
-import { readNativeRecord, type completeNativeEnrollment } from "./install.js";
+import { prepareNativeReenrollment, readNativeRecord, type completeNativeEnrollment } from "./install.js";
 import { inspectRepository, type commitFirstFiles, type initializeRepository, type planFirstCommit, type pushToManagedRemote } from "./repository-inspect.js";
 import type { StagingStatus } from "./enrollment-staging.js";
 import { readOnboardState, writeOnboardState, type OnboardState } from "./onboard-state.js";
@@ -65,6 +65,8 @@ export interface OnboardDeps {
   personalOpenCode?: () => Promise<boolean>;
   /** Wait for the started service to become active; resolves to the roles it advertises, or null. */
   waitForReady?: (root: string, until?: "ready" | "answering") => Promise<ServiceReadiness | null>;
+  /** One authenticated status snapshot, without waiting for startup or a heartbeat. */
+  runtimeStatus?: (root: string) => Promise<ServiceReadiness | null>;
   /** Graft, injectable for tests. */
   graft?: {
     available?: (root: string) => Promise<boolean>;
@@ -202,6 +204,11 @@ export async function lostMachineKey(supervisorData: string): Promise<{ instance
  * for it any more. The machine then enrolls from an empty supervisor.
  */
 export async function setAsideLostIdentity(root: string, instanceId: string): Promise<void> {
+  const installed = await readNativeRecord(root).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (installed) await prepareNativeReenrollment(root, instanceId);
   const aside = join(root, "retired", `${instanceId}-${Date.now()}`);
   await mkdir(aside, { recursive: true, mode: 0o700 });
   await rename(join(root, "supervisor"), join(aside, "supervisor"));
@@ -365,6 +372,21 @@ export class OnboardSession {
 
   waitForReady(...until: ["ready" | "answering"] | []): Promise<ServiceReadiness | null> {
     return (this.deps.waitForReady ?? waitForServiceReady)(this.context.root, ...until);
+  }
+
+  /** A retained identity is not proof that Core still accepts this runtime. */
+  async assertNotRevoked(): Promise<void> {
+    const identity = await new SupervisorStore(this.supervisorData).identity();
+    if (identity?.administrativeStatus === "revoked") throw new RemoteInstanceError("permission_denied", OWNER_ACCESS_REVOKED);
+    let status: ServiceReadiness | null;
+    if (this.deps.runtimeStatus) status = await this.deps.runtimeStatus(this.context.root);
+    else {
+      const record = await readNativeRecord(this.context.root).catch(() => null);
+      if (!record) return;
+      const control = new SupervisorControl({ supervisorData: this.supervisorData }, record.controlPort);
+      status = (await probeReady(control, "answering", null)).last;
+    }
+    if (status?.administrativeStatus === "revoked") throw new RemoteInstanceError("permission_denied", OWNER_ACCESS_REVOKED);
   }
 
   inspect(): ReturnType<typeof inspectRepository> {
