@@ -49,6 +49,7 @@ import {
   type RelayRuntimeHandshakeResult,
   type SupervisorStatus,
   type PreviewStatusReport,
+  type RecoveryStatusReport,
   type RuntimeAgentLoginDeliveryRequest,
   type RuntimeAssignmentAvailableDeliveryRequest,
   coreContractAtLeast,
@@ -93,6 +94,7 @@ import { PreviewViewerStarts } from "./preview/viewer-start.js";
 import type { SessionPreviewAccess } from "./preview/mcp-server.js";
 import { provisioningCredentialIsExpired, refreshProvisioningCredential, submitReadiness } from "./provisioning/activation.js";
 import { Reconciliation } from "./reconnect/reconciliation.js";
+import { STARTUP_RECOVERY_BOUND_MS, STARTUP_RECOVERY_RETRY_MS, StartupRecoveryBound, type StartupPhase } from "./reconnect/startup-recovery-bound.js";
 import { ChannelMux } from "./relay/channel-mux.js";
 import { RelayClient, type ControlDeliveryOutcome, type RelayClientOptions } from "./relay/relay-client.js";
 import type { RunnerPort } from "./runner-port.js";
@@ -360,7 +362,9 @@ export class Supervisor {
   } | null = null;
   private configurationTimer: NodeJS.Timeout | null = null;
   private configurationRefresh: Promise<void> | null = null;
-  private activeLoopStarted = false;
+  /** Only "started" admits work; "recovery_pending" answers locally after the startup bound. */
+  private activeLoopPhase: StartupPhase = "starting";
+  private readonly startupRecovery = new StartupRecoveryBound();
   private ordinaryHeartbeatStarted = false;
   private activeLoopStarting: Promise<void> | null = null;
   private recoveryRetryTimer: NodeJS.Timeout | null = null;
@@ -1370,7 +1374,7 @@ export class Supervisor {
       reports: this.work.reports,
       onLease: (lease, _expiresAt, assertCurrent) => this.adoptLease(lease, assertCurrent),
       afterEstablishment: async assertCurrent => {
-        if (this.activeLoopStarted) return;
+        if (this.activeLoopPhase === "started") return;
         assertCurrent();
         const agents = this.inventory.agents();
         this.modelCapabilities?.invalidateForAgents(agents);
@@ -1388,7 +1392,7 @@ export class Supervisor {
         assertCurrent();
         if (!this.pendingHeartbeatTimer) {
           this.pendingHeartbeatTimer = setInterval(() => {
-            if (this.stopping || this.activeLoopStarted) return;
+            if (this.stopping || this.activeLoopPhase === "started") return;
             void this.heartbeat.publishPending().catch(error => this.logger.warn({ err: error }, "pending recovery heartbeat failed"));
           }, (this.heartbeatIntervalSeconds ?? this.configuration.heartbeatIntervalSeconds) * 1000);
           this.pendingHeartbeatTimer.unref();
@@ -1711,13 +1715,13 @@ export class Supervisor {
       // owner/establishment/receipt protocol, never by reviving that bearer.
       // Core refuses recovery for identities still provisioning or revoked.
       await this.startActiveLoop();
-      if (this.activeLoopStarted) return;
+      if (this.activeLoopPhase === "started") return;
       setTimeout(() => void this.provisioningTick(), 15_000).unref();
     }
   }
 
   private startActiveLoop(): Promise<void> {
-    if (this.stopping || this.activeLoopStarted) return Promise.resolve();
+    if (this.stopping || this.activeLoopPhase === "started") return Promise.resolve();
     if (this.activeLoopStarting) return this.activeLoopStarting;
     this.startLivenessWatchdog();
     stopTimeout(this.recoveryRetryTimer);
@@ -1738,8 +1742,23 @@ export class Supervisor {
     this.reconnectRefusal = this.describeReconnectRefusal(error, retired);
     // Below Core's minimum no start can succeed: only an update gets back in.
     if (remoteErrorCodeIn(error, ["update_required"])) this.requestUpdateForRefusedBundle();
-    if (retired && !this.stopping && !this.activeLoopStarted) this.restartForRetiredProcess(error);
-    if (!terminal && !this.refusedForGood(error)) this.armRecoveryRetry();
+    if (retired && !this.stopping && this.activeLoopPhase !== "started") this.restartForRetiredProcess(error);
+    this.startupRecovery.recordFailure(this.startupRecoveryReason(error, retired), Date.now());
+    this.scheduleRecoveryRetry(error, terminal);
+  }
+
+  /** Retry a pending startup recovery; the bound only stops the "starting" report, it opens no gate. */
+  private scheduleRecoveryRetry(error: unknown, terminal: boolean): void {
+    if (terminal || this.refusedForGood(error)) return;
+    if (this.startupRecovery.exceeded(Date.now())) this.activeLoopPhase = "recovery_pending";
+    this.armRecoveryRetry();
+  }
+
+  /** Plain words for why startup recovery has not completed, without a path, address or raw provider text. */
+  private startupRecoveryReason(error: unknown, retired: boolean): string {
+    if (retired) return "Konteks no longer accepts this connector process; it restarts to reconnect as a new one";
+    if (this.reconnectRefusal) return this.reconnectRefusal;
+    return `Konteks has not completed startup recovery on this computer: ${startupFailureWords(error)}. It keeps retrying every ${STARTUP_RECOVERY_RETRY_MS / 1_000} seconds and takes no new work until recovery completes`;
   }
 
   /**
@@ -1763,17 +1782,21 @@ export class Supervisor {
   }
 
   private armRecoveryRetry(): void {
-    if (this.stopping || this.activeLoopStarted || this.recoveryRetryTimer) return;
-    this.recoveryRetryTimer = setTimeout(() => { this.recoveryRetryTimer = null; void this.startActiveLoop(); }, 15_000);
+    if (this.stopping || this.activeLoopPhase === "started" || this.recoveryRetryTimer) return;
+    this.recoveryRetryTimer = setTimeout(() => { this.recoveryRetryTimer = null; void this.startActiveLoop(); }, STARTUP_RECOVERY_RETRY_MS);
     this.recoveryRetryTimer.unref();
   }
 
   /** Plain words for `doctor` when Core refused the startup reconnect; null for a passing failure. */
   private describeReconnectRefusal(error: unknown, retired: boolean): string | null {
     if (retired) return "Konteks no longer accepts this connector process; it restarts to reconnect as a new one";
-    if (!(error instanceof RemoteInstanceError)) return null;
-    if (error.code === "update_required") return `Konteks refuses release ${this.config.SUPERVISOR_BUNDLE_VERSION} for this computer (${error.message}); it needs an update to the release Konteks accepts`;
-    if (error instanceof CoreResponseError && error.status >= 400 && error.status < 500) return `Konteks refused the reconnect: ${error.message}`;
+    if (error instanceof RemoteInstanceError) {
+      if (error.code === "update_required") return `Konteks refuses release ${this.config.SUPERVISOR_BUNDLE_VERSION} for this computer (${error.message}); it needs an update to the release Konteks accepts`;
+      if (error instanceof CoreResponseError && error.status >= 400 && error.status < 500) return `Konteks refused the reconnect: ${error.message}`;
+    }
+    if (this.startupRecovery.exceeded(Date.now())) {
+      return `Konteks has not completed startup recovery on this computer within ${STARTUP_RECOVERY_BOUND_MS / 60_000} minutes (${startupFailureWords(error)}); it keeps retrying every ${STARTUP_RECOVERY_RETRY_MS / 1_000} seconds and takes no new work until recovery completes`;
+    }
     return null;
   }
 
@@ -1786,7 +1809,7 @@ export class Supervisor {
   private restartForRetiredProcess(error: unknown): void {
     if (this.refusedRestartTimer) return;
     this.refusedRestartTimer = setTimeout(() => {
-      if (this.stopping || this.activeLoopStarted) return;
+      if (this.stopping || this.activeLoopPhase === "started") return;
       const detail = { reason: "recovery_refused", code: error instanceof RemoteInstanceError ? error.code : "unknown" };
       this.logger.error(detail, "Konteks no longer accepts this connector process; restarting to reconnect as a new one");
       this.options.onLivenessLost?.(detail);
@@ -1805,7 +1828,7 @@ export class Supervisor {
   }
 
   private leaseLapseNeedsRestart(): boolean {
-    return leaseLapseNeedsRestart({ now: Date.now(), stopping: this.stopping, activeLoopStarted: this.activeLoopStarted, refusedSince: this.leaseRefusedSince,
+    return leaseLapseNeedsRestart({ now: Date.now(), stopping: this.stopping, activeLoopStarted: this.activeLoopPhase === "started", refusedSince: this.leaseRefusedSince,
       leaseMode: this.lease.mode(), administrativeStatus: this.administrativeStatus, thresholdMs: LEASE_LAPSE_RESTART_MS });
   }
 
@@ -1827,7 +1850,7 @@ export class Supervisor {
     const liveness = this.heartbeat.liveness();
     const verdict = evaluateHeartbeatLiveness({ now: Date.now(), watchingSince: this.livenessWatchingSince ?? Date.now(), liveness, budgetMs });
     if (verdict.state === "live") { this.livenessQuietWarned = false; return; }
-    const detail = { ...verdict, budgetMs, heartbeat: liveness, activeLoopStarted: this.activeLoopStarted, activeLoopStarting: this.activeLoopStarting !== null,
+    const detail = { ...verdict, budgetMs, heartbeat: liveness, startupPhase: this.activeLoopPhase, activeLoopStarted: this.activeLoopPhase === "started", activeLoopStarting: this.activeLoopStarting !== null,
       recoveryRetryArmed: this.recoveryRetryTimer !== null, leaseMode: this.lease.mode(), administrativeStatus: this.administrativeStatus,
       activeResources: process.getActiveResourcesInfo().slice(0, 32) };
     if (verdict.state === "quiet") return this.warnLivenessQuiet(detail);
@@ -1872,7 +1895,9 @@ export class Supervisor {
     await this.startOrdinaryLoops();
     if (this.stopping) return;
     this.requireRecoveryAuthority();
-    this.activeLoopStarted = true;
+    // Only the completed recovery promotes the phase and runs the gated tail.
+    this.activeLoopPhase = "started";
+    this.startupRecovery.complete();
     this.reconnectRefusal = null;
     this.beginActiveWork();
     await this.work.reports.flushAll();
@@ -2490,6 +2515,11 @@ export class Supervisor {
     };
   }
 
+  /** `recovery.status`: whether startup recovery completed, whether its bound passed, and why. */
+  private recoveryStatus(): RecoveryStatusReport {
+    return this.startupRecovery.report(Date.now());
+  }
+
   private connectivityStatus(): SupervisorStatus["connectivity"] {
     const relay = this.relay?.status();
     const relayConnected = relay?.state === "connected";
@@ -2571,6 +2601,9 @@ export class Supervisor {
         const channel = this.updates ? this.updateChannelReport() : null;
         return channel ? { host: channel.host, override: channel.override, lastCheckedAt: channel.lastCheckedAt, error: channel.lastError } : null;
       },
+      // Its own op, not a status field, for the same reason as `update.channel`:
+      // a connector whose recovery has not completed says so and why.
+      "recovery.status": () => this.recoveryStatus(),
       // Its own op for the same reason as `update.channel`.
       "git.choice": async () => gitChoiceReport(this.gitChoice ?? await connectorGit()),
       "release.accepted": async () => {
@@ -2842,7 +2875,7 @@ export class Supervisor {
       cancel: () => { void runner.loginCancel(loginId).catch(() => undefined); },
       onFinished: () => { this.activeLogins.delete(loginId); },
       // Ready shows on the site now, not at the next heartbeat.
-      onSucceeded: () => { if (this.activeLoopStarted) void this.heartbeat.publish().catch(error => this.logger.warn({ err: error }, "heartbeat after login failed")); },
+      onSucceeded: () => { if (this.activeLoopPhase === "started") void this.heartbeat.publish().catch(error => this.logger.warn({ err: error }, "heartbeat after login failed")); },
     });
     this.activeLogins.set(loginId, { agentId, emit: event => relay.emit(event) });
     try {
@@ -2935,10 +2968,10 @@ export class Supervisor {
    * never falls between two 30 s heartbeats unseen.
    */
   private nudgeHeartbeat(): void {
-    if (!this.activeLoopStarted || this.stopping || this.turnActivityTimer) return;
+    if (this.activeLoopPhase !== "started" || this.stopping || this.turnActivityTimer) return;
     this.turnActivityTimer = setTimeout(() => {
       this.turnActivityTimer = null;
-      if (!this.activeLoopStarted || this.stopping) return;
+      if (this.activeLoopPhase !== "started" || this.stopping) return;
       void this.heartbeat.publish().catch(error => this.logger.warn({ err: error }, "heartbeat after a turn change failed"));
     }, TURN_ACTIVITY_HEARTBEAT_MS);
     this.turnActivityTimer.unref();
@@ -2952,7 +2985,7 @@ export class Supervisor {
       if (onComputerSettled(now, watch.until)) {
         void this.stopOnComputerWatch(watch.loginId);
         void report({ state: "succeeded" });
-        if (this.activeLoopStarted) void this.heartbeat.publish().catch(error => this.logger.warn({ err: error }, "heartbeat after an on-computer step failed"));
+        if (this.activeLoopPhase === "started") void this.heartbeat.publish().catch(error => this.logger.warn({ err: error }, "heartbeat after an on-computer step failed"));
       } else if (Date.now() > watch.deadline) {
         void this.stopOnComputerWatch(watch.loginId);
         void report({ state: "failed", failure: "timed_out" });
@@ -3573,6 +3606,11 @@ const RETIRED_CODES = ["reconciliation_replay", "resume_deadline_expired"] as co
 
 function remoteErrorCodeIn(error: unknown, codes: readonly string[]): boolean {
   return error instanceof RemoteInstanceError && codes.includes(error.code);
+}
+
+/** A plain, bounded cause for a failed startup attempt: no address, path or raw provider text. */
+function startupFailureWords(error: unknown): string {
+  return error instanceof RemoteInstanceError ? error.message : "Konteks could not reach Core";
 }
 
 /** The first five call sites of an error's stack, innermost first, when it has one. */

@@ -71,6 +71,17 @@ describe("doctor and support bundle", () => {
     expect(waiting.checks.find(check => check.id === "reconciliation")?.detail).toBe("waiting for Core reconciliation; no new work until it completes");
   });
 
+  it("says in doctor that startup recovery has not completed and why, past its five-minute bound", async () => {
+    const base = {
+      now: () => "2026-11-05T19:30:00Z", dataDir: dir, identity: { instanceId: "inst", administrativeStatus: "active" }, lease: { mode: "active" as const, expiresAt: null },
+      relay: { state: "offline", lastError: null, consecutiveFailures: 0 }, transport: "relay" as const, reconciliationComplete: false, components: [], agents: [],
+      configRevision: 1, diskFreeBytes: 1, minimumDiskBytes: 0, outboxDepth: 0, recoveryRequired: 1, coreSignatureConfigured: true,
+    };
+    const bound = "Konteks has not completed startup recovery on this computer within 5 minutes (Konteks could not reach Core); it keeps retrying every 15 seconds and takes no new work until recovery completes";
+    const report = await runDoctor({ ...base, reconciliationRefusal: bound });
+    expect(report.checks.find(check => check.id === "reconciliation")).toMatchObject({ status: "warn", detail: bound });
+  });
+
   it("reports whether previews are offered and when the last one failed, without paths or commands", async () => {
     const base = {
       now: () => "2026-09-06T00:00:00Z", dataDir: dir, identity: { instanceId: "inst", administrativeStatus: "active" }, lease: { mode: "active" as const, expiresAt: null },

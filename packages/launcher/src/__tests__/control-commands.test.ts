@@ -328,6 +328,34 @@ describe("native control commands", () => {
     expect(older.text()).not.toMatch(/^git\b/m);
   });
 
+  it("says in status when recovery has not completed and why, and leaves the line out for a connector without recovery.status", async () => {
+    const withRecovery = (report: unknown) => {
+      const f = fake();
+      const call = f.context.control.call;
+      f.context.control.call = (async (request: ControlRequest, schema: { parse: (value: unknown) => unknown }, options?: { onEvent?: (event: unknown) => void }) =>
+        request.op === "recovery.status" ? schema.parse(report) : call(request, schema as never, options)) as typeof f.context.control.call;
+      return f;
+    };
+    const bound = "Konteks has not completed startup recovery on this computer within 5 minutes (Konteks could not reach Core); it keeps retrying every 15 seconds and takes no new work until recovery completes";
+    const pending = withRecovery({ completed: false, boundExceeded: true, reason: bound, retryIntervalMs: 15_000 });
+    await status(pending.context);
+    expect(pending.text()).toContain(`recovery has not completed: ${bound}`);
+    const complete = withRecovery({ completed: true, boundExceeded: false, reason: null, retryIntervalMs: 15_000 });
+    await status(complete.context);
+    expect(complete.text()).not.toContain("recovery has not completed");
+    // A connector from before `recovery.status` still answers; it just reconciles.
+    const original = supervisorStatus.connectivity;
+    supervisorStatus.connectivity = { ...original, reconciliationComplete: false };
+    try {
+      const older = fake();
+      await status(older.context);
+      expect(older.text()).toContain("— reconciling");
+      expect(older.text()).not.toContain("recovery has not completed");
+    } finally {
+      supervisorStatus.connectivity = original;
+    }
+  });
+
   it("exposes only the public lease summary in machine-readable status", async () => {
     const f = fake({ json: true });
     await status(f.context);
