@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { ActivationIdentityReportSchema, DoctorReportSchema, GitChoiceReportSchema, PreviewStatusReportSchema, RemoteInstanceError, SupervisorStatusSchema, UpdateChannelReportSchema, type ControlLoginEvent, type GitChoiceReport, type UpdateChannelReport } from "@konteks/remote-common";
+import { ActivationIdentityReportSchema, DoctorReportSchema, GitChoiceReportSchema, PreviewStatusReportSchema, RecoveryStatusReportSchema, RemoteInstanceError, SupervisorStatusSchema, UpdateChannelReportSchema, type ControlLoginEvent, type GitChoiceReport, type RecoveryStatusReport, type UpdateChannelReport } from "@konteks/remote-common";
 import type { SupervisorControl } from "../control.js";
 import { isHostAgentId } from "@konteks/remote-release";
 import { AlreadyToldError, type Output } from "../output.js";
@@ -40,6 +40,8 @@ export async function status(context: ControlContext): Promise<void> {
   const identity = await context.control.call({ op: "identity.status" }, ActivationIdentityReportSchema).catch(() => null);
   // A connector from before `update.channel` refuses the op: the line is simply left out.
   const channel = await context.control.call({ op: "update.channel" }, UpdateChannelReportSchema).catch(() => null);
+  // Likewise `recovery.status`, from a connector before it.
+  const recovery = await context.control.call({ op: "recovery.status" }, RecoveryStatusReportSchema).catch(() => null);
   // Likewise `git.choice`, from a connector before it.
   const git = await context.control.call({ op: "git.choice" }, GitChoiceReportSchema).catch(() => null);
   // `lease` is intentionally bearer-redacted by generic output. Publish a
@@ -49,7 +51,7 @@ export async function status(context: ControlContext): Promise<void> {
     ["instance", value.instanceId ?? "(not activated)"],
     ...(identity ? [["activation", identity.activationId ?? "(not activated)"] as [string, string]] : []),
     ["status", value.administrativeStatus],
-    ["connectivity", connectivityLine(value.connectivity)],
+    ["connectivity", connectivityLine(value.connectivity, recovery)],
     ["lease", `${value.lease.mode}${value.lease.expiresAt ? `, expires ${value.lease.expiresAt}` : ""}`],
     ["bundle", bundleLine(value.version)],
     ...(channel ? [["updates", releaseChannelLine(channel)] as [string, string]] : []),
@@ -70,8 +72,11 @@ function gitLine(git: GitChoiceReport): string {
   return git.path ?? "not found";
 }
 
-function connectivityLine(connectivity: SupervisorStatus["connectivity"]): string {
-  return `${connectivity.transport}${connectivity.relayConnected ? " (relay connected)" : ""}${connectivity.reconciliationComplete ? "" : " — reconciling"}`;
+function connectivityLine(connectivity: SupervisorStatus["connectivity"], recovery: RecoveryStatusReport | null): string {
+  const base = `${connectivity.transport}${connectivity.relayConnected ? " (relay connected)" : ""}`;
+  // Never call it merely "reconciling": say recovery has not completed, and why.
+  if (recovery && !recovery.completed && recovery.reason) return `${base} — recovery has not completed: ${recovery.reason}`;
+  return `${base}${connectivity.reconciliationComplete ? "" : " — reconciling"}`;
 }
 
 function bundleLine(version: SupervisorStatus["version"]): string {

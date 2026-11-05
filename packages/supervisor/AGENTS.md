@@ -114,6 +114,13 @@ QA browser, structured results, updates and doctor/support.
   their existing contracts.
 - **Self-recovery.** A lapsed lease is never renewed in-process: the liveness
   watchdog asks the service manager to restart (`leaseLapseNeedsRestart`).
+  Startup recovery is bounded (`reconnect/startup-recovery-bound.ts`): five
+  minutes from the first failed `establish()` the connector leaves `starting`
+  for `recovery_pending`, so `status`, `doctor` and the control socket answer
+  with why recovery has not completed. The bound opens no work gate: work
+  pull, the transport (and so every non-control channel), the ordinary
+  heartbeat and recovery authority stay closed, reconciliation keeps retrying
+  every 15 s, and only a completed recovery reports `started`.
   A runtime below Core's minimum may install a strictly newer signed release
   without an accepted one (`mayUpdateWithoutAcceptedRelease`). A release on
   update probation (`updateProbation`) takes no new work. Native runners stop

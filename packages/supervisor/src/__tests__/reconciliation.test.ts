@@ -300,6 +300,30 @@ describe("reconnect and reconciliation", () => {
     expect(terminalReports(sent)[0]?.result).toMatchObject({ class: "interrupted", reason: "agent_session_lost" });
   });
 
+  it("settles a not_resumable interruption on the first pass, without a retry, and leaves a resumable decision alone", async () => {
+    const f = await harness([
+      entry({ assignmentId: "a", claimId: "ca", state: "running" }),
+      entry({ assignmentId: "b", claimId: "cb", state: "checkpointed", checkpoint: { ref: "ckpt", hash: "h".repeat(43), createdAt: "2026-09-06T00:00:00Z" } }),
+    ]);
+    const manifest = await f.bound({ manifestId: "m", decisions: [
+      { action: "report_interrupted", assignmentId: "a", attempt: 1, reason: "not_resumable" },
+      { action: "resume_from_checkpoint", assignmentId: "b", attempt: 1, recoveryEpoch: 2, authorization: "x", latestResumeAt: "2026-09-07T00:00:00Z" },
+    ] });
+    const outcomes = await f.reconciliation.apply(manifest);
+    expect(outcomes.get("a:1")).toBe("interrupted");
+    expect(outcomes.get("b:1")).toBe("interrupted");
+    expect(f.reconciliation.isComplete).toBe(true);
+    // Exactly one terminal interrupted report for the unresumable claim; the
+    // resumable decision still settles through its own reason.
+    expect(terminalReports(f.sent).filter(report => report.assignmentId === "a")).toHaveLength(1);
+    expect(terminalReports(f.sent).find(report => report.assignmentId === "a")?.result).toMatchObject({ class: "interrupted", reason: "not_resumable" });
+    expect(terminalReports(f.sent).find(report => report.assignmentId === "b")?.result).toMatchObject({ class: "interrupted", reason: "agent_session_lost" });
+    // The same manifest again converges as a duplicate: no retry, no second report.
+    expect((await f.reconciliation.apply(manifest)).get("a:1")).toBe("duplicate");
+    expect(terminalReports(f.sent)).toHaveLength(2);
+    expect(f.journal.decisions.get("m:a:1")?.result).toMatchObject({ disposition: "interrupted" });
+  });
+
   it("cancel decisions produce a cancelled terminal report and duplicates converge", async () => {
     const { reconciliation, sent, bound } = await harness([entry({})]);
     const manifest = (await bound({ manifestId: "m", decisions: [{ action: "cancel", assignmentId: "a", attempt: 1, reason: "revoked" }] }));

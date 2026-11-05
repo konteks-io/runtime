@@ -1,12 +1,14 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { Supervisor } from "../supervisor.js";
 import { SupervisorConfigSchema } from "../config.js";
-import type { RelayRuntimeHandshakeResult } from "@konteks/remote-common";
+import type { JournalEntry } from "../state/journal.js";
+import type { RecoveryStatusReport, RelayRuntimeHandshakeResult } from "@konteks/remote-common";
 
 // Composition test: no bridge, listener, filesystem mutation or cloud request.
 interface StartupInternals {
   startActiveLoop(): Promise<void>;
   recoveryAuthority(): string | null;
+  recoveryStatus(): RecoveryStatusReport;
   captureLeaseFence(): () => void;
   validateRelayHandshake(result: RelayRuntimeHandshakeResult): void;
   onRelayConnected(result: RelayRuntimeHandshakeResult): Promise<void>;
@@ -14,7 +16,8 @@ interface StartupInternals {
   nativeOwnership: { assertOwned(): void } | null;
   instanceId: string;
   runnerIncarnation: string;
-  activeLoopStarted: boolean;
+  activeLoopPhase: "starting" | "recovery_pending" | "started";
+  reconnectRefusal: string | null;
   ordinaryHeartbeatStarted: boolean;
   administrativeStatus: "active" | "provisioning";
   refreshConfiguration(): Promise<void>;
@@ -42,7 +45,7 @@ function fixture() {
   vi.spyOn(supervisor.lease, "mode").mockReturnValue("active");
   const heartbeatStart = vi.fn(async () => { events.push("heartbeat"); });
   supervisor.heartbeat = {
-    start: heartbeatStart, settle: vi.fn(async () => undefined), stop: vi.fn(),
+    start: heartbeatStart, settle: vi.fn(async () => undefined), stop: vi.fn(), roles: vi.fn(() => []),
     // The native liveness watchdog reads these on every tick; a publisher that
     // just attempted is live, so the watchdog never interrupts the ordering.
     liveness: () => ({ running: true, pendingFlight: false, stage: null, inFlightSince: null, lastAttemptAt: Date.now(), lastSettledAt: Date.now() }),
@@ -107,6 +110,69 @@ it("failed recovery starts no ordinary loop and retries once on the bounded time
   await vi.advanceTimersByTimeAsync(15000);
   expect(f.run).toHaveBeenCalledTimes(2);
   expect(f.heartbeatStart).toHaveBeenCalledOnce();
+});
+
+it("bounds startup recovery at five minutes without opening any work gate", async () => {
+  const f = fixture();
+  // The assignment Core already called not_resumable: it must stay exactly as
+  // it is while an unreachable Core keeps the rest of recovery pending.
+  const unresumable: JournalEntry = {
+    assignmentId: "unresumable", attempt: 1, claimId: "claim-unresumable", kind: "delivery", placementId: "placement",
+    workspaceId: "tenant", agentId: "codex", state: "recovery_required", recoveryEpoch: 2, recoveryReason: "not_resumable",
+    reports: { nextSequence: 2, durableWatermark: 1, terminalSequence: 1 }, evidenceUpload: "structured_only",
+    expiresAt: "2026-09-07T00:00:00Z", latestResumeAt: "2026-09-07T00:00:00Z", updatedAt: "2026-09-06T00:00:00Z",
+  };
+  vi.spyOn(f.supervisor.journal, "recoveryRequired").mockReturnValue([unresumable]);
+  f.run.mockImplementation(async () => { throw new Error("Core is unreachable"); });
+
+  // Unreachable Core: the active loop never starts, and no work gate opens.
+  await f.internal.startActiveLoop();
+  expect(f.internal.activeLoopPhase).toBe("starting");
+  expect(f.internal.recoveryStatus()).toMatchObject({ completed: false, boundExceeded: false, retryIntervalMs: 15_000 });
+  expect(f.internal.recoveryStatus().reason).toContain("startup recovery");
+  expect(f.internal.recoveryAuthority()).toBeNull();
+  expect(f.heartbeatStart).not.toHaveBeenCalled();
+  expect(f.transportStart).not.toHaveBeenCalled();
+  expect(f.pull).not.toHaveBeenCalled();
+
+  // Within the bound it is still starting, and reconciliation retries every 15 s.
+  await vi.advanceTimersByTimeAsync(15_000);
+  expect(f.run).toHaveBeenCalledTimes(2);
+  expect(f.internal.activeLoopPhase).toBe("starting");
+
+  // Five minutes from the first failed establish(): it answers, and still no gate opens.
+  await vi.advanceTimersByTimeAsync(285_000);
+  expect(f.internal.activeLoopPhase).toBe("recovery_pending");
+  expect(f.internal.recoveryStatus()).toMatchObject({ completed: false, boundExceeded: true, retryIntervalMs: 15_000 });
+  expect(f.internal.recoveryStatus().reason).toContain("within 5 minutes");
+  expect(f.internal.reconnectRefusal).toContain("within 5 minutes");
+  expect(f.internal.ordinaryHeartbeatStarted).toBe(false);
+  expect(f.heartbeatStart).not.toHaveBeenCalled();
+  expect(f.transportStart).not.toHaveBeenCalled();
+  expect(f.pull).not.toHaveBeenCalled();
+  expect(f.internal.recoveryAuthority()).toBeNull();
+  expect(f.supervisor.status().journal.recoveryRequired).toBe(1);
+  expect(f.supervisor.journal.recoveryRequired()).toEqual([unresumable]);
+  // status, doctor and the control socket answer rather than report "still starting".
+  const answer = await f.supervisor.controlHandler()({ op: "recovery.status" } as never, { event: () => undefined, signal: new AbortController().signal });
+  expect(answer).toMatchObject({ completed: false, boundExceeded: true });
+
+  // Reconciliation keeps retrying on its existing 15 s schedule after the bound.
+  const retries = f.run.mock.calls.length;
+  await vi.advanceTimersByTimeAsync(15_000);
+  expect(f.run.mock.calls.length).toBe(retries + 1);
+  expect(f.heartbeatStart).not.toHaveBeenCalled();
+  expect(f.transportStart).not.toHaveBeenCalled();
+
+  // Only a completed recovery promotes the phase and opens work pull.
+  f.run.mockImplementation(async () => { f.events.push("recovery"); f.setComplete(true); });
+  await vi.advanceTimersByTimeAsync(15_000);
+  expect(f.internal.activeLoopPhase).toBe("started");
+  expect(f.internal.recoveryStatus()).toMatchObject({ completed: true, boundExceeded: false, reason: null });
+  expect(f.heartbeatStart).toHaveBeenCalledOnce();
+  expect(f.transportStart).toHaveBeenCalledOnce();
+  await vi.advanceTimersByTimeAsync(5_000);
+  expect(f.pull).toHaveBeenCalledOnce();
 });
 
 it.each(["expired", "superseded", "establishment_conflict"])("does not automatically recreate a %s recovery", async state => {

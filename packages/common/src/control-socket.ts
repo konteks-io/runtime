@@ -74,6 +74,8 @@ export const ControlRequestSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("update.status") }).strict(),
   /** Where the unattended update reads releases (host only), an override, and the last read's failure. */
   z.object({ op: z.literal("update.channel") }).strict(),
+  /** Whether startup recovery has completed, whether its 5-minute bound passed, and why. */
+  z.object({ op: z.literal("recovery.status") }).strict(),
   /** Which git the connector and its agents run, and why (git-choice.ts). */
   z.object({ op: z.literal("git.choice") }).strict(),
   /** The release Konteks accepts for this machine, asked with this machine's lease. */
@@ -564,6 +566,23 @@ export const UpdateChannelReportSchema = z
   .strict()
   .nullable();
 export type UpdateChannelReport = z.infer<typeof UpdateChannelReportSchema>;
+
+/**
+ * `recovery.status`'s answer: a connector whose startup recovery has not
+ * completed says so plainly, and whether that is past its 5-minute bound.
+ */
+export const RecoveryStatusReportSchema = z
+  .object({
+    completed: z.boolean(),
+    /** Five minutes from the first failed establish() passed without recovery. */
+    boundExceeded: z.boolean(),
+    /** Plain words for why recovery has not completed; null once it has. */
+    reason: z.string().max(1_024).nullable(),
+    /** How often a pending recovery is retried. */
+    retryIntervalMs: z.number().int().positive(),
+  })
+  .strict();
+export type RecoveryStatusReport = z.infer<typeof RecoveryStatusReportSchema>;
 
 /** `git.choice`'s answer: which git runs, its path (the home folder as `~`), why, and the license finding when git cannot run. */
 export const GitChoiceReportSchema = z
