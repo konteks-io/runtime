@@ -63,7 +63,7 @@ describe("onboard", () => {
       ...(answer !== undefined ? { answer } : {}),
       // No test reaches a real Core: a lookup nobody stubbed fails fast.
       // Nor the person's own OpenCode on this machine.
-      deps: { waitForReady: readyService, fetchFn: offline as never, openCodeProblem: async () => null, dshProblem: async () => null, personalOpenCode: async () => false, ...extra },
+      deps: { waitForReady: readyService, runtimeStatus: readyService, fetchFn: offline as never, openCodeProblem: async () => null, dshProblem: async () => null, personalOpenCode: async () => false, ...extra },
     });
 
   it("asks for the email in its very first response on a machine that is not connected", async () => {
@@ -932,6 +932,34 @@ describe("onboard", () => {
       expect(await readOnboardState(root)).toMatchObject({ step: "inspect", instanceId: "instance-1" });
       const { readOwnerToken } = await import("../native/owner-api.js");
       expect((await readOwnerToken(join(root, "supervisor")))?.token).toBe("site-token");
+    });
+
+    it.each(["identity", "done", "system", "inspect"] as const)("offers recovery for a revoked site-connected runtime at %s without discarding its identity", async state => {
+      await connected();
+      if (state !== "identity") await writeOnboardState(root, { step: state, closing: state === "done" });
+      const refreshOwnerToken = vi.fn(async () => { throw new Error("must not claim a revoked runtime"); });
+      const error = await step({
+        runtimeStatus: async () => ({ administrativeStatus: "revoked", roles: [] }),
+        enrollment: { refreshOwnerToken } as never,
+      }).catch((value: unknown) => value);
+      expect(error).toMatchObject({ code: "permission_denied", message: OWNER_ACCESS_REVOKED });
+      expect(refreshOwnerToken).not.toHaveBeenCalled();
+      const recovery = await onboardFailureStep({ root, output: output() }, error);
+      expect(recovery.ask?.kind).toBe("confirm");
+      expect(recovery.done).toBeUndefined();
+      expect(await readOnboardState(root)).toMatchObject({ step: "reconnect" });
+      const { SupervisorStore } = await import("@konteks/remote-supervisor");
+      expect(await new SupervisorStore(join(root, "supervisor")).identity()).toMatchObject({ instanceId: "instance-1", workspaceId: "acme" });
+    });
+
+    it("keeps a confirmed revocation when the service is stopped", async () => {
+      await connected();
+      const { SupervisorStore } = await import("@konteks/remote-supervisor");
+      vi.mocked(SupervisorStore.prototype.identity).mockResolvedValue({ instanceId: "instance-1", workspaceId: "acme", administrativeStatus: "revoked" } as never);
+      const runtimeStatus = vi.fn(async () => null);
+      const error = await step({ runtimeStatus }).catch((value: unknown) => value);
+      expect(error).toMatchObject({ code: "permission_denied", message: OWNER_ACCESS_REVOKED });
+      expect(runtimeStatus).not.toHaveBeenCalled();
     });
 
     it("ends plainly when Konteks gives no one's access, instead of offering a System it cannot make", async () => {

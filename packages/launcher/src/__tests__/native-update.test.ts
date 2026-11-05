@@ -67,7 +67,7 @@ async function fixture({ oldVersion = "1.0.0", nextVersion = "1.1.0", openCode =
   const installed = await installNative({ root, activationId: "activation-123", coreUrl: "https://core.example", relayUrl: "wss://relay.example/runtime", agents: openCode ? ["claude-code", "opencode"] : ["claude-code"], output, deps: { roots: trust, platform, manifest: oldManifest, activate, fetchFn, git: null } } as never);
   await writeFile(join(root, "credentials", "claude-code", "keep"), "credential-owned-by-agent");
   const deps = { roots: trust, platform, fetchFn };
-  return { root, output, trust, platform, manifest, oldManifest, fetchFn, installed, deps };
+  return { root, output, trust, platform, manifest, oldManifest, fetchFn, installed, deps, signed };
 }
 
 async function directoryBytes(directory: string): Promise<Record<string, string>> {
@@ -128,6 +128,42 @@ async function retainedWorkspace(root: string) {
 }
 
 describe("native update staging and commit", () => {
+  it("offers Core's exact accepted intermediate release for a manual update", async () => {
+    const f = await fixture();
+    const { signature: _signature, digest: _digest, ...body } = f.manifest;
+    const latest = f.signed({ ...body, bundleVersion: "1.2.0" });
+    vi.stubEnv("KONTEKS_RELEASE_MANIFEST_URL", "https://releases.example/owner/runtime/releases/latest/download/native-manifest.json");
+    const fetchFn = vi.fn(async () => new Response(JSON.stringify(f.manifest)));
+    const result = await checkNativeUpdate({ root: f.root, deps: {
+      ...f.deps, manifest: latest, fetchFn,
+      acceptedTarget: async () => ({ bundleVersion: "1.1.0", manifestDigest: f.manifest.digest }),
+    } as never });
+    expect(result).toMatchObject({ status: "available", release: { manifest: { bundleVersion: "1.1.0", digest: f.manifest.digest } } });
+    expect(fetchFn).toHaveBeenCalledWith("https://releases.example/owner/runtime/releases/download/v1.1.0/native-manifest.json", expect.anything());
+    expect(await readNativeRecord(f.root)).toEqual(f.installed);
+    fetchFn.mockImplementation(async () => new Response(JSON.stringify(latest)));
+    await expect(checkNativeUpdate({ root: f.root, deps: {
+      ...f.deps, manifest: latest, fetchFn,
+      acceptedTarget: async () => ({ bundleVersion: "1.1.0", manifestDigest: f.manifest.digest }),
+    } })).rejects.toMatchObject({ code: "bundle_untrusted" });
+    expect(await readNativeRecord(f.root)).toEqual(f.installed);
+  });
+
+  it("stages the frozen accepted release even after the public channel advances", async () => {
+    const f = await fixture();
+    const { signature: _signature, digest: _digest, ...body } = f.manifest;
+    const latest = f.signed({ ...body, bundleVersion: "1.2.0" });
+    const immutable = "https://releases.example/owner/runtime/releases/download/v1.1.0/native-manifest.json";
+    vi.stubEnv("KONTEKS_RELEASE_MANIFEST_URL", "https://releases.example/owner/runtime/releases/latest/download/native-manifest.json");
+    vi.stubEnv(NATIVE_UPDATE_TARGET_ENV, JSON.stringify({ bundleVersion: "1.1.0", manifestDigest: f.manifest.digest }));
+    const artifactFetch = f.fetchFn.getMockImplementation()!;
+    f.fetchFn.mockImplementation(async (input, init) => requestUrl(input) === immutable ? new Response(JSON.stringify(f.manifest)) : artifactFetch(input, init));
+    const staged = await stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, manifest: latest } });
+    expect(staged).toMatchObject({ status: "staged", release: { manifest: { bundleVersion: "1.1.0", digest: f.manifest.digest } } });
+    expect(f.fetchFn).toHaveBeenCalledWith(immutable, expect.anything());
+    expect(await readNativeRecord(f.root)).toEqual(f.installed);
+  });
+
   it("refuses a changed fixed target before acquiring the installer lock, downloading, or staging files", async () => {
     const f = await fixture();
     const before = await readdir(join(f.root, "releases"));

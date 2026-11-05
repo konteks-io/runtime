@@ -217,7 +217,7 @@ export interface SupervisorOptions {
     /** Test/embedding seam for the independently supervised shared Codex owner. */
     codexAppServerOptions?: Omit<NativeCodexAppServerOwnerOptions, "config">;
     /** Self-update policy; absent means the connector only reports `update_required`. */
-    update?: Pick<NativeUpdateCoordinatorOptions, "fetchManifest" | "launch" | "readLedger" | "checkIntervalMs" | "initialDelayMs" | "maxAttemptsPerRelease" | "attemptWindowMs" | "staleAttemptMs">;
+    update?: Pick<NativeUpdateCoordinatorOptions, "fetchManifest" | "fetchManifestForTarget" | "launch" | "readLedger" | "checkIntervalMs" | "initialDelayMs" | "maxAttemptsPerRelease" | "attemptWindowMs" | "staleAttemptMs">;
     /**
      * This release and the update ledger: while an update is still checking
      * this release (its health gate), it takes no new work, so a rollback
@@ -1728,7 +1728,8 @@ export class Supervisor {
     return operation;
   }
 
-  private onActiveLoopFailed(error: unknown): void {
+  private async onActiveLoopFailed(error: unknown): Promise<void> {
+    await this.onHeartbeatFailure(error);
     // The logger keeps no stack, and every local-history refusal says the same
     // sentence: name where it came from, or a stuck recovery is undiagnosable.
     this.logger.warn({ err: error, ...stackField(error) }, "startup recovery remains pending");
@@ -2083,8 +2084,8 @@ export class Supervisor {
 
   private async onHeartbeatFailure(error: unknown): Promise<void> {
     if (this.stopping) return;
-    const code = error instanceof RemoteInstanceError ? error.code : "temporarily_unavailable";
-    if (code === "instance_revoked" || code === "instance_suspended") await this.loseLeaseAuthority(code);
+    if (remoteErrorCodeIn(error, ["instance_revoked"])) await this.loseLeaseAuthority("instance_revoked");
+    else if (remoteErrorCodeIn(error, ["instance_suspended"])) await this.loseLeaseAuthority("instance_suspended");
   }
 
   /** Core revoked or suspended this runtime: stop new work, forget the lease and close its sessions. */
@@ -2097,6 +2098,10 @@ export class Supervisor {
     this.lease.set(null);
     if (!this.draining) { this.draining = true; this.drainReason = "lease_lost"; }
     await this.mutateLease(() => this.store.clearLease());
+    if (code === "instance_revoked") {
+      const identity = await this.store.identity();
+      if (identity && identity.instanceId === this.instanceId) await this.store.saveIdentity({ ...identity, administrativeStatus: "revoked" });
+    }
     this.startLeaseLossCleanup();
   }
 
@@ -2521,6 +2526,7 @@ export class Supervisor {
   private controlOps(): ControlOps {
     return {
       status: () => this.status(),
+      "identity.status": async () => ({ activationId: (await this.store.identity())?.activationId ?? null }),
       agents: () => {
         const agents = this.lastSnapshot?.agents ?? this.inventory.agents();
         return { agents: [...agents, ...this.leftOutAgents(agents)], roles: this.heartbeat?.roles() ?? [], roleBindings: this.roleBindings };
@@ -2572,6 +2578,7 @@ export class Supervisor {
         const accepted = await this.core.acceptedRelease(this.instanceId);
         return { bundleVersion: accepted?.bundleVersion ?? null };
       },
+      "release.accepted-target": async () => ({ target: this.instanceId ? await this.core.acceptedRelease(this.instanceId) : null }),
       "preview.status": () => this.previewReport(),
       doctor: () => this.doctor(),
       logs: () => ({ lines: this.logLines.slice(-2_000) }),

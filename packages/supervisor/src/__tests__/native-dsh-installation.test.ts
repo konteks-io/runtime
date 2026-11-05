@@ -3,13 +3,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { resolveNativeDshInstallation, resolveNativeDshNode, verifyNativeDshRoot } from "../native/dsh-installation.js";
+import { isolateDshDiscovery } from "./native-host-discovery-fixture.js";
 
 const posix = process.platform !== "win32";
 
 describe("native DeepSeek Harness discovery", () => {
   let root = "";
   afterEach(async () => { if (root) await rm(root, { recursive: true, force: true }); });
-  const fresh = async () => (root = await realpath(await mkdtemp(join(tmpdir(), "dsh-install-"))));
+  const fresh = async () => {
+    root = await realpath(await mkdtemp(join(tmpdir(), "dsh-install-")));
+    isolateDshDiscovery(root);
+    return root;
+  };
   /** An installed `@deepseek-ai/dsh` package as npm lays it out. */
   const pkg = async (dir: string, fields: { name?: string; version?: string; bin?: unknown } = {}) => {
     await mkdir(join(dir, "lib"), { recursive: true });

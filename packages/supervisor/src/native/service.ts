@@ -6,7 +6,7 @@ import { createDaemon, type CreateDaemonOptions, type Daemon, type DaemonStep } 
 import { SupervisorStore, type ShutdownProgress } from "../state/store.js";
 import { Supervisor, type SupervisorOptions } from "../supervisor.js";
 import { loadNativeInstallation, type NativeInstallationOptions } from "./installation.js";
-import { fetchNativeReleaseManifest, nativeServiceExecutable, resolveNativeConnectorExecutable } from "@konteks/remote-release";
+import { fetchNativeReleaseManifest, nativeManifestUrlForVersion, nativeServiceExecutable, resolveNativeConnectorExecutable } from "@konteks/remote-release";
 import { launchNativeUpdater } from "./update-launch.js";
 import { readNativeUpdateLedger } from "./update-ledger.js";
 import { startConnectorLogKeeper } from "./connector-log.js";
@@ -83,6 +83,7 @@ function updateOptions(options: NativeServiceOptions, executable: string): NonNu
   if (options.update === false) return undefined;
   return {
     fetchManifest: () => fetchNativeReleaseManifest(),
+    fetchManifestForTarget: target => fetchNativeReleaseManifest(fetch, nativeManifestUrlForVersion(target.bundleVersion)),
     launch: async target => launchNativeUpdater({ root: options.root, executable, os: options.platform.os,
       target: { bundleVersion: target.bundleVersion, manifestDigest: target.manifestDigest },
       ...(target.assertCurrent ? { assertCurrent: target.assertCurrent } : {}) }),

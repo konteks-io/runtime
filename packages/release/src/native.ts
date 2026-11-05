@@ -405,6 +405,23 @@ export function nativeManifestUrl(env: NodeJS.ProcessEnv = process.env): string 
   return url.toString();
 }
 
+/** Resolve an immutable release beside this configured GitHub-style channel, never on a caller-supplied origin. */
+export function nativeManifestUrlForVersion(version: string, channel = nativeManifestUrl()): string {
+  if (!/^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(version)) throw new Error("Invalid native release version.");
+  const releasePath = /\/releases\/(?:latest\/download|download\/v[^/]+)\/native-manifest\.json$/;
+  const url = immutableManifestChannel(channel, releasePath);
+  url.pathname = url.pathname.replace(releasePath, `/releases/download/v${version}/native-manifest.json`);
+  return url.toString();
+}
+
+function immutableManifestChannel(channel: string, releasePath: RegExp): URL {
+  const url = new URL(channel);
+  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash || !releasePath.test(url.pathname)) {
+    throw new Error("The configured release channel cannot resolve an immutable native release.");
+  }
+  return url;
+}
+
 /**
  * Fetch one bounded native manifest document. Release hosts answer with a
  * redirect to their asset store, so redirects are followed but must stay on
