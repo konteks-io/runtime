@@ -501,6 +501,8 @@ after `npm run build`).
   (Windows rotates the running log at 20 MB and limits each new backup to
   20 MB). Linked log paths are preserved. If storage blocks Windows logging,
   the connector continues and reports discarded bytes when writing resumes.
+  Identical structured warnings and errors keep their first entry and use
+  counted summaries for repeats; different contexts stay separate.
   Linux: the user journal. When
   the connector is not running, `doctor` and `support` show the last failed
   start and the log's last lines.
