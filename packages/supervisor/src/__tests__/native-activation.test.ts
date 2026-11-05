@@ -215,6 +215,31 @@ describe("native activation and resumable exchange", () => {
     expect(f.args.readActivationCode).toHaveBeenCalledTimes(2);
   });
 
+  it("retains recovery state when a response is lost before the automatic retry says consumed", async () => {
+    const f = fixture(); f.args.dataDir = join(dir, "fresh");
+    f.args.fetchFn.mockRejectedValueOnce(new Error("response lost after server commit"));
+    f.args.fetchFn.mockImplementation(async () => new Response(JSON.stringify({ code: "activation_consumed", message: "Activation already used" }), { status: 409, headers: { "content-type": "application/json" } }));
+    await expect(runNativeActivationExchange(f.args)).rejects.toMatchObject({ code: "activation_consumed" });
+    const store = new SupervisorStore(f.args.dataDir);
+    expect(await store.loadInstanceKey()).not.toBeNull();
+    expect(await store.activationAttempt()).toMatchObject({ activationId: f.args.activationId });
+    const journal = new SupervisorJournal(store.path("journal")); await journal.load();
+    expect(journal.execution.enrollment()).toMatchObject({ activationId: f.args.activationId });
+  });
+
+  it("keeps an earlier uncertain attempt and its original key when a later command receives a refusal", async () => {
+    const f = fixture();
+    f.args.fetchFn.mockRejectedValue(new Error("response lost after server commit"));
+    await expect(runNativeActivationExchange(f.args)).rejects.toThrow();
+    const store = new SupervisorStore(dir);
+    const attempt = await store.activationAttempt();
+    const key = await readFile(store.path("instance-key.jwk"), "utf8");
+    f.args.fetchFn.mockImplementation(async () => new Response(JSON.stringify({ code: "activation_invalid", message: "Wrong code" }), { status: 401, headers: { "content-type": "application/json" } }));
+    await expect(runNativeActivationExchange(f.args)).rejects.toMatchObject({ code: "activation_invalid" });
+    expect(await store.activationAttempt()).toEqual(attempt);
+    expect(await readFile(store.path("instance-key.jwk"), "utf8")).toBe(key);
+  });
+
   it("does not silently generate a new key when the retry identity was lost", async () => {
     const f = fixture();
     f.args.fetchFn.mockRejectedValue(new Error("lost"));
