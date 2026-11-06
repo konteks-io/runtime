@@ -27,6 +27,7 @@ export interface NativeCliActions {
   serve(input: NativeCommandContext): Promise<void>;
   start(input: NativeCommandContext): Promise<void>;
   stop(input: NativeCommandContext): Promise<void>;
+  switchWorkspace(input: NativeCommandContext & { yes?: boolean }): Promise<void>;
   update(input: NativeCommandContext & { check: boolean; unattended: boolean }): Promise<void>;
   uninstall(input: NativeCommandContext): Promise<void>;
   control(input: NativeCommandContext & { operation: "status" | "agents" | "doctor" | "support" | "preview.status" | "auth.status" | "auth.login" | "auth.logout" | "git.key.add" | "git.key.list" | "git.key.remove"; agent?: string; organization?: boolean; provider?: string; method?: string; reuse?: boolean; project?: string; location?: string; title?: string; keyRef?: string }): Promise<void>;
@@ -108,6 +109,9 @@ export function createNativeProgram(actions: NativeCliActions): Command {
   program.command("serve").description("run the connector in this terminal (the background service uses this)").action(async () => actions.serve(context()));
   program.command("start").description("start the connector's background service").action(async () => actions.start(context()));
   program.command("stop").description("stop the connector's background service; this computer and its work are kept").action(async () => actions.stop(context()));
+  program.command("switch-workspace").description("disconnect the current workspace while keeping agent logins, then use onboard to choose a workspace")
+    .option("--yes", "you agree to disconnect the current workspace (asked otherwise)", false)
+    .action(async (options: { yes: boolean }) => actions.switchWorkspace({ ...context(), yes: options.yes }));
   const agentLifecycle = program.command("agent").description("add or remove agents on this computer");
   agentLifecycle.command("add").description("add one agent without reactivation: Claude Code (Anthropic's installer is offered when it is missing) or Codex (ships with Konteks), then their sign-in, your own DeepSeek Harness or OpenCode 2 install (nothing downloaded), or Google Antigravity, downloaded from Google (dl.google.com, about 110 MB) after you say yes")
     .argument("<agent>", "agent family: claude-code, codex, dsh, opencode or antigravity", agent)

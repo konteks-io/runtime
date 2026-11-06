@@ -554,13 +554,15 @@ const NativeEnrollmentRecordSchema = z.object({
   bundleVersion: z.string().min(1),
   manifestDigest: z.string().min(1),
   controlPort: z.number().int().positive(),
+  /** Preserve the installer's personal profile binding across independent enrollment. */
+  codexHome: NativeRuntimeRecordSchema.shape.codexHome,
 }).strict();
 type NativeEnrollmentRecord = z.infer<typeof NativeEnrollmentRecordSchema>;
 
 /** Keep the verified installed release ready for a new, independently authenticated enrollment. */
 async function publishInstalledEnrollment(root: string, record: NativeRuntimeRecord, manifest: unknown): Promise<void> {
-  const { coreUrl, relayUrl, agents, releaseId, bundleVersion, manifestDigest, controlPort } = record;
-  const prepared = NativeEnrollmentRecordSchema.parse({ schemaVersion: 1, coreUrl, relayUrl, agents, releaseId, bundleVersion, manifestDigest, controlPort });
+  const { coreUrl, relayUrl, agents, releaseId, bundleVersion, manifestDigest, controlPort, codexHome } = record;
+  const prepared = NativeEnrollmentRecordSchema.parse({ schemaVersion: 1, coreUrl, relayUrl, agents, releaseId, bundleVersion, manifestDigest, controlPort, ...(codexHome ? { codexHome } : {}) });
   await writeSecretFile(join(root, "installer", ENROLLMENT_MANIFEST), JSON.stringify(manifest));
   await writeSecretFile(join(root, "native-enrollment.json"), JSON.stringify(prepared));
 }
@@ -605,7 +607,7 @@ export async function completeNativeEnrollment(root: string, identity: { instanc
       return installation.record;
     }
     const { prepared, release } = await boundEnrollment(root, identity, load.roots);
-    const found = await enrolledAgentsFound(root, prepared.agents);
+    const found = await enrolledAgentsFound(root, prepared.agents, prepared.codexHome);
     const git = deps.git === undefined ? await discoverGit() : deps.git;
     const record = NativeRuntimeRecordSchema.parse({
       schemaVersion: 1, deploymentKind: "native_connector",
@@ -639,8 +641,8 @@ async function boundEnrollment(root: string, identity: { instanceId: string; wor
  * Codex profile, a Claude Code executable, a host-installed agent that has
  * gone missing since detection is dropped.
  */
-async function enrolledAgentsFound(root: string, enrolled: readonly string[]): Promise<{ agents: string[]; fields: Partial<NativeRuntimeRecord> }> {
-  const profiles = await enrolledProfiles(enrolled);
+async function enrolledAgentsFound(root: string, enrolled: readonly string[], savedCodexHome?: string): Promise<{ agents: string[]; fields: Partial<NativeRuntimeRecord> }> {
+  const profiles = await enrolledProfiles(enrolled, savedCodexHome);
   const hosted: Partial<NativeRuntimeRecord> = {};
   const found = new Set<string>([...(profiles.codexHome ? ["codex"] : []), ...(profiles.claudeExecutable ? ["claude-code"] : [])]);
   for (const agent of enrolled) {
@@ -651,8 +653,11 @@ async function enrolledAgentsFound(root: string, enrolled: readonly string[]): P
   return { agents, fields: { ...profiles, ...hosted } };
 }
 
-async function enrolledProfiles(enrolled: readonly string[]): Promise<{ codexHome?: string; claudeExecutable?: string }> {
-  const codexHome = enrolled.includes("codex") ? await resolveNativeCodexHome().catch(() => undefined) : undefined;
+async function enrolledProfiles(enrolled: readonly string[], savedCodexHome?: string): Promise<{ codexHome?: string; claudeExecutable?: string }> {
+  let codexHome: string | undefined;
+  if (enrolled.includes("codex")) {
+    codexHome = savedCodexHome === undefined ? await resolveNativeCodexHome().catch(() => undefined) : await resolveNativeCodexHome({ CODEX_HOME: savedCodexHome });
+  }
   const claudeExecutable = enrolled.includes("claude-code") ? await resolveNativeClaudeExecutable().catch(() => undefined) : undefined;
   return { ...(codexHome ? { codexHome } : {}), ...(claudeExecutable ? { claudeExecutable } : {}) };
 }

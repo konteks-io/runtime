@@ -11,6 +11,14 @@ function fixture() {
 }
 
 describe("native customer entry point", () => {
+  it("offers an explicit workspace switch without uninstalling agent data", async () => {
+    const switchWorkspace = vi.fn(async () => {});
+    const { actions } = fixture();
+    const program = createNativeProgram({ ...actions, switchWorkspace }).exitOverride().configureOutput({ writeOut: () => {}, writeErr: () => {} });
+    await program.parseAsync(["--root", "/private/native-root", "switch-workspace", "--yes"], { from: "user" });
+    expect(switchWorkspace).toHaveBeenCalledWith(expect.objectContaining({ root: "/private/native-root", yes: true }));
+    expect(actions.uninstall).not.toHaveBeenCalled();
+  });
   it("accepts claude as the Claude Code sign-in alias", async () => {
     const { program, actions } = fixture();
     await program.parseAsync(["auth", "login", "claude"], { from: "user" });

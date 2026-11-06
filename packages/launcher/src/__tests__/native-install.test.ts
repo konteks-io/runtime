@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { bundleManifestSigningBytes, computeBundleManifestDigest, RemoteInstanceError, writeSecretFile } from "@konteks/remote-common";
 import { buildReleaseFixture } from "@konteks/remote-release";
 import { acquireNativeRootLock, hostAgentInstallAdapter, loadNativeInstallation, OPENCODE_MIN_BINARY_BYTES, SupervisorStore, verifyInstalledNativeConnector } from "@konteks/remote-supervisor";
-import { addNativeAgent, installNative, prepareNativeReenrollment, readNativeEnrollment, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, removeNativeAgent, restoreNativeRecord } from "../native/install.js";
+import { addNativeAgent, completeNativeEnrollment, installNative, prepareNativeReenrollment, readNativeEnrollment, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, removeNativeAgent, restoreNativeRecord } from "../native/install.js";
 import { startNativeConnector } from "../native/commands.js";
 import { SupervisorControl } from "../control.js";
 import { createOutput } from "../output.js";
@@ -79,6 +79,24 @@ async function personOpenCode(root: string, version = "2.0.18", name = "@opencod
 }
 
 describe("native install composition", () => {
+  it.each([false, true])("keeps the original Codex profile during re-enrollment, without substituting a default (missing: %s)", async missing => {
+    const f = await fixture();
+    const installed = await installNative(f.options as never);
+    await prepareNativeReenrollment(f.root, installed.instanceId, f.options.deps);
+    await rm(join(f.root, "native-runtime.json"));
+    await writeSecretFile(join(f.root, "supervisor", "identity.json"), JSON.stringify({ instanceId: "replacement", workspaceId: "new-workspace", activationId: "new-activation", activatedAt: new Date().toISOString(), administrativeStatus: "provisioning", exchangeNonce: "new-nonce" }));
+    const other = join(f.root, "another-codex-profile");
+    await mkdir(other, { mode: 0o700 });
+    vi.stubEnv("CODEX_HOME", other);
+    if (missing) await rm(installed.codexHome!, { recursive: true });
+    const complete = completeNativeEnrollment(f.root, { instanceId: "replacement", workspaceId: "new-workspace" }, f.options.deps);
+    if (missing) {
+      await expect(complete).rejects.toMatchObject({ code: "prerequisite_missing" });
+      await expect(readNativeRecord(f.root)).rejects.toMatchObject({ code: "ENOENT" });
+    } else {
+      await expect(complete).resolves.toMatchObject({ instanceId: "replacement", workspaceId: "new-workspace", codexHome: installed.codexHome });
+    }
+  });
   it("records the verified installed release for later recovery of an App-activated runtime", async () => {
     const f = await fixture();
     const record = await installNative(f.options as never);
@@ -86,6 +104,7 @@ describe("native install composition", () => {
       schemaVersion: 1, coreUrl: record.coreUrl, relayUrl: record.relayUrl,
       agents: record.agents, releaseId: record.releaseId, bundleVersion: record.bundleVersion,
       manifestDigest: record.manifestDigest, controlPort: record.controlPort,
+      codexHome: record.codexHome,
     });
     expect(JSON.parse(await readFile(join(f.root, "installer", "enrollment-manifest.json"), "utf8"))).toEqual(f.manifest);
   });

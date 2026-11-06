@@ -29,6 +29,7 @@ import { checkNativeUpdate } from "./update.js";
 import { prepareDeliveryGraft } from "./graft.js";
 import { earlierFailure, earlierFailureNote, keepLauncherCurrent, productionUpdateDeps, refreshInstalledLauncher, runNativeUpdate, selfUpdateNote } from "./update-transaction.js";
 import { productionUninstallDeps, uninstallNative } from "./uninstall.js";
+import { switchNativeWorkspace } from "./workspace-switch.js";
 import type { NativeCliActions, NativeCommandContext } from "./cli.js";
 import { captureWindowsServiceOwner, stopWindowsBackgroundHost, waitForWindowsServiceExit, type NativeServiceProcessOwner } from "./windows-service-owner.js";
 import { activateServiceExecutable } from "./service-executable.js";
@@ -563,6 +564,24 @@ export async function stopNativeConnector(input: NativeCommandContext, deps: Nat
   setupLine(input.output, "serviceStopping");
   await waitForStopReceipt(input.root, definition, deps, { previousReceipt, stoppedCodes });
   setupLine(input.output, "serviceStopped");
+}
+
+/** Capture ownership before Core retirement can make the connector exit by itself. */
+export async function prepareNativeWorkspaceStop(input: NativeCommandContext, deps: NativeStopDeps = productionNativeStopDeps): Promise<() => Promise<void>> {
+  const definition = await deps.definition(input.root);
+  const owner = (await deps.serviceOwner?.(input.root)) ?? null;
+  const stoppedCodes = stoppedExitCodes(deps.platform.os);
+  if (!owner) assertRunningBeforeStop(await deps.execute(definition.status), stoppedCodes);
+  const previousReceipt = await deps.readReceipt(input.root);
+  return async () => {
+    if (owner) return stopOwnedNativeConnector(input, definition, deps, owner);
+    const status = await deps.execute(definition.status);
+    if (status === 0) await executeNativeStop(definition, deps);
+    else if (status === null || !stoppedCodes.includes(status)) throw setupError("temporarily_unavailable", "serviceUnconfirmedRunning");
+    setupLine(input.output, "serviceStopping");
+    await waitForStopReceipt(input.root, definition, deps, { previousReceipt, stoppedCodes });
+    setupLine(input.output, "serviceStopped");
+  };
 }
 
 async function executeNativeStop(definition: NativeServiceDefinition, deps: NativeStopDeps): Promise<void> {
@@ -1211,6 +1230,7 @@ async function confirmOnTerminal(question: string): Promise<boolean> {
 }
 
 export const nativeCliActions: NativeCliActions = {
+  switchWorkspace: input => switchNativeWorkspace(input, { confirm: confirmOnTerminal, prepareStop: prepareNativeWorkspaceStop }),
   install: async (input) => {
     if (input.enroll) {
       // The enrollment install stops short of an identity, because there is no

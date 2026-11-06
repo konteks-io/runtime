@@ -18,6 +18,7 @@
     { "id": "git.key.list", "command": "konteks-remote git key list", "description": "Lists the keys registered for this computer.", "os": ["macos", "windows", "debian"] },
     { "id": "support", "command": "konteks-remote support", "description": "Collects a support bundle to share with Konteks support.", "os": ["macos", "windows", "debian"] },
     { "id": "version", "command": "konteks-remote --version", "description": "Prints the connector release this computer runs.", "os": ["macos", "windows", "debian"] },
+    { "id": "switch-workspace", "command": "konteks-remote switch-workspace", "description": "Disconnects the current workspace while keeping agent logins. Then use onboard to choose a workspace.", "os": ["macos", "windows", "debian"] },
     { "id": "uninstall", "command": "konteks-remote uninstall", "description": "Removes Konteks from this computer. Your repositories and your agents' own sign-ins stay.", "os": ["macos", "windows", "debian"] }
   ]
 }

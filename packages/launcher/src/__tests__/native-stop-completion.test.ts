@@ -1,9 +1,24 @@
 import { describe, expect, it, vi } from "vitest";
-import { stopNativeConnector } from "../native/commands.js";
+import { prepareNativeWorkspaceStop, stopNativeConnector } from "../native/commands.js";
 import { createOutput } from "../output.js";
 import { nativePlatform, nativeServiceDefinition, type NativeServiceCommand } from "../native/service.js";
 
 describe("ordinary native stop completion", () => {
+  it.each([true, false])("verifies the receipt captured before Core retirement already stopped the service (new receipt: %s)", async completed => {
+    const stop = { command: "stop", args: [] }, status = { command: "status", args: [] };
+    let retired = false, now = 0;
+    const execute = vi.fn(async (command: NativeServiceCommand) => command === status ? retired ? 113 : 0 : 0);
+    const finish = await prepareNativeWorkspaceStop({ root: "/private/test-native-root", output: createOutput({ json: true }) }, {
+      definition: async () => ({ stop, status }) as never, execute,
+      readReceipt: async () => retired && completed ? "retirement-stop-completed" : "old-stop",
+      sleep: async () => { now += 100; }, now: () => now,
+      platform: { os: "macos" }, deadlineMs: 300, pollMs: 100,
+    } as never);
+    retired = true;
+    if (completed) await expect(finish()).resolves.toBeUndefined();
+    else await expect(finish()).rejects.toMatchObject({ code: "temporarily_unavailable" });
+    expect(execute.mock.calls.some(([command]) => command === stop)).toBe(false);
+  });
   it("disables crash restarts before gracefully stopping an owned Windows connector", async () => {
     const stop = { command: "stop", args: [] }, status = { command: "status", args: [] };
     let now = 0, alive = true;

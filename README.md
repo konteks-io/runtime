@@ -362,6 +362,17 @@ an installation that still lists it keeps working without it. A pre-7.0.0
 installation that listed the old bundled OpenCode reads it as your own
 OpenCode 2. The Docker Compose remote instance is retired.
 
+### Change workspace
+
+Run `konteks-remote switch-workspace` to disconnect this computer from its
+current workspace, then `konteks-remote onboard` to authenticate and choose a
+workspace. The command asks first (`--yes` supplies your confirmation).
+Finish running work and close its sessions before retrying a busy switch.
+Core must confirm the old runtime's removal and the connector must finish
+stopping before the command reports success. Agent logins, local files and
+the previous connection's recovery records stay on this computer. An uncertain
+reply keeps those records; onboarding checks Core before replacing an identity.
+
 ### Uninstall
 
 `uninstall` lets running work finish (up to 15 minutes), has Konteks drain,
