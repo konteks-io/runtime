@@ -106,6 +106,12 @@ export function createDaemon(options: CreateDaemonOptions): Daemon {
     }
   }
 
+  function failedStop(failure: Error): void {
+    stopFailure = failure;
+    if (!options.exitProcess) unregister();
+    resolveStopped?.();
+  }
+
   async function stop(reason: string, exitCode: 0 | 1): Promise<void> {
     if (exitCode > shutdownExitCode) shutdownExitCode = exitCode;
     if (stopPromise) return stopPromise;
@@ -113,12 +119,14 @@ export function createDaemon(options: CreateDaemonOptions): Daemon {
     const watchdog = exitProcess
       ? setTimeout(() => {
           logger.error({ reason }, "shutdown did not end the process; forcing exit");
+          unregister();
           exitProcess(shutdownExitCode);
         }, options.shutdownExitGraceMs ?? DEFAULT_SHUTDOWN_EXIT_GRACE_MS)
       : null;
     watchdog?.unref();
     stopPromise = (async () => {
-      unregister();
+      // Keep signal handlers while agents close: a concurrent service-manager
+      // stop must join this cleanup rather than restore Node's immediate exit.
       logger.info({ reason }, "shutting down");
       if (shutdownExitCode === 1) await recordExit(reason);
       // Startup may still be acquiring ownership or spawning children. The
@@ -128,11 +136,11 @@ export function createDaemon(options: CreateDaemonOptions): Daemon {
       if (failure) {
         shutdownExitCode = 1;
         await recordExit("shutdown-step-failed");
-        stopFailure = failure;
-        resolveStopped?.();
+        failedStop(failure);
         throw failure;
       }
       if (watchdog) clearTimeout(watchdog);
+      unregister();
       resolveStopped?.();
       if (!startupFailed) exitProcess?.(shutdownExitCode);
     })();

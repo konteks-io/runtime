@@ -35,6 +35,35 @@ describe("bb-derived native daemon lifecycle", () => {
     await daemon.waitUntilStopped();
     expect(order).toEqual(['startup-settled', 'released']);
   });
+  it("keeps termination handlers until asynchronous cleanup completes", async () => {
+    const signalSource = new EventEmitter();
+    const failureSource = new EventEmitter();
+    let release!: () => void;
+    let entered!: () => void;
+    const startedCleanup = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const cleanup = vi.fn(async () => { entered(); await gate; });
+    const exitProcess = vi.fn();
+    const daemon = createDaemon({ name: "test", signalSource, failureSource, exitProcess,
+      onStart: async () => undefined, shutdownSteps: () => [{ name: "agents", run: cleanup }],
+    });
+    await daemon.start();
+    const stopped = daemon.shutdown("retired", 0);
+    await startedCleanup;
+    // Core retirement and the service manager can both ask the same process to stop.
+    const stillHandlesTerm = signalSource.listenerCount("SIGTERM");
+    signalSource.emit("SIGTERM");
+    signalSource.emit("SIGINT");
+    release();
+    await stopped;
+    expect(stillHandlesTerm).toBe(1);
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    expect(exitProcess).toHaveBeenCalledTimes(1);
+    expect(exitProcess).toHaveBeenCalledWith(0);
+    expect(signalSource.listenerCount("SIGTERM")).toBe(0);
+    expect(failureSource.listenerCount("uncaughtException")).toBe(0);
+  });
+
   it("starts only once and registers one signal handler", async () => {
     const signalSource = new EventEmitter();
     const onStart = vi.fn(async () => undefined);
