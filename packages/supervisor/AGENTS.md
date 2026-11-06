@@ -114,6 +114,13 @@ QA browser, structured results, updates and doctor/support.
   their existing contracts.
 - **Self-recovery.** A lapsed lease is never renewed in-process: the liveness
   watchdog asks the service manager to restart (`leaseLapseNeedsRestart`).
+  Startup recovery is bounded (`reconnect/startup-recovery-bound.ts`): five
+  minutes from the first failed `establish()` the connector leaves `starting`
+  for `recovery_pending`, so `status`, `doctor` and the control socket answer
+  with why recovery has not completed. The bound opens no work gate: work
+  pull, the transport (and so every non-control channel), the ordinary
+  heartbeat and recovery authority stay closed, reconciliation keeps retrying
+  every 15 s, and only a completed recovery reports `started`.
   A runtime below Core's minimum may install a strictly newer signed release
   without an accepted one (`mayUpdateWithoutAcceptedRelease`). A release on
   update probation (`updateProbation`) takes no new work. Native runners stop
@@ -161,6 +168,13 @@ QA browser, structured results, updates and doctor/support.
 - A repository role session whose turn ended unfinished is retired after its
   process is proven gone (`retireAfterClose` in `work/orchestrator.ts`);
   generated changes in the working copy are kept.
+- A delivery turn renewed past its issued hour hands in its output through
+  `NativeInputClient.recheck`, not `prepare`: Core cannot sign an envelope past
+  the selection's pinned stamps (the contract caps it at them), so it answers
+  `assignment_inputs_recheck` after the same checks. That answer grants nothing:
+  Core's output endpoints authorize the acceptance, and reads keep honouring the
+  stamps. Once a turn's output is on its way, the MCP owner stopping
+  no longer closes the session (`capabilityOwnerStopped`).
 - The delivery-output path names every refusal: capture throws
   `OutputCaptureRefusal` with a diagnostic and Git step, and `DeliveryOutput`
   tags each step (`native/delivery-output-failure.ts`). A retained retry
@@ -169,3 +183,5 @@ QA browser, structured results, updates and doctor/support.
   The recovery-checkpoint path does the same (`NamedRefusal`, each Git call
   takes a `CheckpointGitStep`); `seal()` reports the cause in the stage, e.g.
   `workspace_capture_file_hardlinked` (`native/workspace-checkpoint-failure.ts`).
+  A stop waits only for `capture()`; sending the copy runs after the stop has
+  settled, because it can take an hour and the next attempt waits on the stop.

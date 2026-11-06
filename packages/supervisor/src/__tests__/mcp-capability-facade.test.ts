@@ -173,6 +173,22 @@ it('bounds transient renewal to the existing capability expiry and stops the own
 });
 
 
+it('keeps retrying a passing outage for as long as the capability it holds is valid', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+  const renew = vi.fn(async () => { throw new RemoteInstanceError('temporarily_unavailable', 'Core restarting', { retryable: true }); });
+  const onUnavailable = vi.fn();
+  try {
+    const { facade } = await started({ initial: issue('http://127.0.0.1:1/mcp', 'secret', Date.now() + 600_000), renew, onUnavailable });
+    // Refresh starts about two minutes before expiry: more than a minute of outage is survived.
+    await vi.advanceTimersByTimeAsync(560_000);
+    expect(renew).toHaveBeenCalled();
+    expect(onUnavailable).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(41_000);
+    expect(onUnavailable).toHaveBeenCalledTimes(1);
+    await facade.close();
+  } finally { vi.useRealTimers(); }
+});
+
 it('handles a synchronous ownership refusal through the same cleanup path', async () => {
   const onUnavailable = vi.fn();
   const { facade } = await started({ initial: issue('http://127.0.0.1:1/mcp', 'secret', Date.now() + 60_000),

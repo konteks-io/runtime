@@ -228,7 +228,7 @@ async function checkpointComposition(replaceClaim: boolean) {
   });
   await writeFile(join(cwd, "file.txt"), "retained unfinished work");
   work.composeWork({ trustedRoots: [], runners: [RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "codex", RUNNER_WORKSPACE_DIR: root })], git: tool }, new CoreSignatureVerifier([]));
-  return { work, supervisor, assignment, admission, entry, cwd, submit, failure, workspace };
+  return { work, supervisor, assignment, admission, entry, cwd, submit, workspace };
 }
 
 describe("Supervisor diagnostic history admission", () => {
@@ -279,8 +279,13 @@ describe("Supervisor diagnostic history admission", () => {
   it.each([false, true])("binds checkpoint diagnostics to the exact retained admission (claim replaced: %s)", async replaceClaim => {
     const f = await checkpointComposition(replaceClaim);
     const current = vi.fn();
-    await expect(f.work.work.deps.preserveStoppedWorkspace(f.admission, current)).rejects.toBe(f.failure);
+    const warn = vi.spyOn(f.supervisor.logger, "warn");
+    // The stop settles on the local copy; the upload fails after it.
+    await f.work.work.deps.preserveStoppedWorkspace(f.admission, current);
     expect(current).toHaveBeenCalled();
+    await vi.waitFor(() => expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "workspace.checkpoint_retained_locally", assignmentId: f.assignment.id }), expect.any(String),
+    ), { timeout: 10_000 });
     expect(f.workspace.mock.calls.map(call => call[1])).toEqual(["begin", "seal"]);
     expect(await readFile(join(f.cwd, "file.txt"), "utf8")).toBe("retained unfinished work");
     expect(f.supervisor.journal.assignments.get(`${f.assignment.id}:${f.assignment.attempt}`)).toMatchObject({

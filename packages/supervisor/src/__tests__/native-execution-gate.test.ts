@@ -222,6 +222,30 @@ it("adopts Core's fresh check that arrives after the old lease ran out, and keep
   expect(() => f.gate.assertDispatchCurrent(operation.authority)).not.toThrow();
 });
 
+it("abandons a renewal that never settles and checks again, without adopting its late answer", async () => {
+  vi.useFakeTimers();
+  const f = await fixture();
+  const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), child: vi.fn() };
+  const gate = f.makeGate({ logger });
+  const operation = await gate.admit(f.envelope);
+  await gate.begin(operation);
+  const answered = f.client.checkExecution.getMockImplementation()!;
+  let answerLate: (value: Awaited<ReturnType<typeof answered>>) => void = () => undefined;
+  f.client.checkExecution.mockImplementationOnce(() => new Promise(resolve => { answerLate = resolve; }));
+  const before = f.client.checkExecution.mock.calls.length;
+  const verified = () => logger.info.mock.calls.filter(([entry]) => entry.event === "execution.renewal_completed").length;
+  for (let second = 0; second < 25; second += 1) { f.advance(1000); await vi.advanceTimersByTimeAsync(1000); }
+  // The hung exchange did not end the turn or the renewals.
+  expect(f.client.checkExecution.mock.calls.length).toBeGreaterThan(before + 1);
+  expect(f.onAuthorityLost).not.toHaveBeenCalled();
+  expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: "execution.renewal_failed", stage: "check", code: "execution_authority_unavailable" }), expect.any(String));
+  expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: "execution.renewal_retry_scheduled", diagnostic: "renewal_unsettled" }), expect.any(String));
+  const verifiedBefore = verified();
+  answerLate(await answered("instance", "execution", {} as never));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(verified()).toBe(verifiedBefore);
+});
+
 it("keeps the agent running while renewals go unanswered past the lease, backing off, and stops it only when Core answers the execution is gone", async () => {
   vi.useFakeTimers();
   const f = await fixture();
@@ -896,6 +920,34 @@ describe("MCP capability renewal bounded by the execution's live authority", () 
       expect(core.attempts.at(-1)).toEqual({ deadlineAtMs: liveUntil, reachedCore: true });
       expect(Date.parse(renewed.expiresAt)).toBeGreaterThan(Date.parse(capabilityWork.expiresAt));
     } finally { await f.session.close("cancelled"); }
+  });
+
+  it("keeps a finished turn's output going after its platform tools stop, and closes as completed once Core accepts it", async () => {
+    const receipt = { version: 1 as const, acceptanceId: "acceptance", invocationRef: "invocation",
+      binding: { workspaceId: "tenant", instanceId: "instance", sessionId: "session", assignmentId: "assignment", attempt: 1 },
+      claimId: "claim", resultId: "result", resultDigest: `sha256:${"a".repeat(64)}`, inputSelectionDigest: `sha256:${"b".repeat(64)}`,
+      baseRevision: "base", acceptedAt: new Date().toISOString() };
+    let accepting = false;
+    const acceptDeliveryOutput = vi.fn<(authority: { claimId: string; invocationRef: string }) => Promise<RemoteDeliveryAcceptanceReceipt>>(async () => {
+      if (accepting) return receipt;
+      throw new RemoteInstanceError("temporarily_unavailable", "refused", { retryable: true, diagnostic: "response_transient_503" });
+    });
+    const issued = { mcpServer: { name: "konteks-platform", url: "https://mcp.example/mcp", headers: [{ name: "authorization", value: "Bearer capability" }] },
+      expiresAt: new Date(Date.parse("2026-09-10T00:00:00Z") + 3_600_000).toISOString() };
+    const redeem = vi.fn<() => Promise<CapabilityTokenIssue>>().mockResolvedValueOnce(issued)
+      .mockRejectedValue(new RemoteInstanceError("capability_unavailable", "No longer issued"));
+    const logger = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    const f = await sessionFixture(capabilityWork, acceptDeliveryOutput, logger, {}, { redeemCapabilityToken: redeem });
+    await f.session.onToRuntime(f.envelope);
+    const handedIn = f.session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp", requestId: "request", result: { stopReason: "end_turn" } } as never);
+    await vi.waitFor(() => expect(acceptDeliveryOutput).toHaveBeenCalled());
+    await expect(facadeOf(f.session).refresh(true, "timer")).rejects.toMatchObject({ code: "capability_unavailable" });
+    expect(f.session.isClosed).toBe(false);
+    expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: "mcp_capability.owner_stop_deferred" }), expect.any(String));
+    accepting = true;
+    await handedIn;
+    expect(f.session.isClosed).toBe(true);
+    expect(f.send.mock.calls.at(-1)?.[0].body).toMatchObject({ kind: "session_closed", reason: "completed" });
   });
 
   it("stops renewal and closes the session once that authority has ended", async () => {

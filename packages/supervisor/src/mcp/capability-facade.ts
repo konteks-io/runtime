@@ -336,7 +336,7 @@ export class McpCapabilityFacade {
   /** Retry with backoff until the renewal deadline; a permanent refusal or a missed deadline stops the owner. */
   private async afterRefreshFailure(error: unknown): Promise<void> {
     this.refreshFailures++;
-    this.renewalDeadline ??= Math.min(Date.parse(this.issue.expiresAt), this.now() + 60_000);
+    this.renewalDeadline ??= Date.parse(this.issue.expiresAt);
     const remaining = this.renewalDeadline - this.now();
     const retryable = error instanceof RemoteInstanceError && (error.retryable || error.code === "temporarily_unavailable");
     if (retryable && remaining > 0) {

@@ -8,7 +8,9 @@ import { isSignInElicitation } from "./policy-responder.js";
  * Sanitized pending-permission facts. The supervisor forwards ONLY
  * these fields for a policy-deferred request — title, tool kind, options, or
  * a bounded elicitation message + schema — plus the `requestDigest` Core and
- * the answerer must echo. Raw tool input, paths, and `_meta` never leave.
+ * the answerer must echo. Raw tool input and `_meta` never leave; an
+ * execute-kind deferral's title carries the redacted, bounded command from
+ * that input, which can include absolute host paths.
  */
 export interface SanitizedPermission {
   kind: "permission";

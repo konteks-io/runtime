@@ -727,7 +727,7 @@ export class WorkOrchestrator {
     // lane, and its ack waits for this handler. Dispatch can run long:
     // integration and onboarding run to their terminal report, and a relayed
     // session may wait for a deliberate idle release while the previous
-    // session's checkpoint uploads. Awaiting any of that here held every later
+    // session's recovery copy is taken. Awaiting any of that here held every later
     // claim, report ack and cancel behind one read (10-09: three reads claimed
     // at once all finished ~19 min later, as the planner turn waiting on them
     // expired). Every dispatch runs off-lane; `dispatching` keeps it owned and
@@ -1306,7 +1306,7 @@ export class WorkOrchestrator {
 
   /**
    * The channel may be held by a deliberate idle release (the reaper or a
-   * capacity reclaim) while its workspace checkpoint uploads. Wait for that
+   * capacity reclaim) while its recovery copy is taken. Wait for that
    * exact release, bounded by its own deadline, so this placement runs once it
    * finishes instead of being refused as an unqualified recovery. A release
    * that outlives the deadline is named as its own state, then the ordinary
@@ -1959,7 +1959,7 @@ export class WorkOrchestrator {
   private async releaseIdleSession(channelId: string, owner: RelayedSession, idle: IdleCompletedSession, now: number, stage: "idle_reaper" | "capacity_reclaim"): Promise<boolean> {
     if (this.releasingIdle.has(channelId)) return false;
     // Registered before the first await inside the release, so a placement that
-    // arrives during the checkpoint upload can await this exact deliberate release.
+    // arrives while the recovery copy is taken can await this exact deliberate release.
     const completion = this.releaseIdleSessionOnce(channelId, owner, idle, now, stage);
     const release: InFlightIdleRelease = { completion, deadlineAt: Date.now() + IDLE_RELEASE_WAIT_MS, stage };
     this.releasingIdle.set(channelId, release);

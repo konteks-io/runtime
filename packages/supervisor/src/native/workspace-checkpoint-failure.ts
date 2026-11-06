@@ -22,8 +22,43 @@ export function checkpointCause(error: unknown): string | undefined {
   return diagnosticIdentifier(gitStep ? `${error.diagnostic}_${gitStep}` : error.diagnostic);
 }
 
+type SchemaIssue = { message?: string; path?: PropertyKey[]; errors?: SchemaIssue[][] };
+
+/** The contract's own refusals, by name; any other refusal is named by its field. Never the refused value. */
+const SCHEMA_RULES: ReadonlyMap<string, string> = new Map([
+  ["Checkpoint link leaves its workspace", "link_leaves_workspace"],
+  ["Invalid workspace manifest limits or paths", "manifest_limits_or_paths"],
+  ["Invalid workspace manifest identity", "manifest_identity"],
+  ["Workspace manifest is too large", "manifest_too_large"],
+]);
+
+/** A checkpoint is one format, so the other format's refusal of `format` says nothing about it. */
+function formatIssues(issues: SchemaIssue[]): SchemaIssue[] {
+  return issues.flatMap(issue => {
+    const arm = issue.errors?.find(candidate => !candidate.some(item => item.path?.[0] === "format"));
+    return arm ? formatIssues(arm) : [issue];
+  });
+}
+
+function schemaRule(issue: SchemaIssue | undefined): string | undefined {
+  const field = issue?.path?.[0];
+  return SCHEMA_RULES.get(issue?.message ?? "") ?? (typeof field === "string" ? field.toLowerCase() : undefined);
+}
+
 function schemaCause(error: unknown): string | undefined {
-  return error instanceof Error && error.name === "ZodError" ? "schema_invalid" : undefined;
+  if (!(error instanceof Error) || error.name !== "ZodError") return undefined;
+  const rule = schemaRule(formatIssues((error as Error & { issues: SchemaIssue[] }).issues)[0]);
+  return (rule && diagnosticIdentifier(`schema_invalid_${rule}`)) || "schema_invalid";
+}
+
+/** Which rule of the transfer contract a path breaks, by name and never by spelling. */
+export function transferPathRule(path: string): string {
+  if (path !== path.normalize("NFC")) return "not_nfc";
+  if (Buffer.byteLength(path, "utf8") > 1024) return "too_long";
+  if (/[\\:<>"|?*\p{Cc}\p{Cf}\p{Cs}]/u.test(path)) return "character";
+  const parts = path.split("/");
+  if (parts.length > 24) return "too_deep";
+  return parts.some(part => /[ .]$/.test(part)) ? "trailing_dot_or_space" : "reserved_name";
 }
 
 /** A failed checkpoint step as Konteks reads it: the stage carries the cause, the evidence only what was observed. */

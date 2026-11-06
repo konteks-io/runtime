@@ -1,4 +1,4 @@
-import { appendFile, link, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, link, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -66,6 +66,33 @@ describe("named recovery checkpoint refusals", () => {
     const error = await refusal(captured());
     expect(error).toMatchObject({ code: "capability_unavailable", diagnostic: "git_info_exclude_custom" });
     expect(error.message).toBe("The unfinished workspace could not be preserved or verified. The original workspace was kept.");
+  });
+
+  it("names a submodule the index carries", async () => {
+    await testGitCommand(tool, cwd, ["update-index", "--add", "--cacheinfo", `160000,${baseline},sub`]);
+    expect(await refusal(captured())).toMatchObject({ diagnostic: "index_unparsable_gitlink" });
+  });
+
+  it.each([
+    ["a?b.txt", "character"], ["name.", "trailing_dot_or_space"], ["con.txt", "reserved_name"], ["e\u0301.txt", "not_nfc"],
+  ])("names the path rule %s breaks, never the path", async (name, rule) => {
+    await writeFile(join(cwd, name), "x");
+    const error = await refusal(captured());
+    expect(error).toMatchObject({ diagnostic: `path_unsupported_${rule}` });
+    expect(JSON.stringify(checkpointFailure(error, operation))).not.toContain(name);
+  });
+
+  it.each([["v1", undefined], ["v2", { put: async () => undefined }]])("names a link leaving the workspace in a %s checkpoint", async (_format, chunks) => {
+    await symlink(join(root, "outside"), join(cwd, "link"));
+    const error = await refusal(captureWorkspaceCheckpoint({ cwd, baselineCommit: baseline, tool, chunks } as never));
+    expect(checkpointCause(error)).toBe("schema_invalid_link_leaves_workspace");
+  });
+
+  it("names the field a branch name breaks", async () => {
+    await testGitCommand(tool, cwd, ["branch", "feature#1"]);
+    const error = await refusal(captured());
+    expect(checkpointFailure(error, operation)).toEqual({ phase: "checkpoint", stage: "workspace_capture_schema_invalid_refs",
+      code: "checkpoint_capture_failed", evidence: { kind: "runtime_exception" } });
   });
 
   it("names a stash the checkpoint cannot carry", async () => {
