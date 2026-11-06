@@ -126,7 +126,8 @@ function browserRule(identity: PermissionToolIdentity, request: RequestPermissio
   return null;
 }
 
-function admittedTool(identity: { server: string; tool: string }, context: PermissionContext): boolean {
+function admittedTool(identity: { server: string; tool: string }, context: PermissionContext, request: RequestPermissionRequest): boolean {
+  if (personalMcpTool(identity.server, context, request)) return true;
   if (context.directAccountConnectors && context.agentId === "claude-code" && /^claude_ai_[A-Za-z0-9_-]+$/.test(identity.server)) return true;
   return context.admittedMcpTools?.some(entry => entry.server === identity.server && entry.tools.includes(identity.tool)) ?? false;
 }
@@ -166,7 +167,7 @@ export class EvaluatorPolicyResponder implements PolicyResponder {
     const identity = context.toolIdentity ?? identityOf(request, context);
     const escalation = nativePermissionEscalation(request, context, identity, this.humanDeferralAllowed);
     const options = answerOptions(request, escalation);
-    const ruled = browserRule(identity, request, context, options) ?? this.mcpRule(identity, context, options.deny);
+    const ruled = browserRule(identity, request, context, options) ?? this.mcpRule(identity, context, options.deny, request);
     if (ruled) return ruled;
     if (this.evaluator === null) return escalation ?? this.deferOrDeny(options.deny);
     return this.evaluated(this.evaluator, request, context, options, identity, escalation);
@@ -177,13 +178,14 @@ export class EvaluatorPolicyResponder implements PolicyResponder {
    * the MCP servers this session gave its agent are callable: the person's
    * claude.ai connectors and own Codex servers, a repository's servers,
    * anything else is refused, and never put to a person. An owner-admitted
-   * direct Claude session may ask for account connector calls, once. A tool an
+   * direct Claude session may ask for account connectors and bridge-identified
+   * personal MCP calls, once. A tool an
    * integration binding admitted goes to that binding's gate: asked, once.
    */
-  private mcpRule(identity: PermissionToolIdentity, context: PermissionContext, deny: string | null): PolicyDecision | null {
+  private mcpRule(identity: PermissionToolIdentity, context: PermissionContext, deny: string | null, request: RequestPermissionRequest): PolicyDecision | null {
     if (identity.kind === "unidentified" && identity.mcp) return { kind: "deny", optionId: deny };
     if (identity.kind !== "mcp" || context.sessionServers === undefined || context.sessionServers.has(identity.server)) return null;
-    return admittedTool(identity, context) && this.humanDeferralAllowed() ? { kind: "defer", allowOnceOnly: true } : { kind: "deny", optionId: deny };
+    return admittedTool(identity, context, request) && this.humanDeferralAllowed() ? { kind: "defer", allowOnceOnly: true } : { kind: "deny", optionId: deny };
   }
 
   private deferOrDeny(deny: string | null): PolicyDecision {
@@ -218,4 +220,10 @@ export class EvaluatorPolicyResponder implements PolicyResponder {
     if (isSignInElicitation(request)) return { kind: "decline" };
     return this.humanDeferralAllowed() ? { kind: "defer" } : { kind: "decline" };
   }
+}
+
+function personalMcpTool(server: string, context: PermissionContext, request: RequestPermissionRequest): boolean {
+  if (!context.directAccountConnectors || context.agentId !== "claude-code") return false;
+  const meta = request.toolCall._meta as { claudeCode?: { personalMcpServer?: unknown } } | undefined;
+  return meta?.claudeCode?.personalMcpServer === server;
 }

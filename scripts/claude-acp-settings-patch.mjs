@@ -15,9 +15,11 @@ import { konteksPrefixedName } from "./konteks-session-prefix.mjs";
 // every call still meets the connector's integration gate. Owner-admitted
 // direct Claude sessions use the same account connector admission on new, load
 // and resume, with one-time human decisions for external tools. A direct
-// session's own title shows behind the [konteks] prefix.
+// session's own title shows behind the [konteks] prefix. Only owner-direct
+// admission additionally loads top-level personal MCP definitions, never user
+// settings or project MCPs. The bridge identifies their permission requests.
 export const claudeAcpSettingsPatch = {
-  id: "konteks-claude-project-settings-v5",
+  id: "konteks-claude-project-settings-v6",
   version: "0.75.1",
   hashes: {
     "acp-agent.js": "c22424c297429378166524b59ee6bed239c999a420ad0dd06571b768efa7525b",
@@ -36,7 +38,7 @@ export function patchClaudeSettings(source, file, version) {
     source = source.replace(before, after);
   };
   if (file === "acp-agent.js") {
-    source = 'import { hardenClaudeSession, isolateClaudeInstructions, konteksAccountConnectors } from "./konteks-instruction-scope.mjs";\n' + source;
+    source = 'import { hardenClaudeSession, isolateClaudeInstructions, konteksAccountConnectors, ownerClaudeMcpServers, ownerClaudeMcpToolServer } from "./konteks-instruction-scope.mjs";\n' + source;
     replace('        const env = {\n            ...process.env,', '        settings = hardenClaudeSession(await isolateClaudeInstructions(settings, params.cwd, CLAUDE_CONFIG_DIR), konteksAccountConnectors(params._meta));\n        this.logger.log(`[konteks] instruction_scope version=4 settings=${konteksAccountConnectors(params._meta) ? "none" : "project"} ancestors=excluded user=excluded local=excluded auto_memory=excluded auth=official_profile exclusions=${settings.claudeMdExcludes.length} hooks=disabled repository_mcp=excluded account_connectors=${konteksAccountConnectors(params._meta) ? "integration" : "excluded"}`);\n        const env = {\n            ...process.env,');
     replace('settingSources: ["user", "project", "local"],', 'settingSources: ["project"],');
     // Apply after the optional client options too, including session/load and
@@ -44,8 +46,11 @@ export function patchClaudeSettings(source, file, version) {
     // Name the tool in a structured field on every permission request
     // (the request carried it only in its display title). The connector's
     // policy reads `_meta.claudeCode.toolName`, never the title.
-    replace('    async requestPermissionFromClient(params, toolName, signal, parentToolUseId, ownerSessionId = params.sessionId) {\n', '    async requestPermissionFromClient(params, toolName, signal, parentToolUseId, ownerSessionId = params.sessionId) {\n        params = { ...params, toolCall: { ...params.toolCall, _meta: { ...params.toolCall._meta, claudeCode: { ...params.toolCall._meta?.claudeCode, toolName } } } };\n');
+    replace('    async requestPermissionFromClient(params, toolName, signal, parentToolUseId, ownerSessionId = params.sessionId) {\n', '    async requestPermissionFromClient(params, toolName, signal, parentToolUseId, ownerSessionId = params.sessionId) {\n        params = { ...params, toolCall: { ...params.toolCall, _meta: { ...params.toolCall._meta, claudeCode: { ...params.toolCall._meta?.claudeCode, toolName, personalMcpServer: await ownerClaudeMcpToolServer(this.sessions[ownerSessionId]?.creationParams?._meta, CLAUDE_CONFIG_DIR, toolName) } } } };\n');
     replace('            ...userProvidedOptions,\n', '            ...userProvidedOptions,\n            settingSources: konteksAccountConnectors(params._meta) ? [] : ["project"],\n            strictMcpConfig: !konteksAccountConnectors(params._meta),\n');
+
+    replace('            mcpServers: {\n                ...(userProvidedOptions?.mcpServers || {}),',
+      '            mcpServers: {\n                ...await ownerClaudeMcpServers(params._meta, CLAUDE_CONFIG_DIR, [...Object.keys(userProvidedOptions?.mcpServers || {}), ...Object.keys(mcpServers), FILE_CHANGE_AUDIT_SERVER_NAME]),\n                ...(userProvidedOptions?.mcpServers || {}),');
 
   } else if (file === "session-titles.js") {
     // A direct session: Claude's own generated title, behind
