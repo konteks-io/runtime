@@ -398,8 +398,10 @@ export class CoreClient {
   }
 
   async activationExchange(request: Omit<RemoteInstanceActivationExchangeRequest, "proof">, nonce: string): Promise<RemoteInstanceActivationExchangeResult> {
+    // Core permits a consumed activation replay only with its original proof
+    // nonce. The durable attempt binds this nonce to the key, platform and release.
     return this.http.request({ method: "POST", path: CORE_PATHS.activationExchange,
-      bodyFactory: () => ({ ...request, proof: this.proof("activation_exchange", request.activationId, request as unknown as { [key: string]: JsonValue }) }),
+      bodyFactory: () => ({ ...request, proof: this.proof("activation_exchange", request.activationId, request as unknown as { [key: string]: JsonValue }, nonce) }),
       schema: RemoteInstanceActivationExchangeResultSchema, idempotencyKey: `activation:${request.activationId}:${nonce}` });
   }
 

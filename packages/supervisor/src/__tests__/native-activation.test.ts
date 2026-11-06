@@ -114,7 +114,7 @@ describe("native activation and resumable exchange", () => {
     expect(f.args.readActivationCode).toHaveBeenCalledOnce();
   });
 
-  it("persists semantic retry identity and key before the first request while refreshing transport proof", async () => {
+  it("persists retry identity and key before the first request and reuses Core's activation proof nonce", async () => {
     const f = fixture();
     const exchange = f.args.fetchFn.getMockImplementation()!;
     let first: RemoteInstanceActivationExchangeRequest | undefined;
@@ -123,13 +123,14 @@ describe("native activation and resumable exchange", () => {
       const attempt = JSON.parse(await readFile(join(dir, "activation-attempt.json"), "utf8"));
       expect(attempt).toMatchObject({ activationId: f.args.activationId, manifestDigest: f.manifest.digest });
       expect((init?.headers as Record<string, string>)["idempotency-key"]).toBe(`activation:${f.args.activationId}:${attempt.nonce}`);
+      expect(first?.proof.nonce).toBe(attempt.nonce);
       throw new Error("response lost after Core commit");
     });
     await expect(runNativeActivationExchange(f.args)).rejects.toMatchObject({ code: "temporarily_unavailable" });
     f.args.fetchFn.mockReset().mockImplementation(exchange);
     expect(await new SupervisorStore(dir).identity()).toBeNull();
     await runNativeActivationExchange(f.args);
-    expect(f.requests[0]?.proof.nonce).not.toBe(first?.proof.nonce);
+    expect(f.requests[0]?.proof.nonce).toBe(first?.proof.nonce);
     expect(f.requests[0]?.publicKeyJwk).toEqual(first?.publicKeyJwk);
   });
 
@@ -139,7 +140,30 @@ describe("native activation and resumable exchange", () => {
     await expect(runNativeActivationExchange(f.args)).rejects.toThrow("disk full");
     await runNativeActivationExchange(f.args);
     expect(f.requests).toHaveLength(2);
-    expect(f.requests[0]?.proof.nonce).not.toBe(f.requests[1]?.proof.nonce);
+    expect(f.requests[0]?.proof.nonce).toBe(f.requests[1]?.proof.nonce);
+    expect(await new SupervisorStore(dir).provisioning()).not.toBeNull();
+  });
+
+  it("recovers an automatic retry after Core consumed the activation but its response was lost", async () => {
+    const f = fixture();
+    const exchange = f.args.fetchFn.getMockImplementation()!;
+    let committed: RemoteInstanceActivationExchangeRequest | undefined;
+    f.args.fetchFn.mockImplementation(async (url, init) => {
+      const request = JSON.parse(String(init?.body)) as RemoteInstanceActivationExchangeRequest;
+      if (!committed) {
+        committed = request;
+        await exchange(url, init);
+        throw new TypeError("response lost after commit");
+      }
+      // The existing Core contract refuses a fresh nonce on a consumed activation.
+      if (request.proof.nonce !== committed.proof.nonce) {
+        return new Response(JSON.stringify({ code: "activation_consumed", message: "Activation has already been consumed" }), { status: 409, headers: { "content-type": "application/json" } });
+      }
+      return exchange(url, init);
+    });
+    await expect(runNativeActivationExchange(f.args)).resolves.toMatchObject({ instanceId: "instance-native" });
+    expect(f.args.fetchFn).toHaveBeenCalledTimes(2);
+    expect(f.requests[0]?.proof.nonce).toBe(f.requests[1]?.proof.nonce);
     expect(await new SupervisorStore(dir).provisioning()).not.toBeNull();
   });
 
