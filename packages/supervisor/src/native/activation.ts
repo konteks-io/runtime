@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, readdir, rm } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
-import { createLogger, isFsErrorWithCode, jcsDigest, RemoteInstanceError, RemotePlatformSchema, type Clock, type FetchFn } from "@konteks/remote-common";
+import { CoreResponseError, createLogger, isFsErrorWithCode, jcsDigest, RemoteInstanceError, RemotePlatformSchema, type Clock, type FetchFn } from "@konteks/remote-common";
 import { selectNativeArtifacts, verifyNativeRelease, type EmbeddedReleaseRoot, type VerifiedNativeRelease } from "@konteks/remote-release";
 import { CoreClient } from "../core/client.js";
 import { runActivationExchange, type ActivationExchangeOutcome } from "../provisioning/activation.js";
@@ -43,18 +43,24 @@ export async function runNativeActivationExchange(args: NativeActivationArgs): P
     await store.init();
     const journal = new SupervisorJournal(store.path("journal"), mutations.run); await journal.load();
     const prior = await priorActivation(store, journal);
+    // An unstarted install has no exchange to resume. Obtain its input before
+    // writing a key, nonce or enrollment lineage that a failed prompt would strand.
+    const firstCode = needsFirstCode(prior, journal) ? await args.readActivationCode() : undefined;
+    owner.assertOwned();
     const key = await store.loadOrCreateInstanceKey();
     const enrollment = await enrollmentLineage(journal, args, { fresh, prior, keyDigest: jcsDigest(key.publicKeyJwk as never) });
-    const core = new CoreClient({ baseUrl: args.coreUrl, clock: args.clock, key: () => key, credential: () => null, ...(args.fetchFn ? { fetchFn: args.fetchFn } : {}) });
+    let requests = 0;
+    const fetchFn: FetchFn = (...input) => { requests++; return (args.fetchFn ?? fetch)(...input); };
+    const core = new CoreClient({ baseUrl: args.coreUrl, clock: args.clock, key: () => key, credential: () => null, fetchFn });
     const outcome = await exchangeOrForget(() => runActivationExchange({ store, core, key, clock: args.clock, activationId: args.activationId, platform: { ...platform, containerBackend: "none", deploymentKind: "native_connector" }, deploymentKind: "native_connector", release, roots: args.roots,
       // The person reads this terminal: its progress lines say what happens,
       // and a JSON log line in between read as noise. Warnings stay.
       logger: createLogger({ name: "provisioning", level: "warn" }),
       readActivationCode: async () => {
-      const code = await args.readActivationCode();
+      const code = firstCode ?? await args.readActivationCode();
       owner.assertOwned();
       return code;
-    } }), () => forgetRefusedAttempt(args.dataDir, owner, prior.identity));
+    } }), () => forgetRefusedAttempt(args.dataDir, owner, prior, requests));
     owner.assertOwned();
     if (enrollment) await bindEnrollment(store, journal, enrollment, outcome, owner);
     return outcome;
@@ -62,6 +68,10 @@ export async function runNativeActivationExchange(args: NativeActivationArgs): P
     await mutations.close();
     owner.release();
   }
+}
+
+function needsFirstCode(prior: PriorActivation, journal: SupervisorJournal): boolean {
+  return !prior.attempt && !prior.identity && !journal.execution.enrollment();
 }
 
 function verifiedActivationTarget(args: NativeActivationArgs): { platform: ReturnType<typeof RemotePlatformSchema.parse>; release: VerifiedNativeRelease } {
@@ -120,14 +130,12 @@ function untouchedRoot(fresh: boolean, prior: PriorActivation): boolean {
 }
 
 /**
- * Konteks answered: this code will never connect here (used, expired, wrong,
- * or no room), and nothing was made. The next command, with a new code from
- * the site, must not meet "Native enrollment retry changed its original
- * lineage", so this attempt is forgotten. An uncertain exchange (no answer)
- * is kept.
+ * Only one answered request using a newly created key can establish that
+ * nothing was made. A refusal after automatic retries or an earlier command
+ * cannot settle an exchange whose successful response may have been lost.
  */
-async function forgetRefusedAttempt(dataDir: string, owner: RootOwner, identityBeforeExchange: PriorActivation["identity"]): Promise<void> {
-  if (identityBeforeExchange) return;
+async function forgetRefusedAttempt(dataDir: string, owner: RootOwner, prior: PriorActivation, requests: number): Promise<void> {
+  if (prior.identity || prior.keyFile || prior.attempt || requests !== 1) return;
   owner.assertOwned();
   for (const entry of await readdir(dataDir)) {
     if (!entry.startsWith(NATIVE_ROOT_LOCK_FILE)) await rm(join(dataDir, entry), { recursive: true, force: true });
@@ -148,7 +156,13 @@ async function exchangeOrForget<T>(exchange: () => Promise<T>, forget: () => Pro
   try {
     return await exchange();
   } catch (error) {
-    if (error instanceof RemoteInstanceError && REFUSED.has(error.code)) await forget().catch(() => undefined);
+    // A local input error says nothing about an earlier exchange's outcome.
+    if (definitivelyRefused(error)) await forget().catch(() => undefined);
     throw error;
   }
+}
+
+function definitivelyRefused(error: unknown): boolean {
+  const response = error instanceof RemoteInstanceError ? error.cause : null;
+  return response instanceof CoreResponseError && !response.retryable && response.status >= 400 && response.status < 500 && REFUSED.has(response.wireCode);
 }

@@ -95,6 +95,16 @@ shown in the app. These are the terminal entry points:
 curl -fsSL https://github.com/konteks-io/runtime/releases/latest/download/install.sh | sh -s -- --activation-id <id>
 ```
 
+For an agent-controlled activation, the installed connector also accepts
+`konteks-remote install --activation-id <id> --activation-code-stdin`. Give its
+standard input exactly one code, optionally followed by a newline, then close
+the pipe. The input is bounded to 4,098 bytes and 60 seconds; a terminal,
+multiple lines, or incomplete input is refused. Feed it directly from the
+trusted caller's memory. Keep the code out of shell command text, arguments,
+environment variables, files and logs. Without this option, activation still
+uses the hidden terminal prompt. `install --enroll` uses email onboarding and
+does not consume an activation code.
+
 On Windows, run this line in either Command Prompt or PowerShell (including
 Windows PowerShell 5.1 and PowerShell 7):
 
@@ -352,6 +362,17 @@ an installation that still lists it keeps working without it. A pre-7.0.0
 installation that listed the old bundled OpenCode reads it as your own
 OpenCode 2. The Docker Compose remote instance is retired.
 
+### Change workspace
+
+Run `konteks-remote switch-workspace` to disconnect this computer from its
+current workspace, then `konteks-remote onboard` to authenticate and choose a
+workspace. The command asks first (`--yes` supplies your confirmation).
+Finish running work and close its sessions before retrying a busy switch.
+Core must confirm the old runtime's removal and the connector must finish
+stopping before the command reports success. Agent logins, local files and
+the previous connection's recovery records stay on this computer. An uncertain
+reply keeps those records; onboarding checks Core before replacing an identity.
+
 ### Uninstall
 
 `uninstall` lets running work finish (up to 15 minutes), has Konteks drain,
@@ -442,6 +463,18 @@ rules, privacy grants on a signed connector). Each release folder keeps its
 copy only to roll back to. A release that is being checked takes no new work. Konteks can also
 require an update when a release is below its minimum.
 
+During a stopped update, cleanup removes obsolete folders from completed
+update attempts. It keeps the current release, the candidate, the last two
+installed releases, both releases most recently confirmed by Core, and every
+release still named by enrollment, retired identity or in-progress update
+state. Offline installs never count as Core confirmation; cleanup waits until
+two distinct serving bundles have been confirmed for this runtime. A process or open-file reference keeps
+its release too. An unreadable reference, unavailable process query or locked
+file defers cleanup instead of risking a working installation. The bounded
+receipt is `logs/release-cleanup.json`; `--verbose` also prints its counts.
+Deferred folders are checked at the next update. Agent credentials, working
+copies and retired identity records are preserved.
+
 On a connected runtime's page, choose **Update this computer** to request the
 signed release Konteks accepts. The computer must remain on and connected;
 the update waits for active work and may briefly disconnect it. The app shows
@@ -476,7 +509,12 @@ after `npm run build`).
 ## Troubleshooting
 
 - **Logs.** macOS and Windows: `logs/connector.log` in the connector's folder
-  (on Windows kept under 20 MB at each start). Linux: the user journal. When
+  (Windows rotates the running log at 20 MB and limits each new backup to
+  20 MB). Linked log paths are preserved. If storage blocks Windows logging,
+  the connector continues and reports discarded bytes when writing resumes.
+  Identical structured warnings and errors keep their first entry and use
+  counted summaries for repeats; different contexts stay separate.
+  Linux: the user journal. When
   the connector is not running, `doctor` and `support` show the last failed
   start and the log's last lines.
 - **Process names.** The service shows as `konteks-connector` (Linux:

@@ -4,11 +4,12 @@ import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } fro
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { bundleManifestSigningBytes, computeBundleManifestDigest, writeSecretFile } from "@konteks/remote-common";
+import { bundleManifestSigningBytes, computeBundleManifestDigest, RemoteInstanceError, writeSecretFile } from "@konteks/remote-common";
 import { buildReleaseFixture } from "@konteks/remote-release";
 import { acquireNativeRootLock, hostAgentInstallAdapter, loadNativeInstallation, OPENCODE_MIN_BINARY_BYTES, SupervisorStore, verifyInstalledNativeConnector } from "@konteks/remote-supervisor";
-import { addNativeAgent, installNative, prepareNativeReenrollment, readNativeEnrollment, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, removeNativeAgent, restoreNativeRecord } from "../native/install.js";
+import { addNativeAgent, completeNativeEnrollment, installNative, prepareNativeReenrollment, readNativeEnrollment, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, removeNativeAgent, restoreNativeRecord } from "../native/install.js";
 import { startNativeConnector } from "../native/commands.js";
+import { SupervisorControl } from "../control.js";
 import { createOutput } from "../output.js";
 import { terminalFetchConsent } from "../native/consent.js";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
@@ -78,6 +79,24 @@ async function personOpenCode(root: string, version = "2.0.18", name = "@opencod
 }
 
 describe("native install composition", () => {
+  it.each([false, true])("keeps the original Codex profile during re-enrollment, without substituting a default (missing: %s)", async missing => {
+    const f = await fixture();
+    const installed = await installNative(f.options as never);
+    await prepareNativeReenrollment(f.root, installed.instanceId, f.options.deps);
+    await rm(join(f.root, "native-runtime.json"));
+    await writeSecretFile(join(f.root, "supervisor", "identity.json"), JSON.stringify({ instanceId: "replacement", workspaceId: "new-workspace", activationId: "new-activation", activatedAt: new Date().toISOString(), administrativeStatus: "provisioning", exchangeNonce: "new-nonce" }));
+    const other = join(f.root, "another-codex-profile");
+    await mkdir(other, { mode: 0o700 });
+    vi.stubEnv("CODEX_HOME", other);
+    if (missing) await rm(installed.codexHome!, { recursive: true });
+    const complete = completeNativeEnrollment(f.root, { instanceId: "replacement", workspaceId: "new-workspace" }, f.options.deps);
+    if (missing) {
+      await expect(complete).rejects.toMatchObject({ code: "prerequisite_missing" });
+      await expect(readNativeRecord(f.root)).rejects.toMatchObject({ code: "ENOENT" });
+    } else {
+      await expect(complete).resolves.toMatchObject({ instanceId: "replacement", workspaceId: "new-workspace", codexHome: installed.codexHome });
+    }
+  });
   it("records the verified installed release for later recovery of an App-activated runtime", async () => {
     const f = await fixture();
     const record = await installNative(f.options as never);
@@ -85,6 +104,7 @@ describe("native install composition", () => {
       schemaVersion: 1, coreUrl: record.coreUrl, relayUrl: record.relayUrl,
       agents: record.agents, releaseId: record.releaseId, bundleVersion: record.bundleVersion,
       manifestDigest: record.manifestDigest, controlPort: record.controlPort,
+      codexHome: record.codexHome,
     });
     expect(JSON.parse(await readFile(join(f.root, "installer", "enrollment-manifest.json"), "utf8"))).toEqual(f.manifest);
   });
@@ -291,6 +311,52 @@ describe("native install composition", () => {
     }
   });
 
+  it.each(["loaded", "raced"])("waits for a %s service's control socket before a repeated start succeeds", async state => {
+    const f = await fixture();
+    const socket = createServer();
+    await new Promise<void>(resolve => socket.listen(0, "127.0.0.1", resolve));
+    const controlPort = (socket.address() as { port: number }).port;
+    await new Promise<void>((resolve, reject) => socket.close(error => error ? reject(error) : resolve()));
+    const installed = await installNative({ ...f.options, controlPort } as never);
+    const status = { command: "service-status", args: [] };
+    const definition = { status } as never;
+    let elapsed = 0;
+    const call = vi.spyOn(SupervisorControl.prototype, "call")
+      .mockRejectedValueOnce(new RemoteInstanceError("control_socket_unavailable", "still booting"))
+      .mockRejectedValueOnce(new RemoteInstanceError("control_socket_unavailable", "still booting"))
+      .mockResolvedValue({});
+    let checks = 0;
+    const execute = vi.fn(async (_command: unknown) => state === "loaded" || ++checks >= 4 ? 0 : 113);
+    try {
+      await expect(startNativeConnector({ root: f.root, output: f.options.output }, {
+        roots: f.trust, platform: f.platform, definition: async () => definition, execute,
+        controlWaitMs: 10_000, now: () => elapsed, sleep: async (ms: number) => { elapsed += ms; },
+      } as never)).resolves.toBeUndefined();
+      expect(elapsed).toBeGreaterThan(0);
+      expect(call).toHaveBeenCalledTimes(4);
+      expect(execute.mock.calls.every(([command]) => command === status)).toBe(true);
+      expect(await readNativeRecord(f.root)).toEqual(installed);
+    } finally { call.mockRestore(); }
+  });
+
+  it("does not report a service that stopped during the control wait as already running", async () => {
+    const f = await fixture();
+    const installed = await installNative(f.options as never);
+    const status = { command: "service-status", args: [] };
+    let checks = 0;
+    const call = vi.spyOn(SupervisorControl.prototype, "call")
+      .mockRejectedValue(new RemoteInstanceError("control_socket_unavailable", "stopped while booting"));
+    try {
+      await expect(startNativeConnector({ root: f.root, output: f.options.output }, {
+        roots: f.trust, platform: f.platform, definition: async () => ({ status } as never),
+        execute: async () => ++checks === 1 ? 0 : 113,
+        sleep: async () => { throw new Error("must not wait for a stopped service"); },
+      })).rejects.toMatchObject({ code: "temporarily_unavailable" });
+      expect(call).toHaveBeenCalledOnce();
+      expect(await readNativeRecord(f.root)).toEqual(installed);
+    } finally { call.mockRestore(); }
+  });
+
   it("does not claim a loaded but unreachable service is running or change its port", async () => {
     const f = await fixture();
     const holder = createServer();
@@ -315,6 +381,7 @@ describe("native install composition", () => {
             platform: f.platform,
             definition: async () => definition,
             execute: async () => 0,
+            controlWaitMs: 0,
           },
         ),
       ).rejects.toMatchObject({

@@ -19,7 +19,7 @@ type NativeAgentId = (typeof NATIVE_AGENT_IDS)[number];
 
 export interface NativeCommandContext { root: string; output: Output }
 export interface NativeCliActions {
-  install(input: NativeCommandContext & { activationId?: string; enroll?: boolean; coreUrl: string; relayUrl: string; agents?: string[] }): Promise<void>;
+  install(input: NativeCommandContext & { activationId?: string; activationCodeStdin?: boolean; enroll?: boolean; coreUrl: string; relayUrl: string; agents?: string[] }): Promise<void>;
   onboard(input: NativeCommandContext & { answer?: string; cwd?: string }): Promise<void>;
   stageEnrollment(input: NativeCommandContext): Promise<void>;
   addAgent(input: NativeCommandContext & { agent: NativeAgentId; yes?: boolean }): Promise<void>;
@@ -27,6 +27,7 @@ export interface NativeCliActions {
   serve(input: NativeCommandContext): Promise<void>;
   start(input: NativeCommandContext): Promise<void>;
   stop(input: NativeCommandContext): Promise<void>;
+  switchWorkspace(input: NativeCommandContext & { yes?: boolean }): Promise<void>;
   update(input: NativeCommandContext & { check: boolean; unattended: boolean }): Promise<void>;
   uninstall(input: NativeCommandContext): Promise<void>;
   control(input: NativeCommandContext & { operation: "status" | "agents" | "doctor" | "support" | "preview.status" | "auth.status" | "auth.login" | "auth.logout" | "git.key.add" | "git.key.list" | "git.key.remove"; agent?: string; organization?: boolean; provider?: string; method?: string; reuse?: boolean; project?: string; location?: string; title?: string; keyRef?: string }): Promise<void>;
@@ -80,15 +81,17 @@ export function createNativeProgram(actions: NativeCliActions): Command {
   };
   program.command("install").description("install the connector with a one-time code from Konteks, then start it")
     .option("--activation-id <id>", "non-secret activation id from App or MCP", id)
+    .option("--activation-code-stdin", "read one activation code from a closed input pipe instead of the hidden terminal prompt; never pass the code in arguments", false)
     // Agent-first onboarding: no activation, no
     // prompt, no TTY. The install stops short of an identity; `onboard` binds.
     .option("--enroll", "prepare this machine for `konteks-remote onboard` instead of consuming an activation", false)
     .option("--core-url <url>", "Core HTTPS endpoint", process.env.KONTEKS_CORE_URL ?? "https://api.konteks.io")
     .option("--relay-url <url>", "relay WSS endpoint", process.env.KONTEKS_RELAY_URL ?? "wss://relay.konteks.io/relay/runtime")
     .option("--agents <ids>", "only these agents, each required: claude-code, codex, dsh, opencode, antigravity (default: the ones found here, offering Claude Code and Codex when missing; antigravity asks before downloading Google Antigravity from Google)", value => value.split(",").map(part => agent(part.trim())))
-    .action(async (options: { activationId?: string; enroll: boolean; coreUrl: string; relayUrl: string; agents?: string[] }) => {
+    .action(async (options: { activationId?: string; activationCodeStdin: boolean; enroll: boolean; coreUrl: string; relayUrl: string; agents?: string[] }) => {
       if (!options.activationId && !options.enroll) throw new InvalidArgumentError("install needs either --activation-id or --enroll");
       if (options.activationId && options.enroll) throw new InvalidArgumentError("an activation install and an enrollment install are different doors; choose one");
+      if (options.activationCodeStdin && !options.activationId) throw new InvalidArgumentError("--activation-code-stdin requires --activation-id");
       await actions.install({ ...context("install"), ...options });
     },
     );
@@ -106,6 +109,9 @@ export function createNativeProgram(actions: NativeCliActions): Command {
   program.command("serve").description("run the connector in this terminal (the background service uses this)").action(async () => actions.serve(context()));
   program.command("start").description("start the connector's background service").action(async () => actions.start(context()));
   program.command("stop").description("stop the connector's background service; this computer and its work are kept").action(async () => actions.stop(context()));
+  program.command("switch-workspace").description("disconnect the current workspace while keeping agent logins, then use onboard to choose a workspace")
+    .option("--yes", "you agree to disconnect the current workspace (asked otherwise)", false)
+    .action(async (options: { yes: boolean }) => actions.switchWorkspace({ ...context(), yes: options.yes }));
   const agentLifecycle = program.command("agent").description("add or remove agents on this computer");
   agentLifecycle.command("add").description("add one agent without reactivation: Claude Code (Anthropic's installer is offered when it is missing) or Codex (ships with Konteks), then their sign-in, your own DeepSeek Harness or OpenCode 2 install (nothing downloaded), or Google Antigravity, downloaded from Google (dl.google.com, about 110 MB) after you say yes")
     .argument("<agent>", "agent family: claude-code, codex, dsh, opencode or antigravity", agent)

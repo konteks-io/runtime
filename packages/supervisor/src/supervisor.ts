@@ -92,7 +92,7 @@ import { PreviewChannel } from "./preview/preview-channel.js";
 import { PreviewProcessManager, PreviewProcessRegistry, type AgentPreviewActivity } from "./preview/process-manager.js";
 import { PreviewViewerStarts } from "./preview/viewer-start.js";
 import type { SessionPreviewAccess } from "./preview/mcp-server.js";
-import { provisioningCredentialIsExpired, refreshProvisioningCredential, submitReadiness } from "./provisioning/activation.js";
+import { finishActivationAttempt, provisioningCredentialIsExpired, refreshProvisioningCredential, submitReadiness } from "./provisioning/activation.js";
 import { Reconciliation } from "./reconnect/reconciliation.js";
 import { STARTUP_RECOVERY_BOUND_MS, STARTUP_RECOVERY_RETRY_MS, StartupRecoveryBound, type StartupPhase } from "./reconnect/startup-recovery-bound.js";
 import { ChannelMux } from "./relay/channel-mux.js";
@@ -130,7 +130,7 @@ import { observeSlowJournalWork } from "./state/slow-work.js";
 import { EventLoopWatch } from "./event-loop-watch.js";
 import type { RuntimeRecoveryRecord } from "./state/runtime-recovery.js";
 import { DurableOutbox } from "./state/outbox.js";
-import { DEFAULT_CONFIG, MACHINE_KEY_LOST, SupervisorStore, type ConfigRecord, type ShutdownProgress } from "./state/store.js";
+import { DEFAULT_CONFIG, MACHINE_KEY_LOST, SupervisorStore, type ConfigRecord, type NativeServingRelease, type ShutdownProgress } from "./state/store.js";
 import { buildSupportBundle } from "./support/bundle.js";
 import { runDoctor, type AntigravityDoctorInputs, type OpenCodeDoctorInputs } from "./support/doctor.js";
 import { openCodeInstallKind } from "./native/opencode-installation.js";
@@ -226,6 +226,8 @@ export interface SupervisorOptions {
      * never stops it under a claim.
      */
     updateProbation?: { releaseId: string; readLedger: () => Promise<NativeUpdateLedger>; pollMs?: number; staleAttemptMs?: number };
+    /** The serving folder from the verified native installation, never an offline update assertion. */
+    servingRelease?: NativeServingRelease;
   };
 }
 
@@ -1892,6 +1894,10 @@ export class Supervisor {
     await this.refreshConfiguration();
     if (this.stopping) return;
     this.requireRecoveryAuthority();
+    await finishActivationAttempt(this.store, this.logger);
+    this.requireRecoveryAuthority();
+    await this.rememberAcceptedRelease();
+    this.requireRecoveryAuthority();
     await this.startOrdinaryLoops();
     if (this.stopping) return;
     this.requireRecoveryAuthority();
@@ -1901,6 +1907,22 @@ export class Supervisor {
     this.reconnectRefusal = null;
     this.beginActiveWork();
     await this.work.reports.flushAll();
+  }
+
+  private async rememberAcceptedRelease(): Promise<void> {
+    const release = this.options.native?.servingRelease;
+    if (!release) return;
+    try {
+      this.requireRecoveryAuthority();
+      const authority = this.recoveryAuthority();
+      const claims = decodeLeaseClaims(this.lease.current()!.lease, { instanceId: this.instanceId!, audience: LEASE_AUDIENCE });
+      if (claims.bundle_version !== release.bundleVersion || release.bundleVersion !== this.config.SUPERVISOR_BUNDLE_VERSION || release.manifestDigest !== this.manifestDigest) throw new Error("Serving release does not match Core's accepted bundle");
+      await this.store.confirmServingRelease({ instanceId: this.instanceId!, workspaceId: this.workspaceId!, release }, () => {
+        if (this.recoveryAuthority() !== authority) throw new Error("Serving release recovery authority changed");
+      });
+    } catch {
+      this.logger.warn({ stage: "release_retention", code: "unverified_history" }, "Serving release history could not be confirmed; old release cleanup will wait");
+    }
   }
 
   /** Readiness was committed but its response lost: the recovered identity ends provisioning. */

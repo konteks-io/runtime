@@ -11,6 +11,14 @@ function fixture() {
 }
 
 describe("native customer entry point", () => {
+  it("offers an explicit workspace switch without uninstalling agent data", async () => {
+    const switchWorkspace = vi.fn(async () => {});
+    const { actions } = fixture();
+    const program = createNativeProgram({ ...actions, switchWorkspace }).exitOverride().configureOutput({ writeOut: () => {}, writeErr: () => {} });
+    await program.parseAsync(["--root", "/private/native-root", "switch-workspace", "--yes"], { from: "user" });
+    expect(switchWorkspace).toHaveBeenCalledWith(expect.objectContaining({ root: "/private/native-root", yes: true }));
+    expect(actions.uninstall).not.toHaveBeenCalled();
+  });
   it("accepts claude as the Claude Code sign-in alias", async () => {
     const { program, actions } = fixture();
     await program.parseAsync(["auth", "login", "claude"], { from: "user" });
@@ -41,6 +49,17 @@ describe("native customer entry point", () => {
     await program.parseAsync(["--root", "/private/native-root", "install", "--activation-id", "activation-123", "--agents", "codex", "--core-url", "https://core.example", "--relay-url", "wss://relay.example/runtime"], { from: "user" });
     expect(actions.install).toHaveBeenCalledWith(expect.objectContaining({ activationId: "activation-123", agents: ["codex"], root: "/private/native-root" }));
     expect(actions.install.mock.calls[0]?.[0]).not.toHaveProperty("activationCode");
+  });
+  it("accepts an explicit activation code pipe without putting the code in arguments", async () => {
+    const { program, actions } = fixture();
+    await program.parseAsync(["--json", "install", "--activation-id", "activation-123", "--activation-code-stdin"], { from: "user" });
+    expect(actions.install).toHaveBeenCalledWith(expect.objectContaining({ activationId: "activation-123", activationCodeStdin: true }));
+    expect(actions.install.mock.calls.at(-1)?.[0]).not.toHaveProperty("activationCode");
+  });
+  it("refuses activation code input for enrollment before running an action", async () => {
+    const { program, actions } = fixture();
+    await expect(program.parseAsync(["install", "--enroll", "--activation-code-stdin"], { from: "user" })).rejects.toThrow();
+    expect(actions.install).not.toHaveBeenCalled();
   });
   it.each(["--setup-docker-engine", "--gateway-keyed", "--activation-code"])("rejects retired/secret install switch %s", async option => {
     const { program, actions } = fixture();

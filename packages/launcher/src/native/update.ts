@@ -9,6 +9,7 @@ import { setupDetail, setupError, setupLocale, setupProgress } from "../setup-lo
 import { nativePlatform, type NativePlatform } from "./service.js";
 import { moveRecordAndManifest, withRuntimeLocks } from "./install.js";
 import { SupervisorControl } from "../control.js";
+import { pruneCompletedNativeReleases, type ReleaseReferences } from "./release-retention.js";
 
 type UpdateTarget = ReturnType<typeof NativeUpdateTargetSchema.parse>;
 
@@ -22,6 +23,7 @@ export interface NativeUpdateDeps {
   /** Reads a connector's publisher identity; the OS's own tools by default. */
   codeIdentity?: (file: string, os: NativePlatform["os"]) => Promise<CodeIdentity>;
   acceptedTarget?: () => Promise<UpdateTarget | null>;
+  releaseReferences?: ReleaseReferences;
 }
 
 const retryDelayOf = (deps: NativeUpdateDeps | undefined) => deps?.retryDelayMs === undefined ? {} : { retryDelayMs: deps.retryDelayMs };
@@ -218,18 +220,21 @@ async function installedConnector(root: string, os: NativePlatform["os"], releas
  * proves the supervisor is stopped; the previous release directory is kept so
  * `restoreNativeRecord` can roll back without a download.
  */
-export async function commitNativeUpdate(options: { root: string; releaseId: string; output: Output; deps?: Pick<NativeUpdateDeps, "roots" | "platform"> }): Promise<NativeRuntimeRecord> {
+export async function commitNativeUpdate(options: { root: string; releaseId: string; output: Output; deps?: Pick<NativeUpdateDeps, "roots" | "platform" | "releaseReferences"> }): Promise<NativeRuntimeRecord> {
   setupLocale();
   const platform = options.deps?.platform ?? nativePlatform();
   const roots = options.deps?.roots ?? EMBEDDED_RELEASE_ROOTS;
   const root = validRoot(options.root);
   if (!/^release-[A-Za-z0-9_-]+$/.test(options.releaseId)) throw invalid();
-  return withRuntimeLocks(root, async ({ installer }) => {
+  return withRuntimeLocks(root, async ({ installer, supervisor }) => {
     const current = await loadNativeInstallation(root, { roots, platform });
     if (current.record.releaseId === options.releaseId) return current.record;
     const release = await stagedRelease(join(root, "releases", options.releaseId), roots, platform, current.record);
     const successor = NativeRuntimeRecordSchema.parse({ ...current.record, releaseId: options.releaseId, bundleVersion: release.manifest.bundleVersion, manifestDigest: release.manifest.digest });
     await moveRecordAndManifest({ root, lock: installer, load: () => loadNativeInstallation(root, { roots, platform }), current: current.record, successor, manifest: release.manifest, corrupt: invalid });
+    const assertOwned = () => { installer.assertOwned(); supervisor.assertOwned(); };
+    await pruneCompletedNativeReleases({ root, instanceId: current.record.instanceId, workspaceId: current.record.workspaceId, keep: [current.record.releaseId, successor.releaseId], platform, assertOwned, ...(options.deps?.releaseReferences ? { references: options.deps.releaseReferences } : {}) });
+    assertOwned();
     setupDetail(options.output, "updateRecordMoved", { release: options.releaseId, version: successor.bundleVersion, previous: current.record.releaseId });
     return successor;
   });

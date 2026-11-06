@@ -1,12 +1,12 @@
 import { spawn } from "node:child_process";
 import { createHash, sign } from "node:crypto";
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { NATIVE_UPDATE_TARGET_ENV, bundleManifestSigningBytes, computeBundleManifestDigest, jcsDigest, RemoteInstanceError, writeSecretFile, type JsonValue } from "@konteks/remote-common";
 import { buildReleaseFixture, nativeServiceExecutable, resolveNativeConnectorExecutable, verifyNativeRelease, type CodeIdentity } from "@konteks/remote-release";
-import { acquireNativeRootLock, isDeferredUpdateAttempt, loadNativeInstallation, OPENCODE_MIN_BINARY_BYTES, readNativeUpdateLedger, SupervisorStore, verifyInstalledNativeConnector, type NativeRuntimeRecord, type NativeUpdateAttempt } from "@konteks/remote-supervisor";
+import { acquireNativeRootLock, isDeferredUpdateAttempt, loadNativeInstallation, OPENCODE_MIN_BINARY_BYTES, readNativeUpdateLedger, recordNativeUpdateAttempt, SupervisorStore, verifyInstalledNativeConnector, type NativeRuntimeRecord, type NativeUpdateAttempt } from "@konteks/remote-supervisor";
 import { installNative, readNativeRecord, restoreNativeRecord } from "../native/install.js";
 import { checkNativeUpdate, commitNativeUpdate, stageNativeUpdate, type NativeUpdateDeps } from "../native/update.js";
 import { earlierFailure, earlierFailureNote, keepLauncherCurrent, refreshInstalledLauncher, runNativeUpdate, selfUpdateNote, type NativeUpdateTransactionDeps } from "../native/update-transaction.js";
@@ -127,7 +127,136 @@ async function retainedWorkspace(root: string) {
   return { assertPreserved: async () => expect(await snapshot()).toEqual(before) };
 }
 
+async function retentionFixture() {
+  const f = await fixture();
+  const old = ["release-obsolete", "release-rollback", "release-pending"] as const;
+  for (const id of old) {
+    await mkdir(join(f.root, "releases", id));
+    await writeFile(join(f.root, "releases", id, "installer-owned"), id);
+  }
+  for (const [id, outcome] of [[old[0], "applied"], [old[1], "applied"], [f.installed.releaseId, "applied"], [old[2], "in_progress"]] as const) {
+    await recordNativeUpdateAttempt(f.root, { id: `attempt-${id}`, bundleVersion: "1.0.0", manifestDigest: "digest", releaseId: id, reason: "operator", startedAt: new Date().toISOString(), finishedAt: outcome === "in_progress" ? null : new Date().toISOString(), outcome, detail: null });
+  }
+  const staged = await stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, manifest: f.manifest, acceptedTarget: async () => null } });
+  if (staged.status !== "staged") throw new Error("staging expected");
+  await writeSecretFile(join(f.root, "supervisor", "serving-releases.json"), JSON.stringify({ schemaVersion: 1, instanceId: "instance", workspaceId: "tenant", current: { releaseId: f.installed.releaseId, bundleVersion: "1.0.0", manifestDigest: f.oldManifest.digest }, previous: { releaseId: "release-rollback", bundleVersion: "0.9.0", manifestDigest: "previous-core-digest" } }));
+  const commit = (references: NonNullable<NativeUpdateDeps["releaseReferences"]>) => commitNativeUpdate({ root: f.root, releaseId: staged.releaseId, output: f.output, deps: { ...f.deps, releaseReferences: references } });
+  return { ...f, staged, commit };
+}
+
 describe("native update staging and commit", () => {
+  it("prunes an obsolete completed update while keeping current, rollback, staged and in-progress releases", async () => {
+    const f = await retentionFixture();
+    await f.commit(async () => []);
+    const remaining = await readdir(join(f.root, "releases"));
+    expect(remaining).not.toContain("release-obsolete");
+    expect(remaining).toEqual(expect.arrayContaining([f.installed.releaseId, f.staged.releaseId, "release-rollback", "release-pending"]));
+    expect(await readFile(join(f.root, "credentials", "claude-code", "keep"), "utf8")).toBe("credential-owned-by-agent");
+  });
+
+  it("keeps the Core-confirmed release across several newer offline update commits", async () => {
+    const f = await retentionFixture();
+    await writeSecretFile(join(f.root, "supervisor", "serving-releases.json"), JSON.stringify({ schemaVersion: 1, instanceId: "instance", workspaceId: "tenant", current: { releaseId: "release-obsolete", bundleVersion: "0.7.0", manifestDigest: "core-current" }, previous: { releaseId: "release-rollback", bundleVersion: "0.6.0", manifestDigest: "core-previous" } }));
+    await f.commit(async () => []);
+    expect(await readdir(join(f.root, "releases"))).toContain("release-obsolete");
+  });
+
+  it.each(["absent", "one-confirmation", "foreign-workspace"])("defers pruning with %s serving history", async kind => {
+    const f = await retentionFixture();
+    const path = join(f.root, "supervisor", "serving-releases.json");
+    const history = JSON.parse(await readFile(path, "utf8"));
+    if (kind === "absent") await rm(path);
+    else await writeSecretFile(path, JSON.stringify(kind === "one-confirmation" ? { ...history, previous: null } : { ...history, workspaceId: "other-tenant" }));
+    const references = vi.fn(async () => []);
+    await f.commit(references);
+    expect(await readdir(join(f.root, "releases"))).toContain("release-obsolete");
+    expect(references).not.toHaveBeenCalled();
+  });
+
+  it("keeps a completed release while a process still references it", async () => {
+    const f = await retentionFixture();
+    await f.commit(async () => [join(f.root, "releases", "release-obsolete", "agents", "node")]);
+    expect(await readdir(join(f.root, "releases"))).toContain("release-obsolete");
+    expect(JSON.parse(await readFile(join(f.root, "logs", "release-cleanup.json"), "utf8"))).toMatchObject({ state: "checked", removed: [], deferred: ["release-obsolete"] });
+  });
+
+  it("defers pruning when process usage cannot be observed without failing the update", async () => {
+    const f = await retentionFixture();
+    await f.commit(async () => { throw new Error("process query unavailable"); });
+    expect(await readdir(join(f.root, "releases"))).toContain("release-obsolete");
+    expect((await readNativeRecord(f.root)).releaseId).toBe(f.staged.releaseId);
+    expect(JSON.parse(await readFile(join(f.root, "logs", "release-cleanup.json"), "utf8"))).toMatchObject({ state: "deferred", removed: [] });
+  });
+
+  it.each(["prepared", "retired"])("keeps the release a %s enrollment still names", async kind => {
+    const f = await retentionFixture();
+    const path = kind === "prepared" ? join(f.root, "native-enrollment.json") : join(f.root, "retired", "original", "native-runtime.json");
+    if (kind === "retired") await mkdir(dirname(path), { recursive: true });
+    await writeSecretFile(path, JSON.stringify({ releaseId: "release-obsolete" }));
+    const references = vi.fn(async () => []);
+    await f.commit(references);
+    expect(await readdir(join(f.root, "releases"))).toContain("release-obsolete");
+    expect(references).not.toHaveBeenCalled();
+  });
+
+  it.each(["malformed", "missing-retired-record"])("defers pruning for %s recovery metadata", async kind => {
+    const f = await retentionFixture();
+    if (kind === "malformed") await writeSecretFile(join(f.root, "native-enrollment.json"), "not JSON");
+    else await mkdir(join(f.root, "retired", "unfinished"), { recursive: true });
+    const references = vi.fn(async () => []);
+    await f.commit(references);
+    expect(await readdir(join(f.root, "releases"))).toContain("release-obsolete");
+    expect(references).not.toHaveBeenCalled();
+    expect(JSON.parse(await readFile(join(f.root, "logs", "release-cleanup.json"), "utf8"))).toMatchObject({ state: "deferred", removed: [] });
+  });
+
+  it("never follows a release symlink into the person's other files", async () => {
+    const f = await retentionFixture();
+    const target = join(f.root, "person-owned-data");
+    await mkdir(target);
+    await writeFile(join(target, "keep"), "personal data");
+    const path = join(f.root, "releases", "release-obsolete");
+    await rm(path, { recursive: true });
+    await symlink(target, path, process.platform === "win32" ? "junction" : "dir");
+    await f.commit(async () => []);
+    expect((await lstat(path)).isSymbolicLink()).toBe(true);
+    expect(await readFile(join(target, "keep"), "utf8")).toBe("personal data");
+  });
+
+  it("never writes its cleanup receipt through a linked log directory", async () => {
+    const f = await retentionFixture();
+    const target = join(f.root, "person-owned-logs");
+    await mkdir(target);
+    await rm(join(f.root, "logs"), { recursive: true });
+    await symlink(target, join(f.root, "logs"), process.platform === "win32" ? "junction" : "dir");
+    await f.commit(async () => []);
+    expect(await readdir(target)).toEqual([]);
+  });
+
+  it.skipIf(process.platform !== "darwin")("prunes only after a real macOS process and open-file scan succeeds", async () => {
+    const f = await retentionFixture();
+    await commitNativeUpdate({ root: f.root, releaseId: f.staged.releaseId, output: f.output, deps: f.deps });
+    expect(await readdir(join(f.root, "releases"))).not.toContain("release-obsolete");
+    expect(JSON.parse(await readFile(join(f.root, "logs", "release-cleanup.json"), "utf8"))).toMatchObject({ state: "checked", removed: ["release-obsolete"] });
+  });
+
+  it.skipIf(process.platform !== "darwin")("keeps files held by a real process from an older release", async () => {
+    const f = await retentionFixture();
+    const child = spawn("/usr/bin/tail", ["-f", join(f.root, "releases", "release-obsolete", "installer-owned")], { stdio: "ignore" });
+    await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+    try {
+      await commitNativeUpdate({ root: f.root, releaseId: f.staged.releaseId, output: f.output, deps: f.deps });
+      expect(await readdir(join(f.root, "releases"))).toContain("release-obsolete");
+      // lsof may report a partial observation while a file is open; either a
+      // known reference or an unverified scan must keep this release intact.
+      expect(JSON.parse(await readFile(join(f.root, "logs", "release-cleanup.json"), "utf8"))).toMatchObject({ removed: [], deferred: ["release-obsolete"] });
+    } finally {
+      const stopped = new Promise<void>(resolve => child.once("exit", () => resolve()));
+      child.kill("SIGTERM");
+      await stopped;
+    }
+  });
+
   it("offers Core's exact accepted intermediate release for a manual update", async () => {
     const f = await fixture();
     const { signature: _signature, digest: _digest, ...body } = f.manifest;

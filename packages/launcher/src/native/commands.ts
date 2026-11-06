@@ -29,6 +29,7 @@ import { checkNativeUpdate } from "./update.js";
 import { prepareDeliveryGraft } from "./graft.js";
 import { earlierFailure, earlierFailureNote, keepLauncherCurrent, productionUpdateDeps, refreshInstalledLauncher, runNativeUpdate, selfUpdateNote } from "./update-transaction.js";
 import { productionUninstallDeps, uninstallNative } from "./uninstall.js";
+import { switchNativeWorkspace } from "./workspace-switch.js";
 import type { NativeCliActions, NativeCommandContext } from "./cli.js";
 import { captureWindowsServiceOwner, stopWindowsBackgroundHost, waitForWindowsServiceExit, type NativeServiceProcessOwner } from "./windows-service-owner.js";
 import { activateServiceExecutable } from "./service-executable.js";
@@ -565,6 +566,24 @@ export async function stopNativeConnector(input: NativeCommandContext, deps: Nat
   setupLine(input.output, "serviceStopped");
 }
 
+/** Capture ownership before Core retirement can make the connector exit by itself. */
+export async function prepareNativeWorkspaceStop(input: NativeCommandContext, deps: NativeStopDeps = productionNativeStopDeps): Promise<() => Promise<void>> {
+  const definition = await deps.definition(input.root);
+  const owner = (await deps.serviceOwner?.(input.root)) ?? null;
+  const stoppedCodes = stoppedExitCodes(deps.platform.os);
+  if (!owner) assertRunningBeforeStop(await deps.execute(definition.status), stoppedCodes);
+  const previousReceipt = await deps.readReceipt(input.root);
+  return async () => {
+    if (owner) return stopOwnedNativeConnector(input, definition, deps, owner);
+    const status = await deps.execute(definition.status);
+    if (status === 0) await executeNativeStop(definition, deps);
+    else if (status === null || !stoppedCodes.includes(status)) throw setupError("temporarily_unavailable", "serviceUnconfirmedRunning");
+    setupLine(input.output, "serviceStopping");
+    await waitForStopReceipt(input.root, definition, deps, { previousReceipt, stoppedCodes });
+    setupLine(input.output, "serviceStopped");
+  };
+}
+
 async function executeNativeStop(definition: NativeServiceDefinition, deps: NativeStopDeps): Promise<void> {
   const stopRun = serviceRun(await (deps.run ?? deps.execute)(definition.stop));
   if (stopRun.code !== 0) throw setupError("temporarily_unavailable", "serviceStopFailed", { detail: new NativeServiceCommandError("stop", definition.stop, stopRun).message });
@@ -627,17 +646,22 @@ async function stopConfirmed(root: string, definition: NativeServiceDefinition, 
     receipt !== null && receipt !== before.previousReceipt && status !== null && before.stoppedCodes.includes(status)
   );
 }
+interface StartControlWaitDeps {
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+  controlWaitMs?: number;
+}
+
 /** The real start path with narrow hooks for collision and stopped-service tests. */
 export async function startNativeConnector(
   input: NativeCommandContext,
-  deps: {
+  deps: StartControlWaitDeps & {
     roots?: readonly EmbeddedReleaseRoot[];
     platform?: ReturnType<typeof nativePlatform>;
     definition?: (root: string) => Promise<NativeServiceDefinition>;
     execute?: NativeServiceExecute;
     /** How long the service is watched after it starts (default 3 s where its status says it runs: Windows, systemd; none on macOS). */
     settleMs?: number;
-    sleep?: (ms: number) => Promise<void>;
     serviceOwner?: (root: string) => Promise<NativeServiceProcessOwner | null>;
   } = {},
 ): Promise<void> {
@@ -653,7 +677,7 @@ export async function startNativeConnector(
   const stoppedCodes = stoppedExitCodes(platform.os);
   const serviceState = () => readServiceState(executeService, definition, stoppedCodes, windowsOwnerReader(input.root, platform.os, deps.serviceOwner));
   if ((await serviceState()) === "running") {
-    await assertControlAnswers(input.root, installation.record.controlPort);
+    await waitForStartedControl(input, installation.record.controlPort, serviceState, deps);
     setupLine(input.output, "serviceAlreadyRunning");
     return;
   }
@@ -666,6 +690,7 @@ export async function startNativeConnector(
   }).catch((error: unknown) => startFailed(input.root, locale => startFailureDetail(error, platform.os, locale), error),
   );
   if (started === "already_running") {
+    await waitForStartedControl(input, (await readNativeRecord(input.root)).controlPort, serviceState, deps);
     setupLine(input.output, "serviceAlreadyRunning");
     return;
   }
@@ -720,7 +745,20 @@ function logServiceState(code: number | null, stopped: boolean): void {
   verbose(`service state: ${code === 0 ? "running" : stopped ? "stopped" : `unknown (status exited ${code ?? "without a code"})`}`);
 }
 
-/** A registered or starting service whose control socket does not answer holds the port; stopping it is the person's step. */
+/** A running service may still be opening its socket; wait without restarting or changing its port. */
+async function waitForStartedControl(input: NativeCommandContext, controlPort: number, serviceState: () => Promise<"running" | "stopped">, deps: StartControlWaitDeps): Promise<void> {
+  const control = new SupervisorControl({ supervisorData: join(input.root, "supervisor") }, controlPort);
+  await waitWhileStarting({ control, output: input.output }, {
+    running: async () => (await serviceState()) === "running",
+    sleep: deps.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms))),
+    now: deps.now ?? Date.now,
+    ...(deps.controlWaitMs === undefined ? {} : { waitMs: deps.controlWaitMs }),
+  });
+  if ((await serviceState()) !== "running") throw setupError("temporarily_unavailable", "serviceSocketUnavailable", { port: controlPort });
+  await assertControlAnswers(input.root, controlPort);
+}
+
+/** A service still unavailable after the startup wait needs its own stopped-state repair. */
 async function assertControlAnswers(root: string, controlPort: number): Promise<void> {
   try {
     await new SupervisorControl({ supervisorData: join(root, "supervisor") }, controlPort).call({ op: "status" }, SupervisorStatusSchema, { timeoutMs: 2_000 });
@@ -1192,6 +1230,7 @@ async function confirmOnTerminal(question: string): Promise<boolean> {
 }
 
 export const nativeCliActions: NativeCliActions = {
+  switchWorkspace: input => switchNativeWorkspace(input, { confirm: confirmOnTerminal, prepareStop: prepareNativeWorkspaceStop }),
   install: async (input) => {
     if (input.enroll) {
       // The enrollment install stops short of an identity, because there is no

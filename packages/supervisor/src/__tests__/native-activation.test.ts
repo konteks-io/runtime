@@ -3,7 +3,7 @@ import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { FixedClock, bundleManifestSigningBytes, computeBundleManifestDigest, type RemoteInstanceActivationExchangeRequest } from "@konteks/remote-common";
+import { FixedClock, RemoteInstanceError, bundleManifestSigningBytes, computeBundleManifestDigest, type RemoteInstanceActivationExchangeRequest } from "@konteks/remote-common";
 import { buildReleaseFixture, verifyNativeRelease } from "@konteks/remote-release";
 import { runNativeActivationExchange } from "../native/activation.js";
 import { SupervisorStore } from "../state/store.js";
@@ -56,6 +56,19 @@ describe("native activation and resumable exchange", () => {
     expect(journal.execution.coverage("instance-native", "tenant-native")).toBe("legacy_unknown");
   });
 
+  it("does not seed permanent enrollment lineage when a fresh code read fails before any request", async () => {
+    const f = fixture(); f.args.dataDir = join(dir, "fresh");
+    f.args.readActivationCode.mockRejectedValueOnce(new RemoteInstanceError("prerequisite_missing", "no input terminal"));
+    await expect(runNativeActivationExchange(f.args)).rejects.toMatchObject({ code: "prerequisite_missing" });
+    const store = new SupervisorStore(f.args.dataDir);
+    expect(await store.activationAttempt()).toBeNull();
+    expect(await store.loadInstanceKey()).toBeNull();
+    const journal = new SupervisorJournal(store.path("journal")); await journal.load();
+    expect(journal.execution.enrollment()).toBeUndefined();
+    expect(f.args.fetchFn).not.toHaveBeenCalled();
+    await expect(runNativeActivationExchange({ ...f.args, activationId: "replacement-activation" })).resolves.toMatchObject({ instanceId: "instance-native" });
+  });
+
   it("retains the same enrollment seed through an uncertain fresh activation response", async () => {
     const f = fixture(); f.args.dataDir = join(dir, "fresh");
     f.args.fetchFn.mockRejectedValueOnce(new Error("lost response"))
@@ -101,7 +114,7 @@ describe("native activation and resumable exchange", () => {
     expect(f.args.readActivationCode).toHaveBeenCalledOnce();
   });
 
-  it("persists semantic retry identity and key before the first request while refreshing transport proof", async () => {
+  it("persists retry identity and key before the first request and reuses Core's activation proof nonce", async () => {
     const f = fixture();
     const exchange = f.args.fetchFn.getMockImplementation()!;
     let first: RemoteInstanceActivationExchangeRequest | undefined;
@@ -110,13 +123,14 @@ describe("native activation and resumable exchange", () => {
       const attempt = JSON.parse(await readFile(join(dir, "activation-attempt.json"), "utf8"));
       expect(attempt).toMatchObject({ activationId: f.args.activationId, manifestDigest: f.manifest.digest });
       expect((init?.headers as Record<string, string>)["idempotency-key"]).toBe(`activation:${f.args.activationId}:${attempt.nonce}`);
+      expect(first?.proof.nonce).toBe(attempt.nonce);
       throw new Error("response lost after Core commit");
     });
     await expect(runNativeActivationExchange(f.args)).rejects.toMatchObject({ code: "temporarily_unavailable" });
     f.args.fetchFn.mockReset().mockImplementation(exchange);
     expect(await new SupervisorStore(dir).identity()).toBeNull();
     await runNativeActivationExchange(f.args);
-    expect(f.requests[0]?.proof.nonce).not.toBe(first?.proof.nonce);
+    expect(f.requests[0]?.proof.nonce).toBe(first?.proof.nonce);
     expect(f.requests[0]?.publicKeyJwk).toEqual(first?.publicKeyJwk);
   });
 
@@ -126,7 +140,30 @@ describe("native activation and resumable exchange", () => {
     await expect(runNativeActivationExchange(f.args)).rejects.toThrow("disk full");
     await runNativeActivationExchange(f.args);
     expect(f.requests).toHaveLength(2);
-    expect(f.requests[0]?.proof.nonce).not.toBe(f.requests[1]?.proof.nonce);
+    expect(f.requests[0]?.proof.nonce).toBe(f.requests[1]?.proof.nonce);
+    expect(await new SupervisorStore(dir).provisioning()).not.toBeNull();
+  });
+
+  it("recovers an automatic retry after Core consumed the activation but its response was lost", async () => {
+    const f = fixture();
+    const exchange = f.args.fetchFn.getMockImplementation()!;
+    let committed: RemoteInstanceActivationExchangeRequest | undefined;
+    f.args.fetchFn.mockImplementation(async (url, init) => {
+      const request = JSON.parse(String(init?.body)) as RemoteInstanceActivationExchangeRequest;
+      if (!committed) {
+        committed = request;
+        await exchange(url, init);
+        throw new TypeError("response lost after commit");
+      }
+      // The existing Core contract refuses a fresh nonce on a consumed activation.
+      if (request.proof.nonce !== committed.proof.nonce) {
+        return new Response(JSON.stringify({ code: "activation_consumed", message: "Activation has already been consumed" }), { status: 409, headers: { "content-type": "application/json" } });
+      }
+      return exchange(url, init);
+    });
+    await expect(runNativeActivationExchange(f.args)).resolves.toMatchObject({ instanceId: "instance-native" });
+    expect(f.args.fetchFn).toHaveBeenCalledTimes(2);
+    expect(f.requests[0]?.proof.nonce).toBe(f.requests[1]?.proof.nonce);
     expect(await new SupervisorStore(dir).provisioning()).not.toBeNull();
   });
 
@@ -139,11 +176,13 @@ describe("native activation and resumable exchange", () => {
     expect(f.args.fetchFn).not.toHaveBeenCalled();
   });
 
-  it("does not consume the code if the retry record cannot be persisted", async () => {
+  it("does not exchange the code if the retry record cannot be persisted", async () => {
     const f = fixture();
     vi.spyOn(SupervisorStore.prototype, "saveActivationAttempt").mockRejectedValueOnce(new Error("disk unavailable"));
     await expect(runNativeActivationExchange(f.args)).rejects.toThrow("disk unavailable");
-    expect(f.args.readActivationCode).not.toHaveBeenCalled();
+    // Reading the local input does not consume an activation; no request may
+    // reach Core until its retry record is durable.
+    expect(f.args.readActivationCode).toHaveBeenCalledOnce();
     expect(f.args.fetchFn).not.toHaveBeenCalled();
   });
 
@@ -172,6 +211,23 @@ describe("native activation and resumable exchange", () => {
     expect(f.args.readActivationCode).not.toHaveBeenCalled();
   });
 
+  it("retains an uncertain exchange when a later local code read fails", async () => {
+    const f = fixture(); f.args.dataDir = join(dir, "fresh");
+    f.args.fetchFn.mockRejectedValue(new Error("response lost after Core commit"));
+    await expect(runNativeActivationExchange(f.args)).rejects.toMatchObject({ code: "temporarily_unavailable" });
+    const store = new SupervisorStore(f.args.dataDir);
+    const attempt = await store.activationAttempt();
+    const key = await readFile(store.path("instance-key.jwk"), "utf8");
+    const journal = new SupervisorJournal(store.path("journal")); await journal.load();
+    const seed = journal.execution.enrollment();
+    f.args.readActivationCode.mockRejectedValueOnce(new RemoteInstanceError("activation_invalid", "input pipe closed"));
+    await expect(runNativeActivationExchange(f.args)).rejects.toMatchObject({ code: "activation_invalid" });
+    expect(await store.activationAttempt()).toEqual(attempt);
+    expect(await readFile(store.path("instance-key.jwk"), "utf8")).toBe(key);
+    const reloaded = new SupervisorJournal(store.path("journal")); await reloaded.load();
+    expect(reloaded.execution.enrollment()).toEqual(seed);
+  });
+
   it("forgets a code Konteks refused, so a new code from the site connects this machine", async () => {
     const f = fixture();
     const exchange = f.args.fetchFn.getMockImplementation()!;
@@ -181,6 +237,31 @@ describe("native activation and resumable exchange", () => {
     f.args.fetchFn.mockImplementation(exchange);
     await expect(runNativeActivationExchange({ ...f.args, activationId: "new-code-from-the-site" })).resolves.toMatchObject({ instanceId: "instance-native" });
     expect(f.args.readActivationCode).toHaveBeenCalledTimes(2);
+  });
+
+  it("retains recovery state when a response is lost before the automatic retry says consumed", async () => {
+    const f = fixture(); f.args.dataDir = join(dir, "fresh");
+    f.args.fetchFn.mockRejectedValueOnce(new Error("response lost after server commit"));
+    f.args.fetchFn.mockImplementation(async () => new Response(JSON.stringify({ code: "activation_consumed", message: "Activation already used" }), { status: 409, headers: { "content-type": "application/json" } }));
+    await expect(runNativeActivationExchange(f.args)).rejects.toMatchObject({ code: "activation_consumed" });
+    const store = new SupervisorStore(f.args.dataDir);
+    expect(await store.loadInstanceKey()).not.toBeNull();
+    expect(await store.activationAttempt()).toMatchObject({ activationId: f.args.activationId });
+    const journal = new SupervisorJournal(store.path("journal")); await journal.load();
+    expect(journal.execution.enrollment()).toMatchObject({ activationId: f.args.activationId });
+  });
+
+  it("keeps an earlier uncertain attempt and its original key when a later command receives a refusal", async () => {
+    const f = fixture();
+    f.args.fetchFn.mockRejectedValue(new Error("response lost after server commit"));
+    await expect(runNativeActivationExchange(f.args)).rejects.toThrow();
+    const store = new SupervisorStore(dir);
+    const attempt = await store.activationAttempt();
+    const key = await readFile(store.path("instance-key.jwk"), "utf8");
+    f.args.fetchFn.mockImplementation(async () => new Response(JSON.stringify({ code: "activation_invalid", message: "Wrong code" }), { status: 401, headers: { "content-type": "application/json" } }));
+    await expect(runNativeActivationExchange(f.args)).rejects.toMatchObject({ code: "activation_invalid" });
+    expect(await store.activationAttempt()).toEqual(attempt);
+    expect(await readFile(store.path("instance-key.jwk"), "utf8")).toBe(key);
   });
 
   it("does not silently generate a new key when the retry identity was lost", async () => {

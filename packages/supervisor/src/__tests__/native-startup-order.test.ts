@@ -32,6 +32,7 @@ function fixture() {
   const record = { state: "applied", intent: { instanceId: "instance", runnerIncarnation: internal.runnerIncarnation }, manifest: { manifestId: "manifest", ownerRevision: 1 }, receipt: { digest: "digest" }, acceptedAt: "2026-09-06T00:00:00Z" };
   internal.instanceId = "instance";
   vi.spyOn(supervisor.store, "provisioning").mockResolvedValue(null);
+  vi.spyOn(supervisor.store, "clearCompletedActivationAttempt").mockResolvedValue();
   internal.nativeOwnership = { assertOwned: vi.fn() };
   internal.openCoreChannels = vi.fn();
   // The managed-git binding reload reads the key store from disk; under fake

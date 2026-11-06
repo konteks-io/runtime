@@ -41,10 +41,10 @@ describe("native background service definitions", () => {
     const script = Buffer.from(encoded, 'base64').toString('utf16le');
     // Single-quoted PowerShell literals keep percent variables, metacharacters
     // and apostrophes in the installation paths literal, not executable input;
-    // cmd reads them from the environment and appends the output to the log.
+    // cmd reads them from the environment and merges output into the host's pipe.
     expect(script).toContain(`$env:KONTEKS_SERVICE_PROGRAM = '${executable.replace(/'/g, "''")}'`);
     expect(script).toContain(`$env:KONTEKS_SERVICE_ROOT = '${root.replace(/'/g, "''")}'`);
-    expect(script).toContain('serve --root "%KONTEKS_SERVICE_ROOT%" >> "%KONTEKS_SERVICE_LOG%" 2>&1');
+    expect(script).toContain('serve --root "%KONTEKS_SERVICE_ROOT%" 2>&1');
     expect(script).toContain('if ($child.ExitCode -eq 0) { break }');
     // A hidden PowerShell host still creates a console for cmd unless this
     // ProcessStartInfo option is set (Windows installation RCA 2026-10-04).
