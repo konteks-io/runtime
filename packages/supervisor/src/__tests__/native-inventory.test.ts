@@ -14,6 +14,21 @@ function fixture(executionPermitsReady?: () => boolean, cancellationDeliveryRead
 }
 
 describe("native host inventory", () => {
+  it("can connect an agent-free computer without advertising agent work", async () => {
+    const inventory = new NativeInventoryCollector({ runners: new Map(), sampler: { sample: async () => signals }, bundleVersion: "1.0.0", allowEmptyRunners: true, executionPermitsReady: () => true, deliveryExecutionPermitsReady: () => true });
+    const snapshot = await inventory.collect();
+    expect(snapshot.components[0]).toMatchObject({ healthStatus: "healthy", capabilities: ["core-contract-version-v1"] });
+    expect(snapshot.agents).toEqual([]);
+    expect(snapshot.activeSessions).toBe(0);
+    expect(snapshot.activeTurns).toBe(0);
+    expect(deriveAdvertisedRoles([{ role: "generator", agentPreference: [] }], snapshot.agents, snapshot)).toEqual([]);
+  });
+
+  it("does not treat a failed configured runner as an agent-free installation", async () => {
+    const inventory = new NativeInventoryCollector({ runners: new Map([["codex", { readiness: async () => { throw Error("unavailable"); } }]]), sampler: { sample: async () => signals }, bundleVersion: "1.0.0", allowEmptyRunners: true });
+    expect((await inventory.collect()).components[0]?.healthStatus).toBe("unhealthy");
+  });
+
   it.each([
     { hostAgentVersion: "0.1.7-rc.2", expected: true },
     { hostAgentVersion: "0.1.5-rc.3", expected: false },

@@ -35,6 +35,8 @@ interface NativeInventoryOptions {
   runners: ReadonlyMap<string, Pick<RunnerPort, "readiness">>;
   sampler: Pick<SignalSampler, "sample">;
   bundleVersion: string;
+  /** Only an installation with no configured or unavailable agents may connect empty. */
+  allowEmptyRunners?: boolean;
   /** Live composition/ownership check; absence never advertises permit support. */
   executionPermitsReady?: () => boolean;
   /** Trusted ACP call capture and the native journal are composed under current ownership. */
@@ -100,7 +102,8 @@ function parsedSignals<T>(signals: { success: true; data: T } | { success: false
   return signals?.success ? signals.data : null;
 }
 
-function runnerHealth(healthy: number, total: number): "unhealthy" | "healthy" | "degraded" {
+function runnerHealth(healthy: number, total: number, allowEmpty: boolean): "unhealthy" | "healthy" | "degraded" {
+  if (total === 0 && allowEmpty) return "healthy";
   if (healthy === 0) return "unhealthy";
   return healthy === total ? "healthy" : "degraded";
 }
@@ -152,7 +155,7 @@ export class NativeInventoryCollector {
         {
           kind: "agent_runner",
           version: this.options.bundleVersion,
-          healthStatus: runnerHealth(tally.healthyRunners, results.length),
+          healthStatus: runnerHealth(tally.healthyRunners, results.length, this.options.allowEmptyRunners === true),
           capabilities,
           lastProbeAt: at,
         },

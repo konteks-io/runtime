@@ -660,6 +660,7 @@ export class Supervisor {
     const claudeExecutable = native.runners.find(runner => runner.RUNNER_AGENT_ID === "claude-code")?.RUNNER_NATIVE_CLAUDE_EXECUTABLE;
     const claudeIdentity = claudeExecutable ? new ClaudeExecutableIdentity(claudeExecutable, { logger: this.logger }) : null;
     this.inventory = new NativeInventoryCollector({ runners: this.runners, sampler: new SignalSampler(this.config.SUPERVISOR_DATA_DIR), bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION,
+      allowEmptyRunners: native.runners.length === 0 && (native.unavailableAgents?.length ?? 0) === 0,
       gitVersion: () => this.git.version(),
       workspaceRecoveryReady: () => Boolean(native.git) && Boolean(this.work) && !this.stopping,
       coordinationInvocationsReady: () => {
