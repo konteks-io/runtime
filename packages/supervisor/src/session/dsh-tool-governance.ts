@@ -11,8 +11,11 @@ import type { HostPermissionDecision } from "./host-tool-governance.js";
  * dsh reports every tool call as ACP kind `other`, titled with its own tool
  * name, and its `session/request_permission` carries only the tool call id. The runtime policy judges a kind plus raw input, so on its own it
  * would see nothing: a shell `git push` or a write outside the workspace
- * would pass unjudged. dsh always sends the `tool_call` update before the
- * request (13 of 13), so this keeps each session's recent tool calls and
+ * would pass unjudged. dsh's ACP bridge drains its updates before it asks
+ * (`drainUpdates` in @deepseek-ai/dsh-acp), so the `tool_call` update is
+ * sent first; the connector handles the two events concurrently, so
+ * `RelayedSession` waits a bounded time for a call not yet recorded here
+ * (`ToolCallArrivals`). This keeps each session's recent tool calls and
  * rebuilds the request the policy needs. A request it cannot rebuild is
  * denied, never allowed by default.
  *
@@ -149,6 +152,9 @@ export class DshToolGovernance {
   constructor(private readonly limit = 512) {}
 
   size(): number { return this.calls.size; }
+
+  /** The call is announced and not yet finished. */
+  knows(toolCallId: string): boolean { return this.calls.has(toolCallId); }
 
   /** Record a session update; returns the call that ran without asking, if any. */
   observe(update: unknown): { toolCallId: string; title: string } | null {

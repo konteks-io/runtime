@@ -418,6 +418,12 @@ export class AntigravityToolGovernance implements HostToolGovernance {
     }
   }
 
+  /** The trust question names no announced call: it is judged at once. */
+  unannouncedCall(request: RequestPermissionRequest): string | null {
+    const toolCallId = request.toolCall.toolCallId;
+    return isAntigravityTrustQuestion(request.toolCall as AskedCall) || this.calls.has(toolCallId) ? null : toolCallId;
+  }
+
   decide(request: RequestPermissionRequest, context: HostPermissionContext): HostPermissionDecision {
     const toolCallId = request.toolCall.toolCallId;
     this.asked.set(toolCallId, undefined);

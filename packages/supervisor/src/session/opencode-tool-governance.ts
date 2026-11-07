@@ -290,6 +290,11 @@ export class OpenCodeToolGovernance implements HostToolGovernance {
     return UNGATED.has(observed.tool) ? null : { toolCallId, title: observed.tool };
   }
 
+  unannouncedCall(request: RequestPermissionRequest): string | null {
+    const toolCallId = request.toolCall.toolCallId;
+    return this.calls.has(toolCallId) ? null : toolCallId;
+  }
+
   decide(request: RequestPermissionRequest, context: HostPermissionContext): HostPermissionDecision {
     const toolCallId = request.toolCall.toolCallId;
     this.asked.add(toolCallId);
