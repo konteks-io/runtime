@@ -247,6 +247,9 @@ describe("repository session continuity inputs", () => {
       }
       expect(prepared.skillInstructions).toContain(JSON.stringify({ sessionContextDirectory: contextRoot }));
       expect(prepared.skillInstructions).toContain("untrusted");
+      // Named apart from the skill folders: a shell command reaching only into it is refused at once.
+      expect(prepared.sessionContextRoot).toBe(contextRoot);
+      expect(prepared.skillInstructions).toContain("Use a file-reading tool for them");
       const policy = createWorkspaceToolPolicy();
       const authority = { repoPath: prepared.cwd, workspaceRoot: prepared.cwd, readOnlyRoots: prepared.readOnlyRoots,
         sessionId: binding.sessionId, toolUseId: "context", agentId, input: { file_path: join(contextRoot!, "memory/conversation.md") } };
@@ -360,6 +363,7 @@ describe("repository session continuity inputs", () => {
       repositoryCacheRoot: join(f.root, "cache") })(nativeRepositoryAssignment());
     expect(prepared.readOnlyRoots).toHaveLength(1);
     expect(prepared.skillInstructions).not.toContain("sessionContextDirectory");
+    expect(prepared.sessionContextRoot).toBeUndefined();
     await prepared.beforePrompt();
   });
   it("loads fresh context alongside a restored checkpoint without putting it into the recovered work", async () => {

@@ -1961,6 +1961,7 @@ export class RelayedSession {
   private permissionContext(): Parameters<PolicyResponder["evaluatePermission"]>[1] {
     return { assignmentId: this.assignment.id, agentId: this.assignment.agentRoute.agentId, workspaceRoot: this.policyRoot(),
       cwd: this.sessionCwd(), readOnlyRoots: this.readOnlyRoots, browserTools: this.browserGateway !== null, sessionServers: this.sessionServers, ...(this.mcpCalls ? { ledger: this.mcpCalls } : {}),
+      ...(this.preparedInputs?.sessionContextRoot ? { sessionContextRoot: this.preparedInputs.sessionContextRoot } : {}),
       directAccountConnectors: this.directAccountConnectors(),
       admittedMcpTools: this.deps.admittedMcpTools?.(this.assignment) ?? [] };
   }
@@ -2460,7 +2461,7 @@ export class RelayedSession {
  * too: the agent only hears "declined", and told the person their commit
  * "was declined" (10-10, E33).
  */
-const NOTED_REFUSALS: ReadonlySet<string> = new Set(["outside_workspace", "outside_read_roots", "unresolved_read", "unresolved_write", "bash_blocklist"]);
+const NOTED_REFUSALS: ReadonlySet<string> = new Set(["outside_workspace", "outside_read_roots", "unresolved_read", "unresolved_write", "bash_blocklist", "session_context_shell"]);
 const CANCELLING_CLOSE_REASONS: ReadonlySet<string> = new Set(["relay_replay_gap", "lease_lost", "drain", "cancelled"]);
 
 function cancelledPermission(): { outcome: { outcome: string; optionId?: string } } {
