@@ -50,8 +50,17 @@ const readyAgent = { agentId: "claude-code", displayName: "Claude Code", connect
   authMode: "agent_local_subscription" as const, accountScope: "personal" as const, readiness: "ready" as const,
   tokenUsageObservable: true, acpCapabilities: { sessionResume: true, forkSession: false, structuredOutputShim: true, toolControl: "approve" as const } };
 
+/** The prior claim's report state, optionally carrying Core's ACK of its terminal. */
+function priorReportState(options: { terminal?: boolean; acknowledged?: boolean }): Pick<JournalEntry, "reports" | "terminalResultHash"> {
+  if (options.acknowledged) return { terminalResultHash: "s".repeat(43), reports: { nextSequence: 2, durableWatermark: 1, terminalSequence: 1,
+    terminalAck: { assignmentId: "prior", attempt: 1, claimId: "prior-claim",
+      acknowledged: { reportId: "report-prior", reportSequence: 1 }, durableWatermark: 1, terminalSequence: 1, outcome: "accepted" } } };
+  return { reports: { nextSequence: 2, durableWatermark: 0, ...(options.terminal === false ? {} : { terminalSequence: 1 }) } };
+}
+
 async function fixture(options: {
   terminal?: boolean;
+  acknowledged?: boolean;
   closed?: boolean;
   priorRequestedRef?: string;
   preserveStoppedWorkspace?: (admission: LocalAdmission, assertCurrent: () => void) => Promise<void>;
@@ -68,7 +77,7 @@ async function fixture(options: {
   await journal.execution.bindProcessOwner(prior, processOwner, current);
   await journal.execution.markCompletedTurnSettled(prior, "ref", "2026-09-06T00:00:01.000Z", current);
   await journal.assignments.put({ assignmentId: "prior", attempt: 1, claimId: "prior-claim", kind: "assistant_execution", placementId: "placement-prior", workspaceId: "workspace",
-    agentId: "claude-code", state: "running", recoveryEpoch: 0, reports: { nextSequence: 2, durableWatermark: 0, ...(options.terminal === false ? {} : { terminalSequence: 1 }) },
+    agentId: "claude-code", state: "running", recoveryEpoch: 0, ...priorReportState(options),
     evidenceUpload: "structured_only", expiresAt: "2026-09-06T01:00:00.000Z", latestResumeAt: "2026-09-06T01:00:00.000Z", updatedAt: clock.nowIso() });
   const runner = { stopForRecovery: vi.fn(async () => undefined), releaseSealedSession: vi.fn(async () => undefined), stopRetainedExecution: vi.fn(async () => undefined) };
   const warn = vi.fn();
@@ -670,16 +679,43 @@ it("never frees a completed session whose terminal report is not yet persisted",
   expect(f.runner.releaseSealedSession).not.toHaveBeenCalled();
 });
 
+/** The refusal a genuinely unexpected stop keeps, byte for byte. */
+const UNEXPECTED_STOP_REFUSAL = "The previous execution stopped unexpectedly and its background work could not be confirmed stopped. This session requires recovery before retrying.";
+
 it("explains an unqualified stopped predecessor and preserves its fence", async () => {
   const f = await fixture({ terminal: false });
   await f.journal.execution.markStopping(prior, clock.nowIso(), current);
   await f.journal.execution.markAcpSettled(prior, "ref", clock.nowIso(), current);
-  await expect(f.internal.takeOverCompletedChannel(work(next), next, current)).rejects.toMatchObject({
-    code: "recovery_required", diagnostic: "predecessor_recovery_unqualified",
-  });
+  const refusal = await f.internal.takeOverCompletedChannel(work(next), next, current).then(() => undefined, (error: unknown) => error);
+  expect(refusal).toMatchObject({ code: "recovery_required", diagnostic: "predecessor_recovery_unqualified" });
+  expect((refusal as Error).message).toBe(UNEXPECTED_STOP_REFUSAL);
   expect(f.internal.channelOwners.has("session:session")).toBe(true);
   expect(f.journal.execution.execution(next)).toBeUndefined();
   expect(f.runner.releaseSealedSession).not.toHaveBeenCalled();
+});
+
+it("names a predecessor stopped on purpose instead of claiming an unexpected stop", async () => {
+  // The idle reaper's post-stop shape: the turn had ended and settled, Core
+  // acknowledged its terminal, the process was proven gone and the ACP turn
+  // settled, and the old owner still holds the session channel while the
+  // deliberate release finishes.
+  const f = await fixture({ acknowledged: true });
+  await f.journal.execution.markStopping(prior, clock.nowIso(), current);
+  await f.journal.execution.markProcessStopped(prior, clock.nowIso(), current);
+  await f.journal.execution.markAcpSettled(prior, "ref", clock.nowIso(), current);
+  const refusal = await f.internal.takeOverCompletedChannel(work(next), next, current).then(() => undefined, (error: unknown) => error);
+  expect(refusal).toMatchObject({ code: "recovery_required", diagnostic: "predecessor_deliberate_stop_pending_release" });
+  const message = (refusal as Error).message;
+  expect(message).not.toContain("stopped unexpectedly");
+  expect(message).not.toContain("could not be confirmed stopped");
+  expect(message).toMatch(/on purpose/i);
+  expect(message).toMatch(/deliberate release/i);
+  expect(message).toMatch(/session channel/i);
+  const blocked = f.warn.mock.calls.filter(([fields]) => fields?.event === "execution.successor_blocked");
+  expect(blocked).toHaveLength(1);
+  expect(blocked[0]![0]).toMatchObject({ diagnostic: "predecessor_deliberate_stop_pending_release",
+    processStopped: true, terminalAcknowledged: true, pendingRecoveryEvidence: 0 });
+  expect(f.internal.channelOwners.has("session:session")).toBe(true);
 });
 
 // After a connector update the QA session was

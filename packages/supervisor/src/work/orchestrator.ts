@@ -1125,31 +1125,52 @@ export class WorkOrchestrator {
     const execution = prior && this.deps.journal.execution.execution(prior);
     if (!execution || execution.phase === "opened") return;
     if (this.releaseRecoveredPredecessor(channelId, predecessor, prior, assignment)) return;
-    this.logBlockedSuccessor(assignment, sessionId, predecessor, prior, execution);
+    const settlement = this.predecessorSettlement(prior);
+    const deliberateStop = this.predecessorStoppedOnPurpose(execution, settlement);
+    this.logBlockedSuccessor(assignment, sessionId, predecessor, prior, execution, settlement, deliberateStop);
     // Core may have settled it since (a person's Stop): ask again now, so the next message runs.
     void this.reports.healNow(predecessor.assignment.id, predecessor.assignment.attempt)
       .catch(error => this.logger.warn({ err: error }, "halted claim healing failed"));
+    if (deliberateStop) throw new RemoteInstanceError("recovery_required",
+      "The previous execution was stopped on purpose after its turn completed. This session is waiting for that deliberate release to finish and free the session channel before it can run again.",
+      { diagnostic: "predecessor_deliberate_stop_pending_release" });
     throw new RemoteInstanceError("recovery_required",
       "The previous execution stopped unexpectedly and its background work could not be confirmed stopped. This session requires recovery before retrying.",
       { diagnostic: "predecessor_recovery_unqualified" });
   }
 
   /**
-   * What is still missing before this session can start fresh: a proven
+   * What still blocks this session: for a predecessor stopped on purpose, its
+   * deliberate release finishing; otherwise the missing facts — a proven
    * process stop, Core's settlement of the claim, Core's answer to the stop
    * observation.
    */
-  private logBlockedSuccessor(assignment: RemoteWorkAssignment, sessionId: string, predecessor: RelayedSession, prior: LocalAdmission | undefined, execution: LocalExecution): void {
+  private logBlockedSuccessor(assignment: RemoteWorkAssignment, sessionId: string, predecessor: RelayedSession, prior: LocalAdmission | undefined, execution: LocalExecution,
+    settlement: { terminalAcknowledged: boolean; pendingRecoveryEvidence: number }, deliberateStop: boolean): void {
     const priorEntry = this.deps.journal.assignments.get(`${predecessor.assignment.id}:${predecessor.assignment.attempt}`);
     this.logger.warn({ event: "execution.successor_blocked", assignmentId: assignment.id, attempt: assignment.attempt,
       sessionId, predecessorAssignmentId: predecessor.assignment.id, predecessorAttempt: predecessor.assignment.attempt,
       predecessorClaimId: prior?.claimId, phase: execution.phase, acpSessionRef: execution.acpSessionRef,
       terminalSequence: priorEntry?.reports.terminalSequence ?? null,
       processStopped: execution.processStoppedAt !== undefined,
-      ...this.predecessorSettlement(prior),
+      ...settlement,
       lifecycleProfileDigest: execution.lifecycleProfileDigest ?? null,
       executionProfileDigest: execution.executionProfileDigest ?? null,
-      diagnostic: "predecessor_recovery_unqualified" }, "Previous execution requires recovery before this session can run again");
+      diagnostic: deliberateStop ? "predecessor_deliberate_stop_pending_release" : "predecessor_recovery_unqualified" },
+    "Previous execution requires recovery before this session can run again");
+  }
+
+  /**
+   * A predecessor an idle reaper or capacity reclaim stopped on purpose: its
+   * turn had ended and settled, it never went through recovery interruption,
+   * its process is proven gone, Core acknowledged its terminal and no stop
+   * observation still awaits Core. Only that deliberate release finishing and
+   * freeing the session channel remains.
+   */
+  private predecessorStoppedOnPurpose(execution: LocalExecution,
+    settlement: { terminalAcknowledged: boolean; pendingRecoveryEvidence: number }): boolean {
+    return execution.completedTurnSettledAt !== undefined && execution.interruptedAt === undefined &&
+      execution.processStoppedAt !== undefined && settlement.terminalAcknowledged && settlement.pendingRecoveryEvidence === 0;
   }
 
   private predecessorSettlement(prior: LocalAdmission | undefined): { terminalAcknowledged: boolean; pendingRecoveryEvidence: number } {
