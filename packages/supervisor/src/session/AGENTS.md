@@ -51,7 +51,14 @@ whole permission path.
   `hostToolGovernance` runs first and the unchanged general policy second. A
   request must match the `tool_call` it names; it is rebuilt into the policy's
   shape (shell to command, edits to paths inside the working copy); `.env`
-  reads, uncorrelated, unknown or mismatched requests are refused.
+  reads, uncorrelated, unknown or mismatched requests are refused. Runner
+  events are handled concurrently, so a request can overtake its own
+  `tool_call` inside the connector: `ToolCallArrivals` holds a request whose
+  call is not yet recorded (`unannouncedCall`) until it arrives, for at most
+  `TOOL_CALL_ARRIVAL_MS` or until the session closes; only then is it judged
+  uncorrelated. dsh words a selected reject as "the user rejected tool", so
+  every refusal by Konteks on a dsh session answers `cancelled`
+  (`cancelsPolicyRefusal`); only a person's reject is a reject.
 - **OpenCode Code Mode** (`opencode-code-mode.ts`, acorn): approve only
   `[const|let x =] await tools["<server>"].<tool>(<literal args>)` statements
   and a final `return`, for this session's own servers; the reported

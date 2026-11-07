@@ -14,6 +14,7 @@ import type { DeferredPermissionBody } from "../core/client.js";
 import { EvaluatorPolicyResponder, isSignInElicitation } from "../session/policy-responder.js";
 import { createWorkspaceToolPolicy } from "../session/workspace-tool-policy.js";
 import { RelayedSession, type RelayedSessionDeps } from "../session/relayed-session.js";
+import { TOOL_CALL_ARRIVAL_MS } from "../session/tool-call-arrivals.js";
 import { renderStructuredOutputContract } from "@konteks/agent-core";
 import type { RunnerPort } from "../runner-port.js";
 import { TransportManager } from "../transport/relay-transport.js";
@@ -36,6 +37,17 @@ afterEach(async () => {
 
 const clock = new FixedClock(Date.parse("2026-09-06T00:00:00Z"));
 const permissionRequest = { sessionId: "bridge", toolCall: { toolCallId: "t1", title: "Run `rm -rf` in /home/user/secret‮", kind: "execute", rawInput: { command: "rm" } }, options: [{ optionId: "allow", name: "Allow", kind: "allow_once" as const }, { optionId: "reject", name: "Reject", kind: "reject_once" as const }] };
+
+
+/** A host agent's request naming a call never announced waits out the arrival bound before it is judged. */
+async function pastArrivalBound(ask: () => Promise<void>): Promise<void> {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    const asked = ask();
+    await vi.advanceTimersByTimeAsync(TOOL_CALL_ARRIVAL_MS);
+    await asked;
+  } finally { vi.useRealTimers(); }
+}
 
 describe("sanitized permission facts", () => {
   it("keeps title/kind/options only, strips directional overrides, and digests the sanitized view", () => {
@@ -530,7 +542,8 @@ describe("relayed session", () => {
             await ask(`p-${id}`, id, "other", "execute", { code });
           }
         }
-        expect({ agentId, navigate: answer("p-n"), unsafe: answer("p-u") }).toEqual({ agentId, navigate: "once", unsafe: "reject" });
+        // dsh's refusal is "cancelled" (no option): it words a selected reject as the user's.
+        expect({ agentId, navigate: answer("p-n"), unsafe: answer("p-u") }).toEqual({ agentId, navigate: "once", unsafe: agentId === "dsh" ? "none" : "reject" });
         await f.session.close("cancelled");
       }
       upstream.close();
@@ -989,7 +1002,11 @@ describe("relayed session", () => {
         f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: { sessionUpdate: "tool_call_update", toolCallId, status: "completed", content: [] } } });
       const ask = (requestId: string, toolCallId: string) =>
         f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId, params: { sessionId: "acp-1", toolCall: { toolCallId }, options } });
-      const answer = (requestId: string) => (vi.mocked(f.runner.answer).mock.calls.find(call => call[1] === requestId)?.[2] as { outcome: { optionId?: string } } | undefined)?.outcome.optionId;
+      // A refusal by Konteks answers "cancelled": dsh words a selected reject as "the user rejected tool".
+      const answer = (requestId: string) => {
+        const outcome = (vi.mocked(f.runner.answer).mock.calls.find(call => call[1] === requestId)?.[2] as { outcome: { outcome: string; optionId?: string } } | undefined)?.outcome;
+        return outcome?.optionId ?? outcome?.outcome;
+      };
       return { ...f, quarantine, toolCall, finished, ask, answer };
     }
 
@@ -1002,10 +1019,33 @@ describe("relayed session", () => {
       await f.toolCall("t-out", "write", { file_path: "/etc/outside.txt", content: "no" }); await f.ask("p-out", "t-out");
       await f.toolCall("t-mcp", "mcp__konteks-platform__platform__builtin__echo", { text: "ping" }); await f.ask("p-mcp", "t-mcp");
       await f.toolCall("t-esc", "bash", { command: "ls", sandbox_permissions: "danger-full-access", justification: "x" }); await f.ask("p-esc", "t-esc");
-      await f.ask("p-ghost", "t-never-seen");
+      await pastArrivalBound(() => f.ask("p-ghost", "t-never-seen"));
       expect({ echo: f.answer("p-echo"), push: f.answer("p-push"), sudo: f.answer("p-sudo"), inside: f.answer("p-in"), outside: f.answer("p-out"), mcp: f.answer("p-mcp"), escalation: f.answer("p-esc"), ghost: f.answer("p-ghost") })
-        .toEqual({ echo: "allow-once", push: "reject-once", sudo: "reject-once", inside: "allow-once", outside: "reject-once", mcp: "allow-once", escalation: "reject-once", ghost: "reject-once" });
+        .toEqual({ echo: "allow-once", push: "cancelled", sudo: "cancelled", inside: "allow-once", outside: "cancelled", mcp: "allow-once", escalation: "cancelled", ghost: "cancelled" });
       expect(f.quarantine).not.toHaveBeenCalled();
+    });
+
+    // 11-05: dsh sends the tool_call before its request, but the supervisor
+    // dispatches runner events without awaiting each other (supervisor.ts
+    // onEvent), and the request reached the governance first: 515 genuine
+    // calls refused as "no tool call precedes this permission request".
+    it("judges a dsh request that overtakes its tool call's announcement inside the connector", async () => {
+      const f = await dshSession();
+      const announced = f.toolCall("t-race", "bash", { command: "echo hello" });
+      const asked = f.ask("p-race", "t-race");
+      const announcedPush = f.toolCall("t-race-push", "bash", { command: "git push origin main" });
+      const askedPush = f.ask("p-race-push", "t-race-push");
+      await Promise.all([announced, asked, announcedPush, askedPush]);
+      expect({ echo: f.answer("p-race"), push: f.answer("p-race-push") }).toEqual({ echo: "allow-once", push: "cancelled" });
+      expect(f.quarantine).not.toHaveBeenCalled();
+    });
+
+    it("stops waiting for an unannounced dsh call when the session closes, and never allows it", async () => {
+      const f = await dshSession();
+      const asked = f.ask("p-orphan", "t-orphan");
+      await f.session.close("cancelled");
+      await asked;
+      expect(f.answer("p-orphan")).toBeUndefined();
     });
 
     it("gives dsh tool calls their ACP kind, a title from what they run, and the platform tool name in relayed activity", async () => {
@@ -1076,7 +1116,7 @@ describe("relayed session", () => {
       await code("computed", 'const name = "submit_result"; await tools["konteks-result"][name]({});');
       await code("loop", 'for (const x of [1, 2]) { await tools["konteks-result"].submit_result({ x: 1 }); }');
       await code("preview", 'await tools["konteks-preview"].preview_start();');
-      await f.ask("p-ghost", "never-seen", "execute", "echo", { command: "echo" });
+      await pastArrivalBound(() => f.ask("p-ghost", "never-seen", "execute", "echo", { command: "echo" }));
       expect({
         echo: f.answer("p-echo"), push: f.answer("p-push"), sudo: f.answer("p-sudo"), inside: f.answer("p-in"), outside: f.answer("p-out"), multi: f.answer("p-multi"),
         subagent: f.answer("p-sub"), subagentPush: f.answer("p-subpush"), ours: f.answer("p-ours"), result: f.answer("p-result"), move: f.answer("p-move"),
@@ -1225,7 +1265,7 @@ describe("relayed session", () => {
       await f.asked("p-repo", f.mcp("m-repo", "repo-tools", "exfiltrate"));
       // A hostile repository's `.agents/hooks.json`: the server first asks whether to trust it.
       await f.asked("p-trust", { toolCallId: "interaction_9cf7b4aa", title: "Do you trust the authors of this workspace to execute automated agent hooks?", rawInput: {} });
-      await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: "p-ghost", params: { sessionId: "acp-1", toolCall: f.command("never-seen", "echo"), options } as never });
+      await pastArrivalBound(() => f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: "p-ghost", params: { sessionId: "acp-1", toolCall: f.command("never-seen", "echo"), options } as never }));
       expect({
         echo: f.answer("p-echo"), push: f.answer("p-push"), sudo: f.answer("p-sudo"), cwd: f.answer("p-cwd"), inside: f.answer("p-in"), outside: f.answer("p-out"),
         result: f.answer("p-result"), platform: f.answer("p-platform"), repo: f.answer("p-repo"), trust: f.answer("p-trust"), ghost: f.answer("p-ghost"),

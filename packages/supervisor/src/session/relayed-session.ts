@@ -66,6 +66,7 @@ import {
 import { continuedSession, isDirectAssignment, isNativeTurn } from "../work/continued-session.js";
 import { isWorkspacePolicyFailure } from "../work/dispatch-failure-outcome.js";
 import { hostToolGovernance, type HostToolBypass, type HostToolGovernance } from "./host-tool-governance.js";
+import { ToolCallArrivals } from "./tool-call-arrivals.js";
 import { McpToolCallLedger, type ObservedMcpInvocation } from "./permission-tool-identity.js";
 import { FolderAccessCue, type FolderAccessCueOptions } from "./folder-access-cue.js";
 import { heldChunk, StreamedPathHold } from "./path-hold.js";
@@ -296,6 +297,8 @@ export class RelayedSession {
   private readonly toolActivityIdentity = new Map<string, CanonicalAcpToolIdentity>();
   /** Rebuilds a host agent's permission requests and trips on an unapproved tool (host-tool-governance.ts: DeepSeek Harness, OpenCode). */
   private readonly toolGovernance: HostToolGovernance | null;
+  /** A host agent's request that overtook its call's announcement waits here, bounded. */
+  private readonly toolCallArrivals = new ToolCallArrivals();
   /** The MCP servers this session gave its agent (the only Code Mode namespaces an OpenCode block may call, the only servers Antigravity may reach). */
   private sessionServers: ReadonlySet<string> = new Set();
   private platformServers: ReadonlySet<string> = new Set();
@@ -1661,6 +1664,7 @@ export class RelayedSession {
     this.mcpCalls?.observe(update);
     this.folderAccess.observe(update);
     const bypass = this.toolGovernance?.observe(update, this.sessionCwd(), this.readOnlyRoots) ?? null;
+    this.toolCallArrivals.observe(update);
     await this.sendUpdate(event.params);
     if (bypass) await this.onToolGovernanceBypass(bypass);
   }
@@ -1937,6 +1941,7 @@ export class RelayedSession {
    */
   private async governPermission(ref: string, requestId: string, params: RequestPermissionRequest, governance: HostToolGovernance): Promise<RequestPermissionRequest | null> {
     const request = { ...params, options: params.options.filter(option => option.kind !== "allow_always") };
+    await this.awaitAnnouncedCall(request, governance);
     this.governedPermissions.set(requestId, { toolCallId: request.toolCall.toolCallId, options: request.options });
     const verdict = governance.decide(request, { cwd: this.sessionCwd(), readOnlyRoots: this.readOnlyRoots, servers: this.sessionServers, browserTools: this.browserGateway !== null });
     if (verdict.kind === "evaluate") return verdict.request;
@@ -1946,9 +1951,24 @@ export class RelayedSession {
     return null;
   }
 
+  /**
+   * The runner's events are handled concurrently, so a request can reach the
+   * governance before the `tool_call` it names is recorded. Wait for it,
+   * bounded; one line says it happened and whether the call came.
+   */
+  private async awaitAnnouncedCall(request: RequestPermissionRequest, governance: HostToolGovernance): Promise<void> {
+    const toolCallId = governance.unannouncedCall(request);
+    if (toolCallId === null) return;
+    const startedAt = Date.now();
+    const arrived = await this.toolCallArrivals.wait(toolCallId);
+    this.logger.info({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId, arrived, waitedMs: Date.now() - startedAt },
+      `${governance.agentName} permission request came before its tool call`);
+  }
+
   private async answerGoverned(ref: string, requestId: string, request: RequestPermissionRequest, verdict: Exclude<ReturnType<HostToolGovernance["decide"]>, { kind: "evaluate" }>, governance: HostToolGovernance): Promise<void> {
     const wanted = verdict.kind === "allow" ? "allow_once" : "reject_once";
-    const optionId = request.options.find(option => option.kind === wanted)?.optionId;
+    const cancels = verdict.kind === "deny" && governance.cancelsPolicyRefusal === true;
+    const optionId = cancels ? undefined : request.options.find(option => option.kind === wanted)?.optionId;
     if (verdict.kind === "deny") {
       this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: request.toolCall.toolCallId, reason: verdict.reason.slice(0, 512) },
         `${governance.agentName} tool call refused by policy`);
@@ -1988,7 +2008,8 @@ export class RelayedSession {
     if (decision.message && NOTED_REFUSALS.has(decision.refusal?.reason ?? "")) {
       await this.noteRefusedToolCall(ref, request.toolCall.toolCallId, decision.message);
     }
-    await this.answerPermission(ref, requestId, decision.optionId === null ? cancelledPermission() : selectedOption(decision.optionId));
+    const optionId = this.toolGovernance?.cancelsPolicyRefusal === true ? null : decision.optionId;
+    await this.answerPermission(ref, requestId, optionId === null ? cancelledPermission() : selectedOption(optionId));
   }
 
   /** Ask a person through Konteks, when the assignment allows it; an integration gate's question is answered once, never "always". */
@@ -2191,7 +2212,7 @@ export class RelayedSession {
   /** Recovery owns the terminal report, so this never invokes onClosed or
    * synthesizes session_closed(cancelled). Failure keeps the session fenced.
    */
-  fenceForRecovery(): void { this.executionGate?.stop(); this.recoveryStopping = true; this.closed = true; this.wakeDeferral?.(); }
+  fenceForRecovery(): void { this.executionGate?.stop(); this.recoveryStopping = true; this.closed = true; this.wakeDeferral?.(); this.toolCallArrivals.release(); }
 
   stopForRecovery(): Promise<void> {
     if (this.recoveryStopTask) return this.recoveryStopTask;
@@ -2287,6 +2308,7 @@ export class RelayedSession {
     this.executionGate?.stop();
     this.folderAccess.stop();
     this.wakeDeferral?.();
+    this.toolCallArrivals.release();
     if (this.closeTask) return this.closeTask;
     if (this.closed) return Promise.resolve();
     this.completedSettlementInProgress = reason === "completed";

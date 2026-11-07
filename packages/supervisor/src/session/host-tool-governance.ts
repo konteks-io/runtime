@@ -41,6 +41,17 @@ export interface HostToolGovernance {
   readonly quarantineMessage: string;
   /** Record a session update; returns the call that ran without approval, if any. */
   observe(update: unknown, cwd: string, readOnlyRoots?: readonly string[]): HostToolBypass | null;
+  /**
+   * The tool call id `decide` needs announced and has not seen yet, or null
+   * when it can judge the request now (`ToolCallArrivals` waits for it).
+   */
+  unannouncedCall(request: RequestPermissionRequest): string | null;
+  /**
+   * A refusal by Konteks answers `cancelled`, not the agent's reject option:
+   * dsh tells its model a selected reject as "the user rejected tool …",
+   * though no person saw the request. A person's own reject stays a reject.
+   */
+  readonly cancelsPolicyRefusal?: boolean;
   decide(request: RequestPermissionRequest, context: HostPermissionContext): HostPermissionDecision;
   /**
    * Konteks' final answer to a request `decide` saw (after policy or a
@@ -66,7 +77,9 @@ export function hostToolGovernance(agentId: string): HostToolGovernance | null {
     agentName: "DeepSeek Harness",
     bypassDiagnostic: "dsh_tool_governance_bypassed",
     quarantineMessage: "DeepSeek Harness ran a tool without asking Konteks first. Update or reinstall DeepSeek Harness, then restart the connector.",
+    cancelsPolicyRefusal: true,
     observe: update => dsh.observe(update),
+    unannouncedCall: request => dsh.knows(request.toolCall.toolCallId) ? null : request.toolCall.toolCallId,
     decide: (request, context) => dsh.decide(request, context.cwd, { browserTools: context.browserTools === true, servers: context.servers }),
   };
 }
