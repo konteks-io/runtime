@@ -36,7 +36,11 @@ whole permission path.
 - **Explicit native escalation asks a person.** Codex command permission bundles,
   standalone filesystem/network permission grants, network approvals and command
   paths/cwd outside trusted roots are never automatically approved. Claude's
-  structured `SandboxNetworkAccess` and blocked shell paths also defer. If human
+  structured `SandboxNetworkAccess` and blocked shell paths also defer, except
+  a Claude shell command whose blocked paths lie only in the working copy and
+  the session context folder (`sessionContextRoot`, data the agent is told to
+  read): it is refused at once with a note naming the Read tool, never put to
+  a person and never allowed. Skill folders still ask. If human
   deferral or the exact safe options are unavailable, refuse. Codex's manual
   standalone grant is turn-scoped; session grants and strict automatic review
   are excluded from the broker and Core view. Ordinary same-authority commands

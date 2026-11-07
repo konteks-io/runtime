@@ -11,6 +11,8 @@ export interface PreparedSessionInputs {
   managedRepository?: true;
   /** Verified selected organization-skill directories; read authority only, local to this session. */
   readOnlyRoots?: readonly string[];
+  /** The verified session context folder, also in `readOnlyRoots`; data only. */
+  sessionContextRoot?: string;
   skillInstructions: string;
   beforePrompt: () => Promise<void>;
   /** Delivery-only terminal barrier. Public ACP completion waits for its durable cloud receipt. */
