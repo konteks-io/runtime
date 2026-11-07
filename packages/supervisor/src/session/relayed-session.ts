@@ -2612,7 +2612,8 @@ const BOOTSTRAP_FAILURE_ORIGINS = new Set([
   "local_execution_unprovable", "mcp_transport_reference_mismatch", "legacy_mcp_thread_loaded_or_unverified",
   "session_generation_fenced", "agent_session_lost", "transfer_admissions_unrelated", "transfer_starts_mismatch",
   "transfer_successor_exists", "transfer_predecessor_missing", "transfer_predecessor_not_continuable",
-  "transfer_reference_moved", "transfer_before_completion", "predecessor_recovery_unqualified", "unfinished_continuation_stop_unconfirmed",
+  "transfer_reference_moved", "transfer_before_completion", "predecessor_recovery_unqualified",
+  "predecessor_deliberate_stop_pending_release", "unfinished_continuation_stop_unconfirmed",
 ]);
 
 /** Retain the original boundary and a known typed origin without copying error text. */

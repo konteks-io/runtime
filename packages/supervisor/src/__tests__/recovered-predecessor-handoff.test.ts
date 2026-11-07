@@ -27,6 +27,8 @@ afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
 
 const clock = new FixedClock(Date.parse("2026-09-06T00:00:05Z"));
 const current = () => undefined;
+/** The refusal a genuinely unexpected stop keeps, byte for byte. */
+const UNEXPECTED_STOP_REFUSAL = "The previous execution stopped unexpectedly and its background work could not be confirmed stopped. This session requires recovery before retrying.";
 const processOwner = { version: 1 as const, platform: "darwin" as const, pid: 42, processGroupId: 42,
   startToken: "start-token", commandDigest: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" };
 const admission = (assignmentId: string, runnerIncarnation = "process", openedAt = "2026-09-06T00:00:00.000Z"): LocalAdmission => ({
@@ -148,8 +150,9 @@ it("keeps the session blocked while the process stop is unconfirmed and Core has
   expect(record).toMatchObject({ delivery: "pending", lastFailureCode: "temporarily_unavailable" });
   // Backoff: the first failure waits 5 s, not a fixed hammer on an overloaded Core.
   expect(Date.parse(record!.nextAttemptAt) - clock.coreNow()).toBe(5_000);
-  await expect(f.internal.takeOverCompletedChannel(conversation(f.next), f.next, current)).rejects.toMatchObject({
-    code: "recovery_required", diagnostic: "predecessor_recovery_unqualified" });
+  const refusal = await f.internal.takeOverCompletedChannel(conversation(f.next), f.next, current).then(() => undefined, (error: unknown) => error);
+  expect(refusal).toMatchObject({ code: "recovery_required", diagnostic: "predecessor_recovery_unqualified" });
+  expect((refusal as Error).message).toBe(UNEXPECTED_STOP_REFUSAL);
   expect(f.owner.releaseRecoveredChannel).not.toHaveBeenCalled();
   expect(f.internal.channelOwners.has("session:session")).toBe(true);
   expect(f.journal.execution.execution(f.next)).toBeUndefined();
@@ -357,8 +360,9 @@ describe("a direct session after its turn was stopped by force", () => {
     await f.work.retryRecoveryEvidence();
     const forgetRecoveredSession = vi.fn(() => { throw new RemoteInstanceError("recovery_required", "still running", { diagnostic: "forget_not_recovered" }); });
     (f.work as unknown as { deps: { runners: Map<string, unknown> } }).deps.runners.set("codex", { forgetRecoveredSession });
-    await expect(f.internal.takeOverCompletedChannel(conversation(f.next), f.next, current)).rejects.toMatchObject({
-      code: "recovery_required", diagnostic: "predecessor_recovery_unqualified" });
+    const refusal = await f.internal.takeOverCompletedChannel(conversation(f.next), f.next, current).then(() => undefined, (error: unknown) => error);
+    expect(refusal).toMatchObject({ code: "recovery_required", diagnostic: "predecessor_recovery_unqualified" });
+    expect((refusal as Error).message).toBe(UNEXPECTED_STOP_REFUSAL);
     expect(forgetRecoveredSession).toHaveBeenCalledWith("fenced-ref");
     expect(f.owner.releaseRecoveredChannel).not.toHaveBeenCalled();
     expect(f.internal.channelOwners.has("session:session")).toBe(true);
