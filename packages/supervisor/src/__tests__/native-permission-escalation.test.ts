@@ -100,3 +100,28 @@ describe("a native escalation the person reads on the card", () => {
     expect(sanitizePermissionRequest(request as never).params.title).toBe(title);
   });
 });
+
+describe("a Claude shell command that reaches only into the session context folder", () => {
+  const contextRoot = "/work/session-context/session-1/source";
+  const skillRoot = "/work/skills/org-1";
+  const context = { ...claudeContext, readOnlyRoots: [skillRoot, contextRoot], sessionContextRoot: contextRoot };
+  const decide = (paths: string[], ctx: object = context, canDefer = true) => nativePermissionEscalation({
+    sessionId: "acp-1", options: claudeOptions,
+    toolCall: { toolCallId: "tool-1", title: "Check context file sizes", kind: "execute", locations: paths.map(path => ({ path })),
+      rawInput: { command: "wc -l memory/conversation.md" }, _meta: { claudeCode: { toolName: "Bash" } } },
+  } as never, ctx as never, { kind: "native", tool: "Bash" } as never, () => canDefer);
+
+  it("is refused at once with the Read tool named, never put to a person", () => {
+    for (const paths of [[`${contextRoot}/memory/conversation.md`], [`${contextRoot}/memory`, "/work/session/notes.md"]]) {
+      expect(decide(paths)).toEqual({ kind: "deny", optionId: "reject", refusal: { reason: "session_context_shell" },
+        message: expect.stringMatching(/^Konteks refused this shell command: .*Read tool/) });
+    }
+  });
+
+  it("still asks a person for anything beyond it: other folders, skill folders, or no known context folder", () => {
+    expect(decide([`${contextRoot}/memory/conversation.md`, "/tmp/outside.txt"])).toMatchObject({ kind: "defer" });
+    expect(decide([`${skillRoot}/scripts/run.sh`])).toMatchObject({ kind: "defer" });
+    expect(decide(["/work/session/src/a.ts"])).toMatchObject({ kind: "defer" });
+    expect(decide([`${contextRoot}/memory/conversation.md`], { ...context, sessionContextRoot: undefined })).toMatchObject({ kind: "defer" });
+  });
+});

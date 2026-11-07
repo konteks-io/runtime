@@ -2421,6 +2421,34 @@ describe("relayed session", () => {
     expect(runner.answer).not.toHaveBeenCalled();
   });
 
+  // 11-01..11-05: 46 of 54 Claude "Outside this session's folder" cards were
+  // `wc`/`ls`/`cat` on the session context folder the connector told it to
+  // read; each waited up to ten minutes for a person.
+  it("refuses a Claude shell read of the session context folder at once, with a note, and asks no person", async () => {
+    const registered = registeredCard();
+    const context = "/private/native/session-context/session-1/source";
+    const { session, sent, runner } = await build({
+      registerDeferral: registered,
+      policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true),
+      prepareInputs: async (target: RemoteWorkAssignment) => ({ binding: { workspaceId: target.workspaceId, sessionId: "s", assignmentId: target.id, instanceId: target.instanceId, attempt: target.attempt },
+        cwd: "/private/native/checkout", readOnlyRoots: [context], sessionContextRoot: context, skillInstructions: "", beforePrompt: async () => undefined }),
+    }, { ...validation, agentRoute: { ...validation.agentRoute, agentId: "claude-code" } });
+    await session.bootstrap();
+    const ask = (requestId: string, paths: string[]) => session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId, params: { sessionId: "acp-1", options: escalationOptions,
+      toolCall: { toolCallId: `t-${requestId}`, kind: "execute", title: "Check context file sizes", locations: paths.map(path => ({ path })),
+        rawInput: { command: `wc -l ${paths.join(" ")}` }, _meta: { claudeCode: { toolName: "Bash" } } } } } as never);
+    await ask("perm-context", [`${context}/memory/conversation.md`, `${context}/memory/typed-facts.json`]);
+    expect(registered).not.toHaveBeenCalled();
+    expect(runner.answer).toHaveBeenCalledWith("acp-1", "perm-context", { outcome: { outcome: "selected", optionId: "reject" } });
+    const notes = sent.map(message => message.body as { method?: string; params?: { update?: { toolCallId?: string; content?: Array<{ content: { text: string } }> } } })
+      .filter(body => body.method === "session/update" && body.params?.update?.toolCallId === "t-perm-context");
+    expect(notes[0]?.params?.update?.content?.[0]?.content.text).toMatch(/^Konteks refused this shell command: .*Read tool/);
+    // A path beyond the context folder still goes to a person.
+    await ask("perm-beyond", [`${context}/memory/conversation.md`, "/private/native/other/notes.md"]);
+    expect(registered).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(runner.answer).mock.calls.some(call => call[1] === "perm-beyond")).toBe(false);
+  });
+
   it("shows a long, multi-line Codex command on the execute card as one redacted bounded line", async () => {
     const registered = registeredCard();
     const { session, sent } = await build({ registerDeferral: registered }, validation);
