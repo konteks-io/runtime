@@ -57,7 +57,9 @@ describe("structured error repetition", () => {
   it("flushes a ready logger's repetition count before explicit process exit", () => {
     const result = logs(`setImmediate(()=>{for(let i=0;i<5;i++)logger.error("refused");process.exit(0);});`);
     expect(result.entries).toHaveLength(2);
-    expect(result.entries[1]).toMatchObject({ runtimeLogRepetition: { suppressed: 4 } });
+    // The first line's asynchronous write can still be in flight when the exit handler writes the summary synchronously.
+    expect(result.entries.filter(entry => !entry.runtimeLogRepetition)).toHaveLength(1);
+    expect(result.entries.find(entry => entry.runtimeLogRepetition)).toMatchObject({ runtimeLogRepetition: { suppressed: 4 } });
   });
 
   it("redacts child logger fields before they can enter a repetition summary", () => {

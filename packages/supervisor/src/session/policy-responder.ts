@@ -48,6 +48,8 @@ export interface PermissionContext {
   cwd?: string;
   /** Local preparation authority; never read from tool arguments. */
   readOnlyRoots?: readonly string[];
+  /** The session context folder among `readOnlyRoots` (data only, nothing to run); local preparation authority. */
+  sessionContextRoot?: string;
   browserTools?: boolean;
   sessionServers?: ReadonlySet<string>;
   ledger?: McpToolCallLedger;

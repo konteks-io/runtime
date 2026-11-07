@@ -3,9 +3,10 @@ import { plainRecord, redactText } from "@konteks/remote-common";
 import { boundTitle } from "./activity.js";
 import type { PermissionToolIdentity } from "./permission-tool-identity.js";
 import type { PermissionContext, PolicyDecision } from "./policy-responder.js";
-import { isWithinReadRoots, isWithinWorkspace } from "./workspace-tool-policy.js";
+import { isWithinReadRoots, isWithinWorkspace, POLICY_REFUSAL_PREFIX } from "./workspace-tool-policy.js";
 
-interface Escalation { allowOptionId: string; valid?: boolean; title: string }
+/** `contextShell`: a shell command that reaches only into the session's context folder. */
+interface Escalation { allowOptionId: string; valid?: boolean; title: string; contextShell?: true }
 export type NativeEscalationDecision = Extract<PolicyDecision, { kind: "deny" | "defer" }>;
 
 const REJECT_OPTION_IDS: Readonly<Record<string, readonly string[]>> = {
@@ -24,6 +25,7 @@ export function nativePermissionEscalation(
   if (escalation === null) return null;
   const deny = safeRejectOption(request, escalation.allowOptionId);
   if (escalation.valid === false) return { kind: "deny", optionId: deny };
+  if (escalation.contextShell) return { kind: "deny", optionId: deny, message: CONTEXT_SHELL_MESSAGE, refusal: { reason: "session_context_shell" } };
   const optionIds = safeOptionIds(request, escalation.allowOptionId);
   if (optionIds === null || !canDefer()) return { kind: "deny", optionId: deny };
   return { kind: "defer", allowOnceOnly: true, optionIds, title: escalation.title };
@@ -31,6 +33,15 @@ export function nativePermissionEscalation(
 
 /** What the person reads on the card, before the agent's own words for the call. */
 const OUTSIDE_FOLDER = "Outside this session's folder";
+
+/**
+ * The connector tells every agent to read its session context folder, and
+ * Claude Code reaches for `wc`, `ls`, `cat` or `sed` there. Its shell runs
+ * outside the working copy, so each asked a person, who waited up to ten
+ * minutes: 46 of 54 such cards (11-01 to 11-05). The folder holds only data,
+ * readable with the Read tool, so the command is refused at once instead.
+ */
+const CONTEXT_SHELL_MESSAGE = `${POLICY_REFUSAL_PREFIX} shell command: it reads this session's context folder, which is outside the working copy. Read those files with the Read tool (or Grep and Glob) instead.`;
 const NEEDS_NETWORK = "Needs the network";
 
 /** The permission title's contract limit, counted in code points and UTF-16 units. */
@@ -48,10 +59,24 @@ function providerEscalation(request: RequestPermissionRequest, context: Permissi
   if (context.agentId === "codex") return codexEscalation(request, context);
   if (context.agentId !== "claude-code") return null;
   if (tool === "SandboxNetworkAccess") return { allowOptionId: "allow-once", title: escalationTitle(request, NEEDS_NETWORK, "network access") };
-  if (tool !== "Bash" && tool !== "PowerShell") return null;
-  return (request.toolCall.locations ?? []).length > 0
-    ? { allowOptionId: "allow-once", title: escalationTitle(request, OUTSIDE_FOLDER, tool) }
-    : null;
+  return tool === "Bash" || tool === "PowerShell" ? claudeShellEscalation(request, context, tool) : null;
+}
+
+/** Claude names the path its shell would reach outside the working copy in `locations`. */
+function claudeShellEscalation(request: RequestPermissionRequest, context: PermissionContext, tool: string): Escalation | null {
+  const locations = request.toolCall.locations ?? [];
+  if (locations.length === 0) return null;
+  const escalation: Escalation = { allowOptionId: "allow-once", title: escalationTitle(request, OUTSIDE_FOLDER, tool) };
+  return onlySessionContext(locations, context) ? { ...escalation, contextShell: true } : escalation;
+}
+
+/** Every path Claude flagged lies in the working copy or the session context folder, and one in the latter. */
+function onlySessionContext(locations: ReadonlyArray<{ path: string }>, context: PermissionContext): boolean {
+  const root = context.sessionContextRoot;
+  if (root === undefined) return false;
+  const cwd = context.cwd ?? context.workspaceRoot;
+  return locations.every(location => isWithinReadRoots(location.path, cwd, [root]))
+    && locations.some(location => !isWithinWorkspace(location.path, cwd));
 }
 
 function codexEscalation(request: RequestPermissionRequest, context: PermissionContext): Escalation | null {
