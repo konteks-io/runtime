@@ -133,14 +133,10 @@ async function captureIndex(executable: string, cwd: string, baselineCommit: str
   return tree;
 }
 
-/** Previously accepted paths remain project output even if a later ignore rule hides them. */
-async function captureAcceptedPaths(executable: string, cwd: string, env: NodeJS.ProcessEnv, executableBits: boolean, previous?: PreviousOutput | null): Promise<void> {
-  if (!previous) return;
-  const parsed = RemoteFileTreeSchema.safeParse(previous.files);
-  if (!parsed.success) throw unavailable("previous_output_invalid");
-  const files = parsed.data;
-  const present: typeof files.entries = [];
-  for (const entry of files.entries) {
+/** The accepted entries still on disk as files, tool artifacts left out. */
+async function presentAcceptedEntries<T extends { path: string }>(cwd: string, entries: readonly T[]): Promise<T[]> {
+  const present: T[] = [];
+  for (const entry of entries) {
     if (isToolArtifactPath(entry.path)) continue;
     const stat = await lstat(join(cwd, entry.path)).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT" || error.code === "ENOTDIR") return null;
@@ -148,6 +144,15 @@ async function captureAcceptedPaths(executable: string, cwd: string, env: NodeJS
     });
     if (stat && !stat.isDirectory()) present.push(entry);
   }
+  return present;
+}
+
+/** Previously accepted paths remain project output even if a later ignore rule hides them. */
+async function captureAcceptedPaths(executable: string, cwd: string, env: NodeJS.ProcessEnv, executableBits: boolean, previous?: PreviousOutput | null): Promise<void> {
+  if (!previous) return;
+  const parsed = RemoteFileTreeSchema.safeParse(previous.files);
+  if (!parsed.success) throw unavailable("previous_output_invalid");
+  const present = await presentAcceptedEntries(cwd, parsed.data.entries);
   const paths = present.map(entry => entry.path);
   if (paths.length) await runGit(executable, cwd, "add_accepted", [...modeConfig(executableBits), "--literal-pathspecs", "add", "--no-renormalize", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"], env, paths.join("\0") + "\0");
   if (!executableBits) await keepAcceptedModes(executable, cwd, env, present);
