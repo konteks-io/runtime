@@ -9,6 +9,10 @@ import { canonicalize, sha256Hex } from "@konteks/remote-common";
 import { NativeRepositoryCache } from "../native/repository-cache.js";
 import { testGitCommand, testGitTool } from "./native-git-fixture.js";
 
+/** Whether the cache's file system holds an executable bit; false simulates a Windows computer. */
+const fileSystem = vi.hoisted(() => ({ executableBits: true }));
+vi.mock("../native/executable-bit.js", () => ({ filesystemKeepsExecutableBit: async () => fileSystem.executableBits }));
+
 vi.mock("node:fs/promises", async importOriginal => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
   return { ...actual, rename: vi.fn(actual.rename) };
@@ -16,6 +20,7 @@ vi.mock("node:fs/promises", async importOriginal => {
 
 const roots: string[] = [];
 afterEach(async () => {
+  fileSystem.executableBits = true;
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
@@ -612,5 +617,76 @@ describe("a delivery session returning to a computer with its old checkout", () 
     await f.cache.prepare({ ...session, revision: f.first, agentWorkspaceRoot: f.claudeRoot });
     const second = await published(f, "two\n");
     await expect(f.cache.prepare({ ...session, revision: second, agentWorkspaceRoot: f.claudeRoot })).rejects.toThrow();
+  });
+});
+
+// 11-08: deliveries on a Windows computer published every executable script
+// as 100644, some rewritten with CRLF, though the agent never changed them.
+describe("a checkout the agent's own Git works in, whatever the host's Git configuration", () => {
+  const script = "#!/usr/bin/env sh\necho one\necho two\n";
+  const request = { repositoryId: "repository:online-store", worktreeId: "delivery" };
+
+  async function withScript(f: Awaited<ReturnType<typeof fixture>>) {
+    await writeFile(join(f.seed, "run.sh"), script);
+    await chmod(join(f.seed, "run.sh"), 0o755);
+    await testGitCommand(f.tool, f.seed, ["add", "run.sh"]);
+    await testGitCommand(f.tool, f.seed, ["-c", "user.name=Test", "-c", "user.email=test@invalid", "commit", "-m", "script"]);
+    await testGitCommand(f.tool, f.seed, ["push", f.origin, "HEAD:refs/heads/main"]);
+    return (await testGitCommand(f.tool, f.seed, ["rev-parse", "HEAD"])).trim();
+  }
+
+  /** The agent's Git: it reads the host's configuration, here Git for Windows' line-ending default. */
+  async function agentGit(f: Awaited<ReturnType<typeof fixture>>, cwd: string, args: string[]) {
+    const global = join(f.root, "host.gitconfig");
+    await writeFile(global, "[core]\n\tautocrlf = true\n\teol = crlf\n\tfilemode = true\n");
+    return (await promisify(execFile)(f.tool.executable, ["-C", cwd, ...args], {
+      env: { PATH: dirname(f.tool.executable), GIT_CONFIG_GLOBAL: global, GIT_CONFIG_NOSYSTEM: "1" },
+    })).stdout;
+  }
+
+  it("never converts line endings when the agent restores a file", async () => {
+    const f = await fixture();
+    const revision = await withScript(f);
+    const work = await f.cache.prepare({ ...request, revision, agentWorkspaceRoot: f.codexRoot });
+    expect(await readFile(join(work.cwd, "run.sh"), "utf8")).toBe(script);
+    await rm(join(work.cwd, "run.sh"));
+    await writeFile(join(work.cwd, "app.txt"), "edited\n");
+    await agentGit(f, work.cwd, ["checkout", "--", "run.sh", "app.txt"]);
+    expect(await readFile(join(work.cwd, "run.sh"), "utf8")).toBe(script);
+    expect(await readFile(join(work.cwd, "app.txt"), "utf8")).toBe("one\n");
+    expect(await agentGit(f, work.cwd, ["status", "--porcelain"])).toBe("");
+  });
+
+  it("shows no executable file as changed where the file system holds no executable bit", async () => {
+    fileSystem.executableBits = false;
+    const f = await fixture();
+    const revision = await withScript(f);
+    const work = await f.cache.prepare({ ...request, revision, agentWorkspaceRoot: f.codexRoot });
+    // How Git for Windows reads every file there: never executable.
+    await chmod(join(work.cwd, "run.sh"), 0o644);
+    expect(await agentGit(f, work.cwd, ["status", "--porcelain"])).toBe("");
+    expect(await agentGit(f, work.cwd, ["ls-files", "--stage", "run.sh"])).toMatch(/^100755 /u);
+    await work.verify();
+  });
+
+  it("upgrades a repository an earlier connector configured, keeping the agent's work", async () => {
+    const f = await fixture();
+    const revision = await withScript(f);
+    const input = { ...request, revision, agentWorkspaceRoot: f.codexRoot };
+    const work = await f.cache.prepare(input);
+    await writeFile(join(work.cwd, "app.txt"), "unsaved\n");
+    const legacy = "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n\thooksPath = hooks-disabled\n" +
+      "[gc]\n\tauto = 0\n[fetch]\n\tfsckObjects = true\n[transfer]\n\tfsckObjects = true\n";
+    const common = (await testGitCommand(f.tool, work.cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"])).trim();
+    await writeFile(join(common, "config"), legacy, { mode: 0o600 });
+    fileSystem.executableBits = false;
+    const resumed = await f.cache.prepare(input);
+    expect(resumed.cwd).toBe(work.cwd);
+    const config = await readFile(join(common, "config"), "utf8");
+    expect(config).toContain("\tfilemode = false\n");
+    expect(config).toContain("\tautocrlf = false\n\teol = lf\n");
+    expect(await readFile(join(work.cwd, "app.txt"), "utf8")).toBe("unsaved\n");
+    await writeFile(join(common, "config"), config.replace("hooksPath = hooks-disabled", "hooksPath = .husky/_"));
+    await expect(resumed.verify()).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "workspace_policy_invalid" });
   });
 });

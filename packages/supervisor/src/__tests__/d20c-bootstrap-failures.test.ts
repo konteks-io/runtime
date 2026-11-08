@@ -535,7 +535,7 @@ async function policyGitFixture() {
   // The exact mutation made by Husky 9.1.7 during the production prepare lifecycle.
   await testGitCommand(tool, worktrees[1], ["config", "core.hooksPath", ".husky/_"]);
   const config = await readFile(join(shared, "config"));
-  expect(sha256Hex(config)).toBe("1bdec8526c501f13b0f5bfca21b911294a74ed550aad87f82b4053a3ecb10693");
+  expect(sha256Hex(config)).toBe("8b81ced1005dca5643cffb26c6c5958f12e70174be34064101b0b9c6eda1a199");
   async function preservedWork() {
     const result = [];
     for (const cwd of worktrees) result.push({
