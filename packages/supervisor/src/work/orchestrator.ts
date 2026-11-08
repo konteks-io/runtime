@@ -1954,7 +1954,21 @@ export class WorkOrchestrator {
     return false;
   }
 
-  /** A closed, reported completion settled at least `idleMs` ago whose execution still holds its process. */
+  /**
+   * Eligibility is local to one logical role session: its owner must be closed
+   * and unfenced, its terminal report durably journaled, and its execution still
+   * opened on the exact ACP reference with a retained process owner and a turn
+   * settled for `idleMs`. A generator can therefore qualify while the same task's
+   * separate QA session remains live; that other owner and channel are untouched.
+   * Releasing costs the generator's warm ACP context and, when its process is not
+   * retained, a proven process stop plus the workspace-retention step before ACP
+   * settlement. Once Core acknowledges that terminal, its exact successor starts
+   * a fresh ACP session while the repository workspace remains preserved.
+   *
+   * Keep this role-local rule: tying generator lifetime to its review would hold
+   * an otherwise idle execution slot for the review's duration and prevent both
+   * scheduled and capacity reclamation without protecting the separate QA owner.
+   */
   private idleCompletedSession(owner: RelayedSession, now: number, idleMs: number): IdleCompletedSession | undefined {
     const prior = this.deps.journal.execution.admission(owner.assignment.id, owner.assignment.attempt);
     const ref = owner.acpSessionRef;

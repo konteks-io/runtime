@@ -518,6 +518,63 @@ it("releases a completed session idle past the reaper window and keeps a recent 
   expect(f.internal.channelOwners.has("session:session")).toBe(false);
 });
 
+it("reaps a settled generator while its delivery review stays active, then starts the exact successor fresh", async () => {
+  let f: Awaited<ReturnType<typeof harnessReleaseWindow>>;
+  const preserveStoppedWorkspace = vi.fn(async (admission: LocalAdmission, assertCurrent: () => void) => {
+    assertCurrent();
+    expect(admission).toEqual(prior);
+    expect(f.journal.execution.execution(admission)?.phase).toBe("process_stopped");
+  });
+  f = await harnessReleaseWindow(preserveStoppedWorkspace);
+
+  const reviewAdmission: LocalAdmission = { ...prior, assignmentId: "review", claimId: "review-claim",
+    executionGeneration: "review-generation", openedAt: "2026-09-06T00:00:02.000Z" };
+  const reviewBase = delivery(reviewAdmission, "review-1", false);
+  if (reviewBase.source.kind !== "harness_delivery") throw new Error("review fixture mismatch");
+  const review: RemoteWorkAssignment = { ...reviewBase, kind: "validation",
+    agentRoute: { ...reviewBase.agentRoute, requiredRole: "qa" },
+    source: { ...reviewBase.source, executionSessionId: "repository-qa-session" } };
+  await f.journal.execution.beginAdmission({ schemaVersion: 1, mandatoryOpenVersion: 1, admission: reviewAdmission, assignment: review,
+    evidenceUpload: "structured_only", projectionCreatedAt: reviewAdmission.openedAt, claimCreatedAt: reviewAdmission.openedAt }, current);
+  await f.journal.execution.reserveAllocation(reviewAdmission, current);
+  await f.journal.execution.open(reviewAdmission, current, reviewAdmission.openedAt);
+  await f.journal.execution.bindReference(reviewAdmission, "review-ref", current);
+  const reviewProcessOwner = { ...processOwner, pid: 84, processGroupId: 84, startToken: "review-start-token" };
+  await f.journal.execution.bindProcessOwner(reviewAdmission, reviewProcessOwner, current);
+  await f.journal.assignments.put({ assignmentId: "review", attempt: 1, claimId: "review-claim", kind: "validation",
+    placementId: review.placementId, workspaceId: "workspace", agentId: "claude-code", state: "running", recoveryEpoch: 0,
+    reports: { nextSequence: 1, durableWatermark: 0 }, evidenceUpload: "structured_only",
+    expiresAt: review.expiresAt, latestResumeAt: review.policy.latestResumeAt, updatedAt: clock.nowIso() });
+  const reviewChannel = "session:repository-qa-session";
+  const reviewOwner = { assignment: review, acpSessionRef: "review-ref", isClosed: false,
+    releaseCompletedChannel: vi.fn(() => { f.internal.channelOwners.delete(reviewChannel); }) };
+  f.internal.channelOwners.set(reviewChannel, reviewOwner);
+  f.internal.sessions.set("review:1", reviewOwner);
+
+  clock.advance(45 * 60_000);
+  try {
+    await expect(f.internal.reapIdleCompletedSessions(30 * 60_000)).resolves.toBe(1);
+    expect(f.runner.releaseSealedSession).toHaveBeenCalledOnce();
+    expect(f.runner.releaseSealedSession).toHaveBeenCalledWith("generator-ref");
+    expect(f.runner.stopRetainedExecution).toHaveBeenCalledOnce();
+    expect(f.runner.stopRetainedExecution).toHaveBeenCalledWith(processOwner);
+    expect(preserveStoppedWorkspace).toHaveBeenCalledOnce();
+    expect(f.journal.execution.execution(prior)).toMatchObject({ phase: "acp_settled", acpSessionRef: "generator-ref", processOwner });
+    expect(f.internal.channelOwners.has(f.channel)).toBe(false);
+    expect(f.internal.sessions.has("prior:1")).toBe(false);
+    expect(reviewOwner.releaseCompletedChannel).not.toHaveBeenCalled();
+    expect(f.internal.channelOwners.get(reviewChannel)).toBe(reviewOwner);
+    expect(f.internal.sessions.get("review:1")).toBe(reviewOwner);
+    expect(f.journal.execution.execution(reviewAdmission)).toMatchObject({ phase: "opened", acpSessionRef: "review-ref",
+      processOwner: reviewProcessOwner });
+
+    await expect(f.internal.takeOverCompletedChannel(f.successor, next, current)).resolves.toBeUndefined();
+    expect(f.warn.mock.calls.some(([fields]) => fields?.outcome === "fresh_after_settled_predecessor")).toBe(true);
+    expect(f.runner.releaseSealedSession).toHaveBeenCalledOnce();
+    expect(reviewOwner.releaseCompletedChannel).not.toHaveBeenCalled();
+  } finally { clock.advance(-45 * 60_000); }
+});
+
 // TKT-1: a claim reply is handled on the assignment channel's one-at-a-time
 // lane. Waiting for the deliberate release there would hold every later claim,
 // report ack and cancel, so the dispatch itself must be handed off-lane.
