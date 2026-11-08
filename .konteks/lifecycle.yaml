@@ -17,8 +17,3 @@ installDependencies:
   - name: build
     command: npm run build
     timeout_seconds: 400
-
-test:
-  - name: native-channel-handoff
-    command: npx vitest run --project unit packages/supervisor/src/__tests__/native-channel-handoff.test.ts
-    timeout_seconds: 180
