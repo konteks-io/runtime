@@ -519,13 +519,12 @@ it("releases a completed session idle past the reaper window and keeps a recent 
 });
 
 it("reaps a settled generator while its delivery review stays active, then starts the exact successor fresh", async () => {
-  let f: Awaited<ReturnType<typeof harnessReleaseWindow>>;
   const preserveStoppedWorkspace = vi.fn(async (admission: LocalAdmission, assertCurrent: () => void) => {
     assertCurrent();
     expect(admission).toEqual(prior);
     expect(f.journal.execution.execution(admission)?.phase).toBe("process_stopped");
   });
-  f = await harnessReleaseWindow(preserveStoppedWorkspace);
+  const f = await harnessReleaseWindow(preserveStoppedWorkspace);
 
   const reviewAdmission: LocalAdmission = { ...prior, assignmentId: "review", claimId: "review-claim",
     executionGeneration: "review-generation", openedAt: "2026-09-06T00:00:02.000Z" };
