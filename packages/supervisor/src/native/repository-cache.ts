@@ -7,6 +7,7 @@ import { dirname, isAbsolute, join, parse, resolve } from "node:path";
 import { RemoteInstanceError, canonicalize, createLogger, sha256Hex, type JsonValue } from "@konteks/remote-common";
 import { verifyNativeGitTool, type NativeGitTool } from "./git-workspace.js";
 import { staleCheckoutVerdict } from "./output-capture.js";
+import { filesystemKeepsExecutableBit } from "./executable-bit.js";
 
 const logger = createLogger({ name: "native-repository-cache" });
 
@@ -285,9 +286,28 @@ interface WorktreeRequest {
   } | undefined;
 }
 
-const REPOSITORY_CONFIG =
+/**
+ * The repository's own configuration, which outranks the host's system and
+ * global Git configuration for every Git that works in its checkouts, the
+ * agent's included. Line endings are never converted: Git for Windows ships
+ * `core.autocrlf=true`, and an agent restoring files with it wrote CRLF into
+ * scripts it never meant to change (11-08). `filemode` follows the file
+ * system: where it holds no executable bit, every 100755 file would otherwise
+ * read as a change to 100644.
+ */
+function repositoryConfig(executableBits: boolean): string {
+  return `[core]\n\trepositoryformatversion = 0\n\tfilemode = ${executableBits}\n\tbare = true\n\thooksPath = hooks-disabled\n` +
+    "\tautocrlf = false\n\teol = lf\n" +
+    "[gc]\n\tauto = 0\n[fetch]\n\tfsckObjects = true\n[transfer]\n\tfsckObjects = true\n";
+}
+
+/** Configurations this connector wrote before, upgraded in place; any other difference is drift and refused. */
+const KNOWN_REPOSITORY_CONFIGS: readonly string[] = [
   "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n\thooksPath = hooks-disabled\n" +
-  "[gc]\n\tauto = 0\n[fetch]\n\tfsckObjects = true\n[transfer]\n\tfsckObjects = true\n";
+    "[gc]\n\tauto = 0\n[fetch]\n\tfsckObjects = true\n[transfer]\n\tfsckObjects = true\n",
+  repositoryConfig(true),
+  repositoryConfig(false),
+];
 
 /** The cache's Git with no system or global configuration, no prompt, and only the transports a fetch may use. */
 function gitEnvironment(tool: NativeGitTool): NodeJS.ProcessEnv {
@@ -324,6 +344,7 @@ class WorktreePreparation {
   private readonly legacyReceiptPath: string;
   private readonly expected: WorktreeReceipt;
   private readonly env: NodeJS.ProcessEnv;
+  private executableBits?: Promise<boolean>;
 
   constructor(private readonly setup: {
     tool: NativeGitTool;
@@ -432,9 +453,32 @@ class WorktreePreparation {
   private async verifyRepository(gitDir = this.gitDir): Promise<void> {
     await privateDirectory(gitDir);
     await privateDirectory(join(gitDir, "hooks-disabled"));
-    if ((await readFile(join(gitDir, "config"), "utf8")) !== REPOSITORY_CONFIG)
-      throw new RemoteInstanceError("capability_unavailable", "Private Git configuration violates workspace policy.", { diagnostic: "workspace_policy_invalid" });
+    await this.currentConfig(gitDir);
     if ((await this.git(["--git-dir", gitDir, "remote"])).trim() !== "") throw unavailable();
+  }
+
+  private expectedConfig(): Promise<string> {
+    this.executableBits ??= filesystemKeepsExecutableBit(this.setup.root);
+    return this.executableBits.then(repositoryConfig);
+  }
+
+  /** This host's configuration: one an earlier connector wrote is replaced in one rename; anything else is refused. */
+  private async currentConfig(gitDir: string): Promise<void> {
+    const expected = await this.expectedConfig();
+    const path = join(gitDir, "config");
+    const actual = await readFile(path, "utf8");
+    if (actual === expected) return;
+    if (!KNOWN_REPOSITORY_CONFIGS.includes(actual))
+      throw new RemoteInstanceError("capability_unavailable", "Private Git configuration violates workspace policy.", { diagnostic: "workspace_policy_invalid" });
+    const temporary = `${path}.upgrade-${randomUUID()}`;
+    try {
+      await writePrivate(temporary, expected);
+      await rename(temporary, path);
+    } finally {
+      await rm(temporary, { force: true });
+    }
+    logger.info({ event: "native.repository.config_upgraded", executableBits: await this.executableBits },
+      "a repository written by an earlier connector now keeps line endings and file modes as Git stored them");
   }
 
   private async verify(receiptExpected = this.expected): Promise<void> {
@@ -533,7 +577,7 @@ class WorktreePreparation {
       await this.git(["init", "--bare", "--object-format=sha1", "--template=", temporary]);
       await chmod(temporary, 0o700);
       await mkdir(join(temporary, "hooks-disabled"), { mode: 0o700 });
-      await writePrivate(join(temporary, "config"), REPOSITORY_CONFIG);
+      await writePrivate(join(temporary, "config"), await this.expectedConfig());
       await rename(temporary, gitDir);
     } finally {
       await rm(temporary, { recursive: true, force: true });

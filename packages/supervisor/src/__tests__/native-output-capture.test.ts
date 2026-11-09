@@ -8,6 +8,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { computeRemoteDeliveryOutputDigest, computeRemoteFileTreeDigest } from "@konteks/remote-common";
 import { captureNativeDeliveryOutput, checkOutputTreeLimits, staleCheckoutVerdict } from "../native/output-capture.js";
 
+/** Whether the capture's file system holds an executable bit; false simulates a Windows work tree. */
+const fileSystem = vi.hoisted(() => ({ executableBits: true }));
+vi.mock("../native/executable-bit.js", () => ({ filesystemKeepsExecutableBit: async () => fileSystem.executableBits }));
+
 let dir = "";
 let linked = "";
 const run = promisify(execFile);
@@ -21,6 +25,7 @@ beforeEach(async () => {
   await run("git", ["-C", dir, "-c", "user.name=Test", "-c", "user.email=test@invalid", "commit", "-qm", "base"]);
 });
 afterEach(async () => {
+  fileSystem.executableBits = true;
   if (linked) await rm(linked, { recursive: true, force: true });
   await rm(dir, { recursive: true, force: true });
   linked = "";
@@ -342,5 +347,70 @@ describe("native delivery output capture", () => {
       baselineCommit: stdout.trim(), binding: { workspaceId: "tenant", sessionId: "session", assignmentId: "assignment", attempt: 1, instanceId: "instance" },
       claimId: "claim", invocationRef: "invocation", inputSelectionDigest: `sha256:${"a".repeat(64)}`, baseRevision: stdout.trim() });
     expect(result.files.entries.map(entry => entry.path)).toEqual(["kept.txt"]);
+  });
+
+  describe("on a file system without executable bits (Windows)", () => {
+    const script = "#!/usr/bin/env sh\nexit 0\n";
+    async function windowsCheckout() {
+      await writeFile(join(dir, "run.sh"), script);
+      await chmod(join(dir, "run.sh"), 0o755);
+      await run("git", ["-C", dir, "add", "run.sh"]);
+      await run("git", ["-C", dir, "-c", "user.name=Test", "-c", "user.email=test@invalid", "commit", "-qm", "executable base"]);
+      expect((await run("git", ["-C", dir, "ls-files", "--stage", "run.sh"])).stdout).toMatch(/^100755 /u);
+      // How Git for Windows and Node read every file there: never executable.
+      fileSystem.executableBits = false;
+      await chmod(join(dir, "run.sh"), 0o644);
+      return outputOptions();
+    }
+    const view = (entries: { path: string; mode: number; contentBase64: string }[]) =>
+      entries.map(entry => [entry.path, entry.mode, Buffer.from(entry.contentBase64, "base64").toString()]);
+
+    it("never publishes an untouched executable file as a mode change", async () => {
+      const options = await windowsCheckout();
+      await writeFile(join(dir, "kept.txt"), "after\n");
+      const result = await captureNativeDeliveryOutput(options);
+      expect(view(result.files.entries)).toEqual([["kept.txt", 0o600, "after\n"]]);
+      expect(result.deletions).toEqual([]);
+      await writeFile(join(dir, "kept.txt"), "before\n");
+      await expect(staleCheckoutVerdict({ ...options, publishedCommit: options.baselineCommit })).resolves.toBe("clean");
+    });
+
+    it("publishes the agent's edit to an executable file with its base mode", async () => {
+      const options = await windowsCheckout();
+      await writeFile(join(dir, "run.sh"), "#!/usr/bin/env sh\nexit 1\n");
+      const result = await captureNativeDeliveryOutput(options);
+      expect(view(result.files.entries)).toEqual([["run.sh", 0o700, "#!/usr/bin/env sh\nexit 1\n"]]);
+    });
+
+    it("keeps a file the accepted output made executable executable", async () => {
+      fileSystem.executableBits = true;
+      const options = await outputOptions();
+      await writeFile(join(dir, "tool.sh"), script);
+      await chmod(join(dir, "tool.sh"), 0o755);
+      await chmod(join(dir, "kept.txt"), 0o755);
+      const first = await captureNativeDeliveryOutput(options);
+      expect(view(first.files.entries)).toEqual([["kept.txt", 0o700, "before\n"], ["tool.sh", 0o700, script]]);
+      fileSystem.executableBits = false;
+      await chmod(join(dir, "tool.sh"), 0o644);
+      await chmod(join(dir, "kept.txt"), 0o644);
+      const second = await captureNativeDeliveryOutput({ ...options, invocationRef: "second", previousOutput: first });
+      expect(second.files).toEqual(first.files);
+    });
+  });
+
+  it("still publishes a real mode change where the file system holds executable bits", async () => {
+    await writeFile(join(dir, "run.sh"), "#!/bin/sh\n");
+    await chmod(join(dir, "run.sh"), 0o755);
+    await run("git", ["-C", dir, "add", "run.sh"]);
+    await run("git", ["-C", dir, "-c", "user.name=Test", "-c", "user.email=test@invalid", "commit", "-qm", "executable base"]);
+    const options = await outputOptions();
+    await chmod(join(dir, "run.sh"), 0o644);
+    const result = await captureNativeDeliveryOutput(options);
+    expect(result.files.entries.map(entry => [entry.path, entry.mode])).toEqual([["run.sh", 0o600]]);
+  });
+
+  it.skipIf(process.platform === "win32")("probes a POSIX file system as holding executable bits", async () => {
+    const actual = await vi.importActual<typeof import("../native/executable-bit.js")>("../native/executable-bit.js");
+    await expect(actual.filesystemKeepsExecutableBit(dir)).resolves.toBe(true);
   });
 });

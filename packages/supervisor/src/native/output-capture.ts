@@ -20,6 +20,7 @@ import {
 import { acceptUnchangedGitlink, baselineGitlinks, requireAllGitlinksSeen, verifyEmptyGitlinks } from "./output-gitlinks.js";
 import { OutputCaptureRefusal, diagnosticIdentifier, type OutputGitStep, type OutputRefusalFacts } from "./delivery-output-failure.js";
 import { filesystemFailure, gitFailure } from "./named-refusal.js";
+import { filesystemKeepsExecutableBit } from "./executable-bit.js";
 
 const MAX_GIT_OUTPUT = 16 * 1024 * 1024;
 const oidPattern = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/;
@@ -103,7 +104,17 @@ function decodePaths(value: Buffer): string[] {
   return decodeUtf8(value).split("\0").filter(Boolean).sort();
 }
 
-async function captureIndex(executable: string, cwd: string, baselineCommit: string, env: NodeJS.ProcessEnv, previous?: PreviousOutput | null): Promise<string> {
+/**
+ * Where the work tree cannot hold an executable bit (Windows), Git must take
+ * every tracked file's mode from the index, never from the file system:
+ * otherwise each 100755 file reads as changed to 100644 and is published with
+ * its on-disk bytes although the agent never touched it (11-08, runtime#182).
+ */
+function modeConfig(executableBits: boolean): string[] {
+  return executableBits ? [] : ["-c", "core.fileMode=false"];
+}
+
+async function captureIndex(executable: string, cwd: string, baselineCommit: string, env: NodeJS.ProcessEnv, executableBits: boolean, previous?: PreviousOutput | null): Promise<string> {
   await runGit(executable, cwd, "read_tree", ["read-tree", "--reset", baselineCommit], env);
   // Enumerate eligible names before reading their bytes. Naming an ignored
   // parent in an `add` exclusion makes Git refuse otherwise valid changes.
@@ -115,29 +126,48 @@ async function captureIndex(executable: string, cwd: string, baselineCommit: str
   // (Laravel's storage/.gitignore `*` beside tracked storage/*/.gitignore),
   // and every capture of that repository failed (E67, 11-01).
   if (paths.length) await runGit(executable, cwd, "add",
-    ["--literal-pathspecs", "add", "--no-renormalize", "-A", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"], env, paths.join("\0") + "\0");
-  await captureAcceptedPaths(executable, cwd, env, previous);
+    [...modeConfig(executableBits), "--literal-pathspecs", "add", "--no-renormalize", "-A", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"], env, paths.join("\0") + "\0");
+  await captureAcceptedPaths(executable, cwd, env, executableBits, previous);
   const tree = (await runGit(executable, cwd, "write_tree", ["write-tree"], env)).toString("ascii").trim();
   if (!oidPattern.test(tree)) throw unavailable("tree_unparsable");
   return tree;
 }
 
-/** Previously accepted paths remain project output even if a later ignore rule hides them. */
-async function captureAcceptedPaths(executable: string, cwd: string, env: NodeJS.ProcessEnv, previous?: PreviousOutput | null): Promise<void> {
-  if (!previous) return;
-  const parsed = RemoteFileTreeSchema.safeParse(previous.files);
-  if (!parsed.success) throw unavailable("previous_output_invalid");
-  const files = parsed.data;
-  const paths: string[] = [];
-  for (const entry of files.entries) {
+/** The accepted entries still on disk as files, tool artifacts left out. */
+async function presentAcceptedEntries<T extends { path: string }>(cwd: string, entries: readonly T[]): Promise<T[]> {
+  const present: T[] = [];
+  for (const entry of entries) {
     if (isToolArtifactPath(entry.path)) continue;
     const stat = await lstat(join(cwd, entry.path)).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT" || error.code === "ENOTDIR") return null;
       throw error;
     });
-    if (stat && !stat.isDirectory()) paths.push(entry.path);
+    if (stat && !stat.isDirectory()) present.push(entry);
   }
-  if (paths.length) await runGit(executable, cwd, "add_accepted", ["--literal-pathspecs", "add", "--no-renormalize", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"], env, paths.join("\0") + "\0");
+  return present;
+}
+
+/** Previously accepted paths remain project output even if a later ignore rule hides them. */
+async function captureAcceptedPaths(executable: string, cwd: string, env: NodeJS.ProcessEnv, executableBits: boolean, previous?: PreviousOutput | null): Promise<void> {
+  if (!previous) return;
+  const parsed = RemoteFileTreeSchema.safeParse(previous.files);
+  if (!parsed.success) throw unavailable("previous_output_invalid");
+  const present = await presentAcceptedEntries(cwd, parsed.data.entries);
+  const paths = present.map(entry => entry.path);
+  if (paths.length) await runGit(executable, cwd, "add_accepted", [...modeConfig(executableBits), "--literal-pathspecs", "add", "--no-renormalize", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"], env, paths.join("\0") + "\0");
+  if (!executableBits) await keepAcceptedModes(executable, cwd, env, present);
+}
+
+/**
+ * Without executable bits the file system cannot say what an accepted file's
+ * mode is, so the earlier accepted output keeps saying it: a file it made
+ * executable (on a computer that can) stays executable here.
+ */
+async function keepAcceptedModes(executable: string, cwd: string, env: NodeJS.ProcessEnv, entries: ReadonlyArray<{ path: string; mode: number }>): Promise<void> {
+  for (const [flag, mode] of [["+x", 0o700], ["-x", 0o600]] as const) {
+    const paths = entries.filter(entry => entry.mode === mode).map(entry => entry.path);
+    if (paths.length) await runGit(executable, cwd, "accepted_mode", [...modeConfig(false), "update-index", `--chmod=${flag}`, "-z", "--stdin"], env, paths.join("\0") + "\0");
+  }
 }
 
 function parseTree(value: Buffer, gitlinks: ReadonlyMap<string, string>): Map<string, { oid: string; mode: 0o600 | 0o700 }> {
@@ -194,7 +224,8 @@ export async function captureNativeDeliveryOutput(options: CaptureOptions): Prom
     temporary = await mkdtemp(join(dirname(root), ".output-capture-")); await chmod(temporary, 0o700);
     const temporaryObjects = join(temporary, "objects"); await mkdir(temporaryObjects, { mode: 0o700 });
     const env = { GIT_INDEX_FILE: join(temporary, "index"), GIT_OBJECT_DIRECTORY: temporaryObjects, GIT_ALTERNATE_OBJECT_DIRECTORIES: objectDirectory };
-    const { entries, deletions } = await capturedChanges(options.gitExecutable, root, options.baselineCommit, env, options.previousOutput);
+    const executableBits = await filesystemKeepsExecutableBit(temporary);
+    const { entries, deletions } = await capturedChanges(options.gitExecutable, root, options.baselineCommit, env, executableBits, options.previousOutput);
     const result = deliveryCandidate(options, entries, deletions);
     logger.info({ event: "native.output.capture_completed", correlationId: result.invocationRef, stage: "capture", outcome: "success",
       files: entries.length, bytes: entries.reduce((total, entry) => total + entry.sizeBytes, 0), treeDigest: result.files.treeDigest,
@@ -252,11 +283,11 @@ async function commonObjectDirectory(gitExecutable: string, root: string): Promi
 }
 
 /** The files written and deleted since the baseline, captured twice into the private index and required to agree. */
-async function capturedChanges(gitExecutable: string, root: string, baselineCommit: string, env: NodeJS.ProcessEnv, previous?: PreviousOutput | null): Promise<{ entries: CapturedEntry[]; deletions: string[] }> {
+async function capturedChanges(gitExecutable: string, root: string, baselineCommit: string, env: NodeJS.ProcessEnv, executableBits: boolean, previous?: PreviousOutput | null): Promise<{ entries: CapturedEntry[]; deletions: string[] }> {
   const gitlinks = baselineGitlinks(await runGit(gitExecutable, root, "ls_tree", ["ls-tree", "-rz", baselineCommit]));
   await verifyEmptyGitlinks(root, gitlinks, await runGit(gitExecutable, root, "ls_files_stage", ["ls-files", "--stage", "-z"]));
-  const first = await captureIndex(gitExecutable, root, baselineCommit, env, previous);
-  const second = await captureIndex(gitExecutable, root, baselineCommit, env, previous);
+  const first = await captureIndex(gitExecutable, root, baselineCommit, env, executableBits, previous);
+  const second = await captureIndex(gitExecutable, root, baselineCommit, env, executableBits, previous);
   if (first !== second) throw unavailable("tree_unstable");
   let deletions = decodePaths(await runGit(gitExecutable, root, "diff", ["diff", "--cached", "--diff-filter=D", "--name-only", "-z", "--no-renames", baselineCommit, "--"], env));
   const writes = decodePaths(await runGit(gitExecutable, root, "diff", ["diff", "--cached", "--diff-filter=ACMRTUXB", "--name-only", "-z", "--no-renames", baselineCommit, "--"], env));
@@ -314,7 +345,7 @@ export async function staleCheckoutVerdict(options: StaleCheckoutInput): Promise
     temporary = await mkdtemp(join(dirname(root), ".stale-checkout-")); await chmod(temporary, 0o700);
     const temporaryObjects = join(temporary, "objects"); await mkdir(temporaryObjects, { mode: 0o700 });
     const env = { GIT_INDEX_FILE: join(temporary, "index"), GIT_OBJECT_DIRECTORY: temporaryObjects, GIT_ALTERNATE_OBJECT_DIRECTORIES: objectDirectory };
-    return await verdictOf(options, root, env);
+    return await verdictOf(options, root, env, await filesystemKeepsExecutableBit(temporary));
   } finally {
     if (temporary) await rm(temporary, { recursive: true, force: true }).catch(() => undefined);
   }
@@ -328,9 +359,9 @@ function assertStaleInput(options: StaleCheckoutInput): void {
   if (!oidPattern.test(options.baselineCommit) || !oidPattern.test(options.publishedCommit)) throw unavailable("baseline_invalid");
 }
 
-async function verdictOf(options: StaleCheckoutInput, root: string, env: NodeJS.ProcessEnv): Promise<StaleCheckoutVerdict> {
+async function verdictOf(options: StaleCheckoutInput, root: string, env: NodeJS.ProcessEnv, executableBits: boolean): Promise<StaleCheckoutVerdict> {
   const previous = options.accepted?.files ? { files: options.accepted.files, deletions: [...options.accepted.deletions] } : undefined;
-  const { entries, deletions } = await capturedChanges(options.gitExecutable, root, options.baselineCommit, env, previous);
+  const { entries, deletions } = await capturedChanges(options.gitExecutable, root, options.baselineCommit, env, executableBits, previous);
   if (!entries.length && !deletions.length) return "clean";
   if (sameOutput(options.accepted, entries, deletions)) return "accepted";
   // The private index now holds the checkout exactly as captured.

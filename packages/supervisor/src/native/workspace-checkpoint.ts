@@ -254,7 +254,9 @@ async function restoreGit(git: Git, cwd: string, checkpoint: RemoteWorkspaceAnyC
   await git(cwd, "cat_file", ["cat-file", "-e", `${checkpoint.baselineCommit}^{commit}`]);
   await mkdir(join(cwd, ".git", "hooks-disabled"), { mode: 0o700 });
   await git(cwd, "config", ["config", "core.hooksPath", ".git/hooks-disabled"]);
+  // Byte-exact line endings whatever the host's own Git configuration says (repository-cache.ts).
   await git(cwd, "config", ["config", "core.autocrlf", "false"]);
+  await git(cwd, "config", ["config", "core.eol", "lf"]);
   await git(cwd, "config", ["config", "core.fsmonitor", "false"]);
   await rm(bundlePath);
 }
