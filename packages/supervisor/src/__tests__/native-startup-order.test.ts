@@ -2,7 +2,8 @@ import { afterEach, expect, it, vi } from "vitest";
 import { Supervisor } from "../supervisor.js";
 import { SupervisorConfigSchema } from "../config.js";
 import type { JournalEntry } from "../state/journal.js";
-import type { RecoveryStatusReport, RelayRuntimeHandshakeResult } from "@konteks/remote-common";
+import { FixedClock, type RecoveryStatusReport, type RelayRuntimeHandshakeResult } from "@konteks/remote-common";
+import { ModelCapabilitySnapshotProducer } from "../native/model-capability-snapshot.js";
 
 // Composition test: no bridge, listener, filesystem mutation or cloud request.
 interface StartupInternals {
@@ -22,7 +23,6 @@ interface StartupInternals {
   administrativeStatus: "active" | "provisioning";
   refreshConfiguration(): Promise<void>;
   openCoreChannels(): void;
-  afterEstablishment(assertCurrent: () => void): Promise<void>;
   modelCapabilities: unknown;
   inventory: unknown;
 }
@@ -43,7 +43,8 @@ function fixture() {
   internal.reloadManagedGitBinding = vi.fn(async () => undefined);
   internal.refreshConfiguration = vi.fn(async () => { events.push("configuration"); });
   const run = vi.fn(async () => { events.push("recovery"); complete = true; });
-  supervisor.reconciliation = { run, get isComplete() { return complete; } } as never;
+  const reconciliation = { run, get isComplete() { return complete; } };
+  supervisor.reconciliation = reconciliation as never;
   vi.spyOn(supervisor.journal.recovery, "current").mockImplementation(() => record as never);
   vi.spyOn(supervisor.lease, "isValid").mockReturnValue(true);
   vi.spyOn(supervisor.lease, "mode").mockReturnValue("active");
@@ -63,7 +64,25 @@ function fixture() {
   const pull = vi.fn();
   supervisor.work = { reports: { flushAll }, pull } as never;
   supervisor.relay = null;
-  return { supervisor, internal, events, run, heartbeatStart, publishPending, publish, transportStart, flushAll, pull, record, setComplete: (value: boolean) => { complete = value; } };
+  return { supervisor, internal, events, run, reconciliation, heartbeatStart, publishPending, publish, transportStart, flushAll, pull, record, setComplete: (value: boolean) => { complete = value; } };
+}
+
+/**
+ * The establishment callback the production `Reconciliation` holds. This is
+ * the same seam before and after the fix: before, its deps carried the inline
+ * `async assertCurrent => … await modelCapabilities.refresh …`; now they call
+ * the supervisor's non-blocking method. Composing it with the test's stubs
+ * keeps the characterization test about the discovery seam, not a private
+ * helper introduced by the fix.
+ */
+function establishmentCallback(f: ReturnType<typeof fixture>): (assertCurrent: () => void) => Promise<void> {
+  const internals = f.supervisor as unknown as { composeRecovery(verifier: unknown): void };
+  internals.composeRecovery({ verifyPlanningTerminal: () => undefined });
+  const callback = (f.supervisor.reconciliation as unknown as {
+    deps: { afterEstablishment: (assertCurrent: () => void) => Promise<void> };
+  }).deps.afterEstablishment;
+  f.supervisor.reconciliation = f.reconciliation as never;
+  return callback;
 }
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); });
 
@@ -94,22 +113,34 @@ it("establishes accepted recovery before ordinary heartbeat, transport, replay a
 
 it("starts the control loop while one agent bridge never answers initialize (bridge did not answer init)", async () => {
   const f = fixture();
-  // One agent's read never settles, exactly as a bridge that never answers
-  // ACP initialize would hold the old establishment path forever.
-  const never = new Promise<void>(() => undefined);
-  const refresh = vi.fn(() => never);
-  f.internal.inventory = { agents: () => [] };
+  // One agent's discovery never answers `discover`, exactly as a bridge that
+  // never answers ACP initialize would hold the old establishment path.
+  const ready = { agentId: "codex", authMode: "agent_local_subscription", readiness: "ready",
+    connectionState: "ready", authIdentityFingerprint: "identity-codex" };
+  f.internal.inventory = { agents: () => [ready] };
   f.internal.administrativeStatus = "active";
-  f.internal.modelCapabilities = { invalidateForAgents: vi.fn(), refresh, snapshots: () => [] };
-  // Reconciliation awaits afterEstablishment exactly as the real one does.
+  const producer = new ModelCapabilitySnapshotProducer({
+    clock: new FixedClock(Date.parse("2026-11-09T12:00:00Z")), instanceId: () => "instance",
+    runnerIncarnation: () => "process", manifestId: () => "manifest", mappings: () => [],
+    catalogueAgents: () => ["codex"], discover: () => new Promise<never>(() => undefined),
+    discoveryTimeoutMs: 10_000,
+  });
+  const refresh = vi.spyOn(producer, "refresh");
+  f.internal.modelCapabilities = producer;
+  // The production Reconciliation awaits its own deps.afterEstablishment; on
+  // the pre-fix code that callback awaited refresh here and startup blocked.
+  const afterEstablishment = establishmentCallback(f);
   f.run.mockImplementation(async () => {
-    await f.internal.afterEstablishment(() => undefined);
+    await afterEstablishment(() => undefined);
     f.events.push("recovery");
     f.setComplete(true);
   });
   let settled = false;
   const startup = f.internal.startActiveLoop().then(() => { settled = true; });
   await vi.advanceTimersByTimeAsync(50);
+  // Provenance: run verbatim against the pre-change source, this same test
+  // fails here (settled stays false) because the production
+  // afterEstablishment awaited refresh; it does not fail on a missing helper.
   expect(settled).toBe(true);
   await startup;
   expect(refresh).toHaveBeenCalledOnce();

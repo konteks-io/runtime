@@ -47,7 +47,13 @@ export interface ModelCapabilityDiscoveryStatus {
   nextRetryAt: string | null;
 }
 
-/** One agent's discovery may not hold the shared refresh lane longer than this. */
+/**
+ * One agent's discovery may not hold this producer's shared refresh lane or
+ * in-flight slot longer than this. The runner has its own whole-read bound
+ * (13 min) and keeps a single in-flight read per sign-in/config, so a retry
+ * here attaches to that read instead of spawning another bridge; this bound
+ * only stops the supervisor waiting on it.
+ */
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 60_000;
 const DISCOVERY_DEADLINE_DIAGNOSTIC = "model_capability_discovery_deadline";
 
@@ -141,7 +147,12 @@ export class ModelCapabilitySnapshotProducer {
     if (this.hasSnapshot(agentId)) {
       return { agentId, state: "ready", lastAttemptAt: recorded?.lastAttemptAt ?? null, nextRetryAt: null };
     }
-    if (recorded) return recorded.state === "ready" ? { agentId, state: "never_attempted", lastAttemptAt: recorded.lastAttemptAt, nextRetryAt: null } : { ...recorded };
+    // A ready record whose snapshot has expired or been invalidated no longer
+    // describes a known list; report it as not attempted now, without a stale
+    // attempt timestamp that would contradict that state.
+    if (recorded) return recorded.state === "ready"
+      ? { agentId, state: "never_attempted", lastAttemptAt: null, nextRetryAt: null }
+      : { ...recorded };
     return this.authorities().some(resolved => resolved.agentId === agentId)
       ? { agentId, state: "never_attempted", lastAttemptAt: null, nextRetryAt: null }
       : undefined;

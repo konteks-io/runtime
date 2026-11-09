@@ -205,4 +205,18 @@ describe("authenticated model offered-values snapshot producer", () => {
     expect(producer.discoveryState("codex")).toMatchObject({ state: "timed_out", nextRetryAt: expect.any(String) });
     expect(onDiagnostic).toHaveBeenCalledWith({ reason: "discovery_timed_out", agentId: "codex", errorKind: "timeout" });
   });
+
+  it("does not report a stale success as attempted once its snapshot has expired", async () => {
+    const own = new FixedClock(Date.parse("2026-09-06T00:00:00Z"));
+    const producer = new ModelCapabilitySnapshotProducer({ clock: own, instanceId: () => "instance", runnerIncarnation: () => "process",
+      manifestId: () => "manifest", mappings: () => [], catalogueAgents: () => ["codex"], ttlMs: 5 * 60_000,
+      discover: async () => ({ currentValue: "gpt", offeredValues: ["gpt"] }), newId: () => "snapshot" });
+    await producer.refresh([{ ...ready, agentId: "codex" }]);
+    expect(producer.discoveryState("codex")).toMatchObject({ state: "ready" });
+    own.advance(5 * 60_000 + 1);
+    // `snapshots()` drops the expired cache entry; the recorded success is no
+    // longer a known list and must not carry its old attempt time.
+    expect(producer.snapshots()).toEqual([]);
+    expect(producer.discoveryState("codex")).toEqual({ agentId: "codex", state: "never_attempted", lastAttemptAt: null, nextRetryAt: null });
+  });
 });
