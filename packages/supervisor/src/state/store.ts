@@ -34,7 +34,7 @@ import type { RelayDurableState } from "../relay/channel-mux.js";
  *   heartbeat.json       monotonic heartbeat sequence
  *   cursors.json         legacy durable receive cursors (migration fallback)
  *   relay-state.json     atomic cursors, allocation floors, and unacked relay frames
- *   last-exit.json       last controlled nonzero exit classification and timestamp
+ *   last-exit.json       bounded ledger of controlled nonzero exits, newest at the top level
  *   shutdown-progress.json  last reached native shutdown phase and timestamp
  *   control.token        loopback control-socket token
  *   journal/             assignment recovery journal, pending requests, decisions, erase
@@ -259,7 +259,12 @@ export class SupervisorStore {
     return newest ? { schemaVersion: 1, reason: newest.reason, occurredAt: newest.occurredAt } : null;
   }
 
-  /** The bounded exit ledger, oldest first; a legacy single record is its one entry. */
+  /**
+   * The bounded exit ledger, oldest first; a legacy single record is its one
+   * entry. An unparseable record, or one from a schema this build does not
+   * know (a newer connector's after a rollback), reads as no restarts so
+   * reporting still answers and the next record can replace it.
+   */
   async exitLedger(): Promise<ControlledExitEntry[]> {
     const path = this.path("last-exit.json");
     try {
@@ -268,11 +273,16 @@ export class SupervisorStore {
       if (isFsErrorWithCode(error, "ENOENT")) return [];
       throw error;
     }
-    const record = await this.readJson("last-exit.json", LastExitSchema);
-    if (!record) return [];
-    return record.schemaVersion === 1
-      ? [{ reason: record.reason, occurredAt: record.occurredAt }]
-      : record.entries;
+    try {
+      const record = await this.readJson("last-exit.json", LastExitSchema);
+      if (!record) return [];
+      return record.schemaVersion === 1
+        ? [{ reason: record.reason, occurredAt: record.occurredAt }]
+        : record.entries;
+    } catch (error) {
+      if (isUnusableExitRecord(error)) return [];
+      throw error;
+    }
   }
 
   /** One restricted, bounded marker for the last reached shutdown boundary. */
@@ -486,6 +496,11 @@ export class SupervisorStore {
 }
 
 type JsonWebKey = import("node:crypto").JsonWebKey;
+
+/** A record this build cannot parse or does not know, as opposed to an I/O failure. */
+function isUnusableExitRecord(error: unknown): boolean {
+  return error instanceof SyntaxError || error instanceof z.ZodError;
+}
 
 /** Oldest first, inside the trailing window from the newest entry, and never over the cap. */
 function pruneExitLedger(entries: readonly ControlledExitEntry[]): ControlledExitEntry[] {

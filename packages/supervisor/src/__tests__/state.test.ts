@@ -78,6 +78,25 @@ describe("supervisor store", () => {
     ]);
   });
 
+  it("tolerates an unusable exit record and replaces it on the next write", async () => {
+    await mkdir(dir, { recursive: true });
+    const path = join(dir, "last-exit.json");
+    // A newer connector's record left behind by a rollback, then malformed JSON.
+    await writeFile(path, `${JSON.stringify({ schemaVersion: 3, reason: "liveness_lost", occurredAt: "2026-09-27T08:00:00.000Z" })}\n`);
+    const store = new SupervisorStore(dir);
+    expect(await store.exitLedger()).toEqual([]);
+    expect(await store.lastExit()).toBeNull();
+
+    await writeFile(path, "{ not json\n");
+    expect(await store.exitLedger()).toEqual([]);
+
+    await store.recordLastExit("shutdown_step_failed", "2026-09-27T08:10:00.000Z");
+    expect(await new SupervisorStore(dir).exitLedger()).toEqual([
+      { reason: "shutdown_step_failed", occurredAt: "2026-09-27T08:10:00.000Z" },
+    ]);
+    expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({ schemaVersion: 2 });
+  });
+
   it("prunes the ledger by its trailing window and fixed cap", async () => {
     const store = new SupervisorStore(dir);
     await store.recordLastExit("other", "2026-09-25T08:00:00.000Z");

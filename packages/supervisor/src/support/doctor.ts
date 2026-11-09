@@ -413,16 +413,12 @@ function channelCheck(inputs: DoctorInputs): CheckDraft[] {
 function selfRestartsCheck({ restarts }: DoctorInputs): CheckDraft[] {
   if (!restarts) return [];
   const base = { id: "self-restarts", title: "Self-restarts" };
-  const window = restartWindowWords(restarts.windowMs);
+  const window = "the last hour";
   if (restarts.latest === null) return [{ ...base, status: "pass", detail: `no self-restart recorded in ${window}` }];
   const latest = `the latest was at ${restarts.latest.occurredAt} because ${selfRestartReasonWords(restarts.latest.reason)}`;
   if (restarts.countLastHour === 0) return [{ ...base, status: "pass", detail: `no self-restart in ${window}; ${latest}` }];
   return [{ ...base, status: restarts.repeating ? "warn" : "pass",
     detail: `${restartCountWords(restarts.countLastHour, window)}; ${latest}${repeatingSuffix(restarts.repeating)}` }];
-}
-
-function restartWindowWords(windowMs: number): string {
-  return windowMs === 60 * 60_000 ? "the last hour" : `the last ${Math.max(1, Math.round(windowMs / 60_000))} minutes`;
 }
 
 function restartCountWords(count: number, window: string): string {
