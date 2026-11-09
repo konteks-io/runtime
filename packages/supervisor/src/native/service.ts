@@ -1,16 +1,16 @@
-import { startControlSocketServer, type ControlSocketServer } from "@konteks/remote-common";
+import { startControlSocketServer, createLogger, writeSecretFile, type ControlSocketServer } from "@konteks/remote-common";
 import { lstat } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createDaemon, type CreateDaemonOptions, type Daemon, type DaemonStep } from "../daemon.js";
 import { SupervisorStore, type ShutdownProgress } from "../state/store.js";
 import { Supervisor, type SupervisorOptions } from "../supervisor.js";
+import { StartupPhases } from "../reconnect/startup-phases.js";
 import { loadNativeInstallation, type NativeInstallationOptions } from "./installation.js";
 import { fetchNativeReleaseManifest, nativeManifestUrlForVersion, nativeServiceExecutable, resolveNativeConnectorExecutable } from "@konteks/remote-release";
 import { launchNativeUpdater } from "./update-launch.js";
 import { readNativeUpdateLedger } from "./update-ledger.js";
 import { startConnectorLogKeeper } from "./connector-log.js";
-import { writeSecretFile } from "@konteks/remote-common";
 
 export const NATIVE_SHUTDOWN_RECEIPT_FILE = "shutdown-complete";
 
@@ -110,6 +110,9 @@ export function createNativeService(options: NativeServiceOptions): Daemon {
   let supervisor: Supervisor | undefined;
   let control: ControlSocketServer | undefined;
   let stopLogKeeper: (() => void) | undefined;
+  // One recorder for the whole process: the startup logs and the exit ledger
+  // it carries come from the same baseline.
+  const startupPhases = new StartupPhases(createLogger({ name: "startup" }));
   // Written outside the supervisor's ownership-fenced mutation gate, which
   // has closed by the time a controlled exit is recorded.
   const exitStore = new SupervisorStore(join(options.root, "supervisor"));
@@ -118,8 +121,9 @@ export function createNativeService(options: NativeServiceOptions): Daemon {
     name: "native-connector",
     ...(options.signalSource ? { signalSource: options.signalSource } : {}),
     ...(options.exitProcess ? { exitProcess: options.exitProcess } : {}),
-    recordNonzeroExit: reason => exitStore.recordLastExit(reason),
+    recordNonzeroExit: reason => exitStore.recordLastExit(reason, new Date().toISOString(), startupPhases.summary()),
     onStart: async () => {
+      startupPhases.complete("process_start");
       stopLogKeeper = startConnectorLogKeeper(options.root);
       const installation = await loadNativeInstallation(options.root, options);
       const executable = await updaterExecutable(options.root, installation.record.releaseId, options.platform.os);
@@ -140,7 +144,9 @@ export function createNativeService(options: NativeServiceOptions): Daemon {
             handler: created.controlHandler(),
             onUnexpectedError: (error, operation) => created.logger.error({ err: error, operation }, "control operation failed"),
           });
+          startupPhases.complete("control_channel");
         },
+        startupPhases,
         native: nativeSupervisorOptions(options, installation, executable),
       });
       supervisor = created;

@@ -21,6 +21,7 @@ import {
   type SelfRestartReason,
 } from "@konteks/remote-common";
 import type { RelayDurableState } from "../relay/channel-mux.js";
+import type { StartupSummary } from "../reconnect/startup-phases.js";
 
 /**
  * The supervisor's restricted volume. Layout (all files 0600, directory 0700):
@@ -159,9 +160,21 @@ export type ControlledExitReason = SelfRestartReason;
 export const EXIT_LEDGER_CAP = 20;
 export const EXIT_LEDGER_WINDOW_MS = 24 * 60 * 60_000;
 
+/** The bounded startup timing summary carried on the exit that ended this process. */
+const StartupSummarySchema = z.object({
+  processStartedAt: z.string().datetime(),
+  phasesMs: z.record(z.string().min(1).max(64), z.number().int().nonnegative())
+    .refine(record => Object.keys(record).length <= 8, { message: "startup phase timings exceed their bound" }),
+  stepsMs: z.record(z.string().min(1).max(128), z.number().int().nonnegative())
+    .refine(record => Object.keys(record).length <= 32, { message: "startup step timings exceed their bound" }),
+  totalMs: z.number().int().nonnegative(),
+}).strict();
+
 const ExitEntrySchema = z.object({
   reason: ControlledExitReasonSchema,
   occurredAt: z.string().datetime(),
+  /** How startup spent its time before this controlled exit, absent before it was timed. */
+  startup: StartupSummarySchema.optional(),
 }).strict();
 export type ControlledExitEntry = z.infer<typeof ExitEntrySchema>;
 
@@ -171,16 +184,23 @@ const LegacyLastExitSchema = z.object({
   occurredAt: z.string().datetime(),
 }).strict();
 type LastExit = z.infer<typeof LegacyLastExitSchema>;
-const ExitLedgerSchema = z.object({
+/** schemaVersion 2's ledger: the same entries, without the optional startup summary. */
+const LegacyExitLedgerSchema = z.object({
   schemaVersion: z.literal(2),
+  reason: ControlledExitReasonSchema,
+  occurredAt: z.string().datetime(),
+  entries: z.array(ExitEntrySchema).min(1).max(EXIT_LEDGER_CAP),
+}).strict();
+const ExitLedgerSchema = z.object({
+  schemaVersion: z.literal(3),
   // The newest entry, kept at the top level so a launcher that reads only the
   // old single (schemaVersion 1) fields still sees the latest exit.
   reason: ControlledExitReasonSchema,
   occurredAt: z.string().datetime(),
   entries: z.array(ExitEntrySchema).min(1).max(EXIT_LEDGER_CAP),
 }).strict();
-/** A current schemaVersion 1 record and the bounded ledger both parse. */
-const LastExitSchema = z.union([LegacyLastExitSchema, ExitLedgerSchema]);
+/** A legacy single record and both bounded ledgers parse; only v3 is written. */
+const LastExitSchema = z.union([LegacyLastExitSchema, LegacyExitLedgerSchema, ExitLedgerSchema]);
 
 /** Diagnostic progress only. The shutdown-complete receipt remains the sole
  * attestation that every native shutdown step finished. */
@@ -243,12 +263,12 @@ export class SupervisorStore {
    * a person can see self-restarts that repeat. The newest entry is also kept
    * at the top level for a launcher that reads only the old fields.
    */
-  async recordLastExit(reason: ControlledExitReason, occurredAt = new Date().toISOString()): Promise<void> {
-    const recorded = ExitEntrySchema.parse({ reason, occurredAt });
+  async recordLastExit(reason: ControlledExitReason, occurredAt = new Date().toISOString(), startup?: StartupSummary): Promise<void> {
+    const recorded = ExitEntrySchema.parse({ reason, occurredAt, ...(startup ? { startup } : {}) });
     const entries = pruneExitLedger([...(await this.exitLedger()), recorded]);
     const newest = entries[entries.length - 1]!;
     await this.writeJson("last-exit.json", ExitLedgerSchema.parse({
-      schemaVersion: 2, reason: newest.reason, occurredAt: newest.occurredAt, entries,
+      schemaVersion: 3, reason: newest.reason, occurredAt: newest.occurredAt, entries,
     }));
   }
 

@@ -97,6 +97,7 @@ import { PreviewViewerStarts } from "./preview/viewer-start.js";
 import type { SessionPreviewAccess } from "./preview/mcp-server.js";
 import { finishActivationAttempt, provisioningCredentialIsExpired, refreshProvisioningCredential, submitReadiness } from "./provisioning/activation.js";
 import { Reconciliation } from "./reconnect/reconciliation.js";
+import { StartupPhases, type StartupPhase as TimedStartupPhase } from "./reconnect/startup-phases.js";
 import { heartbeatSignal, livenessSignal, relaySignal, connectorAvailability } from "./reconnect/availability.js";
 import { STARTUP_RECOVERY_BOUND_MS, STARTUP_RECOVERY_RETRY_MS, StartupRecoveryBound, type StartupPhase } from "./reconnect/startup-recovery-bound.js";
 import { ChannelMux } from "./relay/channel-mux.js";
@@ -213,6 +214,12 @@ export interface SupervisorOptions {
    * answer `availability.status` while it is starting or recovering.
    */
   onStartupAnswering?: () => Promise<void>;
+  /**
+   * The one startup-phase recorder the native service owns: its process-start
+   * baseline is shared with the exit ledger, so a recorded nonzero exit keeps
+   * the timings this process logged.
+   */
+  startupPhases?: StartupPhases;
   native?: {
     /** Public trust provided by the verified native executable, never by writable install metadata. */
     trustedRoots: readonly EmbeddedReleaseRoot[];
@@ -1167,6 +1174,9 @@ export class Supervisor {
     const legacyCodexRestore = sharedCodexOwnerConfigured ? {} : { legacyCodexFreshRestore: true as const };
     this.work = new WorkOrchestrator({
       verifyCancellation: directive => verifier.verify(directive, directive.signature),
+      // Recovery steps report through the same recorder, so a slow workspace
+      // capture names itself while it still waits.
+      onStep: (name, run) => this.timeStartupStep("recovery", name, run),
       preserveStoppedWorkspace: async (admission, assertCurrent) => {
         if (!coreContractAtLeast(this.coreContractVersion, REMOTE_WORKSPACE_CHECKPOINT_MIN_CORE_CONTRACT_VERSION)) return;
         assertCurrent();
@@ -1395,6 +1405,7 @@ export class Supervisor {
       reports: this.work.reports,
       onLease: (lease, _expiresAt, assertCurrent) => this.adoptLease(lease, assertCurrent),
       afterEstablishment: async assertCurrent => this.afterEstablishment(assertCurrent),
+      onStep: (name, run) => this.timeStartupStep("recovery", name, run),
       captureLeaseFence: () => this.captureLeaseFence(),
       withLeaseAcquisition: (operation, name) => this.withLeaseAcquisition(operation, name),
     });
@@ -1412,7 +1423,10 @@ export class Supervisor {
     assertCurrent();
     const agents = this.inventory.agents();
     this.modelCapabilities?.invalidateForAgents(agents);
-    void this.modelCapabilities?.refresh(agents).catch(error => this.logger.warn({ err: error }, "native model capability refresh failed"));
+    const refresh = () => this.modelCapabilities?.refresh(agents) ?? Promise.resolve();
+    // Fire and forget: discovery is timed but never holds the control path.
+    void this.timeStartupStep("capability_discovery", "model_capabilities", refresh)
+      .catch(error => this.logger.warn({ err: error }, "native model capability refresh failed"));
     assertCurrent();
     if (this.ordinaryHeartbeatStarted) {
       // A startup retry may follow a completed publisher transition.
@@ -1937,7 +1951,7 @@ export class Supervisor {
     // the key survives a restart, and a lane that forgot it would fall back to
     // the machine's ambient git on a host where only this key authenticates.
     await this.reloadManagedGitBinding();
-    try { await this.reconciliation.run(); }
+    try { await this.timeStartupStep("recovery", "reconciliation", () => this.reconciliation.run()); }
     finally {
       this.stopPendingHeartbeat();
       await this.heartbeat.settle();
@@ -1959,8 +1973,22 @@ export class Supervisor {
     this.activeLoopPhase = "started";
     this.startupRecovery.complete();
     this.reconnectRefusal = null;
+    this.recordStartedPhase();
     this.beginActiveWork();
     await this.work.reports.flushAll();
+  }
+
+  /** Time one startup phase or recovery step when the service supplied the shared recorder. */
+  private timeStartupStep<T>(phase: TimedStartupPhase, step: string, run: () => Promise<T>): Promise<T> {
+    return this.options.startupPhases?.step(phase, step, run) ?? run();
+  }
+
+  /** The promotion is the "started" phase; its summary is the startup record a person reads. */
+  private recordStartedPhase(): void {
+    const phases = this.options.startupPhases;
+    if (!phases) return;
+    phases.complete("started");
+    this.logger.info({ event: "startup.timings", ...phases.summary() }, "startup phases complete");
   }
 
   private async rememberAcceptedRelease(): Promise<void> {
@@ -2052,6 +2080,10 @@ export class Supervisor {
     // Reconnect completes before any channel other than control reopens.
     try {
       this.validateRelayHandshake(result);
+      // The relay connects only after "started" (beginActiveWork starts the
+      // transport); logging it here keeps the phase when it actually happens
+      // instead of reordering startup to match the ticket's enumeration.
+      this.options.startupPhases?.complete("relay_connected");
       this.transport.resumeAfterRecovery();
       await this.work.reports.flushAll();
       void this.ensureRuntimeUpdates()?.recover().catch(() => {

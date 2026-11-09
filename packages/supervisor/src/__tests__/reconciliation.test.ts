@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { FixedClock, computeRemoteReconciliationReceiptSnapshotDigest, type AssignmentReport } from "@konteks/remote-common";
+import { FixedClock, computeRemoteReconciliationReceiptSnapshotDigest, type AssignmentReport, type Logger } from "@konteks/remote-common";
 import { Reconciliation } from "../reconnect/reconciliation.js";
 import { SupervisorJournal, type JournalEntry } from "../state/journal.js";
 import { DurableOutbox } from "../state/outbox.js";
@@ -40,7 +40,7 @@ const entry = (overrides: Partial<JournalEntry>): JournalEntry => ({
 type Intent = { instanceId: string; runnerIncarnation: string; reconnectIntentId: string; lastHeartbeatSequence: number };
 
 let harnessCount = 0;
-async function harness(entries: JournalEntry[]) {
+async function harness(entries: JournalEntry[], options: { onStep?: <T>(name: string, run: () => Promise<T>) => Promise<T>; logger?: Logger } = {}) {
   // Each harness owns its journal: two in one test must not share decisions.
   const dir = await mkdtemp(join(testDir, `h${(harnessCount += 1)}-`));
   const journal = new SupervisorJournal(dir);
@@ -67,7 +67,7 @@ async function harness(entries: JournalEntry[]) {
     }),
     reconnect: vi.fn(async (request: Intent) => ({ lease: "lease-2", leaseExpiresAt: "2026-09-06T01:00:00Z", manifest: manifest(request, { manifestId: "m1", lease: "lease-2" }) })),
   } as unknown as CoreClient;
-  const reconciliation = new Reconciliation({ clock, journal, core, instanceId: () => "inst", runnerIncarnation: () => "process", assertOwned: () => undefined, reserveHeartbeatFloor: async () => undefined, stopLocalWork: () => local.stop(), bundleVersion: "1.0.0", protocolVersion: "1.0", lastHeartbeatSequence: async () => 5, reports, onLease: async (lease) => void leases.push(lease) });
+  const reconciliation = new Reconciliation({ clock, journal, core, instanceId: () => "inst", runnerIncarnation: () => "process", assertOwned: () => undefined, reserveHeartbeatFloor: async () => undefined, stopLocalWork: () => local.stop(), bundleVersion: "1.0.0", protocolVersion: "1.0", lastHeartbeatSequence: async () => 5, reports, onLease: async (lease) => void leases.push(lease), ...options });
   /** A complete manifest for the generation `run()` would sign. */
   function manifest(intent: Intent, patch: Record<string, unknown>) {
     return {
@@ -339,5 +339,21 @@ describe("reconnect and reconciliation", () => {
     const stop = vi.spyOn(local, "stop");
     expect((await reconciliation.apply((await bound({ manifestId: "m", decisions: [{ action: "replay_terminal", assignmentId: "a", attempt: 1, recoveryEpoch: 2, authorization: "x" }] })))).get("a:1")).toBe("executed");
     expect(stop).not.toHaveBeenCalled();
+  });
+
+  it("times each recovery stage and carries the decision's own duration", async () => {
+    const stages: string[] = [];
+    const first = await harness([], { onStep: async (name, run) => { stages.push(name); return run(); } });
+    await first.reconciliation.run();
+    expect(stages).toEqual(["establish", "afterEstablishment", "applyManifest"]);
+
+    const timed: string[] = [];
+    const info = vi.fn();
+    const logger = { info, warn: vi.fn(), debug: vi.fn(), error: vi.fn() } as unknown as Logger;
+    const second = await harness([entry({})], { logger, onStep: async (name, run) => { timed.push(name); return run(); } });
+    await second.reconciliation.apply((await second.bound({ manifestId: "m", decisions: [{ action: "cancel", assignmentId: "a", attempt: 1, reason: "revoked" }] })));
+    expect(timed).toEqual(["decision:cancel"]);
+    const decision = info.mock.calls.find(call => call[1] === "recovery decision");
+    expect(decision?.[0]).toMatchObject({ action: "cancel", outcome: "executed", durationMs: expect.any(Number) });
   });
 });
