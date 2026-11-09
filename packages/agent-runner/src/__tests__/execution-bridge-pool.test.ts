@@ -38,7 +38,8 @@ const modelOption = {
 };
 const modelOptions = [modelOption];
 
-async function fixture(options: { limit?: number; ttlMs?: number; now?: () => Date; modelCapabilityTtlMs?: number; probe?: () => Promise<IdentityProbe>;
+async function fixture(options: { limit?: number; ttlMs?: number; now?: () => Date; modelCapabilityTtlMs?: number; modelCapabilityDiscoveryTimeoutMs?: number;
+  probe?: () => Promise<IdentityProbe>; newSessionHangs?: () => boolean;
   newSessionFails?: () => boolean | Error; closeSession?: () => Promise<object>; reclaimIdleExecution?: () => Promise<boolean> } = {}) {
   const root = await mkdtemp(join(tmpdir(), "execution-pool-")); roots.push(root);
   const owners: Owner[] = [];
@@ -54,6 +55,7 @@ async function fixture(options: { limit?: number; ttlMs?: number; now?: () => Da
       connection: {
         // A reused process hands out a fresh private id per `session/new`.
         newSession: vi.fn(async () => {
+          if (options.newSessionHangs?.()) return new Promise(() => undefined);
           const failure = options.newSessionFails?.();
           if (failure instanceof Error) throw failure;
           if (failure) throw new Error("session/new refused");
@@ -84,6 +86,7 @@ async function fixture(options: { limit?: number; ttlMs?: number; now?: () => Da
     ...(options.ttlMs === undefined ? {} : { idleExecutionBridgeTtlMs: options.ttlMs }),
     ...(options.now ? { now: options.now } : {}),
     ...(options.modelCapabilityTtlMs === undefined ? {} : { modelCapabilityTtlMs: options.modelCapabilityTtlMs }),
+    ...(options.modelCapabilityDiscoveryTimeoutMs === undefined ? {} : { modelCapabilityDiscoveryTimeoutMs: options.modelCapabilityDiscoveryTimeoutMs }),
     ...(options.reclaimIdleExecution ? { reclaimIdleExecution: options.reclaimIdleExecution } : {}),
   });
   runtimes.push(runtime);
@@ -367,6 +370,17 @@ it("re-reads the offered models once the discovery TTL has passed", async () => 
   await vi.waitFor(() => expect(f.spawn).toHaveBeenCalledTimes(3));
   await vi.waitFor(async () => expect((await f.runtime.discoverModelCapability("model")).observedAgoMs).toBeUndefined());
   expect(f.spawn).toHaveBeenCalledTimes(3);
+});
+
+it("bounds a read whose bridge never answers, then retries it to a later success with no restart", async () => {
+  let hang = true;
+  const f = await fixture({ modelCapabilityDiscoveryTimeoutMs: 20, newSessionHangs: () => hang });
+  await f.runtime.probe(false);
+  await expect(f.runtime.discoverModelCapability("model")).rejects.toMatchObject({ code: "agent_unavailable" });
+  // The shared refresh slot is free again: the next read starts its own bridge
+  // and a now-answering agent fills the capability list in.
+  hang = false;
+  await expect(f.runtime.discoverModelCapability("model")).resolves.toMatchObject({ currentValue: "sonnet", offeredValues: ["sonnet", "opus"] });
 });
 
 it("closes each released session on the reused process, so it never accumulates agent sessions (2026-10-02 leak)", async () => {

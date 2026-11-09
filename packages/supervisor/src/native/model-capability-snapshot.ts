@@ -3,6 +3,7 @@ import { isNativeAgentRuntimeId } from "@konteks/backstage-plugin-common";
 import { classifyAgentBilling, credentialKindFor } from "@konteks/backstage-plugin-common/known-models";
 import {
   AgentModelOfferedValuesSnapshotSchema,
+  RemoteInstanceError,
   catalogueModelAuthority,
   computeAgentModelOfferedValuesSnapshotDigest,
   parseRfc3339,
@@ -36,6 +37,26 @@ interface DiscoveredOffer {
   observedAgoMs?: number;
 }
 
+/** Where one agent's offered-models read stands, for `agents` and `doctor`; no path or provider text ever enters it. */
+export type ModelCapabilityDiscoveryState = "never_attempted" | "in_progress" | "timed_out" | "failed" | "ready";
+
+export interface ModelCapabilityDiscoveryStatus {
+  agentId: string;
+  state: ModelCapabilityDiscoveryState;
+  lastAttemptAt: string | null;
+  nextRetryAt: string | null;
+}
+
+/**
+ * One agent's discovery may not hold this producer's shared refresh lane or
+ * in-flight slot longer than this. The runner has its own whole-read bound
+ * (13 min) and keeps a single in-flight read per sign-in/config, so a retry
+ * here attaches to that read instead of spawning another bridge; this bound
+ * only stops the supervisor waiting on it.
+ */
+const DEFAULT_DISCOVERY_TIMEOUT_MS = 60_000;
+const DISCOVERY_DEADLINE_DIAGNOSTIC = "model_capability_discovery_deadline";
+
 interface ModelCapabilitySnapshotProducerOptions {
   clock: Clock;
   instanceId: () => string;
@@ -52,10 +73,14 @@ interface ModelCapabilitySnapshotProducerOptions {
    */
   optionBilling?: (agentId: string, value: string, agent: ConnectedAgentView) => "subscription" | "pay_per_use" | undefined;
   onDiagnostic?: (detail: { reason: string; agentId?: string; errorKind?: string }) => void;
+  /** The first snapshot for an agent landed: one heartbeat may carry it now instead of on the next interval. */
+  onFirstSnapshot?: (agentId: string) => void;
   newId?: () => string;
   ttlMs?: number;
   /** Renew asynchronously before expiry so heartbeat publication never gaps. */
   refreshAheadMs?: number;
+  /** How long one agent's discovery may take before it is abandoned, recorded and retried in the background. */
+  discoveryTimeoutMs?: number;
 }
 
 interface CacheEntry { authorityKey: string; snapshot: AgentModelOfferedValuesSnapshot }
@@ -68,6 +93,8 @@ export class ModelCapabilitySnapshotProducer {
   private readonly retry = new Map<string, RetryEntry>();
   private readonly revisions = new Map<string, number>();
   private readonly agentEpochs = new Map<string, number>();
+  private readonly discoveryStates = new Map<string, ModelCapabilityDiscoveryStatus>();
+  private readonly announced = new Set<string>();
   private agents: readonly ConnectedAgentView[] = [];
 
   constructor(private readonly options: ModelCapabilitySnapshotProducerOptions) {}
@@ -95,7 +122,10 @@ export class ModelCapabilitySnapshotProducer {
     for (const [id, entry] of this.cache) {
       const resolved = mappings.get(id), agent = resolved ? agentMap.get(resolved.agentId) : undefined;
       if (!resolved || !eligible(agent) || manifestId === null || entry.authorityKey !== this.authorityKey(resolved, agent!, manifestId)
-        || parseRfc3339(entry.snapshot.expiresAt) <= now) this.cache.delete(id);
+        || parseRfc3339(entry.snapshot.expiresAt) <= now) {
+        this.cache.delete(id);
+        this.announced.delete(entry.snapshot.agentId);
+      }
     }
   }
 
@@ -104,6 +134,32 @@ export class ModelCapabilitySnapshotProducer {
     for (const id of [...this.cache.keys()]) {
       if (id.startsWith(`${agentId}\0`)) this.cache.delete(id);
     }
+    this.discoveryStates.delete(agentId);
+    this.announced.delete(agentId);
+  }
+
+  /**
+   * One agent's offered-models read, as `agents` and `doctor` show it. No
+   * snapshot means the list is unknown, never that the agent offers nothing.
+   */
+  discoveryState(agentId: string): ModelCapabilityDiscoveryStatus | undefined {
+    const recorded = this.discoveryStates.get(agentId);
+    if (this.hasSnapshot(agentId)) {
+      return { agentId, state: "ready", lastAttemptAt: recorded?.lastAttemptAt ?? null, nextRetryAt: null };
+    }
+    // A ready record whose snapshot has expired or been invalidated no longer
+    // describes a known list; report it as not attempted now, without a stale
+    // attempt timestamp that would contradict that state.
+    if (recorded) return recorded.state === "ready"
+      ? { agentId, state: "never_attempted", lastAttemptAt: null, nextRetryAt: null }
+      : { ...recorded };
+    return this.authorities().some(resolved => resolved.agentId === agentId)
+      ? { agentId, state: "never_attempted", lastAttemptAt: null, nextRetryAt: null }
+      : undefined;
+  }
+
+  private hasSnapshot(agentId: string): boolean {
+    return [...this.cache.values()].some(entry => entry.snapshot.agentId === agentId);
   }
 
   async refresh(agents: readonly ConnectedAgentView[]): Promise<void> {
@@ -149,20 +205,52 @@ export class ModelCapabilitySnapshotProducer {
   }
 
   private async discoverOne(id: string, key: string, resolved: OfferedAuthority, agent: ConnectedAgentView, manifestId: string): Promise<void> {
+    const startedAt = this.options.clock.now();
+    this.recordStart(resolved.agentId, startedAt);
     try {
-      const observed = await this.options.discover(resolved.agentId, resolved.configId);
-      const currentAgent = this.agents.find(candidate => candidate.agentId === resolved.agentId);
-      if (!eligible(currentAgent) || key !== this.authorityKey(resolved, currentAgent, this.options.manifestId() ?? "")) return;
-      const now = this.options.clock.now();
-      const window = this.validity(observed, resolved, now);
-      if (window.expires <= now) return;
-      const snapshotRevision = (this.revisions.get(id) ?? 0) + 1;
-      const snapshot = this.snapshotFor({ resolved, observed, currentAgent, manifestId, window, snapshotRevision });
-      this.revisions.set(id, snapshotRevision); this.cache.set(id, { authorityKey: key, snapshot }); this.retry.delete(key);
+      const observed = await withDiscoveryDeadline(this.options.discover(resolved.agentId, resolved.configId),
+        this.options.discoveryTimeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS);
+      this.acceptDiscovery(id, key, resolved, observed, manifestId, startedAt);
     } catch (error) {
-      this.options.onDiagnostic?.({ reason: "discovery_failed", agentId: resolved.agentId, errorKind: discoveryErrorKind(error) });
-      this.recordFailure(id, key);
+      this.recordDiscoveryFailure(id, key, resolved.agentId, error, startedAt);
     }
+  }
+
+  private acceptDiscovery(id: string, key: string, resolved: OfferedAuthority, observed: DiscoveredOffer, manifestId: string, startedAt: number): void {
+    const currentAgent = this.agents.find(candidate => candidate.agentId === resolved.agentId);
+    if (!eligible(currentAgent) || key !== this.authorityKey(resolved, currentAgent, this.options.manifestId() ?? "")) return;
+    const now = this.options.clock.now();
+    const window = this.validity(observed, resolved, now);
+    if (window.expires <= now) return;
+    const snapshotRevision = (this.revisions.get(id) ?? 0) + 1;
+    const snapshot = this.snapshotFor({ resolved, observed, currentAgent, manifestId, window, snapshotRevision });
+    this.revisions.set(id, snapshotRevision); this.cache.set(id, { authorityKey: key, snapshot }); this.retry.delete(key);
+    this.recordState(resolved.agentId, "ready", startedAt, null);
+    this.announce(resolved.agentId);
+  }
+
+  private recordDiscoveryFailure(id: string, key: string, agentId: string, error: unknown, startedAt: number): void {
+    const timedOut = discoveryTimedOut(error);
+    this.options.onDiagnostic?.({ reason: timedOut ? "discovery_timed_out" : "discovery_failed", agentId,
+      errorKind: timedOut ? "timeout" : discoveryErrorKind(error) });
+    const nextAt = this.recordFailure(id, key, agentId);
+    this.recordState(agentId, timedOut ? "timed_out" : "failed", startedAt, nextAt);
+  }
+
+  private recordStart(agentId: string, at: number): void {
+    this.recordState(agentId, "in_progress", at, null);
+  }
+
+  private recordState(agentId: string, state: ModelCapabilityDiscoveryState, at: number, nextAt: number | null): void {
+    this.discoveryStates.set(agentId, { agentId, state, lastAttemptAt: new Date(at).toISOString(),
+      nextRetryAt: nextAt === null ? null : new Date(nextAt).toISOString() });
+  }
+
+  /** Ask for one heartbeat the first time this process has an answer for the agent. */
+  private announce(agentId: string): void {
+    if (this.announced.has(agentId)) return;
+    this.announced.add(agentId);
+    this.options.onFirstSnapshot?.(agentId);
   }
 
   /**
@@ -218,12 +306,15 @@ export class ModelCapabilitySnapshotProducer {
    * readiness hole: the existing same-authority snapshot remains usable until
    * its signed expiry; `snapshots()` removes it at that boundary.
    */
-  private recordFailure(id: string, key: string): void {
+  private recordFailure(id: string, key: string, agentId: string): number {
     const previous = this.retry.get(key)?.failures ?? 0, failures = Math.min(previous + 1, 8);
-    this.retry.set(key, { failures, nextAt: this.options.clock.now() + Math.min(300_000, 5_000 * 2 ** (failures - 1)) });
+    const nextAt = this.options.clock.now() + Math.min(300_000, 5_000 * 2 ** (failures - 1));
+    this.retry.set(key, { failures, nextAt });
     const cached = this.cache.get(id);
     if (!cached || cached.authorityKey !== key
       || parseRfc3339(cached.snapshot.expiresAt) <= this.options.clock.now()) this.cache.delete(id);
+    if (!this.hasSnapshot(agentId)) this.announced.delete(agentId);
+    return nextAt;
   }
 
   private authorityKey(value: OfferedAuthority, agent: ConnectedAgentView & { authIdentityFingerprint: string }, manifestId: string): string {
@@ -266,4 +357,38 @@ function identity(value: OfferedAuthority): string { return `${value.agentId}\0$
 
 function discoveryErrorKind(error: unknown): "invalid_snapshot" | "discovery_error" {
   return error instanceof Error && error.name === "ZodError" ? "invalid_snapshot" : "discovery_error";
+}
+
+/** One agent's read may not hold the shared lane or an in-flight slot past its deadline. */
+function withDiscoveryDeadline<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(discoveryDeadlineElapsed());
+    }, timeoutMs);
+    timer.unref();
+    const finish = (action: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      action();
+    };
+    operation.then(value => finish(() => resolve(value)), error => finish(() => reject(error)));
+  });
+}
+
+function discoveryDeadlineElapsed(): RemoteInstanceError {
+  return new RemoteInstanceError("temporarily_unavailable", "Model capability discovery did not answer within its deadline.", {
+    retryable: true, diagnostic: DISCOVERY_DEADLINE_DIAGNOSTIC,
+  });
+}
+
+/** A deadline is still a timeout when the bridge itself gave up on ACP initialize before our own bound. */
+function discoveryTimedOut(error: unknown): boolean {
+  if (!(error instanceof RemoteInstanceError)) return false;
+  if (error.diagnostic === DISCOVERY_DEADLINE_DIAGNOSTIC || error.diagnostic === "model_discovery_deadline") return true;
+  if (error.diagnostic === "model_discovery_session_new_deadline") return true;
+  return /did not answer initialize within/i.test(error.message);
 }

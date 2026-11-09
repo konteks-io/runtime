@@ -2,7 +2,8 @@ import { afterEach, expect, it, vi } from "vitest";
 import { Supervisor } from "../supervisor.js";
 import { SupervisorConfigSchema } from "../config.js";
 import type { JournalEntry } from "../state/journal.js";
-import type { RecoveryStatusReport, RelayRuntimeHandshakeResult } from "@konteks/remote-common";
+import { FixedClock, type RecoveryStatusReport, type RelayRuntimeHandshakeResult } from "@konteks/remote-common";
+import { ModelCapabilitySnapshotProducer } from "../native/model-capability-snapshot.js";
 
 // Composition test: no bridge, listener, filesystem mutation or cloud request.
 interface StartupInternals {
@@ -22,6 +23,8 @@ interface StartupInternals {
   administrativeStatus: "active" | "provisioning";
   refreshConfiguration(): Promise<void>;
   openCoreChannels(): void;
+  modelCapabilities: unknown;
+  inventory: unknown;
 }
 function fixture() {
   vi.useFakeTimers();
@@ -40,13 +43,16 @@ function fixture() {
   internal.reloadManagedGitBinding = vi.fn(async () => undefined);
   internal.refreshConfiguration = vi.fn(async () => { events.push("configuration"); });
   const run = vi.fn(async () => { events.push("recovery"); complete = true; });
-  supervisor.reconciliation = { run, get isComplete() { return complete; } } as never;
+  const reconciliation = { run, get isComplete() { return complete; } };
+  supervisor.reconciliation = reconciliation as never;
   vi.spyOn(supervisor.journal.recovery, "current").mockImplementation(() => record as never);
   vi.spyOn(supervisor.lease, "isValid").mockReturnValue(true);
   vi.spyOn(supervisor.lease, "mode").mockReturnValue("active");
   const heartbeatStart = vi.fn(async () => { events.push("heartbeat"); });
+  const publishPending = vi.fn(async () => { events.push("pending"); });
+  const publish = vi.fn(async () => { events.push("publish"); });
   supervisor.heartbeat = {
-    start: heartbeatStart, settle: vi.fn(async () => undefined), stop: vi.fn(), roles: vi.fn(() => []),
+    start: heartbeatStart, settle: vi.fn(async () => undefined), stop: vi.fn(), roles: vi.fn(() => []), publishPending, publish,
     // The native liveness watchdog reads these on every tick; a publisher that
     // just attempted is live, so the watchdog never interrupts the ordering.
     liveness: () => ({ running: true, pendingFlight: false, stage: null, inFlightSince: null, lastAttemptAt: Date.now(), lastSettledAt: Date.now() }),
@@ -58,7 +64,25 @@ function fixture() {
   const pull = vi.fn();
   supervisor.work = { reports: { flushAll }, pull } as never;
   supervisor.relay = null;
-  return { supervisor, internal, events, run, heartbeatStart, transportStart, flushAll, pull, record, setComplete: (value: boolean) => { complete = value; } };
+  return { supervisor, internal, events, run, reconciliation, heartbeatStart, publishPending, publish, transportStart, flushAll, pull, record, setComplete: (value: boolean) => { complete = value; } };
+}
+
+/**
+ * The establishment callback the production `Reconciliation` holds. This is
+ * the same seam before and after the fix: before, its deps carried the inline
+ * `async assertCurrent => … await modelCapabilities.refresh …`; now they call
+ * the supervisor's non-blocking method. Composing it with the test's stubs
+ * keeps the characterization test about the discovery seam, not a private
+ * helper introduced by the fix.
+ */
+function establishmentCallback(f: ReturnType<typeof fixture>): (assertCurrent: () => void) => Promise<void> {
+  const internals = f.supervisor as unknown as { composeRecovery(verifier: unknown): void };
+  internals.composeRecovery({ verifyPlanningTerminal: () => undefined });
+  const callback = (f.supervisor.reconciliation as unknown as {
+    deps: { afterEstablishment: (assertCurrent: () => void) => Promise<void> };
+  }).deps.afterEstablishment;
+  f.supervisor.reconciliation = f.reconciliation as never;
+  return callback;
 }
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); });
 
@@ -85,6 +109,51 @@ it("establishes accepted recovery before ordinary heartbeat, transport, replay a
   expect(f.events).toEqual(["recovery", "configuration", "heartbeat", "transport", "replay", "reports"]);
   await vi.advanceTimersByTimeAsync(5000);
   expect(f.pull).toHaveBeenCalledOnce();
+});
+
+it("starts the control loop while one agent bridge never answers initialize (bridge did not answer init)", async () => {
+  const f = fixture();
+  // One agent's discovery never answers `discover`, exactly as a bridge that
+  // never answers ACP initialize would hold the old establishment path.
+  const ready = { agentId: "codex", authMode: "agent_local_subscription", readiness: "ready",
+    connectionState: "ready", authIdentityFingerprint: "identity-codex" };
+  f.internal.inventory = { agents: () => [ready] };
+  f.internal.administrativeStatus = "active";
+  const producer = new ModelCapabilitySnapshotProducer({
+    clock: new FixedClock(Date.parse("2026-11-09T12:00:00Z")), instanceId: () => "instance",
+    runnerIncarnation: () => "process", manifestId: () => "manifest", mappings: () => [],
+    catalogueAgents: () => ["codex"], discover: () => new Promise<never>(() => undefined),
+    discoveryTimeoutMs: 10_000,
+  });
+  const refresh = vi.spyOn(producer, "refresh");
+  f.internal.modelCapabilities = producer;
+  // The production Reconciliation awaits its own deps.afterEstablishment; on
+  // the pre-fix code that callback awaited refresh here and startup blocked.
+  const afterEstablishment = establishmentCallback(f);
+  f.run.mockImplementation(async () => {
+    await afterEstablishment(() => undefined);
+    f.events.push("recovery");
+    f.setComplete(true);
+  });
+  let settled = false;
+  const startup = f.internal.startActiveLoop().then(() => { settled = true; });
+  await vi.advanceTimersByTimeAsync(50);
+  // Provenance: run verbatim against the pre-change source, this same test
+  // fails here (settled stays false) because the production
+  // afterEstablishment awaited refresh; it does not fail on a missing helper.
+  expect(settled).toBe(true);
+  await startup;
+  expect(refresh).toHaveBeenCalledOnce();
+  // The control/relay path opens and the normal heartbeat starts without that answer.
+  expect(f.publishPending).toHaveBeenCalledOnce();
+  expect(f.heartbeatStart).toHaveBeenCalledOnce();
+  expect(f.transportStart).toHaveBeenCalledOnce();
+  expect(f.internal.activeLoopPhase).toBe("started");
+  expect(f.supervisor.status().administrativeStatus).toBe("active");
+  // The control path answers while that agent's read is still unanswered.
+  const answer = await f.supervisor.controlHandler()({ op: "recovery.status" } as never,
+    { event: () => undefined, signal: new AbortController().signal });
+  expect(answer).toMatchObject({ completed: true });
 });
 
 it("coalesces concurrent startup and does not repeat initialization after acceptance", async () => {

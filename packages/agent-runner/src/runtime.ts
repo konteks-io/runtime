@@ -40,6 +40,8 @@ export interface AgentRuntimeOptions {
   retryRandom?: () => number;
   /** How long one authenticated discovery of the agent's offered models is reused. */
   modelCapabilityTtlMs?: number;
+  /** How long one offered-models read may take, every attempt included, before it is abandoned and retried. */
+  modelCapabilityDiscoveryTimeoutMs?: number;
   /** Native supervisor-owned provider process must reload a completed official login. */
   afterSuccessfulLogin?: () => Promise<void>;
   /**
@@ -58,6 +60,13 @@ export interface AgentRuntimeOptions {
  * change re-reads at once: the account fingerprint is part of the cache key.
  */
 const DEFAULT_MODEL_CAPABILITY_TTL_MS = 5 * 60_000;
+
+/**
+ * A bridge that never answers initialize must not hold an offered-models read
+ * (and its shared refresh slot) forever. The per-attempt deadlines already
+ * bound a healthy read; this is the last-resort bound on the whole read.
+ */
+const DEFAULT_MODEL_CAPABILITY_DISCOVERY_TIMEOUT_MS = 13 * 60_000;
 
 /** A wedged agent process must not outlive the conversation it served. */
 const DEFAULT_IDLE_EXECUTION_BRIDGE_TTL_MS = 30 * 60_000;
@@ -1274,6 +1283,7 @@ export class AgentRuntime {
       initializeTimeoutMs: this.options.config.RUNNER_INITIALIZE_TIMEOUT_MS,
       // A background check, not a turn: never the 10 s session bootstrap deadline.
       sessionTimeoutMs: Math.max(this.sessionBootstrapTimeoutMs(), MODEL_DISCOVERY_MIN_SESSION_TIMEOUT_MS),
+      discoveryDeadlineMs: this.options.modelCapabilityDiscoveryTimeoutMs ?? DEFAULT_MODEL_CAPABILITY_DISCOVERY_TIMEOUT_MS,
       clientVersion: this.options.config.RUNNER_BRIDGE_VERSION,
       logger: this.logger,
       ...withoutUndefined({ retrySleep: this.options.retrySleep, retryRandom: this.options.retryRandom }),

@@ -126,9 +126,29 @@ export async function agents(context: ControlContext): Promise<void> {
   context.output.result(value);
   for (const agent of value.agents as Array<Record<string, string>>) {
     if (agent.startFailure) { context.output.line(`${agent.agentId}: could not start (${agent.startFailure}); trying again in the background`); continue; }
-    context.output.line(`${agent.agentId}: ${agent.readiness} (${agent.authMode}, scope ${agent.accountScope})${agent.recoveryAction ? ` — ${agent.recoveryAction}` : ""}${downloadNote(agent)}`);
+    context.output.line(`${agent.agentId}: ${agent.readiness} (${agent.authMode}, scope ${agent.accountScope})${agent.recoveryAction ? ` — ${agent.recoveryAction}` : ""}${downloadNote(agent)}${modelCapabilityNote(agent)}`);
   }
   context.output.line(`advertised roles: ${value.roles.join(", ") || "(none)"}`);
+}
+
+const MODEL_CAPABILITY_NOTES: Readonly<Record<string, string>> = {
+  in_progress: "reading its model list now",
+  timed_out: "its model list is not yet known",
+  failed: "its model list could not be read",
+};
+
+/** Where an agent's offered-models read stands, in plain words; absent when this connector has not attempted it. */
+function modelCapabilityNote(agent: Record<string, unknown>): string {
+  const discovery = agent.modelCapabilityDiscovery as { state?: unknown; nextRetryAt?: unknown } | undefined;
+  const state = typeof discovery?.state === "string" ? discovery.state : "";
+  const note = MODEL_CAPABILITY_NOTES[state];
+  if (note === undefined) return "";
+  if (state === "in_progress") return ` — ${note}`;
+  return ` — ${note}; it is read again in the background${retryAt(discovery?.nextRetryAt)}`;
+}
+
+function retryAt(value: unknown): string {
+  return typeof value === "string" ? ` (next at ${value})` : "";
 }
 
 /** A fetched agent's download state (Google Antigravity), in words, with the command that changes it. */

@@ -243,6 +243,28 @@ describe("doctor and support bundle", () => {
     expect((await runDoctor(base)).checks.find(entry => entry.id === "antigravity")).toBeUndefined();
   });
 
+  it("names the agent whose capability discovery timed out and when it is tried again, leaving other agents alone", async () => {
+    const report = await runDoctor({
+      now: () => "2026-11-09T12:00:06Z", dataDir: dir, identity: { instanceId: "inst", administrativeStatus: "active" },
+      lease: { mode: "active", expiresAt: null }, relay: { state: "connected", lastError: null, consecutiveFailures: 0 },
+      transport: "relay", reconciliationComplete: true, components: [],
+      agents: [
+        { agentId: "claude-code", readiness: "ready" },
+        { agentId: "codex", readiness: "ready", modelCapabilityDiscovery: { state: "timed_out",
+          lastAttemptAt: "2026-11-09T12:00:00.000Z", nextRetryAt: "2026-11-09T12:00:05.000Z" } },
+        { agentId: "dsh", readiness: "ready", modelCapabilityDiscovery: { state: "ready",
+          lastAttemptAt: "2026-11-09T12:00:00.000Z", nextRetryAt: null } },
+      ],
+      configRevision: 1, diskFreeBytes: 1, minimumDiskBytes: 0, outboxDepth: 0, recoveryRequired: 0, coreSignatureConfigured: true,
+    });
+    expect(report.checks.find(check => check.id === "model-capability-codex")).toMatchObject({ status: "warn",
+      detail: "its model list is not yet known; it is tried again in the background at 2026-11-09T12:00:05.000Z" });
+    // A ready agent and one with no discovery fact have no model-capability line.
+    expect(report.checks.find(check => check.id === "model-capability-dsh")).toBeUndefined();
+    expect(report.checks.find(check => check.id === "model-capability-claude-code")).toBeUndefined();
+    expect(report.checks.find(check => check.id === "agent-codex")).toMatchObject({ status: "pass" });
+  });
+
   it("the support bundle carries config keys without values, is redacted, chunked, and secret-scanned", () => {
     const bundle = buildSupportBundle({
       bundleVersion: "1.0.0",

@@ -17,7 +17,8 @@ import { NativeInputClient } from "../native/input-client.js";
 import { SupervisorConfigSchema } from "../config.js";
 import { SupervisorStore } from "../state/store.js";
 import { submitReadiness } from "../provisioning/activation.js";
-import { REMOTE_INSTANCE_PROTOCOL_VERSION, SystemClock } from "@konteks/remote-common";
+import { FixedClock, REMOTE_INSTANCE_PROTOCOL_VERSION, SystemClock } from "@konteks/remote-common";
+import { ModelCapabilitySnapshotProducer } from "../native/model-capability-snapshot.js";
 import { LEASE_AUDIENCE, type CoreClient } from "../core/client.js";
 import { decodeLeaseClaims, leaseRecordFromClaims } from "../lease/lease.js";
 import { BROWSER_NO_PACKAGE_MESSAGE } from "../native/browser-capability.js";
@@ -718,6 +719,46 @@ describe("native Supervisor composition", () => {
     expect(doctor.checks.find(check => check.id === "agent-codex")).toMatchObject({ status: "fail", detail: "could not start (The signed Codex app-server did not become ready in time); trying again in the background" });
     // Never advertised to Core: the inventory still leaves it out.
     expect((await supervisor.inventory.collect()).agents).toEqual([]);
+  });
+
+  it("reports a timed-out model capability read against its agent in agents and doctor, then clears it after a later success", async () => {
+    const f = await fixture();
+    const supervisor = new Supervisor(f.config, f.options); supervisors.push(supervisor);
+    await supervisor.start();
+    const internal = supervisor as unknown as { modelCapabilities: unknown; lastSnapshot: unknown };
+    const snapshot = await supervisor.inventory.collect();
+    const ready = { agentId: "codex", displayName: "Codex", authMode: "agent_local_subscription", accountScope: "personal",
+      authIdentityFingerprint: "identity-codex", connectionState: "ready", readiness: "ready", capabilities: [],
+      acpCapabilities: { sessionResume: false, forkSession: false, structuredOutputShim: true, toolControl: "approve" },
+      tokenUsageObservable: true, lastProbeAt: "2026-11-09T12:00:00Z" };
+    internal.lastSnapshot = { ...snapshot, agents: [ready] };
+    let hang = true;
+    const clock = new FixedClock(Date.parse("2026-11-09T12:00:00Z"));
+    const producer = new ModelCapabilitySnapshotProducer({ clock, instanceId: () => "instance", runnerIncarnation: () => "process",
+      manifestId: () => "manifest", mappings: () => [], catalogueAgents: () => ["codex"],
+      discover: () => hang ? new Promise(() => undefined) : Promise.resolve({ currentValue: "gpt-5.6-sol", offeredValues: ["gpt-5.6-sol"] }),
+      discoveryTimeoutMs: 5, newId: () => "snapshot" });
+    internal.modelCapabilities = producer;
+    await producer.refresh([ready]);
+
+    const handle = supervisor.controlHandler();
+    const listed = (await handle({ op: "agents" }, { event: () => undefined } as never)) as { agents: Array<Record<string, unknown>> };
+    expect(listed.agents.find(agent => agent.agentId === "codex")).toMatchObject({ modelCapabilityDiscovery: {
+      state: "timed_out", nextRetryAt: "2026-11-09T12:00:05.000Z" } });
+    const doctor = (await handle({ op: "doctor" }, { event: () => undefined } as never)) as { checks: Array<{ id: string; status: string; detail: string }> };
+    expect(doctor.checks.find(check => check.id === "model-capability-codex")).toMatchObject({ status: "warn",
+      detail: "its model list is not yet known; it is tried again in the background at 2026-11-09T12:00:05.000Z" });
+    // `status` stays field-stable for older launchers.
+    expect(JSON.stringify(supervisor.status())).not.toContain("modelCapabilityDiscovery");
+
+    // The background retry answers: the list is filled in and the timeout is no longer reported.
+    hang = false;
+    clock.advance(5_000);
+    await producer.refresh([ready]);
+    const after = (await handle({ op: "agents" }, { event: () => undefined } as never)) as { agents: Array<Record<string, unknown>> };
+    expect(after.agents.find(agent => agent.agentId === "codex")).toMatchObject({ modelCapabilityDiscovery: { state: "ready", nextRetryAt: null } });
+    const afterDoctor = (await handle({ op: "doctor" }, { event: () => undefined } as never)) as { checks: Array<{ id: string }> };
+    expect(afterDoctor.checks.find(check => check.id === "model-capability-codex")).toBeUndefined();
   });
 
   it("restarts to reconnect as a new process when Core retired this one, and says so in doctor (RCA 2026-10-01)", async () => {
