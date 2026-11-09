@@ -1,6 +1,6 @@
 import { readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { redactText, writeSecretFile } from "@konteks/remote-common";
+import { redactText, selfRestartReasonWords, SelfRestartReasonSchema, writeSecretFile } from "@konteks/remote-common";
 import { NATIVE_SHUTDOWN_RECEIPT_FILE } from "@konteks/remote-supervisor";
 import { CONNECTOR_LOG_FILE } from "./service.js";
 
@@ -93,17 +93,27 @@ export async function connectorLogTail(root: string, lines: number): Promise<str
  */
 export async function localServiceReport(root: string, options: { tailLines: number }): Promise<{
   lines: string[];
-  value: { running: false; lastStartFailure: ServiceStartFailure | null; log: string; logTail: string[] };
+  value: { running: false; lastStartFailure: ServiceStartFailure | null; lastExit: LocalServiceState["lastExit"]; log: string; logTail: string[] };
 }> {
-  const failure = await readServiceStartFailure(root);
-  const tail = await connectorLogTail(root, options.tailLines);
+  const [failure, tail, state] = await Promise.all([
+    readServiceStartFailure(root),
+    connectorLogTail(root, options.tailLines),
+    readLocalServiceState(root),
+  ]);
   const log = connectorLogFile(root);
   const lines = [
     "Konteks is not running on this computer, so only these local checks ran.",
+    ...(state.lastExit ? [`Last exit (${state.lastExit.occurredAt}): ${lastExitReasonWords(state.lastExit.reason)}`] : []),
     ...(failure ? [`Last start (${failure.at}): ${failure.message}`] : []),
     tail === null ? `Connector log: ${log} (not written yet)` : `Connector log: ${log}`,
     ...(tail && tail.length > 0 ? ["Its last lines:", ...tail.map(line => `  ${line}`)] : []),
     "To start it: konteks-remote start (konteks-remote --verbose start shows every step).",
   ];
-  return { lines, value: { running: false, lastStartFailure: failure, log, logTail: tail ?? [] } };
+  return { lines, value: { running: false, lastStartFailure: failure, lastExit: state.lastExit, log, logTail: tail ?? [] } };
+}
+
+/** The recorded exit's reason in plain words; an unrecognised value is never shown raw. */
+function lastExitReasonWords(reason: string): string {
+  const parsed = SelfRestartReasonSchema.safeParse(reason);
+  return parsed.success ? selfRestartReasonWords(parsed.data) : "it stopped unexpectedly";
 }

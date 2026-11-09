@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import {
   ControlRequestSchema,
+  RestartsStatusReportSchema,
   controlCall,
   startControlSocketServer,
   type ControlSocketServer,
@@ -211,7 +212,7 @@ describe("loopback control socket", () => {
 
   it("the protocol is closed: no exec or free-form config field parses", () => {
     expect(ControlRequestSchema.safeParse({ op: "exec", command: "rm -rf /" }).success).toBe(false);
-    for (const op of ["update.check", "update.apply", "update.status", "drain.cancel", "identity.status", "release.accepted-target"]) {
+    for (const op of ["update.check", "update.apply", "update.status", "drain.cancel", "identity.status", "release.accepted-target", "restarts.status"]) {
       expect(ControlRequestSchema.safeParse({ op }).success).toBe(true);
       expect(ControlRequestSchema.safeParse({ op, url: "https://evil.example/manifest.json" }).success).toBe(false);
     }
@@ -222,5 +223,12 @@ describe("loopback control socket", () => {
     // Relay previews left the protocol: no local port is ever exposed.
     expect(ControlRequestSchema.safeParse({ op: "preview.enable", port: 3000 }).success).toBe(false);
     expect(ControlRequestSchema.safeParse({ op: "preview.disable" }).success).toBe(false);
+  });
+
+  it("strictly reads the self-restart report", () => {
+    const report = { countLastHour: 1, windowMs: 3_600_000, latest: { reason: "liveness_lost", occurredAt: "2026-11-09T11:36:06.000Z" }, repeating: false };
+    expect(RestartsStatusReportSchema.safeParse(report).success).toBe(true);
+    expect(RestartsStatusReportSchema.safeParse({ ...report, extra: true }).success).toBe(false);
+    expect(RestartsStatusReportSchema.safeParse({ ...report, countLastHour: -1 }).success).toBe(false);
   });
 });

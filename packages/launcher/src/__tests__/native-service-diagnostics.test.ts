@@ -188,6 +188,19 @@ describe("doctor and support say the last failed start when the connector is not
     expect(report.lines).toContain(`Connector log: ${join(root, "logs", "connector.log")} (not written yet)`);
     expect(await readFile(join(root, "logs", "connector.log"), "utf8").catch(() => null)).toBeNull();
   });
+
+  it("names the last recorded exit when the connector is not running", async () => {
+    const root = await mkdtemp(join(tmpdir(), "service-report-")); dirs.push(root);
+    const occurredAt = "2026-11-04T13:36:06.000Z";
+    await mkdir(join(root, "supervisor"), { recursive: true });
+    await writeFile(join(root, "supervisor", "last-exit.json"), `${JSON.stringify({
+      schemaVersion: 2, reason: "liveness_lost", occurredAt,
+      entries: [{ reason: "liveness_lost", occurredAt }],
+    })}\n`);
+    const report = await localServiceReport(root, { tailLines: 5 });
+    expect(report.lines).toContain(`Last exit (${occurredAt}): it lost its heartbeat`);
+    expect(report.value.lastExit).toEqual({ reason: "liveness_lost", occurredAt });
+  });
 });
 
 describe("the Windows startup manifest is UTF-8 and repairs an outdated definition", () => {

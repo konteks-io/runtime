@@ -14,6 +14,7 @@ import {
   CoreResponseError,
   AgentLoginGcpSchema,
   AgentLoginOptionIdSchema,
+  RestartsStatusReportSchema,
   ON_COMPUTER_LOGIN_OPTION,
   OPENCODE_LOGIN_OPTIONS,
   REMOTE_AGENT_LOGIN_ON_COMPUTER_CAPABILITY,
@@ -51,6 +52,7 @@ import {
   type SupervisorStatus,
   type PreviewStatusReport,
   type RecoveryStatusReport,
+  type RestartsStatusReport,
   type RuntimeAgentLoginDeliveryRequest,
   type RuntimeAssignmentAvailableDeliveryRequest,
   coreContractAtLeast,
@@ -131,6 +133,7 @@ import { ClaudeExecutableIdentity } from "./native/claude-executable-identity.js
 import { SupervisorJournal, type JournalEntry } from "./state/journal.js";
 import { observeSlowJournalWork } from "./state/slow-work.js";
 import { EventLoopWatch } from "./event-loop-watch.js";
+import { summariseRestarts } from "./state/restarts.js";
 import type { RuntimeRecoveryRecord } from "./state/runtime-recovery.js";
 import { DurableOutbox } from "./state/outbox.js";
 import { DEFAULT_CONFIG, MACHINE_KEY_LOST, SupervisorStore, type ConfigRecord, type NativeServingRelease, type ShutdownProgress } from "./state/store.js";
@@ -177,14 +180,14 @@ const IDLE_SESSION_RELEASE_MS = 30 * 60_000;
 const IDLE_SESSION_SWEEP_MS = 5 * 60_000;
 /** How often, and after how long a wait, an orphaned Codex question is interrupted. */
 const CODEX_ORPHAN_SWEEP_MS = 15 * 60_000;
-const LIVENESS_CHECK_MS = 30_000;
+export const LIVENESS_CHECK_MS = 30_000;
 /** How long a site-started step waits on the person at the window on this computer (Core keeps it 30 minutes). */
 const ON_COMPUTER_WATCH_MS = 30 * 60_000;
 /** How often the connector looks whether that step's agent reads ready. */
 const ON_COMPUTER_POLL_MS = 5_000;
 /** A turn's start or end is told to Core this soon, not at the next 30 s heartbeat. */
 const TURN_ACTIVITY_HEARTBEAT_MS = 500;
-const LIVENESS_MIN_BUDGET_MS = 5 * 60_000;
+export const LIVENESS_MIN_BUDGET_MS = 5 * 60_000;
 /**
  * How long Core may keep refusing this runtime's lapsed lease (Core answers,
  * the lease is gone) before the service restarts into its startup reconnect,
@@ -2593,6 +2596,11 @@ export class Supervisor {
     return this.startupRecovery.report(Date.now());
   }
 
+  /** `restarts.status`: the recorded self-restarts, how many in the last hour, and why the latest happened. */
+  private async restartsStatus(): Promise<RestartsStatusReport> {
+    return RestartsStatusReportSchema.parse(summariseRestarts(await this.store.exitLedger(), Date.now()));
+  }
+
   /** `availability.status`: why this connector cannot take work, its phase, and when it expects to. */
   availabilityStatus(): ConnectorAvailability {
     const now = Date.now();
@@ -2706,6 +2714,9 @@ export class Supervisor {
       // Its own op, not a status field, for the same reason as `update.channel`:
       // a connector whose recovery has not completed says so and why.
       "recovery.status": () => this.recoveryStatus(),
+      // Its own op, not a status field, for the same reason as `update.channel`:
+      // the durable exit ledger is readable while the connector is starting.
+      "restarts.status": () => this.restartsStatus(),
       // Its own op, not a status field, for the same reason as `update.channel`:
       // a connector that cannot take work says why, its phase, when it expects
       // to return, and its liveness, heartbeat and relay separately.
@@ -3267,7 +3278,7 @@ export class Supervisor {
     const openCode = this.openCodeDoctor(snapshot.agents);
     const antigravity = await this.antigravityDoctor(snapshot.agents).catch(() => undefined);
     const inputs = {
-      ...this.doctorState(snapshot),
+      ...(await this.doctorState(snapshot)),
       ...(openCode ? { openCode } : {}),
       ...(antigravity ? { antigravity } : {}),
       ...(this.updates ? { updateChannel: this.updateChannelReport() } : {}),
@@ -3276,9 +3287,10 @@ export class Supervisor {
     return runDoctor({ ...inputs, ...(await this.doctorLauncher()) });
   }
 
-  private doctorState(snapshot: InventorySnapshot) {
+  private async doctorState(snapshot: InventorySnapshot) {
     return {
       now: () => this.clock.nowIso(),
+      restarts: summariseRestarts(await this.store.exitLedger(), this.clock.now()),
       dataDir: this.config.SUPERVISOR_DATA_DIR,
       identity: { instanceId: this.instanceId, administrativeStatus: this.administrativeStatus },
       lease: { mode: this.lease.mode(), expiresAt: this.lease.current()?.expiresAt ?? null },
@@ -3613,7 +3625,7 @@ type ControlOps = { [Op in ControlRequest["op"]]: (request: ControlRequestOf<Op>
  * with a RemoteInstanceError until startup completes.
  */
 const PRE_STARTUP_CONTROL_OPS: ReadonlySet<ControlRequest["op"]> = new Set<ControlRequest["op"]>([
-  "status", "availability.status", "identity.status", "recovery.status", "logs", "preview.status", "update.channel", "git.choice", "revoke.pending", "shutdown",
+  "status", "availability.status", "identity.status", "recovery.status", "restarts.status", "logs", "preview.status", "update.channel", "git.choice", "revoke.pending", "shutdown",
 ]);
 
 const PRE_STARTUP_REFUSAL = "Konteks has not finished starting on this computer, so this command cannot run yet. konteks-remote status says which phase it is in and why it cannot take work.";
