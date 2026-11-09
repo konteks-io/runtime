@@ -145,9 +145,9 @@ describe("a command run while the connector cannot take work", () => {
       const out = output();
       const result = await waitWhileStarting({ availability, output: out.value }, { sleep: noSleep, now: () => 0 });
       expect(asked).toContain("availability.status");
-      expect(result.phase).toBe("starting");
+      expect(result.phase).toBe("degraded");
       expect(result.reason).toMatchObject({ code: "service_start_failed" });
-      expect(out.lines[0]).toContain("(starting)");
+      expect(out.lines[0]).toContain("(degraded)");
       expect(out.lines[0]).toContain("its service could not start");
       expect(out.lines[0]).toContain("When it can take work is not known");
     } finally {

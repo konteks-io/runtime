@@ -46,11 +46,11 @@ export async function localAvailability(root: string, running: boolean | null): 
   // failed start, an exit and a shutdown marker all describe another process.
   if (running === true) return missingControl();
   if (startFailure) {
-    return unavailable("starting", "lost", { code: "service_start_failed", message: `its service could not start at ${startFailure.at}: ${startFailure.message}` }, "a start that failed has no return time; konteks-remote start tries again");
+    return unavailable("degraded", "lost", { code: "service_start_failed", message: `its service could not start at ${startFailure.at}: ${startFailure.message}` }, "a start that failed has no return time; konteks-remote start tries again");
   }
   const motion = latestMotion(state);
   if (motion !== null) return motion;
-  if (running === false) return unavailable("liveness_lost", "lost", { code: "service_stopped", message: "its service is not running on this computer" }, "the connector has not reported when it returns; konteks-remote start starts it");
+  if (running === false) return unavailable("degraded", "lost", { code: "service_stopped", message: "its service is not running on this computer" }, "the connector has not reported when it returns; konteks-remote start starts it");
   return missingControl();
 }
 
@@ -63,12 +63,16 @@ function latestMotion(state: LocalServiceState): ConnectorAvailability | null {
   return null;
 }
 
-/** A process that ended on its own: `liveness_lost` is the exit classification daemon.ts records for it. */
+/**
+ * A process that ended on its own. Only the exit `daemon.ts` classifies as
+ * `liveness_lost` is reported in that phase; any other exit is `degraded`,
+ * because this computer cannot claim the watchdog lost liveness.
+ */
 function exitedAvailability(lastExit: { reason: string; occurredAt: string }): ConnectorAvailability {
   if (lastExit.reason === "liveness_lost") {
     return unavailable("liveness_lost", "lost", { code: "liveness_lost", message: `it lost its heartbeat at ${lastExit.occurredAt} and was restarted` }, "the restarted process reports its own return");
   }
-  return unavailable("liveness_lost", "lost", { code: "process_exited", message: `its process stopped at ${lastExit.occurredAt} (${lastExit.reason})` }, "the connector has not reported when it returns");
+  return unavailable("degraded", "lost", { code: "process_exited", message: `its process stopped at ${lastExit.occurredAt} (${lastExit.reason})` }, "the connector has not reported when it returns");
 }
 
 function shutdownAvailability(progress: NonNullable<LocalServiceState["shutdownProgress"]>): ConnectorAvailability {

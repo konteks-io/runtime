@@ -505,14 +505,15 @@ async function statusOrStopped(context: ControlContext, input: ControlInput): Pr
 
 /**
  * Doctor and support ask the running connector; a connector that is not
- * running still gets the last failed start and its log.
+ * running — or one that has not finished starting and refuses the op — still
+ * gets the last failed start and its log.
  */
 async function doctorOrSupport(context: ControlContext, input: ControlInput): Promise<void> {
   const isDoctor = input.operation === "doctor";
   let healthy: boolean;
   try { healthy = isDoctor ? await doctor(context) : (await supportBundle(context), true); }
   catch (error) {
-    if (!controlSocketUnavailable(error)) throw error;
+    if (!controlCannotAnswer(error)) throw error;
     return reportStoppedService(input, isDoctor);
   }
   if (isDoctor) {
@@ -522,6 +523,16 @@ async function doctorOrSupport(context: ControlContext, input: ControlInput): Pr
   }
   const failure = await readServiceStartFailure(input.root);
   if (failure) input.output.line(`Last failed start (${failure.at}): ${failure.message}`);
+}
+
+/**
+ * The connector could not answer at all: unreachable, or still composing and
+ * refusing the op with `temporarily_unavailable` (the pre-startup gate). Both
+ * mean the local report is all this computer can say.
+ */
+function controlCannotAnswer(error: unknown): boolean {
+  if (!(error instanceof RemoteInstanceError)) return false;
+  return error.code === "control_socket_unavailable" || error.code === "temporarily_unavailable";
 }
 
 /** The last failed start and the connector log, for a connector that is not running. */
@@ -1380,7 +1391,7 @@ export const nativeCliActions: NativeCliActions = {
       await CONTROL_OPERATIONS[input.operation](context, input);
     } catch (error) {
       if (answer === null || !unavailableFailure(error, answer)) throw error;
-      throw setupError("temporarily_unavailable", "availabilityUnavailable", availabilityWords(outputLocale(input.output), answer));
+      throw setupError("temporarily_unavailable", "availabilityUnavailable", locale => availabilityWords(locale, answer));
     }
   },
 };

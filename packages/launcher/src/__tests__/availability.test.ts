@@ -46,13 +46,13 @@ describe("the reason this computer can prove while its control channel is missin
     await marker("shutdown-progress.json", shutdown("receipt", "completed", "2026-11-09T12:01:00.000Z"));
     await writeFile(join(root, "supervisor", "shutdown-complete"), "receipt");
     const answer = await localAvailability(root, false);
-    expect(answer).toMatchObject({ phase: "liveness_lost", reason: { code: "service_stopped" } });
+    expect(answer).toMatchObject({ phase: "degraded", reason: { code: "service_stopped" } });
   });
 
   it("reports a failed start with when and why it failed", async () => {
     await marker("service-start-failure.json", { at: "2026-11-09T11:50:00.000Z", message: "the service manager did not start this connector" });
     const answer = await localAvailability(root, false);
-    expect(answer).toMatchObject({ phase: "starting", reason: { code: "service_start_failed" } });
+    expect(answer).toMatchObject({ phase: "degraded", reason: { code: "service_start_failed" } });
     expect(answer.reason?.message).toContain("2026-11-09T11:50:00.000Z");
   });
 
