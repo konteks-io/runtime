@@ -356,6 +356,41 @@ describe("native control commands", () => {
     }
   });
 
+  it("reports why a connector cannot take work, with liveness, heartbeat and relay kept apart", async () => {
+    const f = fake();
+    const call = f.context.control.call;
+    f.context.control.call = (async (request: ControlRequest, schema: { parse: (value: unknown) => unknown }, options?: { onEvent?: (event: unknown) => void }) =>
+      request.op === "availability.status"
+        ? schema.parse({
+            available: false, phase: "degraded",
+            reason: { code: "component_unhealthy", message: "these parts are not healthy: agent_runner" },
+            expectedReturn: { kind: "unknown", why: "no return time is known for an unhealthy component" },
+            liveness: { state: "live", quietMs: 0 },
+            heartbeat: { state: "stalled", lastAttemptAt: null, lastSettledAt: null, budgetMs: 120_000 },
+            relay: { state: "disconnected", lastConnectedAt: "2026-11-09T11:00:00.000Z" },
+          })
+        : call(request, schema as never, options)) as typeof f.context.control.call;
+    await status(f.context);
+    expect(f.text()).toContain("these parts are not healthy: agent_runner");
+    expect(f.text()).toContain("When it can take work is not known");
+    expect(f.text()).toContain("liveness live, heartbeat stalled, relay disconnected");
+    // A connector that answers the op still surfaces it in machine-readable status.
+    const json = fake({ json: true });
+    const jsonCall = json.context.control.call;
+    json.context.control.call = (async (request: ControlRequest, schema: { parse: (value: unknown) => unknown }, options?: { onEvent?: (event: unknown) => void }) =>
+      request.op === "availability.status"
+        ? schema.parse({
+            available: true, phase: null, reason: null,
+            expectedReturn: { kind: "unknown", why: "it can take work now" },
+            liveness: { state: "live", quietMs: 0 },
+            heartbeat: { state: "live", lastAttemptAt: null, lastSettledAt: null, budgetMs: 120_000 },
+            relay: { state: "connected", lastConnectedAt: null },
+          })
+        : jsonCall(request, schema as never, options)) as typeof json.context.control.call;
+    await status(json.context);
+    expect(JSON.parse(json.text()).availability).toMatchObject({ available: true, phase: null });
+  });
+
   it("exposes only the public lease summary in machine-readable status", async () => {
     const f = fake({ json: true });
     await status(f.context);

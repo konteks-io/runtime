@@ -76,6 +76,8 @@ export const ControlRequestSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("update.channel") }).strict(),
   /** Whether startup recovery has completed, whether its 5-minute bound passed, and why. */
   z.object({ op: z.literal("recovery.status") }).strict(),
+  /** Why this connector cannot take work, its phase, when it expects to, and its three signals. */
+  z.object({ op: z.literal("availability.status") }).strict(),
   /** Which git the connector and its agents run, and why (git-choice.ts). */
   z.object({ op: z.literal("git.choice") }).strict(),
   /** The release Konteks accepts for this machine, asked with this machine's lease. */
@@ -583,6 +585,104 @@ export const RecoveryStatusReportSchema = z
   })
   .strict();
 export type RecoveryStatusReport = z.infer<typeof RecoveryStatusReportSchema>;
+
+/**
+ * The phases in which a connector cannot take work. "recovering" is startup
+ * recovery past its five-minute bound; "starting" is before that.
+ */
+export const ConnectorAvailabilityPhaseSchema = z.enum(["starting", "recovering", "draining", "degraded", "liveness_lost"]);
+export type ConnectorAvailabilityPhase = z.infer<typeof ConnectorAvailabilityPhaseSchema>;
+
+/**
+ * A bounded, structured reason: a stable code a caller can branch on and plain
+ * words for the person. `message` carries the context, never a raw error, a
+ * path or a provider's text.
+ */
+export const ConnectorUnavailabilityReasonSchema = z
+  .object({
+    code: z.enum([
+      "startup_in_progress",
+      "startup_recovery_pending",
+      "startup_recovery_bound_exceeded",
+      "drain_in_progress",
+      "update_probation",
+      "component_unhealthy",
+      "lease_unavailable",
+      "liveness_lost",
+      "control_socket_unavailable",
+      "shutdown_in_progress",
+      "service_stopped",
+      "service_start_failed",
+      "process_exited",
+      "unknown",
+    ]),
+    message: z.string().min(1).max(1_024),
+  })
+  .strict();
+export type ConnectorUnavailabilityReason = z.infer<typeof ConnectorUnavailabilityReasonSchema>;
+
+/**
+ * When the connector expects to take work again: a time with the fact it was
+ * derived from, or an explicit unknown with why. There is no third, empty form.
+ */
+export const ConnectorExpectedReturnSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("at"),
+      at: z.string().datetime(),
+      basis: z.enum(["startup_recovery_bound", "startup_recovery_retry", "drain_deadline"]),
+    })
+    .strict(),
+  z.object({ kind: z.literal("unknown"), why: z.string().min(1).max(512) }).strict(),
+]);
+export type ConnectorExpectedReturn = z.infer<typeof ConnectorExpectedReturnSchema>;
+
+/**
+ * Liveness, heartbeat and relay are three separate answers and are never
+ * folded into one: a process can be alive while its heartbeat is stalled, and
+ * a live heartbeat can run while the relay is closed.
+ */
+export const ConnectorLivenessSignalSchema = z
+  .object({ state: z.enum(["live", "quiet", "lost", "unknown"]), quietMs: z.number().int().nonnegative().nullable() })
+  .strict();
+export type ConnectorLivenessSignal = z.infer<typeof ConnectorLivenessSignalSchema>;
+export const ConnectorHeartbeatSignalSchema = z
+  .object({
+    state: z.enum(["live", "stalled", "unknown"]),
+    lastAttemptAt: z.string().datetime().nullable(),
+    lastSettledAt: z.string().datetime().nullable(),
+    budgetMs: z.number().int().positive().nullable(),
+  })
+  .strict();
+export type ConnectorHeartbeatSignal = z.infer<typeof ConnectorHeartbeatSignalSchema>;
+export const ConnectorRelaySignalSchema = z
+  .object({ state: z.enum(["connected", "https_fallback", "disconnected", "unknown"]), lastConnectedAt: z.string().datetime().nullable() })
+  .strict();
+export type ConnectorRelaySignal = z.infer<typeof ConnectorRelaySignalSchema>;
+
+/**
+ * `availability.status`'s answer. Its own op, not a `status` field: launchers
+ * installed before 7.0.0 parse `status` strictly and a user install never
+ * replaces its launcher.
+ */
+export const ConnectorAvailabilitySchema = z
+  .object({
+    available: z.boolean(),
+    /** Null exactly when the connector can take work. */
+    phase: ConnectorAvailabilityPhaseSchema.nullable(),
+    /** Null exactly when the connector can take work. */
+    reason: ConnectorUnavailabilityReasonSchema.nullable(),
+    expectedReturn: ConnectorExpectedReturnSchema,
+    liveness: ConnectorLivenessSignalSchema,
+    heartbeat: ConnectorHeartbeatSignalSchema,
+    relay: ConnectorRelaySignalSchema,
+  })
+  .strict()
+  .refine(
+    value => value.available === (value.phase === null && value.reason === null),
+    "an available connector has no phase or reason, and an unavailable one has both",
+  );
+export type ConnectorAvailability = z.infer<typeof ConnectorAvailabilitySchema>;
 
 /** `git.choice`'s answer: which git runs, its path (the home folder as `~`), why, and the license finding when git cannot run. */
 export const GitChoiceReportSchema = z

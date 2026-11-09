@@ -8,6 +8,7 @@ import { readNativeRecord } from "./install.js";
 import { nativePlatform } from "./service.js";
 import { commitFirstFiles, initializeRepository, planFirstCommit, pushToManagedRemote, type FirstCommitPlan, type inspectRepository } from "./repository-inspect.js";
 import { ensureGraft, graftAlreadyWired, planGraft, readGraftRecord, wireGraft, type GraftTool } from "./graft.js";
+import { availabilityText, localAvailability } from "./availability.js";
 import type { OnboardState } from "./onboard-state.js";
 import type { OwnerApiClient } from "./owner-api.js";
 import { isNo, isYes } from "./onboard-answers.js";
@@ -52,11 +53,12 @@ export async function inspectStep(s: OnboardSession): Promise<OnboardStep> {
  * already coming up (it takes about a minute after a fresh install).
  */
 async function serviceNotAnswering(s: OnboardSession): Promise<OnboardStep> {
+  const why = availabilityText(await localAvailability(s.context.root, null));
   const started = await readNativeRecord(s.context.root).catch(() => null);
   if (!started) {
     return {
       step: "inspect",
-      note: "This machine's Konteks service is not running yet, so nothing can be set up here. Starting it is the step before this one.",
+      note: `${why} It is not running yet, so nothing can be set up; starting it is the step before this one.`,
       run: { argv: ["konteks-remote", "start"] },
     };
   }
@@ -69,14 +71,14 @@ async function serviceNotAnswering(s: OnboardSession): Promise<OnboardStep> {
     await s.save({ startWaits: 0 });
     return {
       step: "inspect",
-      note: "The Konteks service on this machine has not answered for over two minutes. Starting it again; that is safe if it is already running.",
+      note: `${why} It has not answered for over two minutes. Starting it again; that is safe if it is already running.`,
       run: { argv: ["konteks-remote", "start"] },
     };
   }
   await s.save({ startWaits: waits });
   return {
     step: "inspect",
-    note: "The Konteks service on this machine is still starting. It usually opens for work about a minute after a fresh install; the next step waits for it again.",
+    note: `${why} It is still starting; the next step waits for it again.`,
     run: AGAIN,
   };
 }
@@ -405,14 +407,15 @@ async function registeredKey(s: OnboardSession): Promise<{ reply: OnboardStep; s
 }
 
 async function keyRefused(s: OnboardSession, error: unknown): Promise<OnboardStep> {
-  // The service on this machine is not running: say that, and start it,
-  // instead of a control-socket error and "try again". The person already
-  // said yes; the push goes on once it answers.
+  // The service on this machine is not running: say why it is unavailable,
+  // and start it, instead of a control-socket error and "try again". The
+  // person already said yes; the push goes on once it answers.
   if (error instanceof RemoteInstanceError && error.code === "control_socket_unavailable") {
+    const availability = availabilityText(await localAvailability(s.context.root, null));
     await s.save({ step: "pushing" });
     return {
       step: "pushing",
-      note: "The Konteks service on this machine is not running, so nothing was pushed yet. Starting it; the push goes on once it answers.",
+      note: `${availability} Nothing was pushed yet. Starting it; the push goes on once it answers.`,
       run: { argv: ["konteks-remote", "start"] },
     };
   }

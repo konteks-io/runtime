@@ -186,7 +186,7 @@ describe("closed native runtime installation", () => {
       await expect(controlCall({ port, token, timeoutMs: 500 }, { request: { op: "status" }, schema: z.unknown() })).rejects.toThrow();
     } finally { await service.shutdown("test-cleanup", 0); }
   });
-  it("cleans up the started runner and releases ownership when the local control port is occupied", async () => {
+  it("refuses an occupied local control port before any runner starts, and releases ownership", async () => {
     const f = await fixture();
     const listener = createServer();
     await new Promise<void>(resolve => listener.listen(0, "127.0.0.1", resolve));
@@ -198,7 +198,10 @@ describe("closed native runtime installation", () => {
     try {
       await expect(service.start()).rejects.toMatchObject({ code: "EADDRINUSE" });
       await service.waitUntilStopped();
-      expect(stop).toHaveBeenCalledOnce();
+      // The socket opens once this process owns its state and before startup
+      // composes runners: a taken port costs no agent start and no cleanup.
+      expect(spawn).not.toHaveBeenCalled();
+      expect(stop).not.toHaveBeenCalled();
       const nextOwner = acquireNativeRootLock(join(root, "supervisor"));
       nextOwner.release();
     } finally {

@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { createHash, sign } from "node:crypto";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
@@ -20,6 +21,12 @@ afterEach(async () => { vi.restoreAllMocks(); await rm(root, { recursive: true, 
 async function installedIdentity() {
   const keys = buildReleaseFixture();
   const platform = { os: "macos", architecture: "arm64" } as const;
+  // The supervisor opens its control socket before the bounded recovery; a
+  // fixture must not claim the machine's default port.
+  const listener = createServer();
+  await new Promise<void>(resolve => listener.listen(0, "127.0.0.1", resolve));
+  const controlPort = (listener.address() as { port: number }).port;
+  await new Promise<void>((resolve, reject) => listener.close(error => error ? reject(error) : resolve()));
   const bytes = "verified-bootstrap-fixture-not-executed";
   const artifact = { id: "connector", kind: "connector", format: "executable", ...platform,
     url: "https://release.example/connector", digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}`, sizeBytes: Buffer.byteLength(bytes) };
@@ -30,7 +37,7 @@ async function installedIdentity() {
     value: sign(null, bundleManifestSigningBytes(unsigned as never), keys.privateKey).toString("base64url") } };
   const record = { schemaVersion: 1, deploymentKind: "native_connector", instanceId: "instance", workspaceId: "tenant",
     releaseId: "release-1", manifestDigest: manifest.digest, bundleVersion: "1.0.0", coreUrl: "https://core.example",
-    relayUrl: "wss://relay.example/runtime", controlPort: 41800, agents: [] };
+    relayUrl: "wss://relay.example/runtime", controlPort, agents: [] };
   const dataDir = join(root, "supervisor");
   const releaseDir = join(root, "releases", record.releaseId);
   for (const directory of [dataDir, join(releaseDir, "agents"), join(root, "credentials"), join(root, "workspaces")]) {
