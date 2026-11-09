@@ -1,5 +1,5 @@
 import type { ConnectorAvailability, ConnectorAvailabilityPhase, ConnectorExpectedReturn, ConnectorHeartbeatSignal, ConnectorLivenessSignal, ConnectorRelaySignal, ConnectorUnavailabilityReason } from "@konteks/remote-common";
-import { ConnectorAvailabilitySchema } from "@konteks/remote-common";
+import { ConnectorAvailabilitySchema, RemoteInstanceError } from "@konteks/remote-common";
 import type { Output } from "../output.js";
 import { outputLocale, setupText, type SetupCopyKey, type SetupLocale } from "../setup-locale.js";
 import type { SupervisorControl } from "../control.js";
@@ -20,18 +20,43 @@ export interface AvailabilityProbe {
   running(): Promise<boolean>;
 }
 
+/** What `availability.status` gave this launcher, before this computer's own files are read. */
+type AvailabilityAnswer =
+  | { kind: "answer"; availability: ConnectorAvailability }
+  | { kind: "missing" }
+  | { kind: "unreadable" };
+
 export class NativeAvailability implements AvailabilityProbe {
   constructor(private readonly options: { control: Pick<SupervisorControl, "call">; root: string; running: () => Promise<boolean> }) {}
 
   async read(): Promise<ConnectorAvailability> {
-    // A connector from before `availability.status` answers with an error:
-    // the local files are then the only evidence this computer has.
-    const asked = await this.options.control.call({ op: "availability.status" }, ConnectorAvailabilitySchema, { timeoutMs: AVAILABILITY_ASK_MS }).catch(() => null);
-    return asked ?? localAvailability(this.options.root, await this.options.running());
+    const answer = await this.ask();
+    if (answer.kind === "answer") return answer.availability;
+    const running = await this.options.running();
+    // An answer on the control channel while the service manager says it runs
+    // proves the connector is up; it simply cannot describe itself here.
+    if (answer.kind === "unreadable" && running) return reachable();
+    return localAvailability(this.options.root, running);
   }
 
   running(): Promise<boolean> {
     return this.options.running();
+  }
+
+  /** The one place the control channel's answer is classified. */
+  private async ask(): Promise<AvailabilityAnswer> {
+    try {
+      const reply = await this.options.control.call({ op: "availability.status" }, ConnectorAvailabilitySchema, { timeoutMs: AVAILABILITY_ASK_MS });
+      const parsed = ConnectorAvailabilitySchema.safeParse(reply);
+      return parsed.success ? { kind: "answer", availability: parsed.data } : { kind: "unreadable" };
+    } catch (error) {
+      // A missing control socket is described by local evidence; a refused op
+      // (a connector older than the op) or a reply the channel could not read
+      // comes from a connector that is up and talking.
+      return error instanceof RemoteInstanceError && error.code === "control_socket_unavailable"
+        ? { kind: "missing" }
+        : { kind: "unreadable" };
+    }
   }
 }
 
@@ -84,6 +109,19 @@ function missingControl(): ConnectorAvailability {
   return unavailable("starting", "unknown", { code: "control_socket_unavailable", message: "its control socket on this computer did not answer" }, "the connector has not reported a return time yet");
 }
 
+/**
+ * The connector answers no availability this launcher can read while the
+ * service manager proves it runs: it can take work, and liveness, heartbeat
+ * and relay stay unknown because no answer described them.
+ */
+function reachable(): ConnectorAvailability {
+  return {
+    available: true, phase: null, reason: null,
+    expectedReturn: { kind: "unknown", why: "it can take work now" },
+    liveness: UNKNOWN_LIVENESS, heartbeat: UNKNOWN_HEARTBEAT, relay: UNKNOWN_RELAY,
+  };
+}
+
 function unavailable(
   phase: ConnectorAvailabilityPhase,
   liveness: ConnectorLivenessSignal["state"],
@@ -96,7 +134,8 @@ function unavailable(
   };
 }
 
-/** No control answer means no publisher evidence; saying so beats inventing a heartbeat. */
+/** No control answer means no publisher evidence; saying so beats inventing a signal. */
+const UNKNOWN_LIVENESS: ConnectorLivenessSignal = { state: "unknown", quietMs: null };
 const UNKNOWN_HEARTBEAT: ConnectorHeartbeatSignal = { state: "unknown", lastAttemptAt: null, lastSettledAt: null, budgetMs: null };
 const UNKNOWN_RELAY: ConnectorRelaySignal = { state: "unknown", lastConnectedAt: null };
 

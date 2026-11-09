@@ -96,4 +96,27 @@ describe("asking a connector that may be older than this launcher", () => {
     });
     expect(await probe.read()).toMatchObject({ available: true, phase: null });
   });
+
+  it("reports a running connector that refuses availability.status as reachable rather than starting", async () => {
+    const asked: string[] = [];
+    const probe = new NativeAvailability({
+      control: {
+        call: async (request: { op: string }) => {
+          asked.push(request.op);
+          throw new RemoteInstanceError("temporarily_unavailable", "control_request_invalid: request does not match the closed control protocol");
+        },
+      } as never,
+      root,
+      running: async () => true,
+    });
+    const answer = await probe.read();
+    expect(asked).toEqual(["availability.status"]);
+    expect(answer).toMatchObject({
+      available: true, phase: null, reason: null,
+      expectedReturn: { kind: "unknown" },
+      liveness: { state: "unknown" },
+      heartbeat: { state: "unknown" },
+      relay: { state: "unknown" },
+    });
+  });
 });
