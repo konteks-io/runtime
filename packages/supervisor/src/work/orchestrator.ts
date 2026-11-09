@@ -139,6 +139,8 @@ interface OrchestratorDeps {
   onUsage: (observation: AgentTurnUsageObservation) => Promise<void>;
   /** Runs only after proven process exit, before an unfinished execution is released. */
   preserveStoppedWorkspace?: (admission: LocalAdmission, assertCurrent: () => void) => Promise<void>;
+  /** Times one recovery step while it runs; absent, the step runs untimed. */
+  onStep?: <T>(name: string, run: () => Promise<T>) => Promise<T>;
   searchController?: SearchControllerBoundary;
   /** Present on a runtime tagged `onboard`; absent, both kinds are refused. */
   onboardCarrier?: Pick<OnboardWorkCarrier, "execute">;
@@ -1835,15 +1837,27 @@ export class WorkOrchestrator {
    * writer quiescence or releases retained execution capacity. */
   private async retainStoppedWorkspace(admission: LocalAdmission, assertCurrent: () => void): Promise<void> {
     assertCurrent();
-    try { await this.deps.preserveStoppedWorkspace?.(admission, assertCurrent); }
-    catch (error) {
+    const preserve = this.deps.preserveStoppedWorkspace;
+    if (!preserve) return;
+    const startedAt = Date.now();
+    try {
+      await this.timePreservedWorkspace(preserve, admission, assertCurrent);
+      this.logger.info({ event: "workspace.checkpoint_preserved", assignmentId: admission.assignmentId,
+        attempt: admission.attempt, claimId: admission.claimId, durationMs: Math.max(0, Date.now() - startedAt) },
+      "Workspace preservation finished; the original checkout stays on this runtime");
+    } catch (error) {
       assertCurrent();
       this.logger.warn({ event: "workspace.checkpoint_retained_locally", assignmentId: admission.assignmentId,
-        attempt: admission.attempt, claimId: admission.claimId,
+        attempt: admission.attempt, claimId: admission.claimId, durationMs: Math.max(0, Date.now() - startedAt),
         code: error instanceof RemoteInstanceError ? error.code : "unexpected_error", cause: checkpointCause(error) },
       "Workspace preservation is incomplete; its original checkout stays on this runtime and migration remains withheld");
     }
     assertCurrent();
+  }
+
+  /** The open recovery step, so a slow capture names itself instead of waiting silently. */
+  private timePreservedWorkspace(preserve: NonNullable<OrchestratorDeps["preserveStoppedWorkspace"]>, admission: LocalAdmission, assertCurrent: () => void): Promise<void> {
+    return this.deps.onStep?.("retain_stopped_workspace", () => preserve(admission, assertCurrent)) ?? preserve(admission, assertCurrent);
   }
 
   /** An unfinished execution with a retained process, and a runner that can stop it. */

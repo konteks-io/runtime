@@ -34,6 +34,8 @@ export interface ReconciliationDeps {
   onLease: (lease: string, expiresAt: string, assertCurrent: () => void) => Promise<void>;
   /** Optional pending inventory/renewal, after establishment and outside the lease lane. */
   afterEstablishment?: (assertCurrent: () => void) => Promise<void>;
+  /** Times one recovery step while it runs; absent, the step runs untimed. */
+  onStep?: <T>(name: string, run: () => Promise<T>) => Promise<T>;
   /** Captured before network I/O; invalidated by suspension, revocation or shutdown. */
   captureLeaseFence?: () => () => void;
   withLeaseAcquisition?: LeaseAcquisition;
@@ -230,19 +232,24 @@ export class Reconciliation {
     const assertApplication = this.beginApplication();
     const acquire = this.deps.withLeaseAcquisition ?? (operation => operation());
     let assertCurrent = () => {};
-    const result = await acquire(async () => {
+    const result = await this.step("establish", () => acquire(async () => {
       const assertLease = this.deps.captureLeaseFence?.() ?? (() => undefined);
       assertCurrent = () => { assertApplication(); assertLease(); this.deps.assertOwned(); };
       return this.establish(assertCurrent);
-    }, "reconnect");
+    }, "reconnect"));
     // Recovery may touch an agent or a large journal. It never holds the
     // lease-acquisition lane needed for periodic authority renewal.
-    await this.deps.afterEstablishment?.(assertCurrent);
+    await this.step("afterEstablishment", async () => { await this.deps.afterEstablishment?.(assertCurrent); });
     assertCurrent();
-    await this.applyManifest(result.manifest, assertCurrent);
+    await this.step("applyManifest", () => this.applyManifest(result.manifest, assertCurrent));
     assertCurrent();
     if (!this.complete) throw new RemoteInstanceError("recovery_required", "Reconciliation has unresolved decisions.");
     return result.manifest;
+  }
+
+  /** One named recovery step, timed by the supervisor's startup recorder when it supplies one. */
+  private step<T>(name: string, run: () => Promise<T>): Promise<T> {
+    return this.deps.onStep?.(name, run) ?? run();
   }
 
   /** Reconnect to Core and bind the renewed lease and manifest it answers with, inside the lease-acquisition lane. */
@@ -315,10 +322,12 @@ export class Reconciliation {
     if (!this.knownManifest(manifest, manifestDigest)) await this.deps.journal.manifests.put({ manifestId: manifest.manifestId, instanceId: manifest.instanceId, manifestDigest });
     for (const decision of manifest.decisions) {
       assertCurrent();
-      const outcome = await this.applyDecision(manifest, decision, assertCurrent);
+      const startedAt = Date.now();
+      const outcome = await this.step(`decision:${decision.action}`, () => this.applyDecision(manifest, decision, assertCurrent));
       assertCurrent();
       outcomes.set(decisionKey(decision), outcome);
-      this.logger.info({ manifestId: manifest.manifestId, action: decision.action, outcome }, "recovery decision");
+      this.logger.info({ manifestId: manifest.manifestId, action: decision.action, outcome,
+        durationMs: Math.max(0, Date.now() - startedAt) }, "recovery decision");
     }
     assertCurrent();
     if (![...outcomes.values()].every(settledOutcome)) return outcomes;

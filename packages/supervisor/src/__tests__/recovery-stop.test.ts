@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { FixedClock, RemoteInstanceError, ed25519Sign, generateEd25519, remoteControlSigningBytes, type CancelDirective, type RemoteWorkAssignment, type JsonValue } from "@konteks/remote-common";
+import { FixedClock, RemoteInstanceError, ed25519Sign, generateEd25519, remoteControlSigningBytes, type CancelDirective, type RemoteWorkAssignment, type JsonValue, type Logger } from "@konteks/remote-common";
 import { CoreSignatureVerifier } from "../control/core-signature.js";
 import { CancellationReceiver } from "../control/cancellation-receiver.js";
 import { CancellationReplay } from "../control/cancellation-replay.js";
@@ -35,9 +35,9 @@ function managerFixture() {
 }
 const create = (manager: SessionManager) => manager.create({ context: { instanceId: "instance", assignmentId: "assignment", attempt: 1, agentId: "codex" }, cwd: "/workspace", mcpServers: [] });
 
-async function sessionFixture(overrides: Partial<RelayedSessionDeps> = {}, mutate?: ConstructorParameters<typeof SupervisorJournal>[1]) {
-  const journal = new SupervisorJournal(dir, mutate); await journal.load();
-  const outbox = new DurableOutbox(dir); await outbox.load();
+async function sessionFixture(overrides: Partial<RelayedSessionDeps> = {}, mutate?: ConstructorParameters<typeof SupervisorJournal>[1], dataDir = dir) {
+  const journal = new SupervisorJournal(dataDir, mutate); await journal.load();
+  const outbox = new DurableOutbox(dataDir); await outbox.load();
   const runner = { createSession: vi.fn(async () => ({ acpSessionRef: "acp", resumed: false, capabilities: { forkSession: false, sessionResume: false } })), prompt: vi.fn(async () => undefined), cancel: vi.fn(async () => undefined), closeSession: vi.fn(async () => undefined), stopForRecovery: vi.fn(async () => undefined), answer: vi.fn(async () => ({ delivered: true })), setMode: vi.fn(async () => undefined), setConfigOption: vi.fn(async () => undefined) };
   const transport = { send: vi.fn(), openChannel: vi.fn(), closeChannel: vi.fn() };
   const onClosed = vi.fn(async () => undefined);
@@ -530,6 +530,43 @@ describe("proven per-session recovery stop", () => {
     await expect(work.stopForRecovery("assignment", 1, () => undefined)).resolves.toBeUndefined();
     expect(retainedStop).toHaveBeenCalledOnce();
     expect(restarted.execution.execution(admission)?.interruptedAt).toBe(interruptedAt);
+  });
+
+  it("times the stopped-workspace step and reports its duration on success and on the retained-locally warning", async () => {
+    const start = async (preserve: () => Promise<void>) => {
+      // A fresh journal per scenario: the first retained stop changes the record.
+      const runDir = await mkdtemp(join(tmpdir(), "recovery-stop-timed-"));
+      const f = await sessionFixture({}, undefined, runDir);
+      const admission = { instanceId: "instance", workspaceId: "workspace", runnerIncarnation: "predecessor", assignmentId: "assignment", attempt: 1, claimId: "claim", agentId: "codex", executionGeneration: "generation", openedAt: clock.nowIso() };
+      await f.journal.assignments.put({ assignmentId: "assignment", attempt: 1, claimId: "claim", kind: "assistant_execution", placementId: "placement", workspaceId: "workspace", agentId: "codex", state: "running", acpSessionRef: "prior-process-ref", recoveryEpoch: 0, reports: { nextSequence: 1, durableWatermark: 0 }, evidenceUpload: "structured_only", expiresAt: assignment.expiresAt, latestResumeAt: assignment.policy.latestResumeAt, updatedAt: clock.nowIso() });
+      await f.journal.execution.admit(admission, () => undefined);
+      await f.journal.execution.open(admission, () => undefined, clock.nowIso());
+      await f.journal.execution.bindReference(admission, "prior-process-ref", () => undefined);
+      await f.journal.execution.bindProcessOwner(admission, { version: 1 as const, platform: "darwin" as const, pid: 123, processGroupId: 123, startToken: "start", commandDigest: "A".repeat(43) }, () => undefined);
+      const restarted = new SupervisorJournal(runDir); await restarted.load();
+      const steps: string[] = [];
+      const info = vi.fn();
+      const warn = vi.fn();
+      const logger = { info, warn, debug: vi.fn(), error: vi.fn() } as unknown as Logger;
+      const work = new WorkOrchestrator({ journal: restarted, outbox: f.outbox, transport: f.transport, clock,
+        runners: new Map([["codex", { ...f.runner, stopRetainedExecution: vi.fn(async () => undefined) }]]), sessionDeps: () => f.deps,
+        onUsage: async () => undefined, instanceId: () => "instance", workspaceId: () => "workspace", runnerIncarnation: () => "successor",
+        assertOwned: () => undefined, recoveryAuthority: () => "accepted-successor", reportDeliveryAllowed: () => false,
+        onStep: async (name, run) => { steps.push(name); return run(); }, preserveStoppedWorkspace: preserve, logger } as never);
+      try { await work.stopForRecovery("assignment", 1, () => undefined); }
+      finally { await rm(runDir, { recursive: true, force: true }); }
+      return { steps, info, warn };
+    };
+
+    const success = await start(async () => undefined);
+    expect(success.steps).toContain("retain_stopped_workspace");
+    expect(success.warn).not.toHaveBeenCalledWith(expect.objectContaining({ event: "workspace.checkpoint_retained_locally" }), expect.any(String));
+    expect(success.info.mock.calls.find(call => call[0]?.event === "workspace.checkpoint_preserved")?.[0]).toMatchObject({ durationMs: expect.any(Number) });
+
+    const failed = await start(async () => { throw new RemoteInstanceError("capability_unavailable", "capture refused"); });
+    expect(failed.steps).toContain("retain_stopped_workspace");
+    const warning = failed.warn.mock.calls.find(call => call[0]?.event === "workspace.checkpoint_retained_locally");
+    expect(warning?.[0]).toMatchObject({ code: "capability_unavailable", durationMs: expect.any(Number) });
   });
 
   it("reports a retained execution interrupted after a predecessor already settled its ACP turn", async () => {

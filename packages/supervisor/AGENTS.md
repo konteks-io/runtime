@@ -120,7 +120,11 @@ QA browser, structured results, updates and doctor/support.
   with why recovery has not completed. The bound opens no work gate: work
   pull, the transport (and so every non-control channel), the ordinary
   heartbeat and recovery authority stay closed, reconciliation keeps retrying
-  every 15 s, and only a completed recovery reports `started`.
+  every 15 s, and only a completed recovery reports `started`. Startup is timed
+  from one `StartupPhases` recorder (`reconnect/startup-phases.ts`): every phase
+  logs `startup.phase`, an open recovery step names itself every 30 s, and the
+  summary is logged at `startup.timings` and carried in the `last-exit.json`
+  ledger entry recorded for a non-zero exit.
   A runtime below Core's minimum may install a strictly newer signed release
   without an accepted one (`mayUpdateWithoutAcceptedRelease`). A release on
   update probation (`updateProbation`) takes no new work. Native runners stop

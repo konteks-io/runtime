@@ -58,7 +58,7 @@ describe("supervisor store", () => {
     const path = store.path("last-exit.json");
     expect((await stat(path)).mode & 0o777).toBe(0o600);
     expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({
-      schemaVersion: 2, reason: "uncaught_exception", occurredAt: "2026-09-27T08:01:00.000Z",
+      schemaVersion: 3, reason: "uncaught_exception", occurredAt: "2026-09-27T08:01:00.000Z",
     });
   });
 
@@ -94,7 +94,37 @@ describe("supervisor store", () => {
     expect(await new SupervisorStore(dir).exitLedger()).toEqual([
       { reason: "shutdown_step_failed", occurredAt: "2026-09-27T08:10:00.000Z" },
     ]);
-    expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({ schemaVersion: 2 });
+    expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({ schemaVersion: 3 });
+  });
+
+  it("carries the bounded startup summary on the exit entry and still reads v1 and v2 records", async () => {
+    await mkdir(dir, { recursive: true });
+    const path = join(dir, "last-exit.json");
+    // v2 came before startup timing existed; it still parses and appends.
+    await writeFile(path, `${JSON.stringify({
+      schemaVersion: 2, reason: "liveness_lost", occurredAt: "2026-09-27T08:00:00.000Z",
+      entries: [{ reason: "liveness_lost", occurredAt: "2026-09-27T08:00:00.000Z" }],
+    })}\n`);
+    const store = new SupervisorStore(dir);
+    expect(await new SupervisorStore(dir).exitLedger()).toEqual([{ reason: "liveness_lost", occurredAt: "2026-09-27T08:00:00.000Z" }]);
+
+    const startup = {
+      processStartedAt: "2026-09-27T08:05:00.000Z",
+      phasesMs: { process_start: 0, control_channel: 12, recovery: 900_000 },
+      stepsMs: { "recovery:reconciliation": 900_000, "recovery:decision:cancel": 2 },
+      totalMs: 900_030,
+    };
+    await store.recordLastExit("uncaught_exception", "2026-09-27T08:20:30.000Z", startup);
+    expect(await new SupervisorStore(dir).exitLedger()).toEqual([
+      { reason: "liveness_lost", occurredAt: "2026-09-27T08:00:00.000Z" },
+      { reason: "uncaught_exception", occurredAt: "2026-09-27T08:20:30.000Z", startup },
+    ]);
+    expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({ schemaVersion: 3, entries: [{ reason: "liveness_lost" }, { startup }] });
+
+    // A v1 single record still reads, and the next record replaces it with the ledger.
+    await writeFile(path, `${JSON.stringify({ schemaVersion: 1, reason: "liveness_lost", occurredAt: "2026-09-25T08:00:00.000Z" })}\n`);
+    expect(await new SupervisorStore(dir).lastExit()).toEqual({ schemaVersion: 1, reason: "liveness_lost", occurredAt: "2026-09-25T08:00:00.000Z" });
+    expect(await new SupervisorStore(dir).exitLedger()).toEqual([{ reason: "liveness_lost", occurredAt: "2026-09-25T08:00:00.000Z" }]);
   });
 
   it("prunes the ledger by its trailing window and fixed cap", async () => {

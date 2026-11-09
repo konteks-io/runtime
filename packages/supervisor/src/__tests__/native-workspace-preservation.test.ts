@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NativeWorkspaceCheckpointStore } from '../native/workspace-preservation.js';
+import { StartupPhases } from '../reconnect/startup-phases.js';
 import { NativeRecoveredWorkspaceStore } from '../native/workspace-recovery.js';
 import { captureWorkspaceCheckpoint } from '../native/workspace-checkpoint.js';
 import { RemoteWorkspaceBeginRequestSchema, RemoteWorkspaceSealRequestSchema, RemoteWorkspaceAnySealRequestSchema, RemoteWorkspaceChunkWriteRequestSchema, computeRemoteFileTreeDigest, computeRemoteSkillCatalogDigest,
@@ -262,6 +263,20 @@ describe('what a checkpoint carries and how long its local copy stays', () => {
     await send(() => undefined);
     expect(sealed).toHaveLength(1);
     expect(await recovery()).toEqual([]);
+  });
+
+  it('times the real stopped-workspace capture under the recovery step name that waits', async () => {
+    // The 2026-11-04 wait sat here, inside capture(); the step now holds the
+    // ticker open and records its own duration for the retained-locally line.
+    const { api } = chunkClient();
+    const store = new NativeWorkspaceCheckpointStore({ root, client: () => api, chunksSupported: () => true });
+    await store.begin({ assignment, claimId: 'claim', selectionDigest, cwd, baselineCommit: baseline, tool, ...v2 });
+    await writeFile(join(cwd, 'file.txt'), 'edits');
+    const phases = new StartupPhases();
+    const send = await phases.step('recovery', 'retain_stopped_workspace', () => store.capture(admission, () => undefined));
+    phases.complete('started');
+    expect(phases.summary().stepsMs['recovery:retain_stopped_workspace']).toBeGreaterThanOrEqual(0);
+    await send(() => undefined);
   });
 
   it('reports a failed send through its reporter and keeps the copy', async () => {
