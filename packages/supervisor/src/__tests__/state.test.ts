@@ -44,16 +44,54 @@ it("keeps legacy delivery transcript state but strips its obsolete execution aut
 });
 
 describe("supervisor store", () => {
-  it("keeps one private bounded last-exit classification record", async () => {
+  it("keeps a private bounded exit ledger while last-exit still reads the newest entry", async () => {
     const store = new SupervisorStore(dir);
     await store.recordLastExit("liveness_lost", "2026-09-27T08:00:00.000Z");
     await store.recordLastExit("uncaught_exception", "2026-09-27T08:01:00.000Z");
     expect(await new SupervisorStore(dir).lastExit()).toEqual({
       schemaVersion: 1, reason: "uncaught_exception", occurredAt: "2026-09-27T08:01:00.000Z",
     });
+    expect(await new SupervisorStore(dir).exitLedger()).toEqual([
+      { reason: "liveness_lost", occurredAt: "2026-09-27T08:00:00.000Z" },
+      { reason: "uncaught_exception", occurredAt: "2026-09-27T08:01:00.000Z" },
+    ]);
     const path = store.path("last-exit.json");
     expect((await stat(path)).mode & 0o777).toBe(0o600);
-    expect(await readFile(path, "utf8")).not.toContain("liveness_lost");
+    expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({
+      schemaVersion: 2, reason: "uncaught_exception", occurredAt: "2026-09-27T08:01:00.000Z",
+    });
+  });
+
+  it("parses the old schemaVersion 1 record and appends to it", async () => {
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "last-exit.json"), `${JSON.stringify({
+      schemaVersion: 1, reason: "liveness_lost", occurredAt: "2026-09-27T08:00:00.000Z",
+    })}\n`);
+    const store = new SupervisorStore(dir);
+    expect(await store.lastExit()).toEqual({
+      schemaVersion: 1, reason: "liveness_lost", occurredAt: "2026-09-27T08:00:00.000Z",
+    });
+    await store.recordLastExit("unhandled_rejection", "2026-09-27T08:05:00.000Z");
+    expect(await store.exitLedger()).toEqual([
+      { reason: "liveness_lost", occurredAt: "2026-09-27T08:00:00.000Z" },
+      { reason: "unhandled_rejection", occurredAt: "2026-09-27T08:05:00.000Z" },
+    ]);
+  });
+
+  it("prunes the ledger by its trailing window and fixed cap", async () => {
+    const store = new SupervisorStore(dir);
+    await store.recordLastExit("other", "2026-09-25T08:00:00.000Z");
+    await store.recordLastExit("other", "2026-09-27T08:00:01.000Z");
+    // The first entry is older than the 24-hour window measured from the newest.
+    expect(await store.exitLedger()).toEqual([{ reason: "other", occurredAt: "2026-09-27T08:00:01.000Z" }]);
+
+    const start = Date.parse("2026-09-27T09:00:00.000Z");
+    for (let index = 1; index <= 25; index += 1) {
+      await store.recordLastExit("other", new Date(start + index * 60_000).toISOString());
+    }
+    const bounded = await store.exitLedger();
+    expect(bounded).toHaveLength(20);
+    expect(bounded.at(-1)?.occurredAt).toBe(new Date(start + 25 * 60_000).toISOString());
   });
 
   it("replaces shutdown progress with one private phase-only record", async () => {

@@ -82,6 +82,33 @@ describe("doctor and support bundle", () => {
     expect(report.checks.find(check => check.id === "reconciliation")).toMatchObject({ status: "warn", detail: bound });
   });
 
+  it("names recent self-restarts and warns when they are repeating", async () => {
+    const base = {
+      now: () => "2026-11-09T12:00:00Z", dataDir: dir, identity: { instanceId: "inst", administrativeStatus: "active" }, lease: { mode: "active" as const, expiresAt: null },
+      relay: { state: "connected", lastError: null, consecutiveFailures: 0 }, transport: "relay" as const, reconciliationComplete: true, components: [], agents: [],
+      configRevision: 1, diskFreeBytes: 1, minimumDiskBytes: 0, outboxDepth: 0, recoveryRequired: 0, coreSignatureConfigured: true,
+    };
+    const check = (report: Awaited<ReturnType<typeof runDoctor>>) => report.checks.find(entry => entry.id === "self-restarts");
+
+    const none = await runDoctor({ ...base, restarts: { countLastHour: 0, windowMs: 3_600_000, latest: null, repeating: false } });
+    expect(check(none)).toMatchObject({ status: "pass", detail: "no self-restart recorded in the last hour" });
+
+    const one = await runDoctor({ ...base, restarts: {
+      countLastHour: 1, windowMs: 3_600_000, latest: { reason: "liveness_lost", occurredAt: "2026-11-09T11:36:06.000Z" }, repeating: false,
+    } });
+    expect(check(one)).toMatchObject({ status: "pass" });
+    expect(check(one)?.detail).toBe("1 self-restart in the last hour; the latest was at 2026-11-09T11:36:06.000Z because it lost its heartbeat");
+    expectNoPath(one);
+
+    const repeating = await runDoctor({ ...base, restarts: {
+      countLastHour: 3, windowMs: 3_600_000, latest: { reason: "liveness_lost", occurredAt: "2026-11-09T12:00:00.000Z" }, repeating: true,
+    } });
+    expect(check(repeating)).toMatchObject({ status: "warn" });
+    expect(check(repeating)?.detail).toContain("3 self-restarts in the last hour");
+    expect(check(repeating)?.detail).toContain("they are repeating, so this computer keeps restarting");
+    expect(check(repeating)?.detail).not.toContain("/");
+  });
+
   it("reports whether previews are offered and when the last one failed, without paths or commands", async () => {
     const base = {
       now: () => "2026-09-06T00:00:00Z", dataDir: dir, identity: { instanceId: "inst", administrativeStatus: "active" }, lease: { mode: "active" as const, expiresAt: null },

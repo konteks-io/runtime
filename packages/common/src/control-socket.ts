@@ -76,6 +76,8 @@ export const ControlRequestSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("update.channel") }).strict(),
   /** Whether startup recovery has completed, whether its 5-minute bound passed, and why. */
   z.object({ op: z.literal("recovery.status") }).strict(),
+  /** The self-restarts this connector recorded, how many in the last hour, and why the latest happened. */
+  z.object({ op: z.literal("restarts.status") }).strict(),
   /** Why this connector cannot take work, its phase, when it expects to, and its three signals. */
   z.object({ op: z.literal("availability.status") }).strict(),
   /** Which git the connector and its agents run, and why (git-choice.ts). */
@@ -585,6 +587,52 @@ export const RecoveryStatusReportSchema = z
   })
   .strict();
 export type RecoveryStatusReport = z.infer<typeof RecoveryStatusReportSchema>;
+
+/**
+ * Why a connector restarted itself. The exit classification is a closed set
+ * decided when the process stopped, never an inferred cause.
+ */
+export const SelfRestartReasonSchema = z.enum([
+  "liveness_lost",
+  "uncaught_exception",
+  "unhandled_rejection",
+  "startup_failed",
+  "shutdown_step_failed",
+  "other",
+]);
+export type SelfRestartReason = z.infer<typeof SelfRestartReasonSchema>;
+
+const SELF_RESTART_REASON_WORDS: Readonly<Record<SelfRestartReason, string>> = {
+  liveness_lost: "it lost its heartbeat",
+  uncaught_exception: "it hit an unexpected error",
+  unhandled_rejection: "it hit an unhandled error",
+  startup_failed: "it could not start",
+  shutdown_step_failed: "a shutdown step failed",
+  other: "it stopped unexpectedly",
+};
+
+/** Plain words for one reason, so every surface says the same thing; never a path or a log line. */
+export function selfRestartReasonWords(reason: SelfRestartReason): string {
+  return SELF_RESTART_REASON_WORDS[reason] ?? "it stopped unexpectedly";
+}
+
+/**
+ * `restarts.status`'s answer: how many self-restarts happened in the last
+ * hour, why the latest one did, and whether they are repeating. Its own op,
+ * not a `status` field, because older launchers parse `status` strictly.
+ */
+export const RestartsStatusReportSchema = z
+  .object({
+    countLastHour: z.number().int().nonnegative(),
+    windowMs: z.number().int().positive(),
+    latest: z
+      .object({ reason: SelfRestartReasonSchema, occurredAt: z.string().datetime() })
+      .strict()
+      .nullable(),
+    repeating: z.boolean(),
+  })
+  .strict();
+export type RestartsStatusReport = z.infer<typeof RestartsStatusReportSchema>;
 
 /**
  * The phases in which a connector cannot take work. "recovering" is startup

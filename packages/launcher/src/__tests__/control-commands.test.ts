@@ -374,6 +374,35 @@ describe("native control commands", () => {
     }
   });
 
+  it("names recent self-restarts and warns when they are repeating, and leaves the row out for a connector without restarts.status", async () => {
+    const withRestarts = (report: unknown, json = false) => {
+      const f = fake({ json });
+      const call = f.context.control.call;
+      f.context.control.call = (async (request: ControlRequest, schema: { parse: (value: unknown) => unknown }, options?: { onEvent?: (event: unknown) => void }) =>
+        request.op === "restarts.status" ? schema.parse(report) : call(request, schema as never, options)) as typeof f.context.control.call;
+      return f;
+    };
+
+    const one = withRestarts({ countLastHour: 1, windowMs: 3_600_000, latest: { reason: "liveness_lost", occurredAt: "2026-11-09T11:36:06.000Z" }, repeating: false });
+    await status(one.context);
+    expect(one.text()).toContain("restarts");
+    expect(one.text()).toContain("1 self-restart in the last hour; the latest was at 2026-11-09T11:36:06.000Z because it lost its heartbeat");
+
+    const repeating = withRestarts({ countLastHour: 3, windowMs: 3_600_000, latest: { reason: "liveness_lost", occurredAt: "2026-11-09T12:00:00.000Z" }, repeating: true });
+    await status(repeating.context);
+    expect(repeating.text()).toContain("3 self-restarts in the last hour");
+    expect(repeating.text()).toContain("they are repeating, so it keeps restarting");
+
+    const json = withRestarts({ countLastHour: 1, windowMs: 3_600_000, latest: { reason: "liveness_lost", occurredAt: "2026-11-09T11:36:06.000Z" }, repeating: false }, true);
+    await status(json.context);
+    expect(JSON.parse(json.text()).restarts).toMatchObject({ countLastHour: 1, latest: { reason: "liveness_lost" } });
+
+    // A connector from before `restarts.status` still answers; it just leaves the row out.
+    const older = fake();
+    await status(older.context);
+    expect(older.text()).not.toMatch(/^restarts\b/m);
+  });
+
   it("reports why a connector cannot take work, with liveness, heartbeat and relay kept apart", async () => {
     const f = fake();
     const call = f.context.control.call;

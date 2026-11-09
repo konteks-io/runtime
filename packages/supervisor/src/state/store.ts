@@ -13,10 +13,12 @@ import {
   instanceKeyFromPrivateJwk,
   isFsErrorWithCode,
   RemoteInstanceError,
+  SelfRestartReasonSchema,
   readOrCreateSecretFile,
   writeSecretFile,
   type InstanceKeyPair,
   type RemoteSignedBundleManifest,
+  type SelfRestartReason,
 } from "@konteks/remote-common";
 import type { RelayDurableState } from "../relay/channel-mux.js";
 
@@ -150,16 +152,35 @@ const RelayDurableStateSchema = z.object({
 
 const HeartbeatSeqSchema = z.object({ sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER) }).strict();
 
-export const ControlledExitReasonSchema = z.enum([
-  "liveness_lost", "uncaught_exception", "unhandled_rejection", "startup_failed", "shutdown_step_failed", "other",
-]);
-export type ControlledExitReason = z.infer<typeof ControlledExitReasonSchema>;
-const LastExitSchema = z.object({
+export const ControlledExitReasonSchema = SelfRestartReasonSchema;
+export type ControlledExitReason = SelfRestartReason;
+
+/** How many exits the ledger keeps, and how far back; both are fixed, so the file stays small. */
+export const EXIT_LEDGER_CAP = 20;
+export const EXIT_LEDGER_WINDOW_MS = 24 * 60 * 60_000;
+
+const ExitEntrySchema = z.object({
+  reason: ControlledExitReasonSchema,
+  occurredAt: z.string().datetime(),
+}).strict();
+export type ControlledExitEntry = z.infer<typeof ExitEntrySchema>;
+
+const LegacyLastExitSchema = z.object({
   schemaVersion: z.literal(1),
   reason: ControlledExitReasonSchema,
   occurredAt: z.string().datetime(),
 }).strict();
-type LastExit = z.infer<typeof LastExitSchema>;
+type LastExit = z.infer<typeof LegacyLastExitSchema>;
+const ExitLedgerSchema = z.object({
+  schemaVersion: z.literal(2),
+  // The newest entry, kept at the top level so a launcher that reads only the
+  // old single (schemaVersion 1) fields still sees the latest exit.
+  reason: ControlledExitReasonSchema,
+  occurredAt: z.string().datetime(),
+  entries: z.array(ExitEntrySchema).min(1).max(EXIT_LEDGER_CAP),
+}).strict();
+/** A current schemaVersion 1 record and the bounded ledger both parse. */
+const LastExitSchema = z.union([LegacyLastExitSchema, ExitLedgerSchema]);
 
 /** Diagnostic progress only. The shutdown-complete receipt remains the sole
  * attestation that every native shutdown step finished. */
@@ -217,21 +238,41 @@ export class SupervisorStore {
     await this.mutate(() => writeSecretFile(this.path(name), `${JSON.stringify(value)}\n`));
   }
 
-  /** Replaces the single private record before a controlled nonzero exit. */
+  /**
+   * Appends this exit to the private ledger and persists it in one write, so
+   * a person can see self-restarts that repeat. The newest entry is also kept
+   * at the top level for a launcher that reads only the old fields.
+   */
   async recordLastExit(reason: ControlledExitReason, occurredAt = new Date().toISOString()): Promise<void> {
-    await this.writeJson("last-exit.json", LastExitSchema.parse({ schemaVersion: 1, reason, occurredAt }));
+    const recorded = ExitEntrySchema.parse({ reason, occurredAt });
+    const entries = pruneExitLedger([...(await this.exitLedger()), recorded]);
+    const newest = entries[entries.length - 1]!;
+    await this.writeJson("last-exit.json", ExitLedgerSchema.parse({
+      schemaVersion: 2, reason: newest.reason, occurredAt: newest.occurredAt, entries,
+    }));
   }
 
-  /** Readable after the service has stopped, without its control socket. */
+  /** Readable after the service has stopped, without its control socket; the newest entry. */
   async lastExit(): Promise<LastExit | null> {
+    const entries = await this.exitLedger();
+    const newest = entries[entries.length - 1];
+    return newest ? { schemaVersion: 1, reason: newest.reason, occurredAt: newest.occurredAt } : null;
+  }
+
+  /** The bounded exit ledger, oldest first; a legacy single record is its one entry. */
+  async exitLedger(): Promise<ControlledExitEntry[]> {
     const path = this.path("last-exit.json");
     try {
       await assertRestrictedMode(path);
     } catch (error) {
-      if (isFsErrorWithCode(error, "ENOENT")) return null;
+      if (isFsErrorWithCode(error, "ENOENT")) return [];
       throw error;
     }
-    return this.readJson("last-exit.json", LastExitSchema);
+    const record = await this.readJson("last-exit.json", LastExitSchema);
+    if (!record) return [];
+    return record.schemaVersion === 1
+      ? [{ reason: record.reason, occurredAt: record.occurredAt }]
+      : record.entries;
   }
 
   /** One restricted, bounded marker for the last reached shutdown boundary. */
@@ -445,6 +486,15 @@ export class SupervisorStore {
 }
 
 type JsonWebKey = import("node:crypto").JsonWebKey;
+
+/** Oldest first, inside the trailing window from the newest entry, and never over the cap. */
+function pruneExitLedger(entries: readonly ControlledExitEntry[]): ControlledExitEntry[] {
+  const sorted = [...entries].sort((first, second) => Date.parse(first.occurredAt) - Date.parse(second.occurredAt));
+  const newest = sorted[sorted.length - 1];
+  if (!newest) return [];
+  const windowStart = Date.parse(newest.occurredAt) - EXIT_LEDGER_WINDOW_MS;
+  return sorted.filter(entry => Date.parse(entry.occurredAt) >= windowStart).slice(-EXIT_LEDGER_CAP);
+}
 
 function sameServingBundle(first: NativeServingRelease, second: NativeServingRelease): boolean {
   return first.bundleVersion === second.bundleVersion && first.manifestDigest === second.manifestDigest;

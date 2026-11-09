@@ -1,6 +1,6 @@
 import type { Stats } from "node:fs";
 import { stat } from "node:fs/promises";
-import { type DoctorCheck, type DoctorReport, type GitChoiceReport } from "@konteks/remote-common";
+import { selfRestartReasonWords, type DoctorCheck, type DoctorReport, type GitChoiceReport, type RestartsStatusReport } from "@konteks/remote-common";
 
 /**
  * Allowlisted doctor checks: versions, reachability, lease, components,
@@ -37,6 +37,8 @@ interface DoctorInputs {
   outboxDepth: number;
   recoveryRequired: number;
   coreSignatureConfigured: boolean;
+  /** The durable self-restart ledger: how many in the last hour, the latest reason, and whether they repeat. */
+  restarts?: RestartsStatusReport;
   /** Session previews: whether the capability is advertised, how many run, and the last failure's time. */
   preview?: { advertised: boolean; running: number; lastFailureAt: string | null };
   /**
@@ -407,6 +409,30 @@ function channelCheck(inputs: DoctorInputs): CheckDraft[] {
   return inputs.updateChannel ? [updateChannelCheck(inputs.updateChannel, inputs.lease.mode)] : [];
 }
 
+/** Recent self-restarts in plain words: the count, the window and why the latest happened. No path or log line. */
+function selfRestartsCheck({ restarts }: DoctorInputs): CheckDraft[] {
+  if (!restarts) return [];
+  const base = { id: "self-restarts", title: "Self-restarts" };
+  const window = restartWindowWords(restarts.windowMs);
+  if (restarts.latest === null) return [{ ...base, status: "pass", detail: `no self-restart recorded in ${window}` }];
+  const latest = `the latest was at ${restarts.latest.occurredAt} because ${selfRestartReasonWords(restarts.latest.reason)}`;
+  if (restarts.countLastHour === 0) return [{ ...base, status: "pass", detail: `no self-restart in ${window}; ${latest}` }];
+  return [{ ...base, status: restarts.repeating ? "warn" : "pass",
+    detail: `${restartCountWords(restarts.countLastHour, window)}; ${latest}${repeatingSuffix(restarts.repeating)}` }];
+}
+
+function restartWindowWords(windowMs: number): string {
+  return windowMs === 60 * 60_000 ? "the last hour" : `the last ${Math.max(1, Math.round(windowMs / 60_000))} minutes`;
+}
+
+function restartCountWords(count: number, window: string): string {
+  return `${count} self-restart${count === 1 ? "" : "s"} in ${window}`;
+}
+
+function repeatingSuffix(repeating: boolean): string {
+  return repeating ? "; they are repeating, so this computer keeps restarting" : "";
+}
+
 function launcherCheck(inputs: DoctorInputs): CheckDraft[] {
   if (inputs.launcher !== "older") return [];
   return [{ id: "launcher", title: "konteks-remote command", status: "warn", detail: "konteks-remote is from an older installer and runs its old code, not this release's. Update it once: run the Windows install line with -Update in place of -ActivationId." }];
@@ -428,5 +454,5 @@ function configCheck(inputs: DoctorInputs): CheckDraft[] {
 /** Every check, in the order the report lists them. */
 const DOCTOR_CHECKS: readonly DoctorCheckFn[] = [
   dataRootCheck, identityCheck, leaseCheck, relayCheck, reconciliationCheck, componentChecks, coreKeyCheck, agentChecks, capabilityChecks,
-  diskCheck, queueChecks, previewCheck, browserCheck, agentFamilyChecks, channelCheck, launcherCheck, gitCheck, configCheck,
+  diskCheck, queueChecks, previewCheck, browserCheck, agentFamilyChecks, channelCheck, selfRestartsCheck, launcherCheck, gitCheck, configCheck,
 ];

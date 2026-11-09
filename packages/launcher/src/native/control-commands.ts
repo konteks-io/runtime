@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { ActivationIdentityReportSchema, ConnectorAvailabilitySchema, DoctorReportSchema, GitChoiceReportSchema, PreviewStatusReportSchema, RecoveryStatusReportSchema, RemoteInstanceError, SupervisorStatusSchema, UpdateChannelReportSchema, type ConnectorAvailability, type ControlLoginEvent, type GitChoiceReport, type RecoveryStatusReport, type UpdateChannelReport } from "@konteks/remote-common";
+import { ActivationIdentityReportSchema, ConnectorAvailabilitySchema, DoctorReportSchema, GitChoiceReportSchema, PreviewStatusReportSchema, RecoveryStatusReportSchema, RemoteInstanceError, RestartsStatusReportSchema, SupervisorStatusSchema, UpdateChannelReportSchema, selfRestartReasonWords, type ConnectorAvailability, type ControlLoginEvent, type GitChoiceReport, type RecoveryStatusReport, type RestartsStatusReport, type UpdateChannelReport } from "@konteks/remote-common";
 import type { SupervisorControl } from "../control.js";
 import { isHostAgentId } from "@konteks/remote-release";
 import { AlreadyToldError, type Output } from "../output.js";
@@ -43,19 +43,22 @@ export async function status(context: ControlContext): Promise<void> {
   const channel = await context.control.call({ op: "update.channel" }, UpdateChannelReportSchema).catch(() => null);
   // Likewise `recovery.status`, from a connector before it.
   const recovery = await context.control.call({ op: "recovery.status" }, RecoveryStatusReportSchema).catch(() => null);
+  // Likewise `restarts.status`, from a connector before it.
+  const restarts = await context.control.call({ op: "restarts.status" }, RestartsStatusReportSchema).catch(() => null);
   // Likewise `git.choice`, from a connector before it.
   const git = await context.control.call({ op: "git.choice" }, GitChoiceReportSchema).catch(() => null);
   // Likewise `availability.status`, from a connector before it.
   const availability = await context.control.call({ op: "availability.status" }, ConnectorAvailabilitySchema).catch(() => null);
   // `lease` is intentionally bearer-redacted by generic output. Publish a
   // separate, explicit public summary; never exempt bearer fields from redaction.
-  context.output.result(statusResult(value, identity, availability));
+  context.output.result(statusResult(value, identity, availability, restarts));
   context.output.table([
     ["instance", value.instanceId ?? "(not activated)"],
     ...(identity ? [["activation", identity.activationId ?? "(not activated)"] as [string, string]] : []),
     ["status", value.administrativeStatus],
     ...availabilityRows(context.output, availability),
     ["connectivity", connectivityLine(value.connectivity, recovery)],
+    ...restartsRows(restarts),
     ["lease", `${value.lease.mode}${value.lease.expiresAt ? `, expires ${value.lease.expiresAt}` : ""}`],
     ["bundle", bundleLine(value.version)],
     ...(channel ? [["updates", releaseChannelLine(channel)] as [string, string]] : []),
@@ -70,10 +73,26 @@ export async function status(context: ControlContext): Promise<void> {
 
 type SupervisorStatus = z.infer<typeof SupervisorStatusSchema>;
 
-/** Machine-readable status, with the connector's availability only when it answers that op. */
-function statusResult(value: SupervisorStatus, identity: { activationId: string | null } | null, availability: ConnectorAvailability | null) {
+/** Machine-readable status, with each extra answer only when the connector serves that op. */
+function statusResult(value: SupervisorStatus, identity: { activationId: string | null } | null, availability: ConnectorAvailability | null, restarts: RestartsStatusReport | null) {
   const base = { ...value, ...identity, leaseStatus: { mode: value.lease.mode, expiresAt: value.lease.expiresAt, drainDeadline: value.lease.drainDeadline } };
-  return availability === null ? base : { ...base, availability };
+  const described = availability === null ? base : { ...base, availability };
+  return restarts === null ? described : { ...described, restarts };
+}
+
+/** The restarts row, or none when there is nothing to say (a connector that never recorded one). */
+function restartsRows(restarts: RestartsStatusReport | null): Array<[string, string]> {
+  const line = restarts === null ? null : restartsLine(restarts);
+  return line ? [["restarts", line]] : [];
+}
+
+/** Recent self-restarts in plain words; null when none was ever recorded, so the row is left out. */
+function restartsLine(restarts: RestartsStatusReport): string | null {
+  const window = restarts.windowMs === 60 * 60_000 ? "the last hour" : `the last ${Math.max(1, Math.round(restarts.windowMs / 60_000))} minutes`;
+  if (restarts.latest === null) return null;
+  const latest = `the latest was at ${restarts.latest.occurredAt} because ${selfRestartReasonWords(restarts.latest.reason)}`;
+  if (restarts.countLastHour === 0) return `no self-restart in ${window}; ${latest}`;
+  return `${restarts.countLastHour} self-restart${restarts.countLastHour === 1 ? "" : "s"} in ${window}; ${latest}${restarts.repeating ? " — they are repeating, so it keeps restarting" : ""}`;
 }
 
 function gitLine(git: GitChoiceReport): string {

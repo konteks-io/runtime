@@ -1,9 +1,9 @@
 import type { Logger } from "@konteks/remote-common";
 import { lastSlowJournalWork } from "./state/slow-work.js";
 
-const TICK_MS = 1_000;
+export const TICK_MS = 1_000;
 /** A held loop delays heartbeats and relay frames; two seconds is already visible to the person. */
-const STALL_MS = 2_000;
+export const STALL_MS = 2_000;
 
 /**
  * Diagnostic only (D175): logs when the connector's event loop was held, for
