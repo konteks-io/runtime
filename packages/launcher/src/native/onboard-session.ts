@@ -1,11 +1,12 @@
 import { mkdir, rename } from "node:fs/promises";
 import { join } from "node:path";
-import { CoreResponseError, RemoteInstanceError, SupervisorStatusSchema, SystemClock } from "@konteks/remote-common";
+import { CoreResponseError, RemoteInstanceError, SupervisorStatusSchema, SystemClock, type ConnectorAvailability } from "@konteks/remote-common";
 import { NativeEnrollment, SupervisorStore } from "@konteks/remote-supervisor";
 import type { Output } from "../output.js";
 import { SupervisorControl } from "../control.js";
 import { CLI_NAME, cliCommand, cliExecutable, commandHintText } from "../cli-command.js";
 import { prepareNativeReenrollment, readNativeRecord, type completeNativeEnrollment } from "./install.js";
+import { localAvailability } from "./availability.js";
 import { inspectRepository, type commitFirstFiles, type initializeRepository, type planFirstCommit, type pushToManagedRemote } from "./repository-inspect.js";
 import type { StagingStatus } from "./enrollment-staging.js";
 import { readOnboardState, writeOnboardState, type OnboardState } from "./onboard-state.js";
@@ -272,7 +273,7 @@ async function waitForServiceReady(root: string, until: "ready" | "answering" = 
   const deadline = Date.now() + READY_WAIT_MS;
   let last: ServiceReadiness | null = null;
   while (Date.now() < deadline) {
-    const probe = await probeReady(control, until, last);
+    const probe = await probeReady(root, control, until, last);
     if (probe.settled) return probe.last;
     last = probe.last;
     await pause(3_000);
@@ -280,15 +281,23 @@ async function waitForServiceReady(root: string, until: "ready" | "answering" = 
   return last;
 }
 
-async function probeReady(control: SupervisorControl, until: "ready" | "answering", last: ServiceReadiness | null): Promise<{ last: ServiceReadiness | null; settled: boolean }> {
+async function probeReady(root: string, control: SupervisorControl, until: "ready" | "answering", last: ServiceReadiness | null): Promise<{ last: ServiceReadiness | null; settled: boolean }> {
   try {
     const status = await control.call({ op: "status" }, SupervisorStatusSchema, { timeoutMs: 5_000 });
     const seen = { administrativeStatus: status.administrativeStatus, roles: status.roles };
     return { last: seen, settled: until === "answering" || (status.administrativeStatus === "active" && status.connectivity.reconciliationComplete) };
   } catch (error) {
-    // No control token yet means the service has not come up; keep waiting.
-    return { last, settled: !(error instanceof RemoteInstanceError) || error.code !== "control_socket_unavailable" };
+    // No control token yet means the service has not come up. The files this
+    // computer keeps say whether it is still coming up or already stopped:
+    // waiting cannot help the latter, and the reply carries the reason.
+    if (!(error instanceof RemoteInstanceError) || error.code !== "control_socket_unavailable") return { last, settled: true };
+    return { last, settled: stoppedLocally(await localAvailability(root, null)) };
   }
+}
+
+/** A structured reason a stopped service gives: no control answer will arrive on its own. */
+function stoppedLocally(availability: ConnectorAvailability): boolean {
+  return availability.reason?.code === "service_stopped" || availability.reason?.code === "liveness_lost" || availability.reason?.code === "process_exited";
 }
 
 /**
@@ -384,7 +393,7 @@ export class OnboardSession {
       const record = await readNativeRecord(this.context.root).catch(() => null);
       if (!record) return;
       const control = new SupervisorControl({ supervisorData: this.supervisorData }, record.controlPort);
-      status = (await probeReady(control, "answering", null)).last;
+      status = (await probeReady(this.context.root, control, "answering", null)).last;
     }
     if (status?.administrativeStatus === "revoked") throw new RemoteInstanceError("permission_denied", OWNER_ACCESS_REVOKED);
   }

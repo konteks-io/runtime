@@ -1,6 +1,7 @@
 import { readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { redactText, writeSecretFile } from "@konteks/remote-common";
+import { NATIVE_SHUTDOWN_RECEIPT_FILE } from "@konteks/remote-supervisor";
 import { CONNECTOR_LOG_FILE } from "./service.js";
 
 /**
@@ -15,6 +16,51 @@ interface ServiceStartFailure { at: string; message: string }
 
 const failureFile = (root: string) => join(root, "supervisor", SERVICE_START_FAILURE_FILE);
 export const connectorLogFile = (root: string) => join(root, "logs", CONNECTOR_LOG_FILE);
+
+/** What this computer's own files say about the last exit and shutdown. */
+export interface LocalServiceState {
+  /** The supervisor's last controlled nonzero exit, when it recorded one. */
+  lastExit: { reason: string; occurredAt: string } | null;
+  /** The last shutdown boundary the supervisor reached, when it recorded one. */
+  shutdownProgress: { phase: string; state: string; observedAt: string } | null;
+  /** Whether the last shutdown reached its completion receipt. */
+  shutdownComplete: boolean;
+}
+
+/** The supervisor's own markers, readable while its control socket is not. */
+export async function readLocalServiceState(root: string): Promise<LocalServiceState> {
+  const dataDir = join(root, "supervisor");
+  const receipt = await readFile(join(dataDir, NATIVE_SHUTDOWN_RECEIPT_FILE), "utf8").catch(() => null);
+  return {
+    lastExit: await readLastExit(dataDir),
+    shutdownProgress: await readShutdownProgress(dataDir),
+    shutdownComplete: receipt !== null,
+  };
+}
+
+async function readLastExit(dataDir: string): Promise<LocalServiceState["lastExit"]> {
+  const value = await readRecord(join(dataDir, "last-exit.json"));
+  if (!value || typeof value.reason !== "string" || typeof value.occurredAt !== "string") return null;
+  return { reason: value.reason, occurredAt: value.occurredAt };
+}
+
+async function readShutdownProgress(dataDir: string): Promise<LocalServiceState["shutdownProgress"]> {
+  const value = await readRecord(join(dataDir, "shutdown-progress.json"));
+  if (!value || typeof value.phase !== "string" || typeof value.state !== "string" || typeof value.observedAt !== "string") return null;
+  return { phase: value.phase, state: value.state, observedAt: value.observedAt };
+}
+
+/** A private JSON marker, or null when it is absent or not a JSON object. */
+async function readRecord(path: string): Promise<Record<string, unknown> | null> {
+  const text = await readFile(path, "utf8").catch(() => null);
+  if (text === null) return null;
+  try {
+    const value = JSON.parse(text) as unknown;
+    return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
 
 export async function recordServiceStartFailure(root: string, failure: ServiceStartFailure): Promise<void> {
   await writeSecretFile(failureFile(root), `${JSON.stringify({ at: failure.at, message: redactText(failure.message) })}\n`);

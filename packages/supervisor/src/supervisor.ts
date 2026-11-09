@@ -40,6 +40,7 @@ import {
   type ControlRequest,
   type ControlLoginEvent,
   type ConnectedAgentView,
+  type ConnectorAvailability,
   type ConnectorCommandsManifest,
   type HeartbeatResult,
   type InstanceKeyPair,
@@ -72,7 +73,7 @@ import { PermissionAnswerReceiver } from "./control/permission-answer-receiver.j
 import { CancellationReplay } from "./control/cancellation-replay.js";
 import { ControlHandlers, compareSemver } from "./control/handlers.js";
 import { ConfigurationAckDelivery } from "./control/configuration-ack-delivery.js";
-import { HeartbeatPublisher } from "./heartbeat/heartbeat.js";
+import { HeartbeatPublisher, type HeartbeatLiveness } from "./heartbeat/heartbeat.js";
 import type { InventorySnapshot } from "./inventory/snapshot.js";
 import { deriveAdvertisedRoles, type RoleBinding, type RoleCapabilityInputs } from "./inventory/roles.js";
 import { LocalGit, OnboardScratch } from "./onboard/git.js";
@@ -94,6 +95,7 @@ import { PreviewViewerStarts } from "./preview/viewer-start.js";
 import type { SessionPreviewAccess } from "./preview/mcp-server.js";
 import { finishActivationAttempt, provisioningCredentialIsExpired, refreshProvisioningCredential, submitReadiness } from "./provisioning/activation.js";
 import { Reconciliation } from "./reconnect/reconciliation.js";
+import { heartbeatSignal, livenessSignal, relaySignal, connectorAvailability } from "./reconnect/availability.js";
 import { STARTUP_RECOVERY_BOUND_MS, STARTUP_RECOVERY_RETRY_MS, StartupRecoveryBound, type StartupPhase } from "./reconnect/startup-recovery-bound.js";
 import { ChannelMux } from "./relay/channel-mux.js";
 import { RelayClient, type ControlDeliveryOutcome, type RelayClientOptions } from "./relay/relay-client.js";
@@ -202,6 +204,12 @@ export interface SupervisorOptions {
   onRetired?: () => void;
   /** A local `shutdown` request: end the process the way a signal would. */
   onShutdownRequested?: () => void;
+  /**
+   * Native service composition: called once this process owns its state and
+   * before the bounded startup recovery, so the loopback control socket can
+   * answer `availability.status` while it is starting or recovering.
+   */
+  onStartupAnswering?: () => Promise<void>;
   native?: {
     /** Public trust provided by the verified native executable, never by writable install metadata. */
     trustedRoots: readonly EmbeddedReleaseRoot[];
@@ -370,6 +378,8 @@ export class Supervisor {
   private readonly startupRecovery = new StartupRecoveryBound();
   private ordinaryHeartbeatStarted = false;
   private activeLoopStarting: Promise<void> | null = null;
+  /** Set once start() has composed every dependency; before it, non-status control ops refuse. */
+  private startupFinished = false;
   private recoveryRetryTimer: NodeJS.Timeout | null = null;
   private livenessTimer: NodeJS.Timeout | null = null;
   private livenessWatchingSince: number | null = null;
@@ -438,6 +448,9 @@ export class Supervisor {
     const native = this.options.native;
     if (!native) throw new RemoteInstanceError("protocol_incompatible", "Native supervisor composition requires explicit native dependencies.");
     await this.openNativeState();
+    // The socket answers `availability.status` for the whole bounded startup
+    // recovery; controlHandler() refuses every other op until startupFinished.
+    await this.options.onStartupAnswering?.();
     const identity = await this.loadActivation(native);
     try {
       await this.startActivated(native, identity);
@@ -471,6 +484,7 @@ export class Supervisor {
     if (this.stopping) return;
     await this.enterLifecycle();
     this.startChannelTimers();
+    this.startupFinished = true;
   }
 
   /** Preserve an owned post-activation failure before daemon cleanup releases this state. */
@@ -1868,18 +1882,35 @@ export class Supervisor {
   private checkLiveness(): void {
     if (this.stopping || !this.livenessTimer) return;
     if (this.leaseLapseNeedsRestart()) return this.restartForLapsedLease();
-    const budgetMs = Math.max(LIVENESS_MIN_BUDGET_MS, this.heartbeat.livenessBudgetMs());
-    const liveness = this.heartbeat.liveness();
-    const verdict = evaluateHeartbeatLiveness({ now: Date.now(), watchingSince: this.livenessWatchingSince ?? Date.now(), liveness, budgetMs });
-    if (verdict.state === "live") { this.livenessQuietWarned = false; return; }
-    const detail = { ...verdict, budgetMs, heartbeat: liveness, startupPhase: this.activeLoopPhase, activeLoopStarted: this.activeLoopPhase === "started", activeLoopStarting: this.activeLoopStarting !== null,
+    const facts = this.heartbeatLiveness(Date.now());
+    if (!livenessNeedsAttention(facts.verdict)) { this.livenessQuietWarned = false; return; }
+    const detail = { state: facts.verdict, quietMs: facts.quietMs, budgetMs: facts.budgetMs, heartbeat: facts.liveness, startupPhase: this.activeLoopPhase, activeLoopStarted: this.activeLoopPhase === "started", activeLoopStarting: this.activeLoopStarting !== null,
       recoveryRetryArmed: this.recoveryRetryTimer !== null, leaseMode: this.lease.mode(), administrativeStatus: this.administrativeStatus,
       activeResources: process.getActiveResourcesInfo().slice(0, 32) };
-    if (verdict.state === "quiet") return this.warnLivenessQuiet(detail);
+    if (facts.verdict === "quiet") return this.warnLivenessQuiet(detail);
     stopInterval(this.livenessTimer);
     this.livenessTimer = null;
     this.logger.error(detail, "supervisor liveness lost: no heartbeat attempted within the budget; asking the service to restart");
     this.options.onLivenessLost?.(detail);
+  }
+
+  /**
+   * The watchdog's verdict, computed from the publisher's own facts so
+   * `availability.status` and the liveness watchdog agree on the same answer.
+   */
+  private heartbeatLiveness(now: number): {
+    verdict: "live" | "quiet" | "stuck" | "unknown";
+    liveness: HeartbeatLiveness | null;
+    budgetMs: number | null;
+    quietMs: number;
+  } {
+    if (!this.heartbeat || this.livenessWatchingSince === null) {
+      return { verdict: "unknown", liveness: null, budgetMs: null, quietMs: 0 };
+    }
+    const budgetMs = Math.max(LIVENESS_MIN_BUDGET_MS, this.heartbeat.livenessBudgetMs());
+    const liveness = this.heartbeat.liveness();
+    const verdict = evaluateHeartbeatLiveness({ now, watchingSince: this.livenessWatchingSince, liveness, budgetMs });
+    return { verdict: verdict.state, liveness, budgetMs, quietMs: verdict.quietMs };
   }
 
   /** Warn once per quiet stretch. */
@@ -2562,6 +2593,27 @@ export class Supervisor {
     return this.startupRecovery.report(Date.now());
   }
 
+  /** `availability.status`: why this connector cannot take work, its phase, and when it expects to. */
+  availabilityStatus(): ConnectorAvailability {
+    const now = Date.now();
+    const recovery = this.startupRecovery.report(now);
+    const liveness = this.heartbeatLiveness(now);
+    const connectivity = this.connectivityStatus();
+    const drain = this.drainStatus();
+    return connectorAvailability({
+      now,
+      startup: { phase: this.activeLoopPhase, boundEndsAt: this.startupRecovery.boundEndsAt(), boundExceeded: recovery.boundExceeded, reason: recovery.reason },
+      drain: { active: drain.draining, reason: drain.reason, deadline: this.drainDeadline, activeAssignments: drain.activeAssignments },
+      updateProbation: this.onUpdateProbation,
+      leaseMode: this.lease.mode(),
+      unhealthyComponents: (this.lastSnapshot?.components ?? []).filter(component => component.healthStatus !== "healthy").map(component => component.kind),
+      acceptingWork: this.utilizationStatus().acceptingWork,
+      liveness: livenessSignal(liveness.verdict, liveness.quietMs),
+      heartbeat: heartbeatSignal(liveness.liveness, liveness.budgetMs, now),
+      relay: relaySignal({ connected: connectivity.relayConnected, transport: connectivity.transport, configured: this.relay !== null && this.relay !== undefined, lastConnectedAt: connectivity.lastConnectedAt }),
+    });
+  }
+
   private connectivityStatus(): SupervisorStatus["connectivity"] {
     const relay = this.relay?.status();
     const relayConnected = relay?.state === "connected";
@@ -2591,7 +2643,14 @@ export class Supervisor {
 
   controlHandler(): ControlHandler {
     const ops = this.controlOps();
-    return async (request, emit) => (ops[request.op] as (request: ControlRequest, emit: ControlEmitter) => unknown)(request, emit);
+    return async (request, emit) => {
+      // The socket opens before start() finishes so this op answers during
+      // startup; every other handler's dependencies are composed by start().
+      if (!this.startupFinished && !PRE_STARTUP_CONTROL_OPS.has(request.op)) {
+        throw new RemoteInstanceError("temporarily_unavailable", PRE_STARTUP_REFUSAL);
+      }
+      return (ops[request.op] as (request: ControlRequest, emit: ControlEmitter) => unknown)(request, emit);
+    };
   }
 
   /** One handler per control-socket op. */
@@ -2647,6 +2706,10 @@ export class Supervisor {
       // Its own op, not a status field, for the same reason as `update.channel`:
       // a connector whose recovery has not completed says so and why.
       "recovery.status": () => this.recoveryStatus(),
+      // Its own op, not a status field, for the same reason as `update.channel`:
+      // a connector that cannot take work says why, its phase, when it expects
+      // to return, and its liveness, heartbeat and relay separately.
+      "availability.status": () => this.availabilityStatus(),
       // Its own op for the same reason as `update.channel`.
       "git.choice": async () => gitChoiceReport(this.gitChoice ?? await connectorGit()),
       "release.accepted": async () => {
@@ -2732,7 +2795,7 @@ export class Supervisor {
   }
 
   private drainStatus() {
-    return { draining: this.draining, reason: this.drainReason, activeAssignments: this.work.activeCount(), openSessions: this.work.openSessions() };
+    return { draining: this.draining, reason: this.drainReason, activeAssignments: this.work?.activeCount() ?? 0, openSessions: this.work?.openSessions() ?? 0 };
   }
 
   /** Diagnostic only (D175): a held event loop, and the slow journal work before it, are logged. */
@@ -3542,6 +3605,23 @@ const channelOf = channelOfId;
 
 type ControlRequestOf<Op extends ControlRequest["op"]> = Extract<ControlRequest, { op: Op }>;
 type ControlOps = { [Op in ControlRequest["op"]]: (request: ControlRequestOf<Op>, emit: ControlEmitter) => unknown };
+
+/**
+ * Audited: these handlers read only state the constructor and store create, so
+ * they answer while `start()` is still composing the connector. Every other op
+ * touches `work`, `core`, `inventory`, `heartbeat` or a runner and is refused
+ * with a RemoteInstanceError until startup completes.
+ */
+const PRE_STARTUP_CONTROL_OPS: ReadonlySet<ControlRequest["op"]> = new Set<ControlRequest["op"]>([
+  "status", "availability.status", "identity.status", "recovery.status", "logs", "preview.status", "update.channel", "git.choice", "revoke.pending", "shutdown",
+]);
+
+const PRE_STARTUP_REFUSAL = "Konteks has not finished starting on this computer, so this command cannot run yet. konteks-remote status says which phase it is in and why it cannot take work.";
+
+/** Whether the watchdog's verdict is one it must report: quiet or stuck. */
+function livenessNeedsAttention(verdict: "live" | "quiet" | "stuck" | "unknown"): boolean {
+  return verdict === "quiet" || verdict === "stuck";
+}
 
 /** The provider, method, reuse and Gemini Enterprise project and location a local sign-in names; the runner checks them again. */
 function localLoginSelection(request: ControlRequestOf<"auth.login">) {

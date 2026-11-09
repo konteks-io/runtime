@@ -110,6 +110,8 @@ export function createNativeService(options: NativeServiceOptions): Daemon {
   let supervisor: Supervisor | undefined;
   let control: ControlSocketServer | undefined;
   let stopLogKeeper: (() => void) | undefined;
+  // Written outside the supervisor's ownership-fenced mutation gate, which
+  // has closed by the time a controlled exit is recorded.
   const exitStore = new SupervisorStore(join(options.root, "supervisor"));
   // The liveness callback reads `daemon` only after createDaemon has returned.
   const daemon: Daemon = createDaemon({
@@ -121,24 +123,31 @@ export function createNativeService(options: NativeServiceOptions): Daemon {
       stopLogKeeper = startConnectorLogKeeper(options.root);
       const installation = await loadNativeInstallation(options.root, options);
       const executable = await updaterExecutable(options.root, installation.record.releaseId, options.platform.os);
-      supervisor = new Supervisor(installation.config, {
+      const created = new Supervisor(installation.config, {
         onLivenessLost: () => { void daemon.shutdown("liveness-lost", 1).catch(() => undefined); },
         // Uninstalled: nothing is left for this process to do, and its
         // folder is about to be deleted — end it, whatever runs it.
         onRetired: () => { void daemon.shutdown("retired", 0).catch(() => undefined); },
         onShutdownRequested: () => { void daemon.shutdown("control", 0).catch(() => undefined); },
+        // Once this process owns its state: the socket answers
+        // `availability.status` for the whole bounded startup recovery, so a
+        // person is told why it cannot take work instead of finding nothing
+        // listening for five minutes.
+        onStartupAnswering: async () => {
+          control = await startControlSocketServer({
+            token: await created.store.controlToken(),
+            port: installation.config.SUPERVISOR_CONTROL_PORT,
+            handler: created.controlHandler(),
+            onUnexpectedError: (error, operation) => created.logger.error({ err: error, operation }, "control operation failed"),
+          });
+        },
         native: nativeSupervisorOptions(options, installation, executable),
       });
+      supervisor = created;
       if (installation.retiredAgents.length > 0) {
-        supervisor.logger.warn({ retiredAgents: installation.retiredAgents }, "this installation still lists agents Konteks no longer runs; they are skipped (Claude Code, Codex, DeepSeek Harness and OpenCode 2 are supported)");
+        created.logger.warn({ retiredAgents: installation.retiredAgents }, "this installation still lists agents Konteks no longer runs; they are skipped (Claude Code, Codex, DeepSeek Harness and OpenCode 2 are supported)");
       }
-      await supervisor.start();
-      control = await startControlSocketServer({
-        token: await supervisor.store.controlToken(),
-        port: installation.config.SUPERVISOR_CONTROL_PORT,
-        handler: supervisor.controlHandler(),
-        onUnexpectedError: (error, operation) => supervisor?.logger.error({ err: error, operation }, "control operation failed"),
-      });
+      await created.start();
     },
     shutdownSteps: () => nativeShutdownSteps(
       () => { stopLogKeeper?.(); return supervisor; },

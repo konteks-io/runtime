@@ -47,6 +47,14 @@ export class StartupRecoveryBound {
     return !this.completed && this.firstFailureAt !== null && now - this.firstFailureAt >= STARTUP_RECOVERY_BOUND_MS;
   }
 
+  /**
+   * When the bound ends, so `availability.status` can promise a return time;
+   * null until an attempt has failed and started the count.
+   */
+  boundEndsAt(): number | null {
+    return this.completed || this.firstFailureAt === null ? null : this.firstFailureAt + STARTUP_RECOVERY_BOUND_MS;
+  }
+
   /** What `recovery.status` and `doctor` report about a startup recovery. */
   report(now: number): RecoveryStatusReport {
     return {

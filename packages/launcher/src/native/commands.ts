@@ -6,9 +6,11 @@ import { dirname, join, resolve } from "node:path";
 import { z } from "zod";
 import { EMBEDDED_RELEASE_ROOTS, findAgentBridge, nativeServiceExecutable, verifyNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 import { createNativeService, hostAgentInstallAdapter, loadNativeInstallation, ownedByAnotherConnector, readNativeUpdateLedger, resolveNativeClaudeExecutable, verifyInstalledNativeConnector, NATIVE_SHUTDOWN_RECEIPT_FILE, type HostAgentInstallAdapter, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
-import { ReleaseAcceptedSchema, RemoteInstanceError, SupervisorStatusSchema, runCommand, sanitizeInheritedChildProcessEnv, writeSecretFile } from "@konteks/remote-common";
+import { ReleaseAcceptedSchema, RemoteInstanceError, SupervisorStatusSchema, runCommand, sanitizeInheritedChildProcessEnv, writeSecretFile, type ConnectorAvailability } from "@konteks/remote-common";
 import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyList, gitKeyRemove, previewStatus, status, supportBundle, type ControlContext } from "./control-commands.js";
 import { SupervisorControl } from "../control.js";
+import type { Output } from "../output.js";
+import { NativeAvailability, availabilityLine, availabilityWords, localAvailability, type AvailabilityProbe } from "./availability.js";
 import { addNativeAgent, fetchHostAgent, installNative, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, removeNativeAgent, restoreNativeRecord, stageNativeEnrollment } from "./install.js";
 import { terminalFetchConsent, type FetchConsent } from "./consent.js";
 import { closeAgentSetup, ensurePersonalAgent, isPersonalAgent, PERSONAL_AGENTS, productionAgentClosingDeps, setUpPersonalAgent } from "./agent-setup.js";
@@ -360,35 +362,53 @@ const STARTING_WAIT_MS = 90_000;
 
 /**
  * A command that needs the running connector, run while it is still coming up
- * (right after `start`, or after `agent add` restarted it), waits for it and
- * says so once, instead of failing with "cannot reach the supervisor control
- * socket" (the setup window ran `auth login` straight after `agent add`).
- * A stopped service is not waited for: the command's own error says so.
+ * (right after `start`, or after `agent add` restarted it), waits for it while
+ * it reports starting or recovering. Every answer carries the reason, the
+ * phase and either an expected return or an explicit unknown, said once per
+ * change instead of a generic "still starting" message.
+ *
+ * `waitForWork: false` is for the read-only commands that answer while the
+ * connector cannot take work (`status`, `preview status`): they wait only for
+ * a control channel, never for the recovery to finish.
  */
 export async function waitWhileStarting(
-  input: { control: Pick<SupervisorControl, "call">; output: { line(text: string): void } },
-  deps: { running: () => Promise<boolean>; sleep: (ms: number) => Promise<void>; now: () => number; waitMs?: number },
-): Promise<void> {
+  input: { availability: AvailabilityProbe; output: Pick<Output, "line"> & Partial<Pick<Output, "json" | "setupLocale">> },
+  deps: { sleep: (ms: number) => Promise<void>; now: () => number; waitMs?: number; waitForWork?: boolean },
+): Promise<ConnectorAvailability> {
   const deadline = deps.now() + (deps.waitMs ?? STARTING_WAIT_MS);
-  let said = false;
+  const waitForWork = deps.waitForWork ?? true;
+  let said: string | null = null;
   for (;;) {
-    try {
-      await input.control.call({ op: "status" }, SupervisorStatusSchema, { timeoutMs: 5_000 });
-      return;
-    } catch (error) {
-      if (!(await stillStarting(error, deps, deadline))) return;
-      if (!said) setupLine(input.output, "serviceStillStarting");
-      said = true;
-      await deps.sleep(2_000);
-    }
+    const answer = await input.availability.read();
+    if (answer.available) return answer;
+    const line = availabilityLine(input.output, answer);
+    if (line !== said) input.output.line(line);
+    said = line;
+    if (!(await keepWaiting(answer, input.availability, deps.now(), deadline, waitForWork))) return answer;
+    await deps.sleep(2_000);
   }
 }
 
-/** The control socket is not open yet, the service runs, and the wait is not over. */
-async function stillStarting(error: unknown, deps: { running: () => Promise<boolean>; now: () => number }, deadline: number,
-): Promise<boolean> {
-  if (!(error instanceof RemoteInstanceError) || error.code !== "control_socket_unavailable") return false;
-  return deps.now() < deadline && (await deps.running());
+/** A connector still starting or recovering, when this command is willing to wait for it. */
+function canStillAnswer(answer: ConnectorAvailability, waitForWork: boolean): boolean {
+  if (answer.phase !== "starting" && answer.phase !== "recovering") return false;
+  // A read-only command stops once the connector itself answers; only a
+  // missing control channel keeps it waiting.
+  return waitForWork || answer.reason?.code === "control_socket_unavailable";
+}
+
+/** Waiting helps only while the connector runs and time is left. */
+async function keepWaiting(answer: ConnectorAvailability, availability: AvailabilityProbe, now: number, deadline: number, waitForWork: boolean): Promise<boolean> {
+  if (!canStillAnswer(answer, waitForWork)) return false;
+  if (now >= deadline) return false;
+  return availability.running();
+}
+
+/** The failed call a person sees when the connector cannot take work, rather than a raw socket error. */
+function unavailableFailure(error: unknown, answer: ConnectorAvailability): boolean {
+  if (answer.available || !(error instanceof RemoteInstanceError)) return false;
+  if (error.code === "control_socket_unavailable") return true;
+  return error.code === "temporarily_unavailable" && (answer.phase === "starting" || answer.phase === "recovering");
 }
 
 type UpdateCheck = Awaited<ReturnType<typeof checkNativeUpdate>>;
@@ -471,26 +491,29 @@ function controlSocketUnavailable(error: unknown): boolean {
   return error instanceof RemoteInstanceError && error.code === "control_socket_unavailable";
 }
 
-/** A stopped connector is an answer, not an error. */
+/** A stopped or unreachable connector is an answer, not a raw socket error. */
 async function statusOrStopped(context: ControlContext, input: ControlInput): Promise<void> {
   try {
     return await status(context);
   } catch (error) {
-    if (!controlSocketUnavailable(error) || (await serviceRunning(input.root))) throw error;
-    setupLine(input.output, "serviceStoppedStatus");
+    if (!controlSocketUnavailable(error)) throw error;
+    const running = await serviceRunning(input.root);
+    context.output.result(await localAvailability(input.root, running));
+    if (!running) setupLine(input.output, "serviceStoppedStatus");
   }
 }
 
 /**
  * Doctor and support ask the running connector; a connector that is not
- * running still gets the last failed start and its log.
+ * running — or one that has not finished starting and refuses the op — still
+ * gets the last failed start and its log.
  */
 async function doctorOrSupport(context: ControlContext, input: ControlInput): Promise<void> {
   const isDoctor = input.operation === "doctor";
   let healthy: boolean;
   try { healthy = isDoctor ? await doctor(context) : (await supportBundle(context), true); }
   catch (error) {
-    if (!controlSocketUnavailable(error)) throw error;
+    if (!controlCannotAnswer(error)) throw error;
     return reportStoppedService(input, isDoctor);
   }
   if (isDoctor) {
@@ -500,6 +523,16 @@ async function doctorOrSupport(context: ControlContext, input: ControlInput): Pr
   }
   const failure = await readServiceStartFailure(input.root);
   if (failure) input.output.line(`Last failed start (${failure.at}): ${failure.message}`);
+}
+
+/**
+ * The connector could not answer at all: unreachable, or still composing and
+ * refusing the op with `temporarily_unavailable` (the pre-startup gate). Both
+ * mean the local report is all this computer can say.
+ */
+function controlCannotAnswer(error: unknown): boolean {
+  if (!(error instanceof RemoteInstanceError)) return false;
+  return error.code === "control_socket_unavailable" || error.code === "temporarily_unavailable";
 }
 
 /** The last failed start and the connector log, for a connector that is not running. */
@@ -528,6 +561,9 @@ const CONTROL_OPERATIONS: Readonly<Record<ControlInput["operation"], ControlOper
 
 /** Operations that act through the running connector, and so wait for one that is starting. */
 const WAITS_FOR_CONNECTOR: ReadonlySet<string> = new Set(["status", "preview.status", "agents", "auth.status", "auth.login", "auth.logout", "git.key.add", "git.key.list", "git.key.remove"]);
+
+/** Of those, the read-only ones that answer while the connector cannot take work: they wait only for a control channel. */
+const ANSWERS_WHILE_UNAVAILABLE: ReadonlySet<string> = new Set(["status", "preview.status"]);
 
 const productionNativeStopDeps: NativeStopDeps = {
   definition: serviceDefinition,
@@ -748,8 +784,10 @@ function logServiceState(code: number | null, stopped: boolean): void {
 /** A running service may still be opening its socket; wait without restarting or changing its port. */
 async function waitForStartedControl(input: NativeCommandContext, controlPort: number, serviceState: () => Promise<"running" | "stopped">, deps: StartControlWaitDeps): Promise<void> {
   const control = new SupervisorControl({ supervisorData: join(input.root, "supervisor") }, controlPort);
-  await waitWhileStarting({ control, output: input.output }, {
-    running: async () => (await serviceState()) === "running",
+  await waitWhileStarting({
+    availability: new NativeAvailability({ control, root: input.root, running: async () => (await serviceState()) === "running" }),
+    output: input.output,
+  }, {
     sleep: deps.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms))),
     now: deps.now ?? Date.now,
     ...(deps.controlWaitMs === undefined ? {} : { waitMs: deps.controlWaitMs }),
@@ -1342,13 +1380,18 @@ export const nativeCliActions: NativeCliActions = {
   control: async input => {
     const record = await readNativeRecord(input.root);
     const context = { output: input.output, control: new SupervisorControl({ supervisorData: join(input.root, "supervisor") }, record.controlPort) };
+    let answer: ConnectorAvailability | null = null;
     if (WAITS_FOR_CONNECTOR.has(input.operation)) {
-      await waitWhileStarting(context, {
-        running: () => serviceRunning(input.root),
-        sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
-        now: Date.now,
-      });
+      answer = await waitWhileStarting({
+        availability: new NativeAvailability({ control: context.control, root: input.root, running: () => serviceRunning(input.root) }),
+        output: input.output,
+      }, { sleep: ms => new Promise(resolve => setTimeout(resolve, ms)), now: Date.now, waitForWork: !ANSWERS_WHILE_UNAVAILABLE.has(input.operation) });
     }
-    await CONTROL_OPERATIONS[input.operation](context, input);
+    try {
+      await CONTROL_OPERATIONS[input.operation](context, input);
+    } catch (error) {
+      if (answer === null || !unavailableFailure(error, answer)) throw error;
+      throw setupError("temporarily_unavailable", "availabilityUnavailable", locale => availabilityWords(locale, answer));
+    }
   },
 };

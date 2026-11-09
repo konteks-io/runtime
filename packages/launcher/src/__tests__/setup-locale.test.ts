@@ -1,14 +1,16 @@
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { RemoteInstanceError, sanitizeInheritedChildProcessEnv } from "@konteks/remote-common";
+import { RemoteInstanceError, sanitizeInheritedChildProcessEnv, type ConnectorAvailability } from "@konteks/remote-common";
 import { createOutput } from "../output.js";
 import { confirm, promptSecret } from "../prompt.js";
 import { createNativeProgram, type NativeCliActions } from "../native/cli.js";
+import { availabilityWords } from "../native/availability.js";
 import { setUpPersonalAgent, type AgentSetupDeps } from "../native/agent-setup.js";
 import { terminalFetchConsent } from "../native/consent.js";
 import { launcherChildEnv } from "../native/launcher-delegate.js";
 import { runNativeUpdate, type NativeUpdateTransactionDeps } from "../native/update-transaction.js";
 import { describeServiceFailure, NativeServiceCommandError } from "../native/service.js";
+import { setupError, setupFailureText } from "../setup-locale.js";
 import { hostAgentInstallAdapter } from "@konteks/remote-supervisor";
 
 afterEach(() => vi.unstubAllEnvs());
@@ -183,6 +185,25 @@ describe("foreground setup language", () => {
     const json = sink();
     createOutput({ json: true, stderr: json.stream }).error(failure);
     expect(JSON.parse(json.text())).toEqual({ error: failure.toJSON() });
+  });
+
+  it("keeps the availability error's canonical message in English while the terminal speaks Indonesian", () => {
+    vi.stubEnv("KONTEKS_SETUP_LOCALE", "id");
+    const availability: ConnectorAvailability = {
+      available: false, phase: "starting",
+      reason: { code: "startup_in_progress", message: "startup has not finished yet" },
+      expectedReturn: { kind: "unknown", why: "no startup attempt has failed yet" },
+      liveness: { state: "unknown", quietMs: null },
+      heartbeat: { state: "unknown", lastAttemptAt: null, lastSettledAt: null, budgetMs: null },
+      relay: { state: "unknown", lastConnectedAt: null },
+    };
+    // The function form is what keeps error.toJSON()/--json canonical: a
+    // pre-rendered Indonesian value would leak into the message.
+    const failure = setupError("temporarily_unavailable", "availabilityUnavailable", locale => availabilityWords(locale, availability));
+    expect(failure.message).toContain("(starting)");
+    expect(failure.message).not.toContain("sedang dimulai");
+    expect(failure.toJSON()).toMatchObject({ message: failure.message });
+    expect(setupFailureText(failure, "id")).toContain("(sedang dimulai)");
   });
 
   it.each([

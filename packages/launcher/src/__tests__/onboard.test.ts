@@ -634,7 +634,8 @@ describe("onboard", () => {
     const registerGitKey = vi.fn(async () => { throw new RemoteInstanceError("control_socket_unavailable", "cannot reach the supervisor control socket"); });
     const result = await step({ registerGitKey, push: push as never });
     expect(push).not.toHaveBeenCalled();
-    expect(result.note).toContain("service on this machine is not running");
+    expect(result.note).toContain("cannot take work on this computer yet (starting)");
+    expect(result.note).toContain("Nothing was pushed yet");
     expect(result.run).toEqual({ argv: ["konteks-remote", "start"] });
     expect(result.ask).toBeUndefined();
     expect(await readOnboardState(root)).toMatchObject({ step: "pushing" });

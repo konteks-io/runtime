@@ -1,10 +1,11 @@
 import { z } from "zod";
-import { ActivationIdentityReportSchema, DoctorReportSchema, GitChoiceReportSchema, PreviewStatusReportSchema, RecoveryStatusReportSchema, RemoteInstanceError, SupervisorStatusSchema, UpdateChannelReportSchema, type ControlLoginEvent, type GitChoiceReport, type RecoveryStatusReport, type UpdateChannelReport } from "@konteks/remote-common";
+import { ActivationIdentityReportSchema, ConnectorAvailabilitySchema, DoctorReportSchema, GitChoiceReportSchema, PreviewStatusReportSchema, RecoveryStatusReportSchema, RemoteInstanceError, SupervisorStatusSchema, UpdateChannelReportSchema, type ConnectorAvailability, type ControlLoginEvent, type GitChoiceReport, type RecoveryStatusReport, type UpdateChannelReport } from "@konteks/remote-common";
 import type { SupervisorControl } from "../control.js";
 import { isHostAgentId } from "@konteks/remote-release";
 import { AlreadyToldError, type Output } from "../output.js";
 import { confirm, promptLine, promptSecret } from "../prompt.js";
 import { outputLocale, setupError, setupLine, setupWords } from "../setup-locale.js";
+import { availabilityLine } from "./availability.js";
 import { agentName } from "./agent-name.js";
 
 /**
@@ -44,13 +45,16 @@ export async function status(context: ControlContext): Promise<void> {
   const recovery = await context.control.call({ op: "recovery.status" }, RecoveryStatusReportSchema).catch(() => null);
   // Likewise `git.choice`, from a connector before it.
   const git = await context.control.call({ op: "git.choice" }, GitChoiceReportSchema).catch(() => null);
+  // Likewise `availability.status`, from a connector before it.
+  const availability = await context.control.call({ op: "availability.status" }, ConnectorAvailabilitySchema).catch(() => null);
   // `lease` is intentionally bearer-redacted by generic output. Publish a
   // separate, explicit public summary; never exempt bearer fields from redaction.
-  context.output.result({ ...value, ...identity, leaseStatus: { mode: value.lease.mode, expiresAt: value.lease.expiresAt, drainDeadline: value.lease.drainDeadline } });
+  context.output.result(statusResult(value, identity, availability));
   context.output.table([
     ["instance", value.instanceId ?? "(not activated)"],
     ...(identity ? [["activation", identity.activationId ?? "(not activated)"] as [string, string]] : []),
     ["status", value.administrativeStatus],
+    ...availabilityRows(context.output, availability),
     ["connectivity", connectivityLine(value.connectivity, recovery)],
     ["lease", `${value.lease.mode}${value.lease.expiresAt ? `, expires ${value.lease.expiresAt}` : ""}`],
     ["bundle", bundleLine(value.version)],
@@ -65,6 +69,12 @@ export async function status(context: ControlContext): Promise<void> {
 }
 
 type SupervisorStatus = z.infer<typeof SupervisorStatusSchema>;
+
+/** Machine-readable status, with the connector's availability only when it answers that op. */
+function statusResult(value: SupervisorStatus, identity: { activationId: string | null } | null, availability: ConnectorAvailability | null) {
+  const base = { ...value, ...identity, leaseStatus: { mode: value.lease.mode, expiresAt: value.lease.expiresAt, drainDeadline: value.lease.drainDeadline } };
+  return availability === null ? base : { ...base, availability };
+}
 
 function gitLine(git: GitChoiceReport): string {
   if (git.blocked) return git.blocked;
@@ -85,6 +95,17 @@ function bundleLine(version: SupervisorStatus["version"]): string {
 
 function utilizationLine(utilization: SupervisorStatus["utilization"]): string {
   return `${utilization.activeSessions} sessions, ${utilization.activeTurns} turns, ratio ${utilization.utilizationRatio}${utilization.acceptingWork ? "" : " — not accepting work"}`;
+}
+
+/** Liveness, heartbeat and relay are three separate answers; never fold them into one. */
+function signalLine(availability: ConnectorAvailability): string {
+  return `liveness ${availability.liveness.state}, heartbeat ${availability.heartbeat.state}, relay ${availability.relay.state}`;
+}
+
+/** A connector that cannot take work says why, and its three signals, above connectivity. */
+function availabilityRows(output: ControlContext["output"], availability: ConnectorAvailability | null): Array<[string, string]> {
+  if (!availability || availability.available) return [];
+  return [["availability", availabilityLine(output, availability)], ["signals", signalLine(availability)]];
 }
 
 function previewExposureLine(value: SupervisorStatus): string {
