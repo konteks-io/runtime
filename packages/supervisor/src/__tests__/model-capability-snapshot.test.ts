@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { FixedClock, catalogueModelAuthority, computeAgentModelCapabilityMappingDigest, keyedFingerprint } from "@konteks/remote-common";
+import { FixedClock, RemoteInstanceError, catalogueModelAuthority, computeAgentModelCapabilityMappingDigest, keyedFingerprint } from "@konteks/remote-common";
 import { ModelCapabilitySnapshotProducer, openCodeOptionBilling } from "../native/model-capability-snapshot.js";
 
 const clock = new FixedClock(Date.parse("2026-09-06T00:00:00Z"));
@@ -148,5 +148,61 @@ describe("authenticated model offered-values snapshot producer", () => {
     expect(openCodeOptionBilling({ agentId: "codex" }, "gpt-5.5")).toBeUndefined();
     expect(openCodeOptionBilling({ agentId: "opencode" }, "no-provider")).toBeUndefined();
     expect(openCodeOptionBilling({ agentId: "opencode", credentials: [{ providerId: "openai", label: "OpenAI key", kind: "api_key", state: "ready" }] }, "openai/gpt-5.5")).toBe("pay_per_use");
+  });
+
+  it("bounds one agent's read, records a timed-out state with the next retry, and leaves its list unknown", async () => {
+    const own = new FixedClock(Date.parse("2026-09-06T00:00:00Z"));
+    let answer: () => Promise<{ currentValue: string; offeredValues: string[] }> = () => new Promise(() => undefined);
+    const onDiagnostic = vi.fn(), onFirstSnapshot = vi.fn();
+    const codex = { ...ready, agentId: "codex", displayName: "Codex", authIdentityFingerprint: "identity-codex" };
+    const producer = new ModelCapabilitySnapshotProducer({ clock: own, instanceId: () => "instance", runnerIncarnation: () => "process",
+      manifestId: () => "manifest", mappings: () => [], catalogueAgents: () => ["codex"], discover: () => answer(),
+      onDiagnostic, onFirstSnapshot, discoveryTimeoutMs: 5, newId: () => "snapshot" });
+
+    await producer.refresh([codex]);
+
+    // The read was abandoned before it could hold the shared lane: no list, no snapshot.
+    expect(producer.snapshots()).toEqual([]);
+    expect(producer.discoveryState("codex")).toEqual({ agentId: "codex", state: "timed_out",
+      lastAttemptAt: "2026-09-06T00:00:00.000Z", nextRetryAt: "2026-09-06T00:00:05.000Z" });
+    expect(onDiagnostic).toHaveBeenCalledWith({ reason: "discovery_timed_out", agentId: "codex", errorKind: "timeout" });
+    expect(onFirstSnapshot).not.toHaveBeenCalled();
+
+    // The existing backoff retries it in the background; a later answer fills the list in.
+    answer = async () => ({ currentValue: "gpt", offeredValues: ["gpt"] });
+    own.advance(5_000);
+    await producer.refresh([codex]);
+    expect(producer.snapshots()).toEqual([expect.objectContaining({ agentId: "codex", currentValue: "gpt", offeredValues: ["gpt"] })]);
+    expect(producer.discoveryState("codex")).toEqual({ agentId: "codex", state: "ready",
+      lastAttemptAt: "2026-09-06T00:00:05.000Z", nextRetryAt: null });
+    expect(onFirstSnapshot).toHaveBeenCalledOnce();
+    expect(onFirstSnapshot).toHaveBeenCalledWith("codex");
+    // The now-fresh answer is reused, so no redundant heartbeat is requested.
+    await producer.refresh([codex]);
+    expect(onFirstSnapshot).toHaveBeenCalledOnce();
+  });
+
+  it("reports failed and never-attempted discovery state without inventing a capability list", async () => {
+    const onDiagnostic = vi.fn();
+    const producer = new ModelCapabilitySnapshotProducer({ clock, instanceId: () => "instance", runnerIncarnation: () => "process",
+      manifestId: () => "manifest", mappings: () => [], catalogueAgents: () => ["codex"], onDiagnostic,
+      discover: async () => { throw new Error("definite refusal"); } });
+    expect(producer.discoveryState("codex")).toEqual({ agentId: "codex", state: "never_attempted", lastAttemptAt: null, nextRetryAt: null });
+    expect(producer.discoveryState("claude-code")).toBeUndefined();
+    await producer.refresh([{ ...ready, agentId: "codex" }]);
+    expect(producer.snapshots()).toEqual([]);
+    expect(producer.discoveryState("codex")).toMatchObject({ state: "failed", nextRetryAt: expect.any(String) });
+    expect(onDiagnostic).toHaveBeenCalledWith({ reason: "discovery_failed", agentId: "codex", errorKind: "discovery_error" });
+  });
+
+  it("records the bridge's own initialize deadline as a timeout against that agent, with no capability list", async () => {
+    const onDiagnostic = vi.fn();
+    const producer = new ModelCapabilitySnapshotProducer({ clock, instanceId: () => "instance", runnerIncarnation: () => "process",
+      manifestId: () => "manifest", mappings: () => [], catalogueAgents: () => ["codex"], onDiagnostic,
+      discover: async () => { throw new RemoteInstanceError("agent_unavailable", "bridge did not answer initialize within 60000ms"); } });
+    await producer.refresh([{ ...ready, agentId: "codex" }]);
+    expect(producer.snapshots()).toEqual([]);
+    expect(producer.discoveryState("codex")).toMatchObject({ state: "timed_out", nextRetryAt: expect.any(String) });
+    expect(onDiagnostic).toHaveBeenCalledWith({ reason: "discovery_timed_out", agentId: "codex", errorKind: "timeout" });
   });
 });

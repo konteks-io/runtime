@@ -232,4 +232,19 @@ describe("supervisor-only ACP model capability discovery", () => {
     // The agent's own order is kept among what is reported.
     expect(result.offeredValues.indexOf(current)).toBeLessThan(result.offeredValues.indexOf('["openai","gpt-5.6-sol"]'));
   });
+
+  it("settles a whole read within its deadline when the bridge never answers session/new", async () => {
+    const root = await mkdtemp(join(tmpdir(), "model-discovery-test-")); roots.push(root);
+    const f = fixture(exactModel);
+    f.newSession.mockImplementation(() => new Promise(() => undefined));
+    const started = Date.now();
+    await expect(discoverBridgeModelCapability({ configId: "exact-model-id", workspaceRoot: root, spec, spawn: f.spawn,
+      initializeTimeoutMs: 1_000, clientVersion: "1.0.0", sessionTimeoutMs: 5_000, discoveryDeadlineMs: 25,
+      retrySleep: async () => undefined }))
+      .rejects.toMatchObject({ code: "agent_unavailable", diagnostic: "model_discovery_deadline" });
+    expect(Date.now() - started).toBeLessThan(1_000);
+    // The attempt's own process was stopped, and its private workspace removed.
+    expect(f.stop).toHaveBeenCalledOnce();
+    await expect(access(f.newSession.mock.calls[0]![0].cwd)).rejects.toThrow();
+  });
 });

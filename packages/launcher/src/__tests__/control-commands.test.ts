@@ -279,6 +279,24 @@ describe("native control commands", () => {
     ]);
   });
 
+  it("says a timed-out agent's model list is not yet known and is retried, leaving other agents alone", async () => {
+    let text = "";
+    const sink = new Writable({ write(chunk, _encoding, done) { text += chunk.toString(); done(); } });
+    const view = (agentId: string, discovery?: Record<string, unknown>) => ({ agentId, readiness: "ready", authMode: "agent_local_subscription",
+      accountScope: "personal", ...(discovery ? { modelCapabilityDiscovery: discovery } : {}) });
+    const context = { output: createOutput({ json: false, stdout: sink, stderr: sink }), control: { call: async <T,>(_request: ControlRequest, schema: { parse: (value: unknown) => T }) => schema.parse({
+      agents: [
+        view("claude-code", { state: "timed_out", lastAttemptAt: "2026-11-09T12:00:00.000Z", nextRetryAt: "2026-11-09T12:00:05.000Z" }),
+        view("codex"),
+        view("dsh", { state: "ready", lastAttemptAt: "2026-11-09T12:00:00.000Z", nextRetryAt: null }),
+      ], roles: [], roleBindings: [] }) } } as never;
+    await agents(context);
+    const [timedOut, codex, ready] = text.split("\n");
+    expect(timedOut).toBe("claude-code: ready (agent_local_subscription, scope personal) — its model list is not yet known; it is read again in the background (next at 2026-11-09T12:00:05.000Z)");
+    expect(codex).toBe("codex: ready (agent_local_subscription, scope personal)");
+    expect(ready).toBe("dsh: ready (agent_local_subscription, scope personal)");
+  });
+
   it("reads a connector status with a running preview", async () => {
     const f = fake();
     supervisorStatus.previewEnabled = true;

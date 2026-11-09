@@ -18,8 +18,13 @@ interface DoctorInputs {
   /** Why Core refused the last reconnect, in plain words; absent while nothing was refused. */
   reconciliationRefusal?: string;
   components: Array<{ kind: string; healthStatus: string; version: string }>;
-  /** `startFailure`: the agent could not start and is tried again in the background. */
-  agents: Array<{ agentId: string; readiness: string; recoveryAction?: string | undefined; startFailure?: string }>;
+  /**
+   * `startFailure`: the agent could not start and is tried again in the
+   * background. `modelCapabilityDiscovery`: where reading its offered models
+   * stands, with the retry time; absent when nothing was attempted.
+   */
+  agents: Array<{ agentId: string; readiness: string; recoveryAction?: string | undefined; startFailure?: string;
+    modelCapabilityDiscovery?: { state: string; lastAttemptAt: string | null; nextRetryAt: string | null } }>;
   /**
    * The agents this installation lists. Another agent reported here (the
    * site's "Not added" Google Antigravity card) is informational: `skip`,
@@ -336,6 +341,21 @@ function agentStatus(readiness: string): DoctorCheck["status"] {
   return readiness === "not_configured" ? "warn" : "fail";
 }
 
+/** One per agent whose offered models are not settled: names the agent and when it is read again. */
+function capabilityChecks(inputs: DoctorInputs): CheckDraft[] {
+  return inputs.agents.flatMap(agent => capabilityCheck(agent));
+}
+
+function capabilityCheck(agent: DoctorInputs["agents"][number]): CheckDraft[] {
+  const discovery = agent.modelCapabilityDiscovery;
+  if (!discovery || discovery.state === "ready" || discovery.state === "never_attempted") return [];
+  const base = { id: `model-capability-${agent.agentId}`, title: `Agent ${agent.agentId} models` };
+  if (discovery.state === "in_progress") return [{ ...base, status: "warn", detail: "reading the models the agent offers now" }];
+  const reading = discovery.state === "timed_out" ? "its model list is not yet known" : "its model list could not be read";
+  const retry = discovery.nextRetryAt ? `it is tried again in the background at ${discovery.nextRetryAt}` : "it is tried again in the background";
+  return [{ ...base, status: "warn", detail: `${reading}; ${retry}` }];
+}
+
 function diskCheck(inputs: DoctorInputs): CheckDraft[] {
   const enough = inputs.diskFreeBytes >= inputs.minimumDiskBytes;
   return [{ id: "disk", title: "Free disk", status: enough ? "pass" : "fail", detail: `${Math.round(inputs.diskFreeBytes / 1024 ** 3)} GiB free`, ...(enough ? {} : { recoveryActions: [{ kind: "free_disk" }] }) }];
@@ -407,6 +427,6 @@ function configCheck(inputs: DoctorInputs): CheckDraft[] {
 
 /** Every check, in the order the report lists them. */
 const DOCTOR_CHECKS: readonly DoctorCheckFn[] = [
-  dataRootCheck, identityCheck, leaseCheck, relayCheck, reconciliationCheck, componentChecks, coreKeyCheck, agentChecks,
+  dataRootCheck, identityCheck, leaseCheck, relayCheck, reconciliationCheck, componentChecks, coreKeyCheck, agentChecks, capabilityChecks,
   diskCheck, queueChecks, previewCheck, browserCheck, agentFamilyChecks, channelCheck, launcherCheck, gitCheck, configCheck,
 ];

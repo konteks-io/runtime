@@ -21,6 +21,8 @@ interface DiscoverBridgeModelCapabilityOptions {
   bridge?: BridgeProcess;
   /** The first attempt's `session/new` deadline; each later attempt waits longer (`discoverySessionTimeoutMs`). */
   sessionTimeoutMs?: number;
+  /** The whole read, every attempt and its bridge included, settles within this deadline. */
+  discoveryDeadlineMs?: number;
   logger?: Logger;
   retrySleep?: (delayMs: number) => Promise<void>;
   retryRandom?: () => number;
@@ -132,14 +134,37 @@ export async function discoverBridgeModelCapability(options: DiscoverBridgeModel
   const run = discoveryRun(options, cwd);
   try {
     for (let attempt = 1; attempt <= DISCOVERY_ATTEMPTS; attempt += 1) {
-      const capability = await discoveryAttempt(run, attempt);
+      const remainingMs = remainingDiscoveryMs(run);
+      if (remainingMs !== null && remainingMs <= 0) throw discoveryDeadlineElapsed();
+      const capability = await discoveryAttempt(run, attempt, remainingMs);
       if (capability) return capability;
+      if (discoveryDeadlineReached(run)) throw discoveryDeadlineElapsed();
       await retryPause(run, attempt);
     }
     throw unavailable();
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
+}
+
+/** How long this whole read may still take, or null when it has no deadline. */
+function remainingDiscoveryMs(run: DiscoveryRun): number | null {
+  return run.deadlineAt === null ? null : run.deadlineAt - Date.now();
+}
+
+function discoveryDeadlineReached(run: DiscoveryRun): boolean {
+  const remainingMs = remainingDiscoveryMs(run);
+  return remainingMs !== null && remainingMs <= 0;
+}
+
+function capTimeout(configuredMs: number, remainingMs: number | null): number {
+  return remainingMs === null ? configuredMs : Math.max(1, Math.min(configuredMs, remainingMs));
+}
+
+function discoveryDeadlineElapsed(): RemoteInstanceError {
+  return new RemoteInstanceError("agent_unavailable", "ACP model capability discovery did not answer within its deadline.", {
+    retryable: true, diagnostic: "model_discovery_deadline",
+  });
 }
 
 const DISCOVERY_ATTEMPTS = 4;
@@ -150,6 +175,7 @@ interface DiscoveryRun {
   logger: Logger;
   agentId: string;
   baseTimeoutMs: number;
+  deadlineAt: number | null;
   sleep: (delayMs: number) => Promise<void>;
   random: () => number;
 }
@@ -160,6 +186,7 @@ function discoveryRun(options: DiscoverBridgeModelCapabilityOptions, cwd: string
     logger: options.logger ?? createLogger({ name: "runner-model-discovery" }),
     agentId: options.spec.family.agentId,
     baseTimeoutMs: options.sessionTimeoutMs ?? 10_000,
+    deadlineAt: options.discoveryDeadlineMs === undefined ? null : Date.now() + options.discoveryDeadlineMs,
     sleep: options.retrySleep ?? (delayMs => new Promise(resolve => setTimeout(resolve, delayMs))),
     random: options.retryRandom ?? Math.random,
   };
@@ -175,16 +202,16 @@ interface AttemptState {
 }
 
 /** The capability, or null when the attempt failed in a way worth another one (it already stopped its process). */
-async function discoveryAttempt(run: DiscoveryRun, attempt: number,
+async function discoveryAttempt(run: DiscoveryRun, attempt: number, remainingMs: number | null,
 ): Promise<DiscoveredBridgeModelCapability | null> {
   const { options } = run;
-  const timeoutMs = discoverySessionTimeoutMs(run.baseTimeoutMs, attempt);
+  const timeoutMs = capTimeout(discoverySessionTimeoutMs(run.baseTimeoutMs, attempt), remainingMs);
   // Only the first attempt uses the lent bridge; a retry always gets a fresh process.
   const lent = attempt === 1 && options.bridge ? options.bridge : null;
   const state: AttemptState = { bridge: lent, spawned: null, bridgeAcquired: lent !== null, sessionCreated: false, stopped: false };
   const deadline = sessionDeadline(timeoutMs);
   try {
-    const bridge = state.bridge ?? (await spawnDiscoveryBridge(run, state));
+    const bridge = state.bridge ?? (await spawnDiscoveryBridge(run, state, remainingMs));
     const created = await Promise.race([
       bridge.connection.newSession({ cwd: run.cwd, mcpServers: [], _meta: { ...konteksSessionMetadata("Model capability check", run.agentId), ...options.sessionMeta } }),
       deadline.start(),
@@ -208,12 +235,12 @@ function failureOf(bridge: BridgeProcess): Promise<never>[] {
 }
 
 /** An isolated process that refuses every bridge-to-client request. */
-async function spawnDiscoveryBridge(run: DiscoveryRun, state: AttemptState): Promise<BridgeProcess> {
+async function spawnDiscoveryBridge(run: DiscoveryRun, state: AttemptState, remainingMs: number | null): Promise<BridgeProcess> {
   const { options } = run;
   const rejectDiscoveryRequest = async (): Promise<never> => { throw unavailable(); };
   const spawnOptions: SpawnBridgeOptions = {
     spec: options.spec,
-    initializeTimeoutMs: options.initializeTimeoutMs,
+    initializeTimeoutMs: capTimeout(options.initializeTimeoutMs, remainingMs),
     clientVersion: options.clientVersion,
     logger: run.logger,
     handlers: {

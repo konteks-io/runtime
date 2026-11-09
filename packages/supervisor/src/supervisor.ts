@@ -99,7 +99,8 @@ import { ChannelMux } from "./relay/channel-mux.js";
 import { RelayClient, type ControlDeliveryOutcome, type RelayClientOptions } from "./relay/relay-client.js";
 import type { RunnerPort } from "./runner-port.js";
 import { NativeRunner, type NativeRunnerOptions } from "./native/runner.js";
-import { ModelCapabilitySnapshotProducer, antigravityOptionBilling, openCodeOptionBilling } from "./native/model-capability-snapshot.js";
+import { ModelCapabilitySnapshotProducer, antigravityOptionBilling, openCodeOptionBilling,
+  type ModelCapabilityDiscoveryStatus } from "./native/model-capability-snapshot.js";
 import { NativeInventoryCollector, machineHasDesktop } from "./native/inventory.js";
 import { windowsInstalledLauncher } from "./native/windows-launcher.js";
 import { antigravityRunnerCapabilities, openCodeRunnerCapabilities, siteLoginRelay } from "./native/site-login.js";
@@ -715,6 +716,7 @@ export class Supervisor {
       // Every installed native agent reports what it offers; one the release
       // signed no mapping for does so under its catalogue authority.
       catalogueAgents: () => this.nativeRunners.map(runner => runner.agentId),
+      onFirstSnapshot: agentId => this.publishCapabilitySnapshotHeartbeat(agentId),
       discover: async (agentId, configId) => {
         const runner = this.nativeRunners.find(candidate => candidate.agentId === agentId);
         if (!runner) throw new RemoteInstanceError("agent_unavailable", "Reviewed model mapping has no installed native runner.");
@@ -1375,35 +1377,53 @@ export class Supervisor {
       cancelAbsentLocalWork: (manifest, decision, assertCurrent) => this.work.cancelAbsentForRecovery(manifest, decision, assertCurrent),
       reports: this.work.reports,
       onLease: (lease, _expiresAt, assertCurrent) => this.adoptLease(lease, assertCurrent),
-      afterEstablishment: async assertCurrent => {
-        if (this.activeLoopPhase === "started") return;
-        assertCurrent();
-        const agents = this.inventory.agents();
-        this.modelCapabilities?.invalidateForAgents(agents);
-        await this.modelCapabilities?.refresh(agents);
-        assertCurrent();
-        if (this.ordinaryHeartbeatStarted) {
-          // A startup retry may follow a completed publisher transition.
-          // Reconciliation is pending again, so the normal utilization gate
-          // remains closed while this publisher restores connectivity.
-          await this.heartbeat.publish();
-          assertCurrent();
-          return;
-        }
-        await this.heartbeat.publishPending();
-        assertCurrent();
-        if (!this.pendingHeartbeatTimer) {
-          this.pendingHeartbeatTimer = setInterval(() => {
-            if (this.stopping || this.activeLoopPhase === "started") return;
-            void this.heartbeat.publishPending().catch(error => this.logger.warn({ err: error }, "pending recovery heartbeat failed"));
-          }, (this.heartbeatIntervalSeconds ?? this.configuration.heartbeatIntervalSeconds) * 1000);
-          this.pendingHeartbeatTimer.unref();
-        }
-      },
+      afterEstablishment: async assertCurrent => this.afterEstablishment(assertCurrent),
       captureLeaseFence: () => this.captureLeaseFence(),
       withLeaseAcquisition: (operation, name) => this.withLeaseAcquisition(operation, name),
     });
 
+  }
+
+  /**
+   * Core accepted this process: open the control path and heartbeat now.
+   * Per-agent model capability discovery starts behind it, bounded by the
+   * producer, so one non-answering agent degrades its own list instead of
+   * holding the computer's startup.
+   */
+  private async afterEstablishment(assertCurrent: () => void): Promise<void> {
+    if (this.activeLoopPhase === "started") return;
+    assertCurrent();
+    const agents = this.inventory.agents();
+    this.modelCapabilities?.invalidateForAgents(agents);
+    void this.modelCapabilities?.refresh(agents).catch(error => this.logger.warn({ err: error }, "native model capability refresh failed"));
+    assertCurrent();
+    if (this.ordinaryHeartbeatStarted) {
+      // A startup retry may follow a completed publisher transition.
+      // Reconciliation is pending again, so the normal utilization gate
+      // remains closed while this publisher restores connectivity.
+      await this.heartbeat.publish();
+      assertCurrent();
+      return;
+    }
+    await this.heartbeat.publishPending();
+    assertCurrent();
+    this.startPendingHeartbeatTimer();
+  }
+
+  private startPendingHeartbeatTimer(): void {
+    if (this.pendingHeartbeatTimer) return;
+    this.pendingHeartbeatTimer = setInterval(() => {
+      if (this.stopping || this.activeLoopPhase === "started") return;
+      void this.heartbeat.publishPending().catch(error => this.logger.warn({ err: error }, "pending recovery heartbeat failed"));
+    }, (this.heartbeatIntervalSeconds ?? this.configuration.heartbeatIntervalSeconds) * 1000);
+    this.pendingHeartbeatTimer.unref();
+  }
+
+  /** One extra heartbeat when an agent's first capability list lands, instead of waiting for the next interval. */
+  private publishCapabilitySnapshotHeartbeat(agentId: string): void {
+    if (this.stopping) return;
+    const publish = this.ordinaryHeartbeatStarted ? this.heartbeat.publish() : this.heartbeat.publishPending();
+    void publish.catch(error => this.logger.debug({ err: error, agentId }, "capability snapshot heartbeat deferred"));
   }
 
   private composeHeartbeat(): void {
@@ -2581,7 +2601,8 @@ export class Supervisor {
       "identity.status": async () => ({ activationId: (await this.store.identity())?.activationId ?? null }),
       agents: () => {
         const agents = this.lastSnapshot?.agents ?? this.inventory.agents();
-        return { agents: [...agents, ...this.leftOutAgents(agents)], roles: this.heartbeat?.roles() ?? [], roleBindings: this.roleBindings };
+        return { agents: [...agents, ...this.leftOutAgents(agents)].map(agent => this.withModelCapabilityDiscovery(agent)),
+          roles: this.heartbeat?.roles() ?? [], roleBindings: this.roleBindings };
       },
       "auth.status": request => ({ agents: (this.lastSnapshot?.agents ?? this.inventory.agents()).filter((agent) => request.agentId === undefined || agent.agentId === request.agentId) }),
       "auth.login": (request, emit) => this.localLogin(request, emit),
@@ -3084,6 +3105,12 @@ export class Supervisor {
       });
   }
 
+  /** The local, non-contract per-agent discovery fact the `agents` op and `doctor` read; absent when nothing was attempted. */
+  private withModelCapabilityDiscovery<T extends { agentId: string }>(agent: T): T & { modelCapabilityDiscovery?: ModelCapabilityDiscoveryStatus } {
+    const discovery = this.modelCapabilities?.discoveryState(agent.agentId);
+    return discovery ? { ...agent, modelCapabilityDiscovery: discovery } : agent;
+  }
+
   /** The agents this installation lists: its runners and the host agents left out at load. */
   private recordedAgentIds(): Set<string> {
     const native = this.options.native;
@@ -3197,7 +3224,7 @@ export class Supervisor {
       reconciliationComplete: this.reconciliation.isComplete,
       ...(this.reconnectRefusal ? { reconciliationRefusal: this.reconnectRefusal } : {}),
       components: snapshot.components,
-      agents: [...snapshot.agents, ...this.leftOutAgents(snapshot.agents)],
+      agents: [...snapshot.agents, ...this.leftOutAgents(snapshot.agents)].map(agent => this.withModelCapabilityDiscovery(agent)),
       // The snapshot may carry the site's "Not added" Google Antigravity view
       // (only after a fresh collect): an update gate must not read it as a failure.
       ...(this.options.native ? { listedAgents: [...this.recordedAgentIds()] } : {}),

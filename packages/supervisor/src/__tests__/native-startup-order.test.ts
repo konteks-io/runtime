@@ -22,6 +22,9 @@ interface StartupInternals {
   administrativeStatus: "active" | "provisioning";
   refreshConfiguration(): Promise<void>;
   openCoreChannels(): void;
+  afterEstablishment(assertCurrent: () => void): Promise<void>;
+  modelCapabilities: unknown;
+  inventory: unknown;
 }
 function fixture() {
   vi.useFakeTimers();
@@ -45,8 +48,10 @@ function fixture() {
   vi.spyOn(supervisor.lease, "isValid").mockReturnValue(true);
   vi.spyOn(supervisor.lease, "mode").mockReturnValue("active");
   const heartbeatStart = vi.fn(async () => { events.push("heartbeat"); });
+  const publishPending = vi.fn(async () => { events.push("pending"); });
+  const publish = vi.fn(async () => { events.push("publish"); });
   supervisor.heartbeat = {
-    start: heartbeatStart, settle: vi.fn(async () => undefined), stop: vi.fn(), roles: vi.fn(() => []),
+    start: heartbeatStart, settle: vi.fn(async () => undefined), stop: vi.fn(), roles: vi.fn(() => []), publishPending, publish,
     // The native liveness watchdog reads these on every tick; a publisher that
     // just attempted is live, so the watchdog never interrupts the ordering.
     liveness: () => ({ running: true, pendingFlight: false, stage: null, inFlightSince: null, lastAttemptAt: Date.now(), lastSettledAt: Date.now() }),
@@ -58,7 +63,7 @@ function fixture() {
   const pull = vi.fn();
   supervisor.work = { reports: { flushAll }, pull } as never;
   supervisor.relay = null;
-  return { supervisor, internal, events, run, heartbeatStart, transportStart, flushAll, pull, record, setComplete: (value: boolean) => { complete = value; } };
+  return { supervisor, internal, events, run, heartbeatStart, publishPending, publish, transportStart, flushAll, pull, record, setComplete: (value: boolean) => { complete = value; } };
 }
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); });
 
@@ -85,6 +90,39 @@ it("establishes accepted recovery before ordinary heartbeat, transport, replay a
   expect(f.events).toEqual(["recovery", "configuration", "heartbeat", "transport", "replay", "reports"]);
   await vi.advanceTimersByTimeAsync(5000);
   expect(f.pull).toHaveBeenCalledOnce();
+});
+
+it("starts the control loop while one agent bridge never answers initialize (bridge did not answer init)", async () => {
+  const f = fixture();
+  // One agent's read never settles, exactly as a bridge that never answers
+  // ACP initialize would hold the old establishment path forever.
+  const never = new Promise<void>(() => undefined);
+  const refresh = vi.fn(() => never);
+  f.internal.inventory = { agents: () => [] };
+  f.internal.administrativeStatus = "active";
+  f.internal.modelCapabilities = { invalidateForAgents: vi.fn(), refresh, snapshots: () => [] };
+  // Reconciliation awaits afterEstablishment exactly as the real one does.
+  f.run.mockImplementation(async () => {
+    await f.internal.afterEstablishment(() => undefined);
+    f.events.push("recovery");
+    f.setComplete(true);
+  });
+  let settled = false;
+  const startup = f.internal.startActiveLoop().then(() => { settled = true; });
+  await vi.advanceTimersByTimeAsync(50);
+  expect(settled).toBe(true);
+  await startup;
+  expect(refresh).toHaveBeenCalledOnce();
+  // The control/relay path opens and the normal heartbeat starts without that answer.
+  expect(f.publishPending).toHaveBeenCalledOnce();
+  expect(f.heartbeatStart).toHaveBeenCalledOnce();
+  expect(f.transportStart).toHaveBeenCalledOnce();
+  expect(f.internal.activeLoopPhase).toBe("started");
+  expect(f.supervisor.status().administrativeStatus).toBe("active");
+  // The control path answers while that agent's read is still unanswered.
+  const answer = await f.supervisor.controlHandler()({ op: "recovery.status" } as never,
+    { event: () => undefined, signal: new AbortController().signal });
+  expect(answer).toMatchObject({ completed: true });
 });
 
 it("coalesces concurrent startup and does not repeat initialization after acceptance", async () => {
