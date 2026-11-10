@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ConnectorAvailabilitySchema } from "@konteks/remote-common";
-import { connectorAvailability, heartbeatSignal, livenessSignal, relaySignal, type AvailabilityFacts } from "../reconnect/availability.js";
+import { connectorAvailability, availabilityForHeartbeat, heartbeatSignal, livenessSignal, relaySignal, type AvailabilityFacts } from "../reconnect/availability.js";
 import { STARTUP_RECOVERY_BOUND_MS, STARTUP_RECOVERY_RETRY_MS, StartupRecoveryBound } from "../reconnect/startup-recovery-bound.js";
 
 const NOW = Date.parse("2026-11-09T12:00:00.000Z");
@@ -95,6 +95,42 @@ describe("the connector's availability report", () => {
     expect(report.liveness).toEqual({ state: "live", quietMs: 0 });
     expect(report.heartbeat.state).toBe("stalled");
     expect(report.relay).toEqual({ state: "disconnected", lastConnectedAt: "2026-11-09T11:00:00.000Z" });
+  });
+
+  it("reports the relay as the degraded reason while it is disconnected, and stays available on the working fallback", () => {
+    const disconnected = connectorAvailability(facts({ acceptingWork: false, relay: { state: "disconnected", lastConnectedAt: "2026-11-04T13:36:06.000Z" } }));
+    expect(disconnected).toMatchObject({ available: false, phase: "degraded", reason: { code: "relay_disconnected" }, expectedReturn: { kind: "unknown" } });
+    expect(disconnected.reason?.message).toContain("since 2026-11-04T13:36:06.000Z");
+    expect(ConnectorAvailabilitySchema.safeParse(disconnected).success).toBe(true);
+
+    const noRelay = connectorAvailability(facts({ acceptingWork: false, relay: { state: "unknown", lastConnectedAt: null } }));
+    expect(noRelay).toMatchObject({ available: false, phase: "degraded", reason: { code: "relay_disconnected" } });
+
+    // The HTTPS fallback is a working transport, so it does not degrade the connector.
+    const fallback = connectorAvailability(facts({ relay: { state: "https_fallback", lastConnectedAt: null } }));
+    expect(fallback).toMatchObject({ available: true, phase: null, reason: null });
+  });
+});
+
+describe("the availability block on the heartbeat wire", () => {
+  it("sends no block for an available connector, and maps the local relay code to a degraded component", () => {
+    expect(availabilityForHeartbeat(connectorAvailability(facts()))).toBeUndefined();
+    const relay = connectorAvailability(facts({ acceptingWork: false, relay: { state: "disconnected", lastConnectedAt: "2026-11-04T13:36:06.000Z" } }));
+    expect(availabilityForHeartbeat(relay)).toMatchObject({
+      phase: "degraded",
+      reason: { code: "component_unhealthy" },
+      expectedReturn: { kind: "unknown" },
+    });
+    expect(availabilityForHeartbeat(relay)?.reason.message).toContain("the relay is disconnected since");
+  });
+
+  it("passes every other local code and the expected return through unchanged", () => {
+    const report = connectorAvailability(facts({ leaseMode: "none", acceptingWork: false }));
+    expect(availabilityForHeartbeat(report)).toEqual({
+      phase: "degraded",
+      reason: { code: "lease_unavailable", message: expect.any(String) },
+      expectedReturn: report.expectedReturn,
+    });
   });
 });
 

@@ -66,6 +66,43 @@ describe("signed HTTPS heartbeat lifecycle", () => {
     expect(message.components).toEqual(snapshot.components);
     expect(message.utilization).toMatchObject({ activeSessions: 2, activeTurns: 1 });
   });
+  it("carries the availability block the option supplies, and leaves it out when the option returns undefined", async () => {
+    const f = await fixture();
+    const supplied = {
+      phase: "degraded" as const,
+      reason: { code: "component_unhealthy" as const, message: "the relay is disconnected" },
+      expectedReturn: { kind: "unknown" as const, why: "the relay retries with backoff" },
+    };
+    const withAvailability = new HeartbeatPublisher({
+      ...f.options, runnerIncarnation: () => "process", availability: () => supplied,
+    } as HeartbeatOptions);
+    publishers.push(withAvailability);
+    await withAvailability.start();
+    expect((await withAvailability.publish()).availability).toEqual(supplied);
+
+    const withoutAvailability = new HeartbeatPublisher({
+      ...f.options, runnerIncarnation: () => "process", availability: () => undefined,
+    } as HeartbeatOptions);
+    publishers.push(withoutAvailability);
+    await withoutAvailability.start();
+    expect(await withoutAvailability.publish()).not.toHaveProperty("availability");
+  });
+  it("warns without failing the heartbeat when availability cannot be derived", async () => {
+    const f = await fixture();
+    const warn = vi.fn();
+    const publisher = new HeartbeatPublisher({
+      ...f.options, runnerIncarnation: () => "process", logger: { warn } as never,
+      availability: () => {
+        throw new Error("availability derivation failed");
+      },
+    } as HeartbeatOptions);
+    publishers.push(publisher);
+    await publisher.start();
+    const message = await publisher.publish();
+    expect(message.instanceId).toBe("instance");
+    expect(message).not.toHaveProperty("availability");
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({ err: expect.any(Error) }), "availability not reported on this heartbeat");
+  });
   it.each(["ownership_changed", "stopped"] as const)(
     "does not publish collected inventory after %s",
     async (reason) => {

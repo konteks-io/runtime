@@ -391,12 +391,65 @@ describe("native Supervisor composition", () => {
     const f = await fixture(), supervisor = new Supervisor(f.config, f.options); supervisors.push(supervisor); await supervisor.start();
     vi.useFakeTimers();
     const deadline = new Date(Date.now() + 30000).toISOString(), drain = vi.spyOn(supervisor.work, "drainSessions").mockResolvedValue(undefined);
+    // This fixture has no relay; a connected one is what makes the connector ready for work.
+    supervisor.relay = { status: () => ({ state: "connected", lastConnectedAt: null }) } as never;
     const heartbeat = vi.spyOn(supervisor.core, "heartbeat").mockResolvedValue(heartbeatLease("drain_only", "draining", deadline));
     await supervisor.heartbeat.start(); await supervisor.heartbeat.publish();
     expect(supervisor.lease.current()?.drainDeadline).toBe(deadline); expect(supervisor.status().utilization.acceptingWork).toBe(false);
     heartbeat.mockResolvedValue(heartbeatLease()); await supervisor.heartbeat.publish();
     expect(supervisor.status().administrativeStatus).toBe("active"); expect(supervisor.status().utilization.acceptingWork).toBe(true);
     supervisor.heartbeat.stop(); await vi.advanceTimersByTimeAsync(30001); expect(drain).not.toHaveBeenCalled();
+  });
+  it("reports acceptingWork false and names the relay while it is disconnected, even with a fresh heartbeat", async () => {
+    // The 2026-11-04 state: the process is up and its heartbeat is fresh, but
+    // the relay is closed, so this computer cannot take work.
+    const f = await fixture(), supervisor = new Supervisor(f.config, f.options); supervisors.push(supervisor); await supervisor.start();
+    (supervisor as unknown as { activeLoopPhase: string }).activeLoopPhase = "started";
+    supervisor.relay = { status: () => ({ state: "offline", lastConnectedAt: "2026-11-04T13:36:06.000Z", consecutiveFailures: 0 }) } as never;
+    // A configured relay that has not failed over is the active carrier, and it cannot send.
+    supervisor.transport = { kind: "relay", available: false, stop: vi.fn() } as never;
+    vi.spyOn(supervisor.core, "heartbeat").mockResolvedValue(heartbeatLease());
+    await supervisor.heartbeat.start();
+    const message = await supervisor.heartbeat.publish();
+    expect(message.utilization.acceptingWork).toBe(false);
+    expect(supervisor.status().utilization.acceptingWork).toBe(false);
+    const availability = await supervisor.controlHandler()({ op: "availability.status" } as never, { event: () => undefined } as never);
+    expect(availability).toMatchObject({ available: false, phase: "degraded", reason: { code: "relay_disconnected" } });
+    expect((availability as { reason: { message: string } }).reason.message).toContain("the relay is disconnected since 2026-11-04T13:36:06.000Z");
+  });
+  it("keeps the HTTPS fallback ready to take work once the relay has failed over", async () => {
+    const f = await fixture(), supervisor = new Supervisor(f.config, f.options); supervisors.push(supervisor); await supervisor.start();
+    (supervisor as unknown as { activeLoopPhase: string }).activeLoopPhase = "started";
+    supervisor.relay = { status: () => ({ state: "reconnecting", lastConnectedAt: null }) } as never;
+    // The transport manager has failed over: its active carrier is HTTPS.
+    supervisor.transport = { available: true, kind: "https", stop: vi.fn() } as never;
+    vi.spyOn(supervisor.core, "heartbeat").mockResolvedValue(heartbeatLease());
+    await supervisor.heartbeat.start(); await supervisor.heartbeat.publish();
+    expect(supervisor.status().utilization.acceptingWork).toBe(true);
+    expect(supervisor.availabilityStatus()).toMatchObject({ available: true, phase: null, relay: { state: "https_fallback" } });
+  });
+  it("sends availability only to a Core at contract 7.17, and maps the local relay code onto the wire", async () => {
+    const f = await fixture(), supervisor = new Supervisor(f.config, f.options); supervisors.push(supervisor); await supervisor.start();
+    (supervisor as unknown as { activeLoopPhase: string }).activeLoopPhase = "started";
+    supervisor.relay = { status: () => ({ state: "offline", lastConnectedAt: null, consecutiveFailures: 0 }) } as never;
+    // A configured relay that has not failed over is the active carrier, and it cannot send.
+    supervisor.transport = { kind: "relay", available: false, stop: vi.fn() } as never;
+    vi.spyOn(supervisor.core, "heartbeat").mockResolvedValue(heartbeatLease());
+    await supervisor.heartbeat.start();
+    const internal = supervisor as unknown as { coreContractVersion: string | undefined };
+    internal.coreContractVersion = "7.16";
+    const older = await supervisor.heartbeat.publish();
+    expect(older).not.toHaveProperty("availability");
+    internal.coreContractVersion = "7.17";
+    const current = await supervisor.heartbeat.publish();
+    expect(current.availability).toMatchObject({
+      phase: "degraded",
+      reason: { code: "component_unhealthy", message: expect.stringContaining("the relay is disconnected") },
+      expectedReturn: { kind: "unknown" },
+    });
+    // The local report keeps the relay code even though the wire cannot carry it.
+    const availability = await supervisor.controlHandler()({ op: "availability.status" } as never, { event: () => undefined } as never);
+    expect(availability).toMatchObject({ reason: { code: "relay_disconnected" } });
   });
   it("does not let an older reconnect response undo a heartbeat suspension", async () => {
     const f = await fixture(), supervisor = new Supervisor(f.config, f.options); supervisors.push(supervisor); await supervisor.start();
@@ -448,6 +501,8 @@ describe("native Supervisor composition", () => {
   it("renews during slow cancellation but does not admit new work before cleanup settles", async () => {
     const f = await fixture(), supervisor = new Supervisor(f.config, f.options); supervisors.push(supervisor); await supervisor.start();
     const cleanup = Promise.withResolvers<void>();
+    // This fixture has no relay; a connected one is what makes the connector ready for work.
+    supervisor.relay = { status: () => ({ state: "connected", lastConnectedAt: null }) } as never;
     const drain = vi.spyOn(supervisor.work, "drainSessions").mockImplementationOnce(() => cleanup.promise);
     vi.spyOn(supervisor.core, "heartbeat").mockRejectedValueOnce(new RemoteInstanceError("instance_suspended", "suspended")).mockResolvedValue(heartbeatLease());
     await supervisor.heartbeat.start();

@@ -56,6 +56,7 @@ import {
   type RuntimeAgentLoginDeliveryRequest,
   type RuntimeAssignmentAvailableDeliveryRequest,
   coreContractAtLeast,
+  REMOTE_CONNECTOR_AVAILABILITY_MIN_CORE_CONTRACT_VERSION,
   REMOTE_PREVIEW_APP_CREDENTIALS_MIN_CORE_CONTRACT_VERSION,
   REMOTE_PREVIEW_ACTIVITY_MIN_CORE_CONTRACT_VERSION,
 } from "@konteks/remote-common";
@@ -98,7 +99,7 @@ import type { SessionPreviewAccess } from "./preview/mcp-server.js";
 import { finishActivationAttempt, provisioningCredentialIsExpired, refreshProvisioningCredential, submitReadiness } from "./provisioning/activation.js";
 import { Reconciliation } from "./reconnect/reconciliation.js";
 import { StartupPhases, type StartupPhase as TimedStartupPhase } from "./reconnect/startup-phases.js";
-import { heartbeatSignal, livenessSignal, relaySignal, connectorAvailability } from "./reconnect/availability.js";
+import { heartbeatSignal, livenessSignal, relaySignal, connectorAvailability, availabilityForHeartbeat } from "./reconnect/availability.js";
 import { STARTUP_RECOVERY_BOUND_MS, STARTUP_RECOVERY_RETRY_MS, StartupRecoveryBound, type StartupPhase } from "./reconnect/startup-recovery-bound.js";
 import { ChannelMux } from "./relay/channel-mux.js";
 import { RelayClient, type ControlDeliveryOutcome, type RelayClientOptions } from "./relay/relay-client.js";
@@ -1484,10 +1485,11 @@ export class Supervisor {
       connectorCommands: () =>
         this.hostSettings.coreAcceptsRouteBilling ? this.connectorCommands() : undefined,
       previews: () => this.agentPreviewActivity(),
+      availability: () => this.heartbeatAvailability(),
       configRevision: () => this.control.configRevision,
       bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION,
       softMaxConcurrent: () => this.configuration.softMaxConcurrent ?? this.config.SUPERVISOR_SOFT_MAX_CONCURRENT,
-      acceptingWork: () => !this.draining && !this.onUpdateProbation && this.lease.canPullNewWork() && this.reconciliation.isComplete,
+      acceptingWork: () => this.acceptingWork() && this.reconciliation.isComplete,
       intervalSeconds: () => this.heartbeatIntervalSeconds ?? this.configuration.heartbeatIntervalSeconds,
       renewalDelayMs: () => (this.lease.current() ? this.lease.nextRenewalDelayMs() : 5000),
     });
@@ -1497,6 +1499,12 @@ export class Supervisor {
   private agentPreviewActivity(): AgentPreviewActivity[] | undefined {
     if (!coreContractAtLeast(this.coreContractVersion, REMOTE_PREVIEW_ACTIVITY_MIN_CORE_CONTRACT_VERSION)) return undefined;
     return this.previews.agentActive(PREVIEW_AGENT_ACTIVE_WINDOW_MS);
+  }
+
+  /** The availability report on the wire, only to a Core that reads it (an older Core refuses the whole heartbeat). */
+  private heartbeatAvailability(): ReturnType<typeof availabilityForHeartbeat> {
+    if (!coreContractAtLeast(this.coreContractVersion, REMOTE_CONNECTOR_AVAILABILITY_MIN_CORE_CONTRACT_VERSION)) return undefined;
+    return availabilityForHeartbeat(this.availabilityStatus());
   }
 
   private async startLocalAgents(native: NativeOptions): Promise<void> {
@@ -2638,7 +2646,6 @@ export class Supervisor {
     const now = Date.now();
     const recovery = this.startupRecovery.report(now);
     const liveness = this.heartbeatLiveness(now);
-    const connectivity = this.connectivityStatus();
     const drain = this.drainStatus();
     return connectorAvailability({
       now,
@@ -2650,7 +2657,16 @@ export class Supervisor {
       acceptingWork: this.utilizationStatus().acceptingWork,
       liveness: livenessSignal(liveness.verdict, liveness.quietMs),
       heartbeat: heartbeatSignal(liveness.liveness, liveness.budgetMs, now),
-      relay: relaySignal({ connected: connectivity.relayConnected, transport: connectivity.transport, configured: this.relay !== null && this.relay !== undefined, lastConnectedAt: connectivity.lastConnectedAt }),
+      relay: this.connectorRelaySignal(),
+    });
+  }
+
+  /** The relay answer both the local report and the work gate read. */
+  private connectorRelaySignal(): ReturnType<typeof relaySignal> {
+    const connectivity = this.connectivityStatus();
+    return relaySignal({
+      connected: connectivity.relayConnected, transport: connectivity.transport,
+      configured: this.relay !== null && this.relay !== undefined, lastConnectedAt: connectivity.lastConnectedAt,
     });
   }
 
@@ -2662,7 +2678,10 @@ export class Supervisor {
 
   private transportState(relayConnected: boolean): SupervisorStatus["connectivity"]["transport"] {
     if (relayConnected) return "relay";
-    return this.transport?.available ? "https_fallback" : "offline";
+    // The transport manager owns which carrier is active and whether it can
+    // send; this only names that carrier. A configured relay that has not
+    // failed over is the active carrier and is unavailable, so it is offline.
+    return this.transport?.kind === "https" && this.transport.available ? "https_fallback" : "offline";
   }
 
   private leaseStatus(): SupervisorStatus["lease"] {
@@ -2677,8 +2696,28 @@ export class Supervisor {
   }
 
   private utilizationStatus(): SupervisorStatus["utilization"] {
-    return { acceptingWork: !this.draining && !this.onUpdateProbation && this.lease.canPullNewWork(), ...snapshotLoad(this.lastSnapshot),
+    return { acceptingWork: this.acceptingWork(), ...snapshotLoad(this.lastSnapshot),
       ...(this.configuration.softMaxConcurrent === undefined ? {} : { softMaxConcurrent: this.configuration.softMaxConcurrent }) };
+  }
+
+  /**
+   * Whether this connector can take work right now.
+   *
+   * `connected` is per-socket evidence: RelayClient publishes it only after
+   * `validateRelayHandshake` proved the current accepted recovery receipt, and
+   * `onStateChange` drops it when that socket closes. That is why this never
+   * reads `reconciliation.isComplete`, which survives a relay drop. The HTTPS
+   * fallback counts as connected: it is the working carrier hosts behind an
+   * HTTPS proxy take work with.
+   */
+  private relayReadyForWork(): boolean {
+    const signal = this.connectorRelaySignal();
+    return signal.state === "connected" || signal.state === "https_fallback";
+  }
+
+  /** The one local answer both the heartbeat option and `utilizationStatus` read. */
+  private acceptingWork(): boolean {
+    return !this.draining && !this.onUpdateProbation && this.lease.canPullNewWork() && this.relayReadyForWork();
   }
 
   controlHandler(): ControlHandler {

@@ -50,7 +50,7 @@
     "@konteks/backstage-plugin-common": "file:../packages/packages/backstage-plugin-common"
   },
   "konteksContracts": {
-    "@konteks/agent-core": "7.28.0",
-    "@konteks/backstage-plugin-common": "7.28.0"
+    "@konteks/agent-core": "7.30.1",
+    "@konteks/backstage-plugin-common": "7.30.1"
   }
 }
