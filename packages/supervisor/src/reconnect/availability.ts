@@ -57,7 +57,7 @@ export function connectorAvailability(facts: AvailabilityFacts): ConnectorAvaila
 /**
  * The local report as the shared heartbeat's optional `availability` block.
  *
- * The shared 7.30.1 wire enum has no relay code, so the local-only
+ * The shared 7.31.0 wire enum has no relay code, so the local-only
  * `relay_disconnected` goes out as a degraded `component_unhealthy` that names
  * the relay; a dedicated wire code follows later through the contract gate.
  * An available connector sends no block at all: the shared block requires a

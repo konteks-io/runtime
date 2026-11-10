@@ -656,7 +656,7 @@ export const ConnectorUnavailabilityReasonSchema = z
       "update_probation",
       "component_unhealthy",
       "lease_unavailable",
-      // Local to `availability.status`: the shared 7.30.1 wire enum has no
+      // Local to `availability.status`: the shared 7.31.0 wire enum has no
       // relay code, so the heartbeat maps this one onto `component_unhealthy`.
       "relay_disconnected",
       "liveness_lost",
