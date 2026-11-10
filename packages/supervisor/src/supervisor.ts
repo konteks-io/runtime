@@ -170,8 +170,6 @@ const PREVIEW_VIEWER_RETRY_MS = 60_000;
 const PREVIEW_AGENT_ACTIVE_WINDOW_MS = 3 * 60_000;
 /** A preview a person's viewer used this recently outlives its session's release (D214). */
 const PREVIEW_VIEWER_KEEP_MS = 10 * 60_000;
-/** Relay failures before the transport manager hands work to the HTTPS fallback. */
-const RELAY_FALLBACK_FAILURES = 3;
 
 /** bb releases sessions idle for 30 minutes, checked every 5 minutes. */
 /**
@@ -1111,7 +1109,7 @@ export class Supervisor {
     });
     let relayHandler: ((message: InboundMessage) => void | Promise<void>) | null = null;
     const relayTransport = this.relay ? new RelayTransport(this.relay, this.mux, { setHandler: (handler) => (relayHandler = handler) }) : null;
-    this.transport = new TransportManager(relayTransport, https, RELAY_FALLBACK_FAILURES, () => {
+    this.transport = new TransportManager(relayTransport, https, 3, () => {
       const status = this.relay?.status();
       return { consecutiveFailures: status?.consecutiveFailures ?? 0, connected: status?.state === "connected" };
     });
@@ -2648,7 +2646,6 @@ export class Supervisor {
     const now = Date.now();
     const recovery = this.startupRecovery.report(now);
     const liveness = this.heartbeatLiveness(now);
-    const connectivity = this.connectivityStatus();
     const drain = this.drainStatus();
     return connectorAvailability({
       now,
@@ -2660,7 +2657,16 @@ export class Supervisor {
       acceptingWork: this.utilizationStatus().acceptingWork,
       liveness: livenessSignal(liveness.verdict, liveness.quietMs),
       heartbeat: heartbeatSignal(liveness.liveness, liveness.budgetMs, now),
-      relay: relaySignal({ connected: connectivity.relayConnected, transport: connectivity.transport, configured: this.relay !== null && this.relay !== undefined, lastConnectedAt: connectivity.lastConnectedAt }),
+      relay: this.connectorRelaySignal(),
+    });
+  }
+
+  /** The relay answer both the local report and the work gate read. */
+  private connectorRelaySignal(): ReturnType<typeof relaySignal> {
+    const connectivity = this.connectivityStatus();
+    return relaySignal({
+      connected: connectivity.relayConnected, transport: connectivity.transport,
+      configured: this.relay !== null && this.relay !== undefined, lastConnectedAt: connectivity.lastConnectedAt,
     });
   }
 
@@ -2672,12 +2678,10 @@ export class Supervisor {
 
   private transportState(relayConnected: boolean): SupervisorStatus["connectivity"]["transport"] {
     if (relayConnected) return "relay";
-    if (!this.transport?.available) return "offline";
-    // A configured relay is only on the HTTPS fallback once the transport
-    // manager has actually failed over; a working HTTPS carrier beside a
-    // relay that has not given up yet is not the fallback.
-    if (this.relay === null || this.relay === undefined) return "https_fallback";
-    return (this.relay.status().consecutiveFailures ?? 0) >= RELAY_FALLBACK_FAILURES ? "https_fallback" : "offline";
+    // The transport manager owns which carrier is active and whether it can
+    // send; this only names that carrier. A configured relay that has not
+    // failed over is the active carrier and is unavailable, so it is offline.
+    return this.transport?.kind === "https" && this.transport.available ? "https_fallback" : "offline";
   }
 
   private leaseStatus(): SupervisorStatus["lease"] {
@@ -2707,11 +2711,7 @@ export class Supervisor {
    * HTTPS proxy take work with.
    */
   private relayReadyForWork(): boolean {
-    const connectivity = this.connectivityStatus();
-    const signal = relaySignal({
-      connected: connectivity.relayConnected, transport: connectivity.transport,
-      configured: this.relay !== null && this.relay !== undefined, lastConnectedAt: connectivity.lastConnectedAt,
-    });
+    const signal = this.connectorRelaySignal();
     return signal.state === "connected" || signal.state === "https_fallback";
   }
 

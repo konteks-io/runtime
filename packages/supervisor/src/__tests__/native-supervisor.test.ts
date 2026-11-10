@@ -406,6 +406,8 @@ describe("native Supervisor composition", () => {
     const f = await fixture(), supervisor = new Supervisor(f.config, f.options); supervisors.push(supervisor); await supervisor.start();
     (supervisor as unknown as { activeLoopPhase: string }).activeLoopPhase = "started";
     supervisor.relay = { status: () => ({ state: "offline", lastConnectedAt: "2026-11-04T13:36:06.000Z", consecutiveFailures: 0 }) } as never;
+    // A configured relay that has not failed over is the active carrier, and it cannot send.
+    supervisor.transport = { kind: "relay", available: false, stop: vi.fn() } as never;
     vi.spyOn(supervisor.core, "heartbeat").mockResolvedValue(heartbeatLease());
     await supervisor.heartbeat.start();
     const message = await supervisor.heartbeat.publish();
@@ -418,7 +420,8 @@ describe("native Supervisor composition", () => {
   it("keeps the HTTPS fallback ready to take work once the relay has failed over", async () => {
     const f = await fixture(), supervisor = new Supervisor(f.config, f.options); supervisors.push(supervisor); await supervisor.start();
     (supervisor as unknown as { activeLoopPhase: string }).activeLoopPhase = "started";
-    supervisor.relay = { status: () => ({ state: "reconnecting", lastConnectedAt: null, consecutiveFailures: 3 }) } as never;
+    supervisor.relay = { status: () => ({ state: "reconnecting", lastConnectedAt: null }) } as never;
+    // The transport manager has failed over: its active carrier is HTTPS.
     supervisor.transport = { available: true, kind: "https", stop: vi.fn() } as never;
     vi.spyOn(supervisor.core, "heartbeat").mockResolvedValue(heartbeatLease());
     await supervisor.heartbeat.start(); await supervisor.heartbeat.publish();
@@ -429,6 +432,8 @@ describe("native Supervisor composition", () => {
     const f = await fixture(), supervisor = new Supervisor(f.config, f.options); supervisors.push(supervisor); await supervisor.start();
     (supervisor as unknown as { activeLoopPhase: string }).activeLoopPhase = "started";
     supervisor.relay = { status: () => ({ state: "offline", lastConnectedAt: null, consecutiveFailures: 0 }) } as never;
+    // A configured relay that has not failed over is the active carrier, and it cannot send.
+    supervisor.transport = { kind: "relay", available: false, stop: vi.fn() } as never;
     vi.spyOn(supervisor.core, "heartbeat").mockResolvedValue(heartbeatLease());
     await supervisor.heartbeat.start();
     const internal = supervisor as unknown as { coreContractVersion: string | undefined };
