@@ -227,6 +227,9 @@ export {
   coreContractAtLeast,
   // The first contract whose Core reads a heartbeat's `previews`.
   REMOTE_PREVIEW_ACTIVITY_MIN_CORE_CONTRACT_VERSION,
+  // The first contract whose Core reads a heartbeat's `availability`; an
+  // older Core refuses the whole heartbeat on the unknown field.
+  REMOTE_CONNECTOR_AVAILABILITY_MIN_CORE_CONTRACT_VERSION,
   RemoteExecutionRevisionControlIntentSchema,
   computeExecutionRevisionControlIntentDigest,
   RemoteExecutionRevisionControlDeliveryRequestSchema,

@@ -47,6 +47,13 @@ export interface HeartbeatOptions {
    * field out (a Core below 7.8). Never throws the heartbeat away.
    */
   previews?: () => HeartbeatMessage["previews"];
+  /**
+   * The connector's own availability: the phase, the structured reason it
+   * cannot take work and when it expects to; undefined to leave the field out
+   * (a Core below 7.17 refuses the whole heartbeat on the unknown field).
+   * Never throws the heartbeat away.
+   */
+  availability?: () => HeartbeatMessage["availability"];
   configRevision: () => number;
   bundleVersion: string;
   softMaxConcurrent: () => number | undefined;
@@ -234,6 +241,7 @@ export class HeartbeatPublisher {
     const supportedAgents = this.supportedAgents(snapshot.agents);
     const commands = this.unsentConnectorCommands(runnerIncarnation);
     const previews = this.previews();
+    const availability = this.availability();
     this.stage = "sequence";
     const sequence = await this.options.store.allocateHeartbeatSequence();
     assertCurrent();
@@ -250,7 +258,7 @@ export class HeartbeatPublisher {
       activeAssignmentIds: this.options.activeAssignmentIds().slice(0, 256),
       configRevision: this.options.configRevision(),
       bundleVersion: this.options.bundleVersion,
-      ...this.optionalReports(supportedAgents, commands.manifest, previews),
+      ...this.optionalReports(supportedAgents, commands.manifest, previews, availability),
     });
     // The wire carries a top-level `signature` and no `proof` envelope, but the
     // bytes signed are the instance proof's: binding the audience, the
@@ -310,6 +318,15 @@ export class HeartbeatPublisher {
     }
   }
 
+  private availability(): HeartbeatMessage["availability"] {
+    try {
+      return this.options.availability?.();
+    } catch (error) {
+      this.logger.warn({ err: error }, "availability not reported on this heartbeat");
+      return undefined;
+    }
+  }
+
   /** The connector commands when this incarnation has not sent them yet, with the key that records them as sent. */
   private unsentConnectorCommands(runnerIncarnation: string): { manifest?: ConnectorCommandsManifest; key: string | null } {
     try {
@@ -323,11 +340,12 @@ export class HeartbeatPublisher {
   }
 
   private optionalReports(supportedAgents: readonly SupportedAgentEntry[] | undefined, connectorCommands: ConnectorCommandsManifest | undefined,
-    previews: HeartbeatMessage["previews"]): Record<string, unknown> {
+    previews: HeartbeatMessage["previews"], availability: HeartbeatMessage["availability"]): Record<string, unknown> {
     return {
       ...(this.options.modelCapabilitySnapshots ? { modelCapabilitySnapshots: this.options.modelCapabilitySnapshots() } : {}),
       ...(supportedAgents ? { supportedAgents } : {}),
       ...(connectorCommands ? { connectorCommands } : {}),
       ...(previews ? { previews } : {}),
+      ...(availability ? { availability } : {}),
     };
   }}

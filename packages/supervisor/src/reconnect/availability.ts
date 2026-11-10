@@ -6,6 +6,7 @@ import type {
   ConnectorLivenessSignal,
   ConnectorRelaySignal,
   ConnectorUnavailabilityReason,
+  HeartbeatMessage,
 } from "@konteks/remote-common";
 import type { HeartbeatLiveness } from "../heartbeat/heartbeat.js";
 import { STARTUP_RECOVERY_BOUND_MS, STARTUP_RECOVERY_RETRY_MS, type StartupPhase } from "./startup-recovery-bound.js";
@@ -53,6 +54,32 @@ export function connectorAvailability(facts: AvailabilityFacts): ConnectorAvaila
   };
 }
 
+/**
+ * The local report as the shared heartbeat's optional `availability` block.
+ *
+ * The shared 7.30.1 wire enum has no relay code, so the local-only
+ * `relay_disconnected` goes out as a degraded `component_unhealthy` that names
+ * the relay; a dedicated wire code follows later through the contract gate.
+ * An available connector sends no block at all: the shared block requires a
+ * phase and a reason whenever it is present, and the heartbeat's own
+ * `utilization.acceptingWork` already says it can take work.
+ */
+export function availabilityForHeartbeat(report: ConnectorAvailability): NonNullable<HeartbeatMessage["availability"]> | undefined {
+  if (report.available || report.phase === null || report.reason === null) return undefined;
+  if (report.reason.code === "relay_disconnected") {
+    return {
+      phase: "degraded",
+      reason: { code: "component_unhealthy", message: report.reason.message },
+      expectedReturn: report.expectedReturn,
+    };
+  }
+  return {
+    phase: report.phase,
+    reason: { code: report.reason.code, message: report.reason.message },
+    expectedReturn: report.expectedReturn,
+  };
+}
+
 function unavailablePhase(facts: AvailabilityFacts): ConnectorAvailabilityPhase | null {
   if (facts.liveness.state === "lost") return "liveness_lost";
   if (facts.drain.active) return "draining";
@@ -88,6 +115,12 @@ function drainReason(facts: AvailabilityFacts): ConnectorUnavailabilityReason {
 }
 
 function degradedReason(facts: AvailabilityFacts): ConnectorUnavailabilityReason | null {
+  // The relay comes first deliberately: without it no work can reach this
+  // computer, so it is the answer a person needs even when an update
+  // probation or a lease would otherwise also be true. A working HTTPS
+  // fallback is `https_fallback`, not `disconnected`/`unknown`, so it stays
+  // ready to take work.
+  if (facts.relay.state === "disconnected" || facts.relay.state === "unknown") return relayReason(facts.relay);
   if (facts.updateProbation) return { code: "update_probation", message: "an update is still checking this release, so it takes no new work" };
   if (facts.unhealthyComponents.length > 0) {
     return { code: "component_unhealthy", message: `these parts are not healthy: ${facts.unhealthyComponents.join(", ")}` };
@@ -95,6 +128,15 @@ function degradedReason(facts: AvailabilityFacts): ConnectorUnavailabilityReason
   if (facts.leaseMode === "drain_only") return { code: "lease_unavailable", message: "its lease is drain only, so it takes no new work" };
   if (facts.leaseMode === "none") return { code: "lease_unavailable", message: "it has no lease, so it can take no work" };
   return null;
+}
+
+/** The local relay reason. `relay_disconnected` never goes on the wire. */
+function relayReason(relay: ConnectorRelaySignal): ConnectorUnavailabilityReason {
+  if (relay.state === "unknown") {
+    return { code: "relay_disconnected", message: "no relay is configured, so no relay can deliver work to it" };
+  }
+  const since = relay.lastConnectedAt === null ? "" : ` since ${relay.lastConnectedAt}`;
+  return { code: "relay_disconnected", message: `the relay is disconnected${since}, so it cannot take work` };
 }
 
 function expectedReturnFor(phase: ConnectorAvailabilityPhase, facts: AvailabilityFacts): ConnectorExpectedReturn {
@@ -119,6 +161,9 @@ function drainReturn(deadline: string | null): ConnectorExpectedReturn {
 }
 
 function degradedUnknownWhy(facts: AvailabilityFacts): string {
+  if (facts.relay.state === "disconnected" || facts.relay.state === "unknown") {
+    return "the relay retries with backoff and has no fixed return; it is ready once its socket and handshake are current";
+  }
   if (facts.updateProbation) return "an update probation has no fixed end; it ends when the update check keeps or rolls back this release";
   if (facts.unhealthyComponents.length > 0) return "no return time is known for an unhealthy component";
   return "its lease promises no renewal time";
