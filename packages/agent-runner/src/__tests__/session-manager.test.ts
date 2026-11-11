@@ -709,6 +709,24 @@ describe("session manager bootstrap", () => {
     }), expect.stringContaining("assignment retry"));
   });
 
+  it("says when a session bootstrap used its whole budget, and when one starts again", async () => {
+    const never = new Promise<never>(() => undefined);
+    let hang = true;
+    const { bridge } = fakeBridge({ newSession: vi.fn(async () => hang ? never : { sessionId: "bridge-s2" }) });
+    const onBootstrapExhausted = vi.fn(), onBootstrapSucceeded = vi.fn();
+    const manager = new SessionManager({
+      bridge: () => bridge, events: new RunnerEventBus(), refStore: new InMemorySessionRefStore(), bootstrapTimeoutMs: 5,
+      onBootstrapExhausted, onBootstrapSucceeded, logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn() } as unknown as Logger,
+    });
+    await expect(manager.create({ context, cwd: "/w", mcpServers: [] })).rejects.toMatchObject({ code: "agent_unavailable" });
+    expect(onBootstrapExhausted).toHaveBeenCalledOnce();
+    expect(onBootstrapSucceeded).not.toHaveBeenCalled();
+    hang = false;
+    Object.defineProperty(bridge, "exited", { value: false });
+    await manager.create({ context, cwd: "/w", mcpServers: [] }).catch(() => undefined);
+    expect(onBootstrapExhausted).toHaveBeenCalledOnce();
+  });
+
   it.each([
     ["session_resume", { loadSession: true, sessionCapabilities: { resume: {} } }, "resumeSession"],
     ["session_load", { loadSession: true }, "loadSession"],

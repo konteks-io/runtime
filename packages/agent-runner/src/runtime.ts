@@ -70,6 +70,13 @@ const DEFAULT_MODEL_CAPABILITY_DISCOVERY_TIMEOUT_MS = 13 * 60_000;
 
 /** A wedged agent process must not outlive the conversation it served. */
 const DEFAULT_IDLE_EXECUTION_BRIDGE_TTL_MS = 30 * 60_000;
+/**
+ * After a session bootstrap used its whole retry budget, how long the agent
+ * reads as unavailable. Placement then stops sending it work it cannot start;
+ * once this passes it reads as ready again so the next assignment re-tests it,
+ * and any bootstrap that succeeds clears it at once.
+ */
+export const SESSION_BOOTSTRAP_COOLDOWN_MS = 10 * 60_000;
 
 // `finalized` separates the two questions this record answers. A key is kept
 // forever so a reference is never reused, but a finalized owner no longer
@@ -332,6 +339,8 @@ export class AgentRuntime {
   private authRequired = false;
   /** The provider's admin keeps Konteks tools out (the last identity probe said so). */
   private providerAdminBlocked = false;
+  /** Until when the agent reads unavailable after an exhausted session bootstrap budget (epoch ms), or null. */
+  private bootstrapFailingUntil: number | null = null;
   /** ACP exposes model choices only through session/new. Cache the
    * capability by authenticated identity and bridge version so status
    * polling cannot create a visible Codex thread on every refresh, and keep
@@ -403,6 +412,17 @@ export class AgentRuntime {
         this.publishReadiness();
         // A host agent's credentials may now say why (Antigravity: no licence found).
         if (this.host?.identity && !this.stopping) this.probeInBackground();
+      },
+      onBootstrapExhausted: () => {
+        this.bootstrapFailingUntil = this.now().getTime() + SESSION_BOOTSTRAP_COOLDOWN_MS;
+        this.logger.warn({ agentId: this.family.agentId, until: new Date(this.bootstrapFailingUntil).toISOString() },
+          "agent reads unavailable: its session bootstrap retry budget was exhausted");
+        this.publishReadiness();
+      },
+      onBootstrapSucceeded: () => {
+        if (this.bootstrapFailingUntil === null) return;
+        this.bootstrapFailingUntil = null;
+        this.publishReadiness();
       },
     };
   }
@@ -1142,9 +1162,26 @@ export class AgentRuntime {
       bridgeVersionCompatible: true,
       ...withoutUndefined({ hostAgentVersion: this.hostVersion(), tokenUsageObservable: this.tokenUsageObservable }),
       ...(this.providerAdminBlocked && !this.authRequired ? { providerAdminBlocked: true } : {}),
+      ...this.serviceReadiness(),
       ...this.readinessCommands(),
       lastProbeAt: this.lastProbeAt,
     });
+  }
+
+  /** What can make a connected, signed-in agent unable to serve: its installation gone, or failing session bootstraps. */
+  private serviceReadiness(): Pick<Parameters<typeof projectReadiness>[0], "installationMissing" | "sessionBootstrapFailing"> {
+    return {
+      ...(this.host?.installationMissing?.(this.options.config) ? { installationMissing: true } : {}),
+      ...(this.sessionBootstrapFailing() ? { sessionBootstrapFailing: true } : {}),
+    };
+  }
+
+  /** Inside the cool-down after an exhausted session bootstrap budget; the cool-down lapses by itself. */
+  private sessionBootstrapFailing(): boolean {
+    if (this.bootstrapFailingUntil === null) return false;
+    if (this.now().getTime() < this.bootstrapFailingUntil) return true;
+    this.bootstrapFailingUntil = null;
+    return false;
   }
 
   /** A lost sign-in reads as signed out: no identity, and every credential needing a sign-in. */
