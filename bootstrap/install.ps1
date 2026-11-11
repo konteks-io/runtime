@@ -307,6 +307,7 @@ $SetupIndonesian = @{
   "the release manifest's signature is not valid; nothing was installed" = 'tanda tangan manifes rilis tidak valid; tidak ada yang dipasang'
   'the release manifest lists no single {0}; nothing was installed' = 'manifes rilis tidak mencantumkan tepat satu {0}; tidak ada yang dipasang'
   'Downloading the Windows installer...' = 'Mengunduh pemasang Windows...'
+  'Using the cached Windows installer...' = 'Menggunakan pemasang Windows dari cache...'
   'package checksum mismatch; nothing was installed' = 'checksum paket tidak cocok; tidak ada yang dipasang'
   "This release is verified by Konteks' signed checksums." = 'Rilis ini diverifikasi dengan checksum bertanda tangan milik Konteks.'
   "Windows may show 'Unknown publisher' at the approval prompt." = "Windows mungkin menampilkan 'Unknown publisher' pada permintaan persetujuan."
@@ -379,6 +380,36 @@ function Get-SetupSha256([string]$Path) {
   } finally {
     if ($null -ne $stream) { $stream.Dispose() }
     $sha.Dispose()
+  }
+}
+
+function Copy-SetupCachedMsi([string]$CachePath, [string]$MsiPath, [string]$Expected) {
+  if (-not [IO.File]::Exists($CachePath)) { return $false }
+  try {
+    # Verify and install a private working copy so another setup can replace
+    # the cache without changing the bytes passed to Windows Installer.
+    [IO.File]::Copy($CachePath, $MsiPath)
+    return (Get-SetupSha256 $MsiPath) -eq $Expected
+  } catch {
+    return $false
+  }
+}
+
+function Save-SetupCachedMsi([string]$MsiPath, [string]$CachePath) {
+  $cacheDirectory = [IO.Path]::GetDirectoryName($CachePath)
+  $staged = Join-Path $cacheDirectory ([Guid]::NewGuid().ToString('n') + '.tmp')
+  try {
+    [void][IO.Directory]::CreateDirectory($cacheDirectory)
+    [IO.File]::Copy($MsiPath, $staged)
+    # Keep one MSI per user and publish it only after the copy is complete.
+    if ([IO.File]::Exists($CachePath)) {
+      [IO.File]::Replace($staged, $CachePath, [NullString]::Value)
+    } else {
+      [IO.File]::Move($staged, $CachePath)
+    }
+  } catch {
+    # A cache write failure or a concurrent install must not block setup.
+    Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
   }
 }
 
@@ -470,10 +501,16 @@ try {
   $expected = @([Text.Encoding]::UTF8.GetString($sums) -split "`r?`n" | Where-Object { $_ -match "^[0-9a-fA-F]{64}\s+\*?$([regex]::Escape($msi))$" } | ForEach-Object { ($_ -split '\s+')[0].ToLowerInvariant() })
   if ($expected.Count -ne 1) { throw (Get-SetupText 'the release manifest lists no single {0}; nothing was installed' @($msi)) }
   $msiPath = Join-Path $work $msi
-  Write-SetupDiagnostic (Get-SetupText 'Downloading the Windows installer...')
-  Invoke-WebRequest -UseBasicParsing -Uri "$ReleaseBase/$msi" -OutFile $msiPath
-  $actual = Get-SetupSha256 $msiPath
-  if ($expected[0] -ne $actual) { throw (Get-SetupText 'package checksum mismatch; nothing was installed') }
+  $cachePath = Join-Path (Join-Path $RuntimeRoot 'installer-cache') $msi
+  $cacheHit = Copy-SetupCachedMsi $cachePath $msiPath $expected[0]
+  if ($cacheHit) {
+    Write-SetupDiagnostic (Get-SetupText 'Using the cached Windows installer...')
+  } else {
+    Remove-Item -LiteralPath $msiPath -Force -ErrorAction SilentlyContinue
+    Write-SetupDiagnostic (Get-SetupText 'Downloading the Windows installer...')
+    Invoke-WebRequest -UseBasicParsing -Uri "$ReleaseBase/$msi" -OutFile $msiPath
+    if ((Get-SetupSha256 $msiPath) -ne $expected[0]) { throw (Get-SetupText 'package checksum mismatch; nothing was installed') }
+  }
 
   # A signed MSI is still held to its signature and publisher; an unsigned one
   # is already proven by the signed checksums above.
@@ -496,6 +533,7 @@ try {
     if ($ExpectedThumbprint -and $authenticode.SignerCertificate.Thumbprint -ne $ExpectedThumbprint) { throw (Get-SetupText 'package signer thumbprint mismatch; nothing was installed') }
   }
 
+  if (-not $cacheHit) { Save-SetupCachedMsi $msiPath $cachePath }
   Write-SetupDiagnostic (Get-SetupText 'Verified the Windows installer and signed release manifest.')
   $activeStage = 'Install the Konteks command'
   # Windows Installer does not create the log's directory. Keep diagnostics

@@ -257,6 +257,13 @@ interface StageNativeReleaseArgs {
   fetchFn?: typeof fetch;
   /** First wait before an artifact is downloaded again; doubles each time. */
   retryDelayMs?: number;
+  onDownload?: ((progress: NativeDownloadProgress) => void) | undefined;
+}
+
+export interface NativeDownloadProgress {
+  readonly artifact: Readonly<Pick<RemoteNativeArtifact, "id" | "kind" | "agentId" | "sizeBytes">>;
+  readonly attempt: number;
+  readonly receivedBytes: number;
 }
 type StagedNativeRelease = { directory: string; connector: string; bridges: Record<string, string> };
 
@@ -282,7 +289,7 @@ export async function stageNativeRelease(args: StageNativeReleaseArgs): Promise<
 
 async function stageArtifact(args: StageNativeReleaseArgs, artifact: RemoteNativeArtifact, file: string, result: StagedNativeRelease): Promise<void> {
   const fetchFn = args.fetchFn ?? fetch;
-  await downloadArtifactWithRetry(fetchFn, artifact, file, args.retryDelayMs ?? ARTIFACT_RETRY_FIRST_DELAY_MS);
+  await downloadArtifactWithRetry(fetchFn, artifact, file, args.retryDelayMs ?? ARTIFACT_RETRY_FIRST_DELAY_MS, args.onDownload);
   if (artifact.format === "executable") await chmod(file, 0o700);
   if (artifact.kind !== "connector") {
     result.bridges[artifact.agentId!] = file;
@@ -320,10 +327,14 @@ const ARTIFACT_STALL_MS = 60_000;
 const ARTIFACT_ATTEMPTS = 4;
 const ARTIFACT_RETRY_FIRST_DELAY_MS = 2_000;
 
-async function downloadArtifactWithRetry(fetchFn: typeof fetch, artifact: RemoteNativeArtifact, file: string, firstDelayMs: number): Promise<void> {
+async function downloadArtifactWithRetry(fetchFn: typeof fetch, artifact: RemoteNativeArtifact, file: string, firstDelayMs: number, onDownload?: StageNativeReleaseArgs["onDownload"]): Promise<void> {
+  const { id, kind, agentId, sizeBytes } = artifact;
+  const download = { id, kind, ...(agentId && { agentId }), sizeBytes };
   for (let attempt = 1; ; attempt += 1) {
+    const report = (receivedBytes: number) => onDownload?.({ artifact: download, attempt, receivedBytes });
+    report(0);
     try {
-      return await downloadArtifact(fetchFn, artifact, file);
+      return await downloadArtifact(fetchFn, artifact, file, report);
     } catch (error) {
       await rm(file, { force: true });
       if (attempt >= ARTIFACT_ATTEMPTS) throw error;
@@ -332,7 +343,7 @@ async function downloadArtifactWithRetry(fetchFn: typeof fetch, artifact: Remote
   }
 }
 
-async function downloadArtifact(fetchFn: typeof fetch, artifact: RemoteNativeArtifact, file: string): Promise<void> {
+async function downloadArtifact(fetchFn: typeof fetch, artifact: RemoteNativeArtifact, file: string, report: (receivedBytes: number) => void): Promise<void> {
   const controller = new AbortController();
   let stall: ReturnType<typeof setTimeout> | undefined;
   const moving = () => {
@@ -343,13 +354,13 @@ async function downloadArtifact(fetchFn: typeof fetch, artifact: RemoteNativeArt
   try {
     const response = await fetchFn(artifact.url, { redirect: "follow", credentials: "omit", signal: controller.signal });
     if (!downloadedOverHttps(response)) throw new Error(`native artifact download failed (HTTP ${response.status})`);
-    await writeVerifiedArtifact(response.body, artifact, file, moving);
+    await writeVerifiedArtifact(response.body, artifact, file, moving, report);
   } finally {
     clearTimeout(stall);
   }
 }
 
-async function writeVerifiedArtifact(body: ReadableStream<Uint8Array>, artifact: RemoteNativeArtifact, file: string, moving: () => void): Promise<void> {
+async function writeVerifiedArtifact(body: ReadableStream<Uint8Array>, artifact: RemoteNativeArtifact, file: string, moving: () => void, report: (receivedBytes: number) => void): Promise<void> {
   const handle = await open(file, "wx", 0o600);
   let size = 0;
   const hash = createHash("sha256");
@@ -360,6 +371,7 @@ async function writeVerifiedArtifact(body: ReadableStream<Uint8Array>, artifact:
       if (size > artifact.sizeBytes) throw new Error("native artifact exceeds its signed size");
       hash.update(chunk);
       await handle.writeFile(chunk);
+      report(size);
     }
     if (size !== artifact.sizeBytes || `sha256:${hash.digest("hex")}` !== artifact.digest) throw new Error("native artifact size or digest mismatch");
     await handle.sync();

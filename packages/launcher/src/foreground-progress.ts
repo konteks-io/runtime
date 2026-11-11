@@ -7,6 +7,7 @@ export type SetupForeground = "install" | "update" | "onboard";
 export class ForegroundProgress {
   private timer: ReturnType<typeof setInterval> | undefined;
   private label = "";
+  private liveLabel: (() => string) | undefined;
   private width = 0;
   private frame = 0;
   private paused = 0;
@@ -22,9 +23,10 @@ export class ForegroundProgress {
     reporters.set(stderr, this);
   }
 
-  start(label: string): () => void {
+  start(label: string, liveLabel?: () => string): () => void {
     this.stop();
     this.label = plainLabel(label);
+    this.liveLabel = liveLabel;
     this.started = Date.now();
     const generation = ++this.generation;
     if (this.interactive) this.animate();
@@ -44,6 +46,7 @@ export class ForegroundProgress {
     clearInterval(this.timer);
     this.timer = undefined;
     this.label = "";
+    this.liveLabel = undefined;
     this.clear();
   }
 
@@ -68,8 +71,9 @@ export class ForegroundProgress {
     if (this.paused || !this.label) return;
     const columns = (this.stream as NodeJS.WriteStream).columns || 80;
     const seconds = Math.floor((Date.now() - this.started) / 1000);
-    const elapsed = seconds >= 3 ? ` (${seconds}s)` : "";
-    const row = `${FRAMES[this.frame++ % FRAMES.length]} ${this.label}${elapsed}`.slice(
+    const elapsed = !this.liveLabel && seconds >= 3 ? ` (${seconds}s)` : "";
+    const label = this.liveLabel ? plainLabel(this.liveLabel()) : this.label;
+    const row = `${FRAMES[this.frame++ % FRAMES.length]} ${label}${elapsed}`.slice(
       0,
       Math.max(1, columns - 1),
     );

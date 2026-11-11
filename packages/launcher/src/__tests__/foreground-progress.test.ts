@@ -1,6 +1,7 @@
 import { PassThrough, Writable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createOutput } from "../output.js";
+import { setupDownloadProgress } from "../download-progress.js";
 import { promptSecret } from "../prompt.js";
 import { setupText, withSetupProgress } from "../setup-locale.js";
 import { sanitizeInheritedChildProcessEnv } from "@konteks/remote-common";
@@ -123,6 +124,33 @@ describe("foreground setup presentation", () => {
     expect(out.text()).toContain("Downloading and verifying\n");
     expect(out.text()).not.toContain("\r");
     expect(out.text()).not.toContain("\u001b");
+  });
+
+  it("shows signed download progress and drops the ETA during a stall or retry", () => {
+    vi.useFakeTimers();
+    const out = sink(true);
+    const output = createOutput({ json: false, stdout: out.stream, stderr: sink().stream, foreground: "install", locale: "en" });
+    const download = setupDownloadProgress(output);
+    const stop = output.progress!("Downloading and verifying", download.label);
+    const mib = 1024 * 1024;
+    const artifact = { id: "connector", kind: "connector" as const, sizeBytes: 12 * mib };
+    download.onDownload({ artifact, attempt: 1, receivedBytes: 0 });
+    download.onDownload({ artifact, attempt: 1, receivedBytes: 2 * mib });
+    vi.advanceTimersByTime(2_000);
+    download.onDownload({ artifact, attempt: 1, receivedBytes: 6 * mib });
+    vi.advanceTimersByTime(160);
+    expect(out.text().split("\r").at(-1)).toContain("6.0/12.0 MiB (50%) · 2.0 MiB/s · ~3s left");
+
+    vi.advanceTimersByTime(5_000);
+    expect(out.text().split("\r").at(-1)).toMatch(/50%\) · Waiting for data\s*$/);
+    download.onDownload({ artifact, attempt: 2, receivedBytes: 0 });
+    vi.advanceTimersByTime(160);
+    expect(out.text().split("\r").at(-1)).toMatch(/Attempt 2 · Waiting for data\s*$/);
+    download.onDownload({ artifact, attempt: 2, receivedBytes: artifact.sizeBytes });
+    vi.advanceTimersByTime(160);
+    expect(out.text().split("\r").at(-1)).toMatch(/Verifying Runtime\s*$/);
+    stop();
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("animates one transient TTY row and removes its timer when the phase finishes", () => {
