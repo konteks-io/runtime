@@ -175,9 +175,19 @@ describe('signed native executable staging', () => {
       if (calls === 2) return new Response(bytes.subarray(0, 2));
       return new Response(bytes);
     });
-    const staged = await stageNativeRelease({ release: verifyNativeRelease(signed(), roots, now), target, releasesDir: parent, fetchFn: fetchFn as typeof fetch, retryDelayMs: 0 });
+    const onDownload = vi.fn();
+    const staged = await stageNativeRelease({ release: verifyNativeRelease(signed(), roots, now), target, releasesDir: parent, fetchFn: fetchFn as typeof fetch, retryDelayMs: 0, onDownload });
     expect(await readFile(staged.connector)).toEqual(bytes);
     expect(await readFile(staged.bridges['claude-code']!)).toEqual(bytes);
     expect(fetchFn).toHaveBeenCalledTimes(4);
+    expect(onDownload.mock.calls.map(([event]) => [event.attempt, event.receivedBytes, event.artifact.sizeBytes])).toEqual([
+      [1, 0, bytes.length],
+      [2, 0, bytes.length],
+      [2, 2, bytes.length],
+      [3, 0, bytes.length],
+      [3, bytes.length, bytes.length],
+      [1, 0, bytes.length],
+      [1, bytes.length, bytes.length],
+    ]);
   });
 });

@@ -13,6 +13,14 @@ const COPY = {
   foregroundInstall: ["Runtime setup", "Pemasangan runtime"],
   foregroundUpdate: ["Runtime update", "Pembaruan runtime"],
   phaseDownload: ["Downloading and verifying", "Mengunduh dan memverifikasi"],
+  downloadPreparing: ["Preparing downloads", "Menyiapkan unduhan"],
+  downloadRuntime: ["Runtime", "Runtime"],
+  downloadWaiting: ["{name} · {progress} · Waiting for data", "{name} · {progress} · Menunggu data"],
+  downloadRetrying: ["{name} · Attempt {attempt} · Waiting for data", "{name} · Percobaan {attempt} · Menunggu data"],
+  downloadVerifying: ["Verifying {name}", "Memverifikasi {name}"],
+  downloadEta: ["{progress} · {speed} MiB/s · ~{eta} left", "{progress} · {speed} MiB/dtk · ~{eta} tersisa"],
+  downloadSeconds: ["{seconds}s", "{seconds} dtk"],
+  downloadMinutes: ["{minutes}m {seconds}s", "{minutes} mnt {seconds} dtk"],
   phaseInstall: ["Setting up this computer", "Menyiapkan komputer ini"],
   phaseStart: ["Starting runtime", "Memulai runtime"],
   phaseHealth: ["Checking runtime and agents", "Memeriksa runtime dan agen"],
@@ -267,9 +275,9 @@ export function setupLine(output: Pick<Output, "line"> & Partial<Pick<Output, "j
 }
 
 /** A real foreground phase; simple injected outputs retain their normal line. */
-export function setupProgress(output: Output, key: SetupCopyKey, values: Values = {}): () => void {
+export function setupProgress(output: Output, key: SetupCopyKey, values: Values = {}, liveLabel?: () => string): () => void {
   const text = setupWords(output, key, values);
-  if (output.progress) return output.progress(text);
+  if (output.progress) return output.progress(text, liveLabel);
   output.line(text);
   return () => {};
 }
@@ -279,8 +287,9 @@ export async function withSetupProgress<T>(
   output: Output,
   key: SetupCopyKey,
   action: () => Promise<T>,
+  liveLabel?: () => string,
 ): Promise<T> {
-  const stop = setupProgress(output, key);
+  const stop = setupProgress(output, key, {}, liveLabel);
   try {
     return await action();
   } finally {

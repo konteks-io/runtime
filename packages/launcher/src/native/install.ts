@@ -4,11 +4,12 @@ import { chmod, lstat, mkdir, readFile, realpath, rename, rm } from "node:fs/pro
 import { homedir } from "node:os";
 import { basename, delimiter, join, parse, resolve } from "node:path";
 import { CONTROL_SOCKET_DEFAULT_PORT, findGitForWindows, RemoteInstanceError, SystemClock, writeSecretFile, type RemoteSignedBundleManifest } from "@konteks/remote-common";
-import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, findAgentBridge, installOfflineAgentPackage, isHostAgentId, selectNativeArtifacts, stageNativeRelease, verifyNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
+import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, findAgentBridge, installOfflineAgentPackage, isHostAgentId, selectNativeArtifacts, stageNativeRelease, verifyNativeRelease, type EmbeddedReleaseRoot, type NativeDownloadProgress } from "@konteks/remote-release";
 import { acquireNativeRootLock, compareSemver, deleteNativeAntigravity, HOST_AGENT_INSTALL_ADAPTERS, hostAgentInstallAdapter, loadNativeInstallation, signOutNativeAntigravity, type HostAgentInstallAdapter, nativeAgentOffered, NativeRuntimeRecordSchema, parseNativeRuntimeRecord, resolveNativeClaudeExecutable, resolveNativeCodexHome, runNativeActivationExchange, SupervisorStore, verifyNativeGitTool, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { isRetiredAgentId, retiredAgentMessage } from "@konteks/backstage-plugin-common";
 import { z } from "zod";
 import type { Output } from "../output.js";
+import { setupDownloadProgress } from "../download-progress.js";
 import { outputLocale,
   setupDetail,
   setupError, setupLine, setupLocale,
@@ -138,16 +139,19 @@ async function installNew(install: InstallContext, agents: string[]): Promise<Na
   setupDetail(options.output, bundled.length > 0 ? "installUnpacking" : "installSettingUp");
   const total = bundled.filter(id => agents.includes(id)).length;
   let unpacked = 0;
+  const download = setupDownloadProgress(options.output);
   const releaseId = await withSetupProgress(options.output, "phaseDownload", () =>
     stageAgents({
-    root, release, platform, agents, bundled, fetchFn,
-    beforeAgent: async (agent) => {
-      if (!bundled.includes(agent)) return;
-      unpacked += 1;
+      root, release, platform, agents, bundled, fetchFn,
+      onDownload: download.onDownload,
+      beforeAgent: async (agent) => {
+        if (!bundled.includes(agent)) return;
+        unpacked += 1;
         setupProgress(options.output, "installUnpackAgent", { name: findAgentBridge(agent)?.displayName ?? agent, number: unpacked, total });
-    },
-    afterAgent: agent => agentFolders(root, agent),
-  }),
+      },
+      afterAgent: agent => agentFolders(root, agent),
+    }),
+    download.label,
   );
   const git = options.deps?.git === undefined ? await discoverGit() : options.deps.git;
   const record = NativeRuntimeRecordSchema.parse({ ...draft, agents, instanceId: identity.instanceId, workspaceId: identity.workspaceId, releaseId, bundleVersion: release.manifest.bundleVersion, manifestDigest: release.manifest.digest, ...profiles, ...(git ? { git: await verifyNativeGitTool(git) } : {}) });
@@ -507,6 +511,7 @@ async function unpackEnrollment(root: string, prepared: NativeEnrollmentRecord, 
 async function stageAgents(stage: {
   root: string; release: ReturnType<typeof verifyNativeRelease>; platform: NativePlatform;
   agents: readonly string[]; bundled: readonly string[]; fetchFn: typeof fetch;
+  onDownload?: (progress: NativeDownloadProgress) => void;
   beforeAgent?: (agent: string, done: number) => Promise<void>;
   afterAgent?: (agent: string) => Promise<void>;
   beforeRename?: () => void;
@@ -514,7 +519,7 @@ async function stageAgents(stage: {
 }): Promise<string> {
   const { root, release, bundled } = stage;
   const artifacts = selectNativeArtifacts(release, { ...stage.platform, agentIds: [...bundled] });
-  const staged = await stageNativeRelease({ release, target: { ...stage.platform, agentIds: [...bundled] }, releasesDir: join(root, "releases"), fetchFn: stage.fetchFn });
+  const staged = await stageNativeRelease({ release, target: { ...stage.platform, agentIds: [...bundled] }, releasesDir: join(root, "releases"), fetchFn: stage.fetchFn, onDownload: stage.onDownload });
   await privateDirectory(join(staged.directory, "agents"));
   try {
     let done = 0;

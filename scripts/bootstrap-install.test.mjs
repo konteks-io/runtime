@@ -465,6 +465,8 @@ function runWindowsBootstrap(options = {}) {
     architecture,
     osArchitecture,
     entryShell,
+    cachedProfile,
+    msiVersion,
   } = {
     msiCode: 0,
     cancelled: false,
@@ -485,10 +487,12 @@ function runWindowsBootstrap(options = {}) {
     architecture: "AMD64",
     osArchitecture: "AMD64",
     entryShell: "direct",
+    cachedProfile: undefined,
+    msiVersion: "original",
     ...options,
   };
   const fixture = mkdtempSync(join(root, "windows bootstrap "));
-  const profile = join(fixture, "profile");
+  const profile = cachedProfile ?? join(fixture, "profile");
   const temporaryRoot = join(fixture, "temporary downloads");
   const temporaryPath = { original: temporaryRoot, uppercase: temporaryRoot.toUpperCase() }[
     temporaryCase
@@ -499,7 +503,7 @@ function runWindowsBootstrap(options = {}) {
   writeFileSync(join(runtimeRoot, "native-runtime.json"), "{}\n");
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
   const key = publicKey.export({ type: "spki", format: "pem" });
-  const msi = Buffer.from("the Windows installer fixture\n");
+  const msi = Buffer.from(`the Windows installer fixture (${msiVersion})\n`);
   const sums = Buffer.from(`${sha256(msi)}  konteks-remote-x64.msi\n`);
   for (const [name, bytes] of Object.entries({
     "release-signing.pub": key,
@@ -510,6 +514,7 @@ function runWindowsBootstrap(options = {}) {
     writeFileSync(join(fixture, name), bytes);
   const callsPath = join(fixture, "launcher-calls.jsonl");
   const effectsPath = join(fixture, "effect-calls.txt");
+  const downloadsPath = join(fixture, "downloads.txt");
   const localesPath = join(fixture, "launcher-locales.txt");
   const msiCallPath = join(fixture, "msi-call.json");
   const securityDiscoveryPath = join(fixture, "security-discovery.txt");
@@ -547,6 +552,7 @@ ${fixtureLocale(locale)}
 function Invoke-WebRequest {
   param([switch]$UseBasicParsing, [string]$Uri, [string]$OutFile)
   'download' | Add-Content -LiteralPath ${psLiteral(effectsPath)} -Encoding UTF8
+  ([Uri]$Uri).Segments[-1] | Add-Content -LiteralPath ${psLiteral(downloadsPath)} -Encoding UTF8
   if ($${downloadFailed}) { throw ${psLiteral(downloadError)} }
   Copy-Item -LiteralPath (Join-Path ${psLiteral(fixture)} ([Uri]$Uri).Segments[-1]) -Destination $OutFile
 }
@@ -601,11 +607,13 @@ function konteks-remote {
     ),
     calls: fixtureLines(callsPath).map((line) => JSON.parse(line.replace(/^\uFEFF/, ""))),
     effects: fixtureLines(effectsPath),
+    downloads: fixtureLines(downloadsPath),
     launcherLocales: fixtureLines(localesPath),
     msiCall: fixtureJson(msiCallPath),
     securityDiscovery: fixtureText(securityDiscoveryPath),
     securityProof: fixtureJson(securityProofPath),
     runtimeRoot,
+    profile,
   };
 }
 
@@ -1034,6 +1042,35 @@ test("Windows bootstrap rejects a changed MSI before installation", windowsOnly,
     result.output,
     /\n  Return to Konteks and download a fresh setup file if a retry is needed\./,
   );
+});
+
+test("Windows bootstrap reuses only the MSI matching the signed release", windowsOnly, () => {
+  const msi = "konteks-remote-x64.msi";
+  const manifest = ["SHA256SUMS", "SHA256SUMS.sig", "release-signing.pub"];
+  const first = runWindowsBootstrap();
+  assert.equal(first.status, 0, first.output);
+  assert.deepEqual(first.downloads, [...manifest, msi]);
+
+  const options = { cachedProfile: first.profile };
+  const cached = runWindowsBootstrap(options);
+  assert.equal(cached.status, 0, cached.output);
+  assert.deepEqual(cached.downloads, manifest);
+  assert.equal(cached.msiCall.FilePath, "msiexec.exe");
+
+  const next = { ...options, msiVersion: "next" };
+  const upgraded = runWindowsBootstrap(next);
+  assert.equal(upgraded.status, 0, upgraded.output);
+  assert.deepEqual(upgraded.downloads, [...manifest, msi]);
+  const cachePath = join(first.runtimeRoot, "installer-cache", msi);
+  assert.match(readFileSync(cachePath, "utf8"), /\(next\)/);
+
+  writeFileSync(cachePath, "corrupt cache");
+  const recovered = runWindowsBootstrap(next);
+  assert.equal(recovered.status, 0, recovered.output);
+  assert.deepEqual(recovered.downloads, [...manifest, msi]);
+  const reused = runWindowsBootstrap(next);
+  assert.equal(reused.status, 0, reused.output);
+  assert.deepEqual(reused.downloads, manifest);
 });
 
 test("Windows bootstrap formats a failed download with a safe return action", windowsOnly, () => {

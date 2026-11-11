@@ -17,7 +17,7 @@ import { cliCommand, commandHintText } from "./cli-command.js";
 export interface Output {
   json: boolean;
   readonly setupLocale?: SetupLocale;
-  progress?(text: string): () => void;
+  progress?(text: string, liveLabel?: () => string): () => void;
   finishProgress?(): void;
   detail?(text: string): void;
   line(text: string): void;
@@ -73,7 +73,8 @@ export function createOutput(options: OutputOptions): Output {
     setupLocale: locale,
     ...(progress
       ? {
-          progress: (text: string) => progress.start(human(text)),
+          progress: (text: string, liveLabel?: () => string) =>
+            progress.start(human(text), liveLabel && (() => human(liveLabel()))),
           finishProgress: () => progress.stop(),
         }
       : {}),
