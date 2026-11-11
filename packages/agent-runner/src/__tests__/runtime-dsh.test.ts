@@ -78,9 +78,12 @@ async function fixture(options: { failFirstExecution?: boolean } = {}) {
     if (options.failFirstExecution && spawned.length === 2) throw new Error("fixture ACP initialization failed");
     return bridge;
   });
+  // The person's installed dsh and Node: readiness checks they are still on disk.
+  const dshRoot = join(root, "opt", "dsh"), entry = join(dshRoot, "lib", "bin.js"), node = join(root, "opt", "node", "bin", "node");
+  for (const file of [entry, node]) { await mkdir(dirname(file), { recursive: true }); await writeFile(file, ""); }
   const config = RunnerConfigSchema.parse({
     RUNNER_AGENT_ID: "dsh", RUNNER_CREDENTIAL_DIR: join(root, "credentials"), RUNNER_WORKSPACE_DIR: join(root, "workspace"),
-    RUNNER_BRIDGE_PREFIX: "/opt/dsh", RUNNER_NATIVE_DSH_ROOT: "/opt/dsh", RUNNER_NATIVE_DSH_ENTRY: "/opt/dsh/lib/bin.js", RUNNER_NATIVE_DSH_NODE: "/opt/node/bin/node",
+    RUNNER_BRIDGE_PREFIX: dshRoot, RUNNER_NATIVE_DSH_ROOT: dshRoot, RUNNER_NATIVE_DSH_ENTRY: entry, RUNNER_NATIVE_DSH_NODE: node,
   });
   const runtime = new AgentRuntime({ config, spawn, executionBridgeLimit: () => 2, retrySleep: async () => undefined });
   runtimes.push(runtime);
@@ -94,7 +97,7 @@ async function fixture(options: { failFirstExecution?: boolean } = {}) {
   const session = (cwd: string, readOnlyRoots: readonly string[] = []) => runtime.sessions.create({
     context: { instanceId: "i", assignmentId: "a", attempt: 1, agentId: "dsh" }, cwd, readOnlyRoots, mcpServers: [],
   });
-  return { root, config, runtime, spawn, spawned, bridges, stops, policies, stoppedPolicies, operations, events, directory, session, paths: dshRuntimePaths(config.RUNNER_CREDENTIAL_DIR) };
+  return { root, config, entry, node, runtime, spawn, spawned, bridges, stops, policies, stoppedPolicies, operations, events, directory, session, paths: dshRuntimePaths(config.RUNNER_CREDENTIAL_DIR) };
 }
 
 async function completeAndRelease(runtime: AgentRuntime, ref: string) {
@@ -108,7 +111,7 @@ it("writes the Konteks overlay before dsh first starts, and is signed out until 
   const f = await fixture();
   await f.runtime.start();
   for (const name of ["konteks-dsh.patch.yml", "konteks-dsh-ask.patch.yml", "konteks-hooks.json"]) await access(join(f.paths.konteksDir, name));
-  expect(f.spawned[0]!.spec.command).toBe("/opt/node/bin/node");
+  expect(f.spawned[0]!.spec.command).toBe(f.node);
   expect(f.spawned[0]!.spec.args).toContain(join(f.paths.konteksDir, "konteks-dsh-ask.patch.yml"));
   expect(f.runtime.readiness().readiness).not.toBe("ready");
 });
@@ -418,4 +421,23 @@ it("reports lost provider history when a replacement tries to resume under a dif
   expect(f.bridges[2]!.connection.resumeSession).toHaveBeenCalledWith({ sessionId: "private-50002", cwd: nextCwd, mcpServers: [] });
   expect(f.bridges[2]!.connection.newSession).not.toHaveBeenCalled();
   expect(lifecycle.replaceProcessOwner).toHaveBeenCalledWith(f.bridges[1]!.retainedProcessOwner, f.bridges[2]!.retainedProcessOwner);
+});
+
+it("reads unavailable once the installed dsh launcher is gone, though its control process still answers", async () => {
+  const f = await fixture();
+  vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status: 200 })));
+  await f.runtime.start();
+  const flow = f.runtime.startLogin({ organization: false, personal: true });
+  f.runtime.loginInput(flow.loginId, KEY);
+  await flow.done;
+  await vi.waitFor(() => expect(f.runtime.readiness().readiness).toBe("ready"));
+  // 2026-11-11: npm cleared the npx copy, dsh kept reading ready and no session started.
+  await rm(f.entry);
+  expect(f.runtime.readiness().readiness).toBe("unavailable");
+});
+
+it("gives dsh a session bootstrap deadline it can meet on a busy machine", async () => {
+  const { dshRunnerAdapter } = await import("../host/dsh.js");
+  // Live on 2026-11-08/09 dsh took 16 to 47 s to start a session; 10 s recycled every process.
+  expect(dshRunnerAdapter.sessionBootstrapTimeoutMs).toBeGreaterThanOrEqual(45_000);
 });

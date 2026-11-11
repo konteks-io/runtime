@@ -222,6 +222,10 @@ export interface SessionManagerOptions {
   logger?: Logger;
   /** Auth failures must invalidate a prior identity probe before new work is admitted. */
   onAuthRequired?: () => void;
+  /** A session bootstrap used its whole retry budget on deadlines: the agent is not ready for new work. */
+  onBootstrapExhausted?: () => void;
+  /** A session bootstrap succeeded: an earlier exhausted budget no longer says anything about the agent. */
+  onBootstrapSucceeded?: () => void;
   /** Required session selections applied to new, restored and live-continued
    * sessions before any caller selections (Codex: Konteks-governed approval
    * mode). Callers may repeat the same value, but refusedModes prevents them
@@ -497,6 +501,7 @@ export class SessionManager {
           args.lifecycle?.assertCurrent();
           const created = await this.createImpl(args, ref, bridgeId => this.reserveBridgeId(bridgeId, reserved), bridge, loadFromRef, bootstrapAttempt);
           if (reserved.bridgeId !== null) this.creatingBridgeIds.delete(reserved.bridgeId);
+          this.options.onBootstrapSucceeded?.();
           return created;
         } catch (error) {
           const replacement = await this.afterBootstrapFailure(error, { args, ref, bridge, bootstrapAttempt, reservedBridgeId: reserved.bridgeId });
@@ -548,16 +553,29 @@ export class SessionManager {
     // by this bootstrap attempt, including config-timeout indexes.
     if (retryableDeadline) this.forgetTimedOutAttempt(ref, bridge, attempt.reservedBridgeId);
     if (!retryableDeadline || bootstrapAttempt === 4 || !this.options.replaceBridge) {
-      if (retryableDeadline) this.logger.error({ ...contextLog(args), bootstrapAttempt, maxBootstrapAttempts: 4, exhausted: true }, "ACP session bootstrap retry budget exhausted");
+      if (retryableDeadline) this.budgetExhausted(args, bootstrapAttempt);
       throw error;
     }
-    const remainingMs = remainingReadinessMs(args, this.now());
-    if (Number.isNaN(remainingMs) || remainingMs <= 0) throw error;
+    const remainingMs = this.timeForAnotherAttempt(args, error);
     await this.bootstrapBackoff(args, bootstrapAttempt, remainingMs);
     const replacement = await this.options.replaceBridge(ref, bridge, bootstrapAttempt + 1, args.lifecycle, args.cwd, args.readOnlyRoots);
     this.logger.info({ ...contextLog(args), bootstrapAttempt: replacement.bootstrapAttempt, recoveredFromAttempt: bootstrapAttempt, recovery: "fresh_bridge" },
       "ACP session bootstrap acquired a fresh bridge");
     return replacement;
+  }
+
+  /** The readiness time left for one more attempt; with none left, as exhausted as the fourth deadline. */
+  private timeForAnotherAttempt(args: CreateSessionArgs, error: unknown): number {
+    const remainingMs = remainingReadinessMs(args, this.now());
+    if (!Number.isNaN(remainingMs) && remainingMs > 0) return remainingMs;
+    this.options.onBootstrapExhausted?.();
+    throw error;
+  }
+
+  /** Every bootstrap attempt ran out of time: logged, and the agent told it is not ready for new work. */
+  private budgetExhausted(args: CreateSessionArgs, bootstrapAttempt: number): void {
+    this.logger.error({ ...contextLog(args), bootstrapAttempt, maxBootstrapAttempts: 4, exhausted: true }, "ACP session bootstrap retry budget exhausted");
+    this.options.onBootstrapExhausted?.();
   }
 
   /** Exponential backoff with jitter, never past the readiness deadline. */

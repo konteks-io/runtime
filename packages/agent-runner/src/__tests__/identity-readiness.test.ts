@@ -121,6 +121,12 @@ describe("ConnectedAgentView projection", () => {
     expect(projectReadiness({ ...base, providerAdminBlocked: false })).not.toHaveProperty("recoveryAction");
   });
 
+  it("is unavailable while its installation is gone or its session bootstrap keeps failing, though signed in and connected", () => {
+    expect(projectReadiness({ ...base, family: findAgentBridge("dsh")!, installationMissing: true }).readiness).toBe("unavailable");
+    expect(projectReadiness({ ...base, sessionBootstrapFailing: true }).readiness).toBe("unavailable");
+    expect(projectReadiness({ ...base, installationMissing: false, sessionBootstrapFailing: false }).readiness).toBe("ready");
+  });
+
   it("a logged-out subscription agent is not_configured with login_locally", () => {
     const view = projectReadiness({ ...base, identity: "logged_out", scope: INITIAL_SCOPE_STATE });
     expect(view.readiness).toBe("not_configured");
