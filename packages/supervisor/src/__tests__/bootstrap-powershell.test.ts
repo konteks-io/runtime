@@ -84,10 +84,15 @@ describe("bootstrap/install.ps1", () => {
     const signature = at(
       "if ($null -eq $releaseKey -or -not (Test-Ed25519Signature $releaseKey $sums $signature)) {",
     );
-    const checksum = at("$actual = Get-SetupSha256 $msiPath");
-    expect(checksum).toBeGreaterThan(signature);
-    const checksumGuard = at("if ($expected[0] -ne $actual) {");
-    expect(checksumGuard).toBeGreaterThan(checksum);
+    const cacheCheck = at("$cacheHit = Copy-SetupCachedMsi $cachePath $msiPath $expected[0]");
+    expect(cacheCheck).toBeGreaterThan(signature);
+    expect(at("return (Get-SetupSha256 $MsiPath) -eq $Expected")).toBeGreaterThan(
+      at("[IO.File]::Copy($CachePath, $MsiPath)"),
+    );
+    const download = at('Invoke-WebRequest -UseBasicParsing -Uri "$ReleaseBase/$msi"');
+    expect(download).toBeGreaterThan(at("if ($cacheHit) {"));
+    const checksumGuard = at("if ((Get-SetupSha256 $msiPath) -ne $expected[0]) {");
+    expect(checksumGuard).toBeGreaterThan(download);
     expect(at("Get-AuthenticodeSignature")).toBeGreaterThan(checksumGuard);
     expect(at("msiexec.exe")).toBeGreaterThan(at("Get-AuthenticodeSignature"));
   });
