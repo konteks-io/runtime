@@ -21,7 +21,7 @@ const MODELS = { id: "model", name: "Model", type: "select", currentValue: "open
 const MODES = { id: "mode", name: "Session Mode", category: "mode", type: "select", currentValue: "build",
   options: [{ value: "build", name: "build" }, { value: "plan", name: "plan" }] };
 
-async function fixture(options: { limit?: boolean } = {}) {
+async function fixture(options: { limit?: boolean; hangNewSession?: () => boolean; now?: () => Date; bootstrapTimeoutMs?: number } = {}) {
   const root = await realpath(await mkdtemp(join(tmpdir(), "runtime-opencode-"))); roots.push(root);
   const spawned: Array<{ env: NodeJS.ProcessEnv; linked: string | null; bridge: BridgeProcess }> = [];
   const spawn = vi.fn(async (input: SpawnBridgeOptions) => {
@@ -32,7 +32,7 @@ async function fixture(options: { limit?: boolean } = {}) {
     const bridge: BridgeProcess = {
       get exited() { return exited; },
       initializeResult: { protocolVersion: 1, agentCapabilities: {} }, stderrTail: () => [],
-      connection: { newSession: vi.fn(async () => ({ sessionId: `oc-${spawned.length}`, configOptions: [MODELS] })), prompt, cancel: vi.fn(async () => undefined),
+      connection: { newSession: vi.fn(async () => options.hangNewSession?.() ? new Promise<never>(() => undefined) : { sessionId: `oc-${spawned.length}`, configOptions: [MODELS] }), prompt, cancel: vi.fn(async () => undefined),
         setSessionMode: vi.fn(async () => ({})),
         setSessionConfigOption: vi.fn(async ({ configId, value }: { configId: string; value: string }) => ({ configOptions: [{ ...MODELS, ...(configId === "model" ? { currentValue: value } : {}) }, { ...MODES, ...(configId === "mode" ? { currentValue: value } : {}) }] })) } as never,
       stop: vi.fn(async () => { if (!exited) { exited = true; input.handlers.onExit({ code: 0, signal: null }); } }),
@@ -40,11 +40,17 @@ async function fixture(options: { limit?: boolean } = {}) {
     spawned.push({ env: input.spec.env, linked, bridge });
     return bridge;
   });
+  // The person's installed OpenCode: readiness checks that it is still on disk.
+  const binary = join(root, "opt", "opencode", "bin", "opencode");
+  await mkdir(join(root, "opt", "opencode", "bin"), { recursive: true });
+  await writeFile(binary, "");
   const config = RunnerConfigSchema.parse({
     RUNNER_AGENT_ID: "opencode", RUNNER_CREDENTIAL_DIR: join(root, "credentials"), RUNNER_WORKSPACE_DIR: join(root, "workspace"),
-    RUNNER_BRIDGE_PREFIX: "/opt/opencode/bin", RUNNER_BRIDGE_VERSION: "2.0.18", RUNNER_NATIVE_OPENCODE_BINARY: "/opt/opencode/bin/opencode",
+    RUNNER_BRIDGE_PREFIX: join(root, "opt", "opencode", "bin"), RUNNER_BRIDGE_VERSION: "2.0.18", RUNNER_NATIVE_OPENCODE_BINARY: binary,
+    ...(options.bootstrapTimeoutMs === undefined ? {} : { RUNNER_SESSION_BOOTSTRAP_TIMEOUT_MS: options.bootstrapTimeoutMs }),
   });
   const runtime = new AgentRuntime({ config, spawn, probe: async () => ({ kind: "signal", fingerprint: "fp-opencode-0123456789" }),
+    retrySleep: async () => undefined, ...(options.now ? { now: options.now } : {}),
     ...(options.limit === false ? {} : { executionBridgeLimit: () => 4 }) });
   runtimes.push(runtime);
   const workingCopy = async (name: string, agents?: string) => {
@@ -54,7 +60,7 @@ async function fixture(options: { limit?: boolean } = {}) {
     return wc;
   };
   const session = (cwd: string) => runtime.sessions.create({ context: { instanceId: "i", assignmentId: `a-${cwd}`, attempt: 1, agentId: "opencode" }, cwd, mcpServers: [] });
-  return { root, config, runtime, spawn, spawned, workingCopy, session, paths: openCodeRuntimePaths(config.RUNNER_CREDENTIAL_DIR) };
+  return { root, config, binary, runtime, spawn, spawned, workingCopy, session, paths: openCodeRuntimePaths(config.RUNNER_CREDENTIAL_DIR) };
 }
 
 it("runs the control process without a working copy and each session in its own working copy's process", async () => {
@@ -206,4 +212,43 @@ it("ignores a hostile repository's own OpenCode configuration", async () => {
   const folder = join(env.XDG_CONFIG_HOME!, "opencode");
   expect(await readdir(folder)).toEqual(["AGENTS.md"]);
   expect(await readlink(join(folder, "AGENTS.md"))).toBe(join(a, "AGENTS.md"));
+});
+
+it("reads unavailable while the installed OpenCode is gone from disk, and ready again once it is back", async () => {
+  const f = await fixture();
+  await f.runtime.start();
+  await f.runtime.probe(false);
+  expect(f.runtime.readiness().readiness).toBe("ready");
+  // npm cleared the copy the runner was started with; its control process still answers.
+  await rm(f.binary);
+  expect(f.runtime.readiness().readiness).toBe("unavailable");
+  await writeFile(f.binary, "");
+  expect(f.runtime.readiness().readiness).toBe("ready");
+});
+
+it("reads unavailable for a cool-down after a session bootstrap used its whole budget, and a started session clears it", async () => {
+  let now = new Date("2026-11-11T02:00:00.000Z");
+  const f = await fixture({ now: () => now });
+  await f.runtime.start();
+  await f.runtime.probe(false);
+  // The session manager's own budget is covered in session-manager.test.ts; this is what the runtime does with it.
+  const budget = (f.runtime.sessions as unknown as { options: { onBootstrapExhausted(): void; onBootstrapSucceeded(): void } }).options;
+  const changes: RunnerEvent[] = [];
+  f.runtime.events.subscribe(event => { if (event.kind === "readiness_changed") changes.push(event); });
+  expect(f.runtime.readiness().readiness).toBe("ready");
+  budget.onBootstrapExhausted();
+  // Placement must stop sending this agent work it cannot start (2026-11-11: dsh, 0 of 23).
+  expect(f.runtime.readiness().readiness).toBe("unavailable");
+  expect(changes.at(-1)).toMatchObject({ agent: { readiness: "unavailable" } });
+  now = new Date(now.getTime() + 9 * 60_000);
+  expect(f.runtime.readiness().readiness).toBe("unavailable");
+  // The cool-down lapses by itself, so the next assignment re-tests the agent.
+  now = new Date(now.getTime() + 60_000);
+  expect(f.runtime.readiness().readiness).toBe("ready");
+  budget.onBootstrapExhausted();
+  expect(f.runtime.readiness().readiness).toBe("unavailable");
+  // A session that starts says more than an old failure.
+  budget.onBootstrapSucceeded();
+  expect(f.runtime.readiness().readiness).toBe("ready");
+  expect(changes.at(-1)).toMatchObject({ agent: { readiness: "ready" } });
 });

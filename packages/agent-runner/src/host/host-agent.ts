@@ -115,6 +115,12 @@ export interface HostAgentRunnerAdapter {
    * organisation's settings with Google first: 3 to 7 s live).
    */
   readonly sessionBootstrapTimeoutMs?: number;
+  /**
+   * Whether the person's own installation this runner launches is gone from
+   * disk. Stats only, cheap enough for every readiness read; a missing one
+   * reads as unavailable instead of the control process's stale "ready".
+   */
+  installationMissing?(config: RunnerConfig): boolean;
   /** After every process of this runner was stopped: stop anything it left behind (Antigravity: its harness child). */
   sweepLeftovers?(config: RunnerConfig): Promise<void>;
   /**

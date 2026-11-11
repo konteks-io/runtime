@@ -60,6 +60,12 @@ serves the supervisor over the runner port (`packages/supervisor/src/runner-port
   session gateway and restarts Playwright only when nothing is in flight.
 - **7.1 Core only.** Pay-per-use turns, `availableCommands` and option
   billing are reported only while `coreAcceptsRouteBilling` holds.
+- **Readiness is what the agent can do now, not that its control process
+  answers.** A host-installed agent whose installation is gone from disk
+  (`installationMissing`, stats only) and any agent whose last session
+  bootstrap used its whole retry budget (`SESSION_BOOTSTRAP_COOLDOWN_MS`,
+  10 min, cleared by the next started session) read `unavailable`. dsh gets a
+  45 s `session/new` deadline (live: 16 to 47 s).
 - Learnt slash commands are stored per agent in
   `<RUNNER_CREDENTIAL_DIR>/available-commands.json` (0600), minus the
   adapter's refused commands.

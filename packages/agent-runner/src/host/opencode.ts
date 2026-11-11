@@ -1,4 +1,4 @@
-import type { Stats } from "node:fs";
+import { existsSync, type Stats } from "node:fs";
 import { createHash } from "node:crypto";
 import { copyFile, lstat, mkdir, readlink, rm, symlink } from "node:fs/promises";
 import { isAbsolute, posix, resolve, win32 } from "node:path";
@@ -357,6 +357,7 @@ export const openCodeRunnerAdapter: HostAgentRunnerAdapter = {
   agentId: "opencode",
   carriesSettings: config => config.RUNNER_NATIVE_OPENCODE_BINARY !== undefined,
   assertRunner: (config, family) => { binary(config, family); },
+  installationMissing: config => config.RUNNER_NATIVE_OPENCODE_BINARY !== undefined && !existsSync(config.RUNNER_NATIVE_OPENCODE_BINARY),
   launch: (config, family) => ({ command: binary(config, family), args: [...family.command] }),
   environment(config, family) {
     binary(config, family);

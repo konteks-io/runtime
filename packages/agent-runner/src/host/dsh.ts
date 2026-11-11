@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { keyedFingerprint, readOrCreateSecretFile, RemoteInstanceError } from "@konteks/remote-common";
 import type { AgentBridgeFamily } from "@konteks/remote-release";
@@ -33,6 +34,11 @@ export const dshRunnerAdapter: HostAgentRunnerAdapter = {
   agentId: "dsh",
   carriesSettings: config => config.RUNNER_NATIVE_DSH_ROOT !== undefined || config.RUNNER_NATIVE_DSH_ENTRY !== undefined || config.RUNNER_NATIVE_DSH_NODE !== undefined,
   assertRunner: (config, family) => { launcher(config, family); },
+  // DeepSeek Harness answers `session/new` slowly on a busy machine: 16 to 47 s
+  // live on 2026-11-08/09, so the runner's 10 s deadline recycled every process
+  // and, from 2026-11-10, no session started at all.
+  sessionBootstrapTimeoutMs: 45_000,
+  installationMissing: config => [config.RUNNER_NATIVE_DSH_ENTRY, config.RUNNER_NATIVE_DSH_NODE].some(path => path !== undefined && !existsSync(path)),
   launch(config, family) {
     const { node, entry } = launcher(config, family);
     const { patches } = renderDshKonteksProfile(dshRuntimePaths(config.RUNNER_CREDENTIAL_DIR).konteksDir, process.platform);

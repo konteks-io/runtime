@@ -38,6 +38,18 @@ interface ReadinessInputs {
   tokenUsageObservable?: boolean;
   /** Signed in, but the provider's admin keeps Konteks tools out (Antigravity with MCP Servers off): no Konteks work can run on it. */
   providerAdminBlocked?: boolean;
+  /**
+   * The person's own installation of a host-installed agent is gone from
+   * disk (an `npx` copy npm cleared): a still-running control process would
+   * otherwise keep reading as ready while no new session can start.
+   */
+  installationMissing?: boolean;
+  /**
+   * The agent's last session bootstrap used its whole retry budget and no
+   * session has started since, inside the cool-down: it is not ready for
+   * work even though its control process answers.
+   */
+  sessionBootstrapFailing?: boolean;
   /** The slash commands this agent announced on this computer and when. */
   availableCommands?: { readonly commands: readonly AvailableCommand[]; readonly learntAt: string };
   lastProbeAt: string | null;
@@ -95,7 +107,7 @@ function optionalViewFields(inputs: ReadinessInputs): Partial<ConnectedAgentView
 
 function deriveReadiness(inputs: ReadinessInputs): ConnectedAgentView["readiness"] {
   if (!inputs.bridgeVersionCompatible) return "reconnect_required";
-  if (inputs.connectionState !== "ready") return "unavailable";
+  if (!canServe(inputs)) return "unavailable";
   switch (inputs.identity) {
     case "signal":
       return inputs.providerAdminBlocked ? "unavailable" : "ready";
@@ -106,6 +118,11 @@ function deriveReadiness(inputs: ReadinessInputs): ConnectedAgentView["readiness
     default:
       return "unavailable";
   }
+}
+
+/** Connected, still installed, and not inside a failed-bootstrap cool-down. */
+function canServe(inputs: ReadinessInputs): boolean {
+  return inputs.connectionState === "ready" && inputs.installationMissing !== true && inputs.sessionBootstrapFailing !== true;
 }
 
 function deriveRecoveryAction(inputs: ReadinessInputs, readiness: ConnectedAgentView["readiness"]): ConnectedAgentView["recoveryAction"] | undefined {
