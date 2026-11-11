@@ -182,7 +182,7 @@ setup_connect() {
     setup_detail 'Connecting this computer to Konteks...'
     setup_detail 'Enter the activation code when asked. It is hidden while you type.'
   fi
-  if "$@"; then
+  if KONTEKS_RELEASE_MANIFEST_URL="${KONTEKS_RELEASE_MANIFEST_URL:-$RELEASE_BASE/native-manifest.json}" "$@"; then
     setup_stage 'Setup complete'
     setup_detail 'Return to Konteks -> Customize -> Runtimes.'
     setup_detail 'Confirm this computer is online.'
