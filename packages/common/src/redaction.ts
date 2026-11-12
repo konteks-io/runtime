@@ -9,13 +9,23 @@ const SECRET_KEY_PATTERN =
   /(?:^|[_.-])(?:token|secret|password|passwd|credential|api[_-]?key|activation[_-]?code|private[_-]?key|lease|grant|authorization|cookie|set-cookie|x-api-key)(?:$|[_.-])/i;
 
 const BEARER_PATTERN = /\b(bearer)\s+[a-z0-9._~+/=-]{8,}/gi;
+/** Stars can be inserted anywhere inside a credential without changing its recoverable value. */
+function starredLiteral(value: string): string {
+  return [...value].map(character => character.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("\\**");
+}
+
+function keyPattern(prefix: string, body: string, minimum: number, flags = "gi"): RegExp {
+  return new RegExp(`\\b${starredLiteral(prefix)}\\**${body}(?:\\**${body}){${minimum - 1},}`, flags);
+}
+
 const API_KEY_PATTERNS: RegExp[] = [
-  /\bsk-ant-[a-z0-9_-]{8,}/gi, // Anthropic
-  /\bsk-(?:proj-)?[a-z0-9_-]{16,}/gi, // OpenAI / DeepSeek style
-  /\bAIza[0-9A-Za-z_-]{20,}/g, // Google API keys
-  /\bgh[pousr]_[A-Za-z0-9]{20,}/g, // GitHub tokens
-  /\beyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}/g, // JWS compact
-  /\bkxrp_[A-Za-z0-9_-]{4,}/g, // Konteks provisioning credential
+  keyPattern("sk-ant-", "[a-z0-9_-]", 8),
+  keyPattern("sk-proj-", "[a-z0-9_-]", 16),
+  keyPattern("sk-", "[a-z0-9_-]", 16),
+  keyPattern("AIza", "[0-9A-Za-z_-]", 20, "g"),
+  new RegExp(`\\b${starredLiteral("gh")}\\**[pousr]\\**_(?:\\**[A-Za-z0-9]){20,}`, "g"),
+  new RegExp(`\\b${starredLiteral("eyJ")}(?:\\**[a-zA-Z0-9_-]){10,}\\**\\.(?:\\**[a-zA-Z0-9_-]){10,}\\**\\.(?:\\**[a-zA-Z0-9_-]){10,}`, "g"),
+  keyPattern("kxrp_", "[A-Za-z0-9_-]", 4, "g"),
 ];
 
 const REDACTED = "[redacted]";

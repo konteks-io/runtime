@@ -1,3 +1,4 @@
+import { SecretTextRelay } from "./secret-text-relay.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
@@ -291,6 +292,7 @@ export class RelayedSession {
   private releaseChannel: (() => void) | null = null;
   /** Last streamed text per chunk kind, so redaction can tell a mid-token chunk start. */
   private readonly lastChunkText = new Map<string, ChunkTrail>();
+  private readonly secretText = new SecretTextRelay();
   /** A thinking signal went out and no other update has followed it yet. */
   private thinking = false;
   /** Safe tool identity carried from `tool_call` to sparse terminal updates. */
@@ -1074,7 +1076,15 @@ export class RelayedSession {
     const { canonicalMessage, canonicalIdentity } = this.canonicalized(message);
     const parsed = await this.parsedOutbound(message, canonicalMessage, canonicalIdentity);
     if (parsed === null) return;
-    const body = this.outboundBody(parsed, canonicalIdentity);
+    if (parsed.kind === "acp" && parsed.method === "session/update" && parsed.params.sessionId !== this.acpSessionRef) {
+      this.counters.malformedResponses += 1;
+      return;
+    }
+    for (const frame of this.secretText.messages(parsed)) await this.sendRedactedFrame(channelId, frame, canonicalIdentity);
+  }
+
+  private async sendRedactedFrame(channelId: string, frame: SessionToCoreMessage, canonicalIdentity: CanonicalIdentity | undefined): Promise<void> {
+    const body = this.outboundBody(frame, canonicalIdentity);
     if (body === null) return;
     const sourceSequence = await this.deps.beforeSendToCore?.(body);
     this.deps.assertExecutionOwned?.();

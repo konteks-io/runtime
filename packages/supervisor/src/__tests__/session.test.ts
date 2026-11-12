@@ -1918,6 +1918,28 @@ describe("relayed session", () => {
     expect(session.counters.malformedResponses).toBe(1);
   });
 
+  it("masks an asterisk-obfuscated credential split across every relay boundary", async () => {
+    const { session, sent } = await build();
+    await session.bootstrap();
+    const key = "sk-proj-*SYNTHETICNONFUNCTIONAL0123456789ABCDEF";
+    const update = (text: string) => session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: {
+      sessionId: "acp-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
+    } });
+    for (let at = 1; at < key.length; at += 1) {
+      const before = sent.length;
+      await update(`before ${key.slice(0, at)}`);
+      await update(`${key.slice(at)} after`);
+      await session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: {
+        sessionId: "acp-1", update: { sessionUpdate: "plan", entries: [] },
+      } });
+      const text = sent.slice(before).map(message => {
+        const body = message.body as { params?: { update?: { content?: { text?: string } } } };
+        return body.params?.update?.content?.text ?? "";
+      }).join("");
+      expect(text, `split ${at}`).toBe("before [redacted] after");
+    }
+  });
+
   it("relays every streamed chunk after one that ends inside a local path", async () => {
     const warn = vi.fn();
     const { session, sent } = await build({ logger: { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn() } as never });
