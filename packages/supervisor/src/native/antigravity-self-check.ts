@@ -21,7 +21,7 @@ import {
  * tripwire: a subagent tool never appears in a `tool_call`).
  */
 
-/** The sign-in methods antigravity-acp 1.2.x offers (`initialize.authMethods`). */
+/** The sign-in methods antigravity-acp 1.4.5 offers (`initialize.authMethods`). */
 export const ANTIGRAVITY_AUTH_METHODS: readonly string[] = Object.freeze(["oauth-personal", "oauth-business", "gemini-api-key", "agent-platform"]);
 
 interface AntigravitySelfCheckOptions {

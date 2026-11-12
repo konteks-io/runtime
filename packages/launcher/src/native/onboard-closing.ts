@@ -304,7 +304,7 @@ async function agentRemedies(s: OnboardSession, facts: AgentFacts): Promise<stri
   remedies.push(...await unsupportedHostAgents(s, facts.installed));
   // With no agent at all, one line for a person who wants Gemini: the
   // connector downloads Google Antigravity only after they say yes.
-  if (facts.installed.length === 0) remedies.push("If you want Gemini: konteks-remote agent add antigravity downloads Google Antigravity from Google (about 110 MB) after you say yes, then: konteks-remote auth login antigravity");
+  if (facts.installed.length === 0) remedies.push("If you want Gemini: konteks-remote agent add antigravity downloads Google Antigravity from Google (up to 350 MB) after you say yes, then: konteks-remote auth login antigravity");
   if (nativePlatform().os === "debian") {
     remedies.push("To keep the runtime available after logout: loginctl enable-linger $USER");
   }

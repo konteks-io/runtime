@@ -25,10 +25,10 @@ import { downloadPinnedFile, extractZipEntry, FetchedArchiveError, freeDiskBytes
 const ANTIGRAVITY_AGENT_ID = "antigravity";
 
 /** Asked before anything is downloaded: onboarding, `agent add antigravity`, and the site's card. */
-export const ANTIGRAVITY_CONSENT_TEXT = "Konteks will download Google Antigravity from Google's server (dl.google.com, about 110 MB, 400 MB on disk), check Google's signature, and keep it updated with Konteks updates. Google's terms apply to its use (antigravity.google/terms). Download it now? [y/N]";
+export const ANTIGRAVITY_CONSENT_TEXT = "Konteks will download Google Antigravity from Google's server (dl.google.com, up to 350 MB, about 1 GB on disk), check Google's signature where available, and keep it updated with Konteks updates. Google's terms apply to its use (antigravity.google/terms). Download it now? [y/N]";
 
-/** A fetch needs about 1.2 GB (zip, unpacked copy, the previous version during an update); below 1.5 GB free it is refused. */
-export const ANTIGRAVITY_MIN_FREE_BYTES = 1_500_000_000;
+/** A Linux fetch plus its previous copy needs over 2 GB; reserve 3 GB for downloading and updating. */
+export const ANTIGRAVITY_MIN_FREE_BYTES = 3_000_000_000;
 
 type Diagnostic = "antigravity_not_fetched" | "antigravity_unsupported_version" | "antigravity_unsafe_install" | "antigravity_no_disk_space" | "antigravity_unsupported_platform";
 
@@ -37,7 +37,7 @@ const MESSAGES: Record<Diagnostic, string> = {
   antigravity_not_fetched: `Google Antigravity has not been downloaded to this computer. Run \`${ADD}\` to fetch it.`,
   antigravity_unsupported_version: `Google Antigravity on this computer is not the version this connector runs. Run \`${ADD}\` to fetch it again.`,
   antigravity_unsafe_install: `Google Antigravity on this computer does not match Google's release. Run \`${ADD}\` to fetch it again.`,
-  antigravity_no_disk_space: "Google Antigravity needs about 1.2 GB free on this computer. Free some space, then try again.",
+  antigravity_no_disk_space: "Google Antigravity needs about 3 GB free on this computer. Free some space, then try again.",
   antigravity_unsupported_platform: "Google Antigravity is not available for this computer yet.",
 };
 

@@ -329,9 +329,10 @@ konteks-remote auth login antigravity     # a Gemini API key or Gemini Enterpris
 `agent add` asks before downloading (`--yes` is that answer given by you up
 front; without a terminal and without `--yes` nothing is downloaded). The
 connector downloads Google's official Antigravity ACP server, checks it
-against the version, sizes, hashes and Google signature this release pins,
+against the version, sizes, hashes and OS signature (where available) this release pins,
 keeps it in its own folder and checks it again before every start. It needs
-about 1.5 GB free. Only macOS on Apple silicon is supported for now. A
+about 3 GB free. This release supports macOS on Apple silicon, Linux x64/ARM64,
+and Windows x64/ARM64. A
 Konteks update that pins a newer version fetches it on your first yes.
 `konteks-remote agent remove antigravity` signs it out and deletes its
 download and sign-ins.

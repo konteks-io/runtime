@@ -949,10 +949,10 @@ describe("native Supervisor composition", () => {
   });
 
   describe.runIf(fetchedAgentPlatformPin("antigravity") !== undefined)("Google Antigravity (antigravity CP6)", () => {
-    const folder = () => join(root, "agents", "antigravity", "1.2.1-darwin-arm64");
+    const folder = () => join(root, "agents", "antigravity", "1.4.5-darwin-arm64");
     const antigravityConfig = () => RunnerConfigSchema.parse({
       RUNNER_AGENT_ID: "antigravity", RUNNER_CREDENTIAL_DIR: join(root, "credentials", "antigravity"), RUNNER_WORKSPACE_DIR: join(root, "antigravity-work"),
-      RUNNER_BRIDGE_PREFIX: folder(), RUNNER_NATIVE_ANTIGRAVITY_ROOT: folder(), RUNNER_BRIDGE_VERSION: "1.2.1",
+      RUNNER_BRIDGE_PREFIX: folder(), RUNNER_NATIVE_ANTIGRAVITY_ROOT: folder(), RUNNER_BRIDGE_VERSION: "1.4.5",
     });
     const doctorOf = async (supervisor: Supervisor) => (
           (await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never)) as { checks: Array<{ id: string; status: string; detail: string; recoveryActions: unknown[] }> }).checks;
@@ -996,12 +996,12 @@ describe("native Supervisor composition", () => {
       const reported = async () => (await supervisor.inventory.collect()).agents.find(agent => agent.agentId === "antigravity");
       expect(await reported()).toBeUndefined();
       internals.hostSettings = { openCodeFreeModels: false, coreAcceptsRouteBilling: true };
-      if (`${process.platform}-${process.arch}` !== "darwin-arm64") { expect(await reported()).toBeUndefined(); return; }
-      expect(await reported()).toMatchObject({ readiness: "unavailable", hostAgentDownload: { state: "not_downloaded", sizeBytes: 111_725_488 } });
+      if (!fetchedAgentPlatformPin("antigravity")) { expect(await reported()).toBeUndefined(); return; }
+      expect(await reported()).toMatchObject({ readiness: "unavailable", hostAgentDownload: { state: "not_downloaded", sizeBytes: fetchedAgentPlatformPin("antigravity")!.archive.size } });
       const staging = join(root, "agents", "antigravity", ".fetch-launcher");
       await mkdir(staging, { recursive: true, mode: 0o700 });
       await writeFile(join(staging, "archive.zip"), Buffer.alloc(4_096));
-      expect(await reported()).toMatchObject({ hostAgentDownload: { state: "downloading", receivedBytes: 4_096, sizeBytes: 111_725_488 } });
+      expect(await reported()).toMatchObject({ hostAgentDownload: { state: "downloading", receivedBytes: 4_096, sizeBytes: fetchedAgentPlatformPin("antigravity")!.archive.size } });
       // Never an agent to place work on.
       expect((await supervisor.inventory.collect()).components[0]?.capabilities).not.toContain("agent:antigravity");
     });
@@ -1051,10 +1051,10 @@ describe("native Supervisor composition", () => {
       // Started now, not in a minute.
       await vi.waitFor(() => expect(relocate).toHaveBeenCalledTimes(1));
       expect([...supervisor.runners.keys()]).toEqual(["codex"]);
-      const pinned = `${process.platform}-${process.arch}` === "darwin-arm64";
+      const pinned = fetchedAgentPlatformPin("antigravity") !== undefined;
       const updating = (await doctorOf(supervisor)).find(entry => entry.id === "antigravity");
       expect(updating).toMatchObject({ status: "fail" });
-      if (pinned) expect(updating!.detail).toContain("this connector release runs 1.2.1, which is being downloaded from Google and checked before it is used");
+      if (pinned) expect(updating!.detail).toContain("this connector release runs 1.4.5, which is being downloaded from Google and checked before it is used");
       finish!();
       // The zero-delay background retry still yields through the host event
       // loop. Give a loaded cross-platform CI runner room to publish the
