@@ -234,16 +234,16 @@ function queryWindowsProcessPair(pid: number): [WindowsProcessRecord | null, Win
   return windowsPair(value.first, value.second, pid);
 }
 
-function windowsStopDeps(options: StopOptions) {
+function windowsStopDeps(options: StopOptions, owner: RetainedProcessOwner) {
   return {
-    treeAlive: options.treeAlive ?? windowsProcessTreeAlive,
+    treeAlive: options.treeAlive ?? (pid => windowsProcessTreeAlive(pid, owner.startToken)),
     terminate: options.terminateTree ?? terminateWindowsProcessTree,
     pause: options.pause ?? pauseFor,
   };
 }
 
 async function stopWindowsProcessOwner(owner: RetainedProcessOwner, read: (pid: number) => ProcessIdentity | null, options: StopOptions): Promise<void> {
-  const { treeAlive, terminate, pause } = windowsStopDeps(options);
+  const { treeAlive, terminate, pause } = windowsStopDeps(options, owner);
   const survivors = () => treeAlive(owner.pid);
   if (!leaderToStop(owner, read(owner.pid), survivors, "tree")) return;
   terminate(owner.pid, false);
@@ -260,15 +260,45 @@ function terminateWindowsProcessTree(pid: number, force: boolean): void {
   if (result.error && (result.error as NodeJS.ErrnoException).code !== "ESRCH") throw result.error;
 }
 
-function windowsProcessTreeAlive(pid: number): boolean {
+function windowsProcessTreeAlive(pid: number, startToken: string): boolean {
   if (process.platform !== "win32" || !isBridgePid(pid)) throw invalidOwner("Windows process-tree observation is unavailable.");
-  const script = `$ErrorActionPreference='Stop'; $all=@(Get-CimInstance Win32_Process -ErrorAction Stop | Select-Object ProcessId,ParentProcessId); $seen=@(${pid}); do { $before=$seen.Count; $seen += @($all | Where-Object { $seen -contains $_.ParentProcessId } | ForEach-Object ProcessId); $seen=@($seen | Select-Object -Unique) } while ($seen.Count -gt $before); $present=($seen.Count -gt 1 -or @($all | Where-Object ProcessId -eq ${pid}).Count -gt 0); ConvertTo-Json -InputObject ([pscustomobject]@{present=[bool]$present}) -Compress`;
+  const script = "$ErrorActionPreference='Stop'; $all=@(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,CreationDate -ErrorAction Stop | ForEach-Object { $ticks=''; if($_.CreationDate){$ticks=[string]$_.CreationDate.ToUniversalTime().Ticks}; [pscustomobject]@{ProcessId=[int]$_.ProcessId;ParentProcessId=[int]$_.ParentProcessId;CreationDate=$ticks;CommandLine='';ExecutablePath=''} }); ConvertTo-Json -InputObject ([pscustomobject]@{complete=$true;processes=$all}) -Depth 4 -Compress";
   const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script],
     { encoding: "utf8", windowsHide: true, timeout: 20_000, maxBuffer: 64 * 1024 });
   if (result.error || result.status !== 0) throw invalidOwner("Windows process-tree query did not complete successfully.");
   const value = windowsObservation(result.stdout);
-  if (typeof value.present !== "boolean") throw invalidOwner("Windows process-tree observation is incomplete.");
-  return value.present;
+  if (value.complete !== true) throw invalidOwner("Windows process-tree observation is incomplete.");
+  return windowsProcessTreePresent(pid, startToken, value.processes);
+}
+
+/** A numeric parent PID can outlive its process. Only descendants born after
+ * this captured root (and each observed parent) belong to its current tree. */
+export function windowsProcessTreePresent(pid: number, startToken: string, value: unknown): boolean {
+  if (!Array.isArray(value) || !value.every(windowsRecord)) throw invalidOwner("Windows process-tree observation is incomplete.");
+  const start = windowsCreationTicks(startToken);
+  const root = value.find(record => record.ProcessId === pid);
+  // CIM exposes microseconds; Get-Process can expose the remaining 100ns digit.
+  if (root && windowsCreationTicks(root.CreationDate) / 10n !== start / 10n) throw invalidOwner("Retained bridge identity changed while stopping.");
+  const born = new Map<number, bigint>([[pid, start]]);
+  let before: number;
+  do {
+    before = born.size;
+    for (const record of value) addWindowsDescendant(record, born);
+  } while (born.size !== before);
+  return root !== undefined || born.size > 1;
+}
+
+function addWindowsDescendant(record: WindowsProcessRecord, born: Map<number, bigint>): void {
+  const parent = born.get(record.ParentProcessId);
+  if (parent === undefined || born.has(record.ProcessId)) return;
+  const start = windowsCreationTicks(record.CreationDate);
+  if (start < parent) return;
+  born.set(record.ProcessId, start);
+}
+
+function windowsCreationTicks(value: string): bigint {
+  if (!/^[0-9]{1,19}$/.test(value)) throw invalidOwner("Windows process-tree observation is incomplete.");
+  return BigInt(value);
 }
 
 function parseLinuxStat(bytes: Buffer | null, pid: number): LinuxStat | null {

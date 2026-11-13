@@ -20,6 +20,7 @@ import {
   createLogger,
   spawnPiped,
   stopProcessGroupLeaderFirst,
+  stopRetainedProcessOwner,
   type Logger,
   type PipedChildProcess,
   type RetainedProcessOwner,
@@ -227,9 +228,14 @@ function bridgeStopOwner(child: PipedChildProcess, state: { exited: boolean }, r
     get exited() { return state.exited; },
     ...(retainedProcessOwner ? { retainedProcessOwner } : {}),
     stop: async () => {
-      await stopProcessGroupLeaderFirst({ child, timeoutMs: 5_000, killGraceMs: 2_000 });
-      // The bounded group helper may finish on its grace timeout. Require
-      // actual leader-exit observation; this still does not prove tool/MCP
+      // Windows has no POSIX group: a direct leader kill leaves its native
+      // children alive. Use the captured creation identity and tree fence.
+      if (retainedProcessOwner?.platform === "win32") {
+        await stopRetainedProcessOwner(retainedProcessOwner);
+        await observeBridgeLeaderExit(child, state);
+      } else await stopProcessGroupLeaderFirst({ child, timeoutMs: 5_000, killGraceMs: 2_000 });
+      // Require actual leader-exit observation as well as the lifecycle
+      // helper's check; this still does not prove tool/MCP
       // quiescence or authorize release of retained execution capacity.
       if (!leaderExited(child, state)) {
         throw new RemoteInstanceError("recovery_required", "Bridge process exit remains unconfirmed.");
@@ -239,6 +245,22 @@ function bridgeStopOwner(child: PipedChildProcess, state: { exited: boolean }, r
       }
     },
   };
+}
+
+/** Synchronous Windows identity/tree queries can finish before libuv delivers
+ * the child's exit notification. Await that independent fact, boundedly. */
+async function observeBridgeLeaderExit(child: PipedChildProcess, state: { exited: boolean }): Promise<void> {
+  if (leaderExited(child, state)) return;
+  await new Promise<void>(resolve => {
+    const finish = () => {
+      clearTimeout(timer);
+      child.off("exit", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, 2_000);
+    child.once("exit", finish);
+    timer.unref();
+  });
 }
 
 function bridgeClient(handlers: BridgeClientHandlers): Client {

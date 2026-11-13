@@ -7,6 +7,7 @@ import {
   isProcessGroupAlive,
   spawnPiped,
   stopProcessGroupLeaderFirst,
+  stopRetainedProcessOwner,
   type PipedChildProcess,
 } from "@konteks/remote-common";
 import { spawnBridge, type BridgeStopOwner } from "../bridge/process.js";
@@ -15,6 +16,7 @@ import type { BridgeSpawnSpec } from "../bridge/spec.js";
 vi.mock("@konteks/remote-common", async importOriginal => ({
   ...await importOriginal<object>(), captureRetainedProcessOwner: vi.fn(), spawnPiped: vi.fn(),
   stopProcessGroupLeaderFirst: vi.fn(async () => undefined), isProcessGroupAlive: vi.fn(() => false),
+  stopRetainedProcessOwner: vi.fn(async () => undefined),
 }));
 
 beforeEach(() => {
@@ -86,5 +88,64 @@ it("refuses an unobserved process exit and retains the provisional stop owner fo
   await expect(owners[0]!.stop()).rejects.toThrow("Bridge process group exit remains unconfirmed");
   await expect(owners[0]!.stop()).resolves.toBeUndefined();
   expect(owners[0]!.exited).toBe(true);
+  child.stdin.destroy(); child.stdout.destroy(); child.stderr.destroy();
+});
+
+it("stops a captured Windows bridge through its fenced descendant-tree owner", async () => {
+  const child = childProcess();
+  const retained = { version: 1 as const, platform: "win32" as const, pid: child.pid!, processGroupId: child.pid!, startToken: "start", commandDigest: "digest" };
+  vi.mocked(spawnPiped).mockReturnValueOnce(child);
+  vi.mocked(captureRetainedProcessOwner).mockReturnValueOnce(retained);
+  vi.mocked(stopRetainedProcessOwner).mockImplementationOnce(async () => {
+    child.exitCode = 0;
+    child.emit("exit", 0, null);
+  });
+  await expect(spawnBridge({ spec, handlers, initializeTimeoutMs: 100, clientVersion: "fixture",
+    onProcessOwner: () => { throw new Error("fixture initialization aborted"); },
+  })).rejects.toThrow("fixture initialization aborted");
+  expect(stopRetainedProcessOwner).toHaveBeenCalledWith(retained);
+  expect(stopProcessGroupLeaderFirst).not.toHaveBeenCalled();
+  child.stdin.destroy(); child.stdout.destroy(); child.stderr.destroy();
+});
+
+it("does not fall back to a direct kill when the Windows owner fence refuses a stop", async () => {
+  const child = childProcess();
+  const retained = { version: 1 as const, platform: "win32" as const, pid: child.pid!, processGroupId: child.pid!, startToken: "start", commandDigest: "digest" };
+  vi.mocked(spawnPiped).mockReturnValueOnce(child);
+  vi.mocked(captureRetainedProcessOwner).mockReturnValueOnce(retained);
+  vi.mocked(stopRetainedProcessOwner).mockRejectedValueOnce(new RemoteInstanceError("recovery_required", "owner changed"));
+  await expect(spawnBridge({ spec, handlers, initializeTimeoutMs: 100, clientVersion: "fixture",
+    onProcessOwner: () => { throw new Error("fixture initialization aborted"); },
+  })).rejects.toMatchObject({ code: "recovery_required", message: "owner changed" });
+  expect(stopRetainedProcessOwner).toHaveBeenCalledWith(retained);
+  expect(stopProcessGroupLeaderFirst).not.toHaveBeenCalled();
+  child.stdin.destroy(); child.stdout.destroy(); child.stderr.destroy();
+});
+
+it("waits for the queued child-exit notification after the synchronous Windows tree check", async () => {
+  const child = childProcess();
+  const retained = { version: 1 as const, platform: "win32" as const, pid: child.pid!, processGroupId: child.pid!, startToken: "start", commandDigest: "digest" };
+  vi.mocked(spawnPiped).mockReturnValueOnce(child);
+  vi.mocked(captureRetainedProcessOwner).mockReturnValueOnce(retained);
+  vi.mocked(stopRetainedProcessOwner).mockImplementationOnce(async () => {
+    setImmediate(() => { child.exitCode = 0; child.emit("exit", 0, null); });
+  });
+  await expect(spawnBridge({ spec, handlers, initializeTimeoutMs: 100, clientVersion: "fixture",
+    onProcessOwner: () => { throw new Error("fixture initialization aborted"); },
+  })).rejects.toThrow("fixture initialization aborted");
+  expect(stopRetainedProcessOwner).toHaveBeenCalledWith(retained);
+  child.stdin.destroy(); child.stdout.destroy(); child.stderr.destroy();
+});
+
+it("keeps Windows leader exit unconfirmed when no notification arrives", async () => {
+  const child = childProcess();
+  const retained = { version: 1 as const, platform: "win32" as const, pid: child.pid!, processGroupId: child.pid!, startToken: "start", commandDigest: "digest" };
+  vi.mocked(spawnPiped).mockReturnValueOnce(child);
+  vi.mocked(captureRetainedProcessOwner).mockReturnValueOnce(retained);
+  vi.mocked(stopRetainedProcessOwner).mockResolvedValueOnce(undefined);
+  await expect(spawnBridge({ spec, handlers, initializeTimeoutMs: 100, clientVersion: "fixture",
+    onProcessOwner: () => { throw new Error("fixture initialization aborted"); },
+  })).rejects.toThrow("Bridge process exit remains unconfirmed");
+  expect(stopProcessGroupLeaderFirst).not.toHaveBeenCalled();
   child.stdin.destroy(); child.stdout.destroy(); child.stderr.destroy();
 });
