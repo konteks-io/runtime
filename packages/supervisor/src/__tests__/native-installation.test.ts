@@ -386,9 +386,10 @@ describe("closed native runtime installation", () => {
   });
   it("records Google Antigravity's fetched copy, re-verifies it through its adapter, and leaves a missing copy out to be fetched again on the first yes", async () => {
     const f = await fixture();
-    const folder = join(root, "agents", "antigravity", "1.4.5-darwin-arm64");
-    const record = NativeRuntimeRecordSchema.parse({ ...f.record, agents: ["codex", "antigravity"], antigravityVersion: "1.4.5", antigravityRoot: folder });
-    expect(record).toMatchObject({ antigravityVersion: "1.4.5", antigravityRoot: folder });
+    const version = releasePackages.fetchedAgentPin("antigravity")!.version;
+    const folder = join(root, "agents", "antigravity", `${version}-darwin-arm64`);
+    const record = NativeRuntimeRecordSchema.parse({ ...f.record, agents: ["codex", "antigravity"], antigravityVersion: version, antigravityRoot: folder });
+    expect(record).toMatchObject({ antigravityVersion: version, antigravityRoot: folder });
     expect(NativeRuntimeRecordSchema.safeParse({ ...f.record, antigravityRoot: "" }).success).toBe(false);
     // The loader's re-verification runs against the connector's own folder: nothing was fetched here.
     await expect(antigravityInstallAdapter.runnerSettings(record, { root })).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: expect.stringMatching(/^antigravity_(not_fetched|unsupported_platform)$/) });
@@ -401,7 +402,7 @@ describe("closed native runtime installation", () => {
     expect(loaded.record.agents).toEqual(["codex", "antigravity"]);
     expect(loaded.retiredAgents).toEqual([]);
     expect(loaded.runners.map(runner => runner.RUNNER_AGENT_ID)).toEqual(["codex"]);
-    expect(loaded.unavailableAgents).toEqual([expect.objectContaining({ agentId: "antigravity", fetched: { antigravityVersion: "1.4.5", antigravityRoot: folder } })]);
+    expect(loaded.unavailableAgents).toEqual([expect.objectContaining({ agentId: "antigravity", fetched: { antigravityVersion: version, antigravityRoot: folder } })]);
     const [entry] = loaded.unavailableAgents;
     // Where this release pins a copy, the missing one is fetched again at once (the first yes covers it).
     if (entry!.error.diagnostic === "antigravity_not_fetched") expect(entry!.updating).toBe(true);

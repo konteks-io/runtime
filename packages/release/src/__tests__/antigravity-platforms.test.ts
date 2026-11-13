@@ -17,7 +17,7 @@ describe("Google Antigravity on Linux and Windows", () => {
 
   it("accepts the version supplying Google's Linux and Windows packages", () => {
     const pin = fetchedAgentPin("antigravity")!;
-    expect(pin.version).toBe("1.4.5");
+    expect(pin.version).toBe("1.5.0");
     expect(hostAgentVersionSupported(hostAgentFamily("antigravity"), pin.version)).toBe(true);
   });
 

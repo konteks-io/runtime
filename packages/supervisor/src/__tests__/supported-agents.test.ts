@@ -27,7 +27,7 @@ describe("supported agents on this computer", () => {
       { agentId: "codex", state: "needs_sign_in", installCommand: "npm install -g @openai/codex" },
       { agentId: "dsh", state: "sign_in_expired", versionFound: "0.1.7-rc.2", supportedRange: ">=0.1.5-rc.3 <0.1.8", installCommand: "npm install -g @deepseek-ai/dsh@0.1.7-rc.2" },
       { agentId: "opencode", state: "installed_not_added", versionFound: "2.0.18", supportedRange: ">=2.0.18 <3.0.0", installCommand: "curl -fsSL https://opencode.ai/v2/install | bash", windowsInstallCommand: "npm install -g @opencode/cli" },
-      { agentId: "antigravity", state: "not_added", supportedRange: ">=1.4.5 <1.5.0", installCommand: "konteks-remote agent add antigravity" },
+      { agentId: "antigravity", state: "not_added", supportedRange: ">=1.5.0 <1.6.0", installCommand: "konteks-remote agent add antigravity" },
     ]);
   });
 

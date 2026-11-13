@@ -483,7 +483,7 @@ describe("the Antigravity install adapter", () => {
       return;
     }
     const pin = antigravityPin();
-    expect(pin.version).toBe("1.4.5");
+    expect(pin.version).toBe("1.5.0");
     expect(pin.key).toBe(`${process.platform}-${process.arch}`);
     expect(new URL(pin.platform.url).hostname).toBe("dl.google.com");
     expect(pin.platform.files.some(file => file.path === pin.platform.command)).toBe(true);

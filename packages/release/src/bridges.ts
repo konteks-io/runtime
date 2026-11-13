@@ -138,7 +138,7 @@ export const HOST_AGENT_BRIDGES: readonly AgentBridgeFamily[] = Object.freeze([
     agentId: "antigravity",
     displayName: "Google Antigravity",
     package: "antigravity-acp",
-    version: "1.4.5",
+    version: "1.5.0",
     // The arguments come from the pin (the registry's `args`, per platform).
     command: [],
     // Sign-in runs through ACP `authenticate` with a key or Gemini Enterprise.
@@ -149,7 +149,7 @@ export const HOST_AGENT_BRIDGES: readonly AgentBridgeFamily[] = Object.freeze([
       bin: "agy_acp_server",
       // What the start self-check and the canary accept; the connector
       // only ever runs the one version its release pins.
-      versions: { min: "1.4.5", belowCore: "1.5.0" },
+      versions: { min: "1.5.0", belowCore: "1.6.0" },
       installCommand: "konteks-remote agent add antigravity",
     },
   },

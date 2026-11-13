@@ -949,10 +949,10 @@ describe("native Supervisor composition", () => {
   });
 
   describe.runIf(fetchedAgentPlatformPin("antigravity") !== undefined)("Google Antigravity (antigravity CP6)", () => {
-    const folder = () => join(root, "agents", "antigravity", "1.4.5-darwin-arm64");
+    const folder = () => join(root, "agents", "antigravity", "1.5.0-darwin-arm64");
     const antigravityConfig = () => RunnerConfigSchema.parse({
       RUNNER_AGENT_ID: "antigravity", RUNNER_CREDENTIAL_DIR: join(root, "credentials", "antigravity"), RUNNER_WORKSPACE_DIR: join(root, "antigravity-work"),
-      RUNNER_BRIDGE_PREFIX: folder(), RUNNER_NATIVE_ANTIGRAVITY_ROOT: folder(), RUNNER_BRIDGE_VERSION: "1.4.5",
+      RUNNER_BRIDGE_PREFIX: folder(), RUNNER_NATIVE_ANTIGRAVITY_ROOT: folder(), RUNNER_BRIDGE_VERSION: "1.5.0",
     });
     const doctorOf = async (supervisor: Supervisor) => (
           (await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never)) as { checks: Array<{ id: string; status: string; detail: string; recoveryActions: unknown[] }> }).checks;
@@ -1054,7 +1054,7 @@ describe("native Supervisor composition", () => {
       const pinned = fetchedAgentPlatformPin("antigravity") !== undefined;
       const updating = (await doctorOf(supervisor)).find(entry => entry.id === "antigravity");
       expect(updating).toMatchObject({ status: "fail" });
-      if (pinned) expect(updating!.detail).toContain("this connector release runs 1.4.5, which is being downloaded from Google and checked before it is used");
+      if (pinned) expect(updating!.detail).toContain("this connector release runs 1.5.0, which is being downloaded from Google and checked before it is used");
       finish!();
       // The zero-delay background retry still yields through the host event
       // loop. Give a loaded cross-platform CI runner room to publish the

@@ -71,32 +71,32 @@ describe("host-installed agent families", () => {
 
   it("registers Google Antigravity as a fetched host agent, never bundled, with Google's release pinned", () => {
     const antigravity = hostAgentFamily("antigravity");
-    expect(antigravity).toMatchObject({ displayName: "Google Antigravity", package: "antigravity-acp", version: "1.4.5", command: [] });
-    expect(antigravity.hostInstall).toMatchObject({ launch: "fetched", versions: { min: "1.4.5", belowCore: "1.5.0" } });
+    expect(antigravity).toMatchObject({ displayName: "Google Antigravity", package: "antigravity-acp", version: "1.5.0", command: [] });
+    expect(antigravity.hostInstall).toMatchObject({ launch: "fetched", versions: { min: "1.5.0", belowCore: "1.6.0" } });
     expect(isHostAgentId("antigravity")).toBe(true);
     expect(SUPPORTED_AGENT_BRIDGES.some(bridge => bridge.agentId === "antigravity")).toBe(false);
     for (const platform of ["darwin", "linux", "win32"] as const) expect(hostInstallCommand(antigravity, platform)).toBe("konteks-remote agent add antigravity");
-    for (const version of ["1.4.5", "1.4.52"]) expect(hostAgentVersionSupported(antigravity, version), version).toBe(true);
-    for (const version of ["1.1.1", "1.5.0", "1.5.0-rc.1", "2.0.0"]) expect(hostAgentVersionSupported(antigravity, version), version).toBe(false);
+    for (const version of ["1.5.0", "1.5.52"]) expect(hostAgentVersionSupported(antigravity, version), version).toBe(true);
+    for (const version of ["1.1.1", "1.4.5", "1.5.0-rc.1", "1.6.0", "1.6.0-rc.1", "2.0.0"]) expect(hostAgentVersionSupported(antigravity, version), version).toBe(false);
     // The connector only follows the reviewed pins bundled in its own release.
     expect(FETCHED_AGENT_PINS.map(pin => pin.agentId)).toEqual(["antigravity"]);
     const pin = fetchedAgentPin("antigravity")!;
-    expect(pin).toMatchObject({ registryId: "antigravity-acp", version: "1.4.5", terms: "https://antigravity.google/terms" });
+    expect(pin).toMatchObject({ registryId: "antigravity-acp", version: "1.5.0", terms: "https://antigravity.google/terms" });
     expect(hostAgentVersionSupported(antigravity, pin.version)).toBe(true);
     expect(Object.keys(pin.platforms)).toEqual(["darwin-arm64", "linux-x64", "linux-arm64", "win32-x64", "win32-arm64"]);
     expect(fetchedAgentPlatformPin("antigravity", "darwin-arm64")).toEqual({
-      url: "https://dl.google.com/agy-extensions/releases/macos/agy-acp-server-1.4.5-darwin-arm64.zip",
-      archive: { format: "zip", size: 97923855, sha256: "886fff7767d08994ca39eb02c3d01a7532c7325a94aa33aaf52d52068733284f" },
+      url: "https://dl.google.com/agy-extensions/releases/macos/agy-acp-server-1.5.0-darwin-arm64.zip",
+      archive: { format: "zip", size: 100401185, sha256: "c82ecb4ef476bfc35cbe5b2745cdddef873b99c9f5bd7fd11e5ca1fc1667a3fc" },
       command: "agy_acp_server.par", args: [],
       files: [
-        { path: "agy_acp_server.par", size: 178915920, sha256: "fb2581fb49738263db15ffccf3f48d979794ffb748350e85c335953f6b6522a2" },
-        { path: "localharness_external", size: 122957936, sha256: "9d87cb505e6efa316f55bb98459de614de867dce43cdeb5677b2153d77c283e8" },
+        { path: "agy_acp_server.par", size: 179756208, sha256: "bbb138a7ff32982e231af325e3176b252174f4c59e4fee7159c0e364ad5f9613" },
+        { path: "localharness_external", size: 129572384, sha256: "4eddc5c77a0bb275372fb548a9011a1acc70828a4a72412f2da0733c90db30fe" },
       ],
       signer: { kind: "apple_team_id", teamId: "EQHXZ8M8AV" },
     });
     expect(fetchedAgentPlatformPin("antigravity", null)).toBeUndefined();
     expect(fetchedAgentPlatformPin("opencode", "darwin-arm64")).toBeUndefined();
-    expect(fetchedAgentFolderName(pin, "darwin-arm64")).toBe("1.4.5-darwin-arm64");
+    expect(fetchedAgentFolderName(pin, "darwin-arm64")).toBe("1.5.0-darwin-arm64");
     expect(fetchedAgentPlatformKey("darwin", "arm64")).toBe("darwin-arm64");
     expect(fetchedAgentPlatformKey("win32", "x64")).toBe("win32-x64");
     expect(fetchedAgentPlatformKey("freebsd", "x64")).toBeNull();

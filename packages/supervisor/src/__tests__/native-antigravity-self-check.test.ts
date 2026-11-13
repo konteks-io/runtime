@@ -11,22 +11,22 @@ import { ANTIGRAVITY_AUTH_METHODS, antigravityInitializeDrift, checkAntigravityS
 /**
  * The Google Antigravity start check: one `initialize` of the fetched
  * server in the connector's private home proves it answers as the server
- * Konteks governs. The fixture is antigravity-acp 1.4.5's own answer
+ * Konteks governs. The fixture is antigravity-acp 1.5.0's own answer
  * (the shape a live `initialize` returns).
  */
 const pin = fetchedAgentPlatformPin("antigravity");
-const INITIALIZE = JSON.parse(await readFile(new URL("./fixtures/antigravity-1.4.5-initialize.json", import.meta.url), "utf8")) as InitializeResponse;
+const INITIALIZE = JSON.parse(await readFile(new URL("./fixtures/antigravity-1.5.0-initialize.json", import.meta.url), "utf8")) as InitializeResponse;
 
 const roots: string[] = [];
 afterEach(async () => { vi.unstubAllEnvs(); for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
 
 async function fixture(answer: (options: SpawnBridgeOptions) => Promise<InitializeResponse> = async () => structuredClone(INITIALIZE)) {
   const root = await realpath(await mkdtemp(join(tmpdir(), "agy-self-check-"))); roots.push(root);
-  const folder = join(root, "agents", "antigravity", "1.4.5-darwin-arm64");
+  const folder = join(root, "agents", "antigravity", "1.5.0-darwin-arm64");
   await mkdir(folder, { recursive: true });
   for (const file of pin!.files) await writeFile(join(folder, file.path), file.path);
   const config = RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "antigravity", RUNNER_CREDENTIAL_DIR: join(root, "credentials", "antigravity"), RUNNER_WORKSPACE_DIR: join(root, "workspace"),
-    RUNNER_BRIDGE_PREFIX: folder, RUNNER_BRIDGE_VERSION: "1.4.5", RUNNER_NATIVE_ANTIGRAVITY_ROOT: folder });
+    RUNNER_BRIDGE_PREFIX: folder, RUNNER_BRIDGE_VERSION: "1.5.0", RUNNER_NATIVE_ANTIGRAVITY_ROOT: folder });
   const stops: string[] = [];
   const spawn = vi.fn(async (options: SpawnBridgeOptions): Promise<BridgeProcess> => {
     const initializeResult = await answer(options);
@@ -39,7 +39,7 @@ async function fixture(answer: (options: SpawnBridgeOptions) => Promise<Initiali
 }
 
 describe.runIf(pin !== undefined)("the Google Antigravity start check", () => {
-  it("passes on antigravity-acp 1.4.5's own answer, in the private home, with none of the owner's secrets, and stops everything after", async () => {
+  it("passes on antigravity-acp 1.5.0's own answer, in the private home, with none of the owner's secrets, and stops everything after", async () => {
     vi.stubEnv("GITHUB_TOKEN", "ghp_owner_must_not_reach");
     vi.stubEnv("GEMINI_API_KEY", "gemini-owner");
     vi.stubEnv("GOOGLE_CLOUD_PROJECT", "owner-project");
@@ -68,10 +68,10 @@ describe.runIf(pin !== undefined)("the Google Antigravity start check", () => {
     await utimes(harness, before.atime, new Date(before.mtime.getTime() + 5_000));
     await f.check();
     expect(f.spawn).toHaveBeenCalledTimes(2);
-    let version = "1.4.6";
+    let version = "1.5.1";
     const drifting = await fixture(async () => ({ ...structuredClone(INITIALIZE), agentInfo: { ...INITIALIZE.agentInfo!, version } }));
     await expect(drifting.check()).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "antigravity_unsupported_version" });
-    version = "1.4.5";
+    version = "1.5.0";
     await drifting.check();
     expect(drifting.spawn).toHaveBeenCalledTimes(2);
   });
@@ -79,16 +79,16 @@ describe.runIf(pin !== undefined)("the Google Antigravity start check", () => {
   it("reads drift as an unsupported version the person fixes by updating the connector", async () => {
     const f = await fixture(async () => ({ ...structuredClone(INITIALIZE), authMethods: INITIALIZE.authMethods!.filter(method => method.id !== "oauth-business") }));
     await expect(f.check()).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "antigravity_unsupported_version", recoveryActions: [{ kind: "update" }],
-      message: "Unsupported Google Antigravity version: 1.4.5 does not answer as Konteks expects (the oauth-business sign-in is missing). Update the connector." });
+      message: "Unsupported Google Antigravity version: 1.5.0 does not answer as Konteks expects (the oauth-business sign-in is missing). Update the connector." });
   });
 
   it("names each thing that drifted", () => {
-    expect(antigravityInitializeDrift(INITIALIZE, "1.4.5")).toEqual([]);
+    expect(antigravityInitializeDrift(INITIALIZE, "1.5.0")).toEqual([]);
     expect(ANTIGRAVITY_AUTH_METHODS).toEqual(["oauth-personal", "oauth-business", "gemini-api-key", "agent-platform"]);
     const caps = INITIALIZE.agentCapabilities!;
     const cases: Array<[Partial<InitializeResponse>, RegExp]> = [
-      [{ agentInfo: { name: "gemini-cli", version: "1.4.5" } }, /not Google's antigravity-acp/],
-      [{ agentInfo: { name: "antigravity-acp", version: "1.4.4" } }, /reports version 1\.4\.4, not the pinned 1\.4\.5/],
+      [{ agentInfo: { name: "gemini-cli", version: "1.5.0" } }, /not Google's antigravity-acp/],
+      [{ agentInfo: { name: "antigravity-acp", version: "1.4.4" } }, /reports version 1\.4\.4, not the pinned 1\.5\.0/],
       [{ authMethods: [...INITIALIZE.authMethods!, { id: "gateway", name: "Gateway" }] }, /gateway sign-in/],
       [{ authMethods: INITIALIZE.authMethods!.filter(method => method.id !== "gemini-api-key") }, /gemini-api-key sign-in is missing/],
       [{ agentCapabilities: { ...caps, mcpCapabilities: { http: false, sse: true } } }, /MCP servers over http/],
@@ -96,9 +96,14 @@ describe.runIf(pin !== undefined)("the Google Antigravity start check", () => {
       [{ agentCapabilities: { ...caps, sessionCapabilities: { list: {} } } }, /cannot resume/],
       [{ agentCapabilities: { ...caps, promptCapabilities: { image: true, audio: true, embeddedContext: false } } }, /embedded context/],
     ];
-    for (const [change, drift] of cases) expect(antigravityInitializeDrift({ ...structuredClone(INITIALIZE), ...change } as InitializeResponse, "1.4.5").join("; "), String(drift)).toMatch(drift);
+    for (const [change, drift] of cases) expect(antigravityInitializeDrift({ ...structuredClone(INITIALIZE), ...change } as InitializeResponse, "1.5.0").join("; "), String(drift)).toMatch(drift);
     // A pinned version outside the family's range never passes either.
-    expect(antigravityInitializeDrift({ ...INITIALIZE, agentInfo: { name: "antigravity-acp", version: "1.5.0" } }, "1.5.0")).toEqual(["version 1.5.0 is outside the supported range"]);
+    expect(antigravityInitializeDrift({ ...INITIALIZE, agentInfo: { name: "antigravity-acp", version: "1.6.0" } }, "1.6.0")).toEqual(["version 1.6.0 is outside the supported range"]);
+  });
+
+  it("does not mistake the previously captured server for the new pin", async () => {
+    const previous = JSON.parse(await readFile(new URL("./fixtures/antigravity-1.4.5-initialize.json", import.meta.url), "utf8")) as InitializeResponse;
+    expect(antigravityInitializeDrift(previous, "1.5.0")).toContain("it reports version 1.4.5, not the pinned 1.5.0");
   });
 
   it("a server that cannot start is a retryable failure, still followed by the sweep", async () => {
