@@ -87,6 +87,7 @@ async function proveLiveSession(config, bridge, result) {
   const session = await bridge.connection.newSession({ cwd: config.RUNNER_WORKSPACE_DIR, mcpServers: [], _meta: antigravityRunnerAdapter.sessionMeta });
   antigravityRunnerAdapter.verifySession(session);
   const options = session.configOptions.find(option => option.id === "model").options.flatMap(option => option.options ?? [option]);
+  result.offeredModels = options.map(option => option.value).filter(value => /^gemini-[a-z0-9._-]{1,100}$/.test(value)).slice(0, 64);
   const flash = options.filter(option => /flash/.test(option.value));
   flash.sort((a, b) => modelRank(a.value) - modelRank(b.value));
   if (!flash.length) throw new Error("no low-cost Flash model offered");
