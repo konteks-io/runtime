@@ -386,9 +386,12 @@ describe("closed native runtime installation", () => {
   });
   it("records Google Antigravity's fetched copy, re-verifies it through its adapter, and leaves a missing copy out to be fetched again on the first yes", async () => {
     const f = await fixture();
-    const folder = join(root, "agents", "antigravity", "1.2.1-darwin-arm64");
-    const record = NativeRuntimeRecordSchema.parse({ ...f.record, agents: ["codex", "antigravity"], antigravityVersion: "1.2.1", antigravityRoot: folder });
-    expect(record).toMatchObject({ antigravityVersion: "1.2.1", antigravityRoot: folder });
+    const version = releasePackages.fetchedAgentPin("antigravity")!.version;
+    const key = releasePackages.fetchedAgentPlatformKey();
+    expect(key).not.toBeNull();
+    const folder = join(root, "agents", "antigravity", releasePackages.fetchedAgentFolderName({ version }, key!));
+    const record = NativeRuntimeRecordSchema.parse({ ...f.record, agents: ["codex", "antigravity"], antigravityVersion: version, antigravityRoot: folder });
+    expect(record).toMatchObject({ antigravityVersion: version, antigravityRoot: folder });
     expect(NativeRuntimeRecordSchema.safeParse({ ...f.record, antigravityRoot: "" }).success).toBe(false);
     // The loader's re-verification runs against the connector's own folder: nothing was fetched here.
     await expect(antigravityInstallAdapter.runnerSettings(record, { root })).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: expect.stringMatching(/^antigravity_(not_fetched|unsupported_platform)$/) });
@@ -401,12 +404,23 @@ describe("closed native runtime installation", () => {
     expect(loaded.record.agents).toEqual(["codex", "antigravity"]);
     expect(loaded.retiredAgents).toEqual([]);
     expect(loaded.runners.map(runner => runner.RUNNER_AGENT_ID)).toEqual(["codex"]);
-    expect(loaded.unavailableAgents).toEqual([expect.objectContaining({ agentId: "antigravity", fetched: { antigravityVersion: "1.2.1", antigravityRoot: folder } })]);
+    expect(loaded.unavailableAgents).toEqual([expect.objectContaining({ agentId: "antigravity", fetched: { antigravityVersion: version, antigravityRoot: folder } })]);
     const [entry] = loaded.unavailableAgents;
     // Where this release pins a copy, the missing one is fetched again at once (the first yes covers it).
     if (entry!.error.diagnostic === "antigravity_not_fetched") expect(entry!.updating).toBe(true);
     else expect(entry!.updating).toBeUndefined();
     await expect(antigravityInstallAdapter.selfCheck({} as never)).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "antigravity_not_fetched" });
+  });
+  it("refuses an Antigravity record naming another platform's fetched folder", async () => {
+    const f = await fixture();
+    const version = releasePackages.fetchedAgentPin("antigravity")!.version;
+    const foreignKey = releasePackages.fetchedAgentPlatformKey() === "darwin-arm64" ? "linux-x64" : "darwin-arm64";
+    const antigravityRoot = join(root, "agents", "antigravity", releasePackages.fetchedAgentFolderName({ version }, foreignKey));
+    const record = NativeRuntimeRecordSchema.parse({ ...f.record, agents: ["antigravity"], antigravityVersion: version, antigravityRoot });
+    // Without a host pin, platform refusal precedes any record-folder check.
+    const diagnostic = releasePackages.fetchedAgentPlatformPin("antigravity") ? "antigravity_unsafe_install" : "antigravity_unsupported_platform";
+    await expect(antigravityInstallAdapter.runnerSettings(record, { root }))
+      .rejects.toMatchObject({ code: "prerequisite_missing", diagnostic });
   });
   it.each([{ releaseId: "../outside" }, { agents: ["codex", "codex"] }, { coreUrl: "http://core.example" }, { coreUrl: "https://user:password@core.example" }, { relayUrl: "ws://relay.example" }, { gatewayKey: "forbidden" }, { environment: { NODE_OPTIONS: "--require untrusted" } }, { deploymentKind: "appliance" }, { command: "/bin/sh" }])("rejects unsafe or unimplemented install fields", async patch => {
     const f = await fixture();

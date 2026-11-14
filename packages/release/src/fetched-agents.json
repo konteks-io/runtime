@@ -5,31 +5,140 @@
       "agentId": "antigravity",
       "source": "https://github.com/agentclientprotocol/registry/blob/main/antigravity-acp/agent.json",
       "registryId": "antigravity-acp",
-      "version": "1.2.1",
+      "version": "1.5.0",
       "terms": "https://antigravity.google/terms",
       "platforms": {
         "darwin-arm64": {
-          "url": "https://dl.google.com/agy-extensions/releases/macos/agy-acp-server-1.2.1-darwin-arm64.zip",
+          "url": "https://dl.google.com/agy-extensions/releases/macos/agy-acp-server-1.5.0-darwin-arm64.zip",
           "archive": {
             "format": "zip",
-            "size": 111725488,
-            "sha256": "0fab9938812e6b32b3b543e65e4f3a0025ceef755413db13542d9a9b81ea803c"
+            "size": 100401185,
+            "sha256": "c82ecb4ef476bfc35cbe5b2745cdddef873b99c9f5bd7fd11e5ca1fc1667a3fc"
           },
           "command": "agy_acp_server.par",
           "args": [],
           "files": [
             {
               "path": "agy_acp_server.par",
-              "size": 276920768,
-              "sha256": "c93c86c0f505fcdf8b13c695bed26d306141ef5446189d591397074d324db34e"
+              "size": 179756208,
+              "sha256": "bbb138a7ff32982e231af325e3176b252174f4c59e4fee7159c0e364ad5f9613"
             },
             {
               "path": "localharness_external",
-              "size": 120663872,
-              "sha256": "1b8a2b712ca312c9769e425b800bfbcceec4770f19736404474d1e8e50d65456"
+              "size": 129572384,
+              "sha256": "4eddc5c77a0bb275372fb548a9011a1acc70828a4a72412f2da0733c90db30fe"
             }
           ],
-          "signer": { "kind": "apple_team_id", "teamId": "EQHXZ8M8AV" }
+          "signer": {
+            "kind": "apple_team_id",
+            "teamId": "EQHXZ8M8AV"
+          }
+        },
+        "linux-x64": {
+          "url": "https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-1.5.0-linux-x86_64.zip",
+          "archive": {
+            "format": "zip",
+            "size": 274069093,
+            "sha256": "36f373e8948edf1727b39c7d62b5722d6a4474bdfd72b04ad3d6def571808c9f"
+          },
+          "command": "agy_acp_server.par",
+          "args": [
+            "--uid="
+          ],
+          "files": [
+            {
+              "path": "agy_acp_server.par",
+              "size": 714224576,
+              "sha256": "8a35f63dd2284e3790a1d97dd0cb2236057c55a0c598b26f3bde022b843d5c04"
+            },
+            {
+              "path": "localharness_external",
+              "size": 139570072,
+              "sha256": "13dca92307524722a3434cd50baba3f33502d71a24f804f03ee2efbd18b6017d"
+            }
+          ],
+          "signer": {
+            "kind": "none"
+          }
+        },
+        "linux-arm64": {
+          "url": "https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-1.5.0-linux-arm64.zip",
+          "archive": {
+            "format": "zip",
+            "size": 264366319,
+            "sha256": "1e184f439477b54138e94440056b26a78c0a8075a8fd2ffda637ec31267c6459"
+          },
+          "command": "agy_acp_server.par",
+          "args": [
+            "--uid="
+          ],
+          "files": [
+            {
+              "path": "agy_acp_server.par",
+              "size": 721489411,
+              "sha256": "4437a73922a11a67c0185f4b709cb685cf67ae6d56e2ffe9cc29062a99befb20"
+            },
+            {
+              "path": "localharness_external",
+              "size": 132951888,
+              "sha256": "485cb7d96d06ce732d841713e5166d07f4053e8c4aaf31a31f6204ee8d024eb2"
+            }
+          ],
+          "signer": {
+            "kind": "none"
+          }
+        },
+        "win32-x64": {
+          "url": "https://dl.google.com/agy-extensions/releases/windows/agy-acp-server-1.5.0-windows-x86_64.zip",
+          "archive": {
+            "format": "zip",
+            "size": 105513364,
+            "sha256": "6163f6b59b381bae419652dbae167bc8cda0ef29d665c0ba8af3d8c7fddd8867"
+          },
+          "command": "agy_acp_server.exe",
+          "args": [],
+          "files": [
+            {
+              "path": "agy_acp_server.exe",
+              "size": 58314376,
+              "sha256": "209a30dee3f67fbb62710263d38323dc0d66b71b5121eb37ea80b63383dd178a"
+            },
+            {
+              "path": "localharness_external.exe",
+              "size": 155782808,
+              "sha256": "4e3644c05a601fd8da1cc9e72639e857d3a7c78f3d2cdf48ea7805ce4a3263ab"
+            }
+          ],
+          "signer": {
+            "kind": "authenticode",
+            "certificateSha256": "2029505d14baf18af60a0d1a7d8b56447db643b32faa849d4c08d2ab1ff3a4fd"
+          }
+        },
+        "win32-arm64": {
+          "url": "https://dl.google.com/agy-extensions/releases/windows/agy-acp-server-1.5.0-windows-arm64.zip",
+          "archive": {
+            "format": "zip",
+            "size": 108145235,
+            "sha256": "340092b8af6dafc71eb15f4a8ec54b4d1f0bce16d1fa4d163b562c50b905f8f4"
+          },
+          "command": "agy_acp_server.exe",
+          "args": [],
+          "files": [
+            {
+              "path": "agy_acp_server.exe",
+              "size": 65077040,
+              "sha256": "2acaf9e80de0e979c214fc7c00427dd2791469e1a446fe8c545bcb5d8745a7f4"
+            },
+            {
+              "path": "localharness_external.exe",
+              "size": 147104920,
+              "sha256": "4ca67a6d4472c06a09aec01dece2f6001ba6c88002e7a3a14ee7520f25d1a951"
+            }
+          ],
+          "signer": {
+            "kind": "authenticode",
+            "certificateSha256": "2029505d14baf18af60a0d1a7d8b56447db643b32faa849d4c08d2ab1ff3a4fd"
+          }
         }
       }
     }

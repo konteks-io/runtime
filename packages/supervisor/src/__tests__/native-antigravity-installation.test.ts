@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { crc32, deflateRawSync } from "node:zlib";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { fetchedAgentPlatformPin } from "@konteks/remote-release";
 import { RunnerConfigSchema } from "@konteks/remote-agent-runner";
 import {
   ANTIGRAVITY_CONSENT_TEXT, ANTIGRAVITY_MIN_FREE_BYTES, antigravityFolders, antigravityPin, clearAntigravityVerificationCache,
@@ -141,7 +142,7 @@ describe.runIf(haveOpenssl)("fetching Google Antigravity (A2, A14–A20)", () =>
     expect(hits).toEqual([]);
     expect(await readdir(root)).toEqual([]);
     expect(antigravityInstallAdapter.consentText).toBe(ANTIGRAVITY_CONSENT_TEXT);
-    expect(ANTIGRAVITY_CONSENT_TEXT).toContain("dl.google.com, about 110 MB, 400 MB on disk");
+    expect(ANTIGRAVITY_CONSENT_TEXT).toContain("dl.google.com, up to 350 MB, about 1 GB on disk");
     expect(ANTIGRAVITY_CONSENT_TEXT).toMatch(/\[y\/N\]$/);
   });
 
@@ -216,12 +217,20 @@ describe.runIf(haveOpenssl)("fetching Google Antigravity (A2, A14–A20)", () =>
     expect(await readdir(root)).toEqual(["agents"]);
   });
 
-  it("refuses to start a fetch without 1.5 GB free, before downloading anything", async () => {
+  it("refuses to start a fetch without 3 GB free, before downloading anything", async () => {
     await fresh();
     const refusal = await fetchNativeAntigravity({ root, consent: true }, deps(pinFor(GOOD), { freeBytes: async () => ANTIGRAVITY_MIN_FREE_BYTES - 1 })).catch(error => error);
     expect(refusal).toMatchObject({ code: "prerequisite_missing", diagnostic: "antigravity_no_disk_space", recoveryActions: [{ kind: "free_disk", agentId: "antigravity" }] });
-    expect(refusal.message).toBe("Google Antigravity needs about 1.2 GB free on this computer. Free some space, then try again.");
+    expect(refusal.message).toBe("Google Antigravity needs about 3 GB free on this computer. Free some space, then try again.");
     expect(hits).toEqual([]);
+  });
+
+  it("reserves room for the largest Linux archive, unpacked copy and retained prior copy", async () => {
+    for (const key of ["linux-x64", "linux-arm64"] as const) {
+      const pin = fetchedAgentPlatformPin("antigravity", key)!;
+      const unpacked = pin.files.reduce((bytes, file) => bytes + file.size, 0);
+      expect(ANTIGRAVITY_MIN_FREE_BYTES).toBeGreaterThan(pin.archive.size + 2 * unpacked);
+    }
   });
 
   it("refuses a copy without Google's signature, at fetch and at every start", async () => {
@@ -426,7 +435,7 @@ describe("the zip reader and the signature check", () => {
 
   it("never passes a signer for another operating system", async () => {
     await expect(verifyFetchedSignature("/nonexistent", { kind: "apple_team_id", teamId: "EQHXZ8M8AV" }, "linux")).resolves.toBe(false);
-    await expect(verifyFetchedSignature("/nonexistent", { kind: "authenticode", subject: "CN=Google LLC" }, "darwin")).resolves.toBe(false);
+    await expect(verifyFetchedSignature("/nonexistent", { kind: "authenticode", certificateSha256: "0".repeat(64) }, "darwin")).resolves.toBe(false);
     await expect(verifyFetchedSignature("/nonexistent", { kind: "none" }, "linux")).resolves.toBe(true);
   });
 
@@ -463,23 +472,21 @@ describe("the Antigravity install adapter", () => {
     await expect(antigravityInstallAdapter.locate()).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "antigravity_not_fetched" });
     await expect(antigravityInstallAdapter.runnerSettings({} as never)).rejects.toMatchObject({ code: "prerequisite_missing" });
     await expect(antigravityInstallAdapter.selfCheck(RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "antigravity" }))).rejects.toMatchObject({ diagnostic: "antigravity_not_fetched" });
-    // Refused before any consent question where Google publishes no copy (plainly, with nothing to run).
-    if (`${process.platform}-${process.arch}` === "darwin-arm64") expect(() => antigravityInstallAdapter.assertFetchable!()).not.toThrow();
-    else expect(() => antigravityInstallAdapter.assertFetchable!()).toThrow(expect.objectContaining({ diagnostic: "antigravity_unsupported_platform", message: "Google Antigravity is not available for this computer yet.", recoveryActions: [] }));
+    if (fetchedAgentPlatformPin("antigravity")) expect(() => antigravityInstallAdapter.assertFetchable!()).not.toThrow();
+    else expect(() => antigravityInstallAdapter.assertFetchable!()).toThrow(expect.objectContaining({ diagnostic: "antigravity_unsupported_platform" }));
   });
 
-  it("carries this release's pin: Google's 1.2.1 zip for macOS arm64 from dl.google.com, and nothing for platforms not yet proven", () => {
-    const folders = antigravityFolders("/r", { version: "1.2.1", key: "darwin-arm64" });
-    expect(folders).toEqual({ agents: join("/r", "agents"), base: join("/r", "agents", "antigravity"), version: join("/r", "agents", "antigravity", "1.2.1-darwin-arm64") });
-    if (`${process.platform}-${process.arch}` === "darwin-arm64") {
-      expect(antigravityPin()).toMatchObject({ version: "1.2.1", key: "darwin-arm64", platform: {
-        url: "https://dl.google.com/agy-extensions/releases/macos/agy-acp-server-1.2.1-darwin-arm64.zip",
-        archive: { size: 111725488, sha256: "0fab9938812e6b32b3b543e65e4f3a0025ceef755413db13542d9a9b81ea803c" },
-        signer: { kind: "apple_team_id", teamId: "EQHXZ8M8AV" },
-      } });
-    } else {
+  it("carries Google's pinned release for this supported computer", () => {
+    expect(antigravityFolders("/r", { version: "1.4.5", key: "darwin-arm64" })).toEqual({ agents: join("/r", "agents"), base: join("/r", "agents", "antigravity"), version: join("/r", "agents", "antigravity", "1.4.5-darwin-arm64") });
+    if (!fetchedAgentPlatformPin("antigravity")) {
       expect(() => antigravityPin()).toThrow(/not available for this computer yet/);
+      return;
     }
+    const pin = antigravityPin();
+    expect(pin.version).toBe("1.5.0");
+    expect(pin.key).toBe(`${process.platform}-${process.arch}`);
+    expect(new URL(pin.platform.url).hostname).toBe("dl.google.com");
+    expect(pin.platform.files.some(file => file.path === pin.platform.command)).toBe(true);
   });
 });
 

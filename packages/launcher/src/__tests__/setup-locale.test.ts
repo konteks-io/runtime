@@ -150,7 +150,7 @@ describe("foreground setup language", () => {
     input.write("ya\n");
     expect(await pending).toBe(true);
     expect(out.text()).toContain("Konteks akan mengunduh Google Antigravity");
-    for (const fact of ["dl.google.com", "110 MB", "400 MB", "antigravity.google/terms"]) expect(out.text()).toContain(fact);
+    for (const fact of ["dl.google.com", "350 MB", "1 GB", "antigravity.google/terms"]) expect(out.text()).toContain(fact);
     expect(out.text()).toContain("[y=ya/N=tidak]");
   });
 
@@ -170,7 +170,7 @@ describe("foreground setup language", () => {
     const consent = terminalFetchConsent({ yes: true, line: text => { lines.push(text); } });
     expect(await consent("antigravity", hostAgentInstallAdapter("antigravity")!.consentText!)).toBe(true);
     expect(lines[0]).toContain("Konteks akan mengunduh Google Antigravity");
-    for (const fact of ["dl.google.com", "110 MB", "400 MB", "antigravity.google/terms"]) expect(lines[0]).toContain(fact);
+    for (const fact of ["dl.google.com", "350 MB", "1 GB", "antigravity.google/terms"]) expect(lines[0]).toContain(fact);
     expect(lines[1]).toBe("Jawaban ya diberikan melalui --yes.");
   });
 
