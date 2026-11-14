@@ -417,8 +417,10 @@ describe("closed native runtime installation", () => {
     const foreignKey = releasePackages.fetchedAgentPlatformKey() === "darwin-arm64" ? "linux-x64" : "darwin-arm64";
     const antigravityRoot = join(root, "agents", "antigravity", releasePackages.fetchedAgentFolderName({ version }, foreignKey));
     const record = NativeRuntimeRecordSchema.parse({ ...f.record, agents: ["antigravity"], antigravityVersion: version, antigravityRoot });
+    // Without a host pin, platform refusal precedes any record-folder check.
+    const diagnostic = releasePackages.fetchedAgentPlatformPin("antigravity") ? "antigravity_unsafe_install" : "antigravity_unsupported_platform";
     await expect(antigravityInstallAdapter.runnerSettings(record, { root }))
-      .rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "antigravity_unsafe_install" });
+      .rejects.toMatchObject({ code: "prerequisite_missing", diagnostic });
   });
   it.each([{ releaseId: "../outside" }, { agents: ["codex", "codex"] }, { coreUrl: "http://core.example" }, { coreUrl: "https://user:password@core.example" }, { relayUrl: "ws://relay.example" }, { gatewayKey: "forbidden" }, { environment: { NODE_OPTIONS: "--require untrusted" } }, { deploymentKind: "appliance" }, { command: "/bin/sh" }])("rejects unsafe or unimplemented install fields", async patch => {
     const f = await fixture();
