@@ -149,3 +149,33 @@ it("keeps Windows leader exit unconfirmed when no notification arrives", async (
   expect(stopProcessGroupLeaderFirst).not.toHaveBeenCalled();
   child.stdin.destroy(); child.stdout.destroy(); child.stderr.destroy();
 });
+
+it("uses the captured Windows tree owner when initialize times out", async () => {
+  const child = childProcess();
+  const retained = { version: 1 as const, platform: "win32" as const, pid: child.pid!, processGroupId: child.pid!, startToken: "start", commandDigest: "digest" };
+  vi.mocked(spawnPiped).mockReturnValueOnce(child);
+  vi.mocked(captureRetainedProcessOwner).mockReturnValueOnce(retained);
+  vi.mocked(stopRetainedProcessOwner).mockImplementationOnce(async () => {
+    child.exitCode = 0;
+    child.emit("exit", 0, null);
+  });
+  try {
+    await expect(spawnBridge({ spec, handlers, initializeTimeoutMs: 10, clientVersion: "fixture" }))
+      .rejects.toMatchObject({ code: "agent_unavailable" });
+    expect(stopRetainedProcessOwner).toHaveBeenCalledWith(retained);
+    expect(stopProcessGroupLeaderFirst).not.toHaveBeenCalled();
+  } finally { child.stdin.destroy(); child.stdout.destroy(); child.stderr.destroy(); }
+});
+
+it("retains a Windows owner-fence refusal after initialize times out", async () => {
+  const child = childProcess();
+  const retained = { version: 1 as const, platform: "win32" as const, pid: child.pid!, processGroupId: child.pid!, startToken: "start", commandDigest: "digest" };
+  vi.mocked(spawnPiped).mockReturnValueOnce(child);
+  vi.mocked(captureRetainedProcessOwner).mockReturnValueOnce(retained);
+  vi.mocked(stopRetainedProcessOwner).mockRejectedValueOnce(new RemoteInstanceError("recovery_required", "owner changed"));
+  try {
+    await expect(spawnBridge({ spec, handlers, initializeTimeoutMs: 10, clientVersion: "fixture" }))
+      .rejects.toMatchObject({ code: "recovery_required", message: "owner changed" });
+    expect(stopProcessGroupLeaderFirst).not.toHaveBeenCalled();
+  } finally { child.stdin.destroy(); child.stdout.destroy(); child.stderr.destroy(); }
+});
