@@ -387,7 +387,9 @@ describe("closed native runtime installation", () => {
   it("records Google Antigravity's fetched copy, re-verifies it through its adapter, and leaves a missing copy out to be fetched again on the first yes", async () => {
     const f = await fixture();
     const version = releasePackages.fetchedAgentPin("antigravity")!.version;
-    const folder = join(root, "agents", "antigravity", `${version}-darwin-arm64`);
+    const key = releasePackages.fetchedAgentPlatformKey();
+    expect(key).not.toBeNull();
+    const folder = join(root, "agents", "antigravity", releasePackages.fetchedAgentFolderName({ version }, key!));
     const record = NativeRuntimeRecordSchema.parse({ ...f.record, agents: ["codex", "antigravity"], antigravityVersion: version, antigravityRoot: folder });
     expect(record).toMatchObject({ antigravityVersion: version, antigravityRoot: folder });
     expect(NativeRuntimeRecordSchema.safeParse({ ...f.record, antigravityRoot: "" }).success).toBe(false);
@@ -408,6 +410,15 @@ describe("closed native runtime installation", () => {
     if (entry!.error.diagnostic === "antigravity_not_fetched") expect(entry!.updating).toBe(true);
     else expect(entry!.updating).toBeUndefined();
     await expect(antigravityInstallAdapter.selfCheck({} as never)).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "antigravity_not_fetched" });
+  });
+  it("refuses an Antigravity record naming another platform's fetched folder", async () => {
+    const f = await fixture();
+    const version = releasePackages.fetchedAgentPin("antigravity")!.version;
+    const foreignKey = releasePackages.fetchedAgentPlatformKey() === "darwin-arm64" ? "linux-x64" : "darwin-arm64";
+    const antigravityRoot = join(root, "agents", "antigravity", releasePackages.fetchedAgentFolderName({ version }, foreignKey));
+    const record = NativeRuntimeRecordSchema.parse({ ...f.record, agents: ["antigravity"], antigravityVersion: version, antigravityRoot });
+    await expect(antigravityInstallAdapter.runnerSettings(record, { root }))
+      .rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "antigravity_unsafe_install" });
   });
   it.each([{ releaseId: "../outside" }, { agents: ["codex", "codex"] }, { coreUrl: "http://core.example" }, { coreUrl: "https://user:password@core.example" }, { relayUrl: "ws://relay.example" }, { gatewayKey: "forbidden" }, { environment: { NODE_OPTIONS: "--require untrusted" } }, { deploymentKind: "appliance" }, { command: "/bin/sh" }])("rejects unsafe or unimplemented install fields", async patch => {
     const f = await fixture();
