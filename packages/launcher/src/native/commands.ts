@@ -620,6 +620,36 @@ export async function prepareNativeWorkspaceStop(input: NativeCommandContext, de
   };
 }
 
+interface RetiredRuntimeStopDeps {
+  control(root: string, record: NativeRuntimeRecord): Pick<SupervisorControl, "call">;
+  prepareStop(input: NativeCommandContext): Promise<() => Promise<void>>;
+  now(): number;
+  sleep(ms: number): Promise<void>;
+  deadlineMs?: number;
+}
+
+/** Called only after Core verifies retirement; never uninstall or retire a runtime here. */
+export async function stopRetiredRuntimeForInstall(input: NativeCommandContext, record: NativeRuntimeRecord, deps: RetiredRuntimeStopDeps = {
+  control: (root, installed) => new SupervisorControl({ supervisorData: join(root, "supervisor") }, installed.controlPort),
+  prepareStop: prepareNativeWorkspaceStop, now: Date.now, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+}): Promise<void> {
+  const control = deps.control(input.root, record);
+  const identity = z.object({ instanceId: z.literal(record.instanceId), workspaceId: z.literal(record.workspaceId) }).passthrough();
+  await control.call({ op: "status" }, identity);
+  const stop = await deps.prepareStop(input);
+  await control.call({ op: "drain", reason: "update" }, z.unknown());
+  const deadline = deps.now() + (deps.deadlineMs ?? 15 * 60_000);
+  setupLine(input.output, "reinstallWaiting");
+  for (;;) {
+    const state = await control.call({ op: "drain.status" }, DrainStatusSchema);
+    if (state.activeAssignments === 0 && state.openSessions === 0) break;
+    if (deps.now() >= deadline) throw setupError("active_work", "reinstallBusy");
+    await deps.sleep(1_000);
+  }
+  await control.call({ op: "status" }, identity);
+  await stop();
+}
+
 async function executeNativeStop(definition: NativeServiceDefinition, deps: NativeStopDeps): Promise<void> {
   const stopRun = serviceRun(await (deps.run ?? deps.execute)(definition.stop));
   if (stopRun.code !== 0) throw setupError("temporarily_unavailable", "serviceStopFailed", { detail: new NativeServiceCommandError("stop", definition.stop, stopRun).message });
@@ -1303,7 +1333,9 @@ export const nativeCliActions: NativeCliActions = {
     // Without --agents, a missing Claude Code or Codex is offered before the code is asked.
     const setUp: string[] = [];
     const setupAgent = async (agent: "claude-code" | "codex") => { const done = await setUpPersonalAgent(agent, input.output); if (done) setUp.push(agent); return done; };
-    const record = await installNative({ ...input, activationId: input.activationId!, deps: { consent, ...(input.agents === undefined ? { setupAgent } : {}) } });
+    const record = await installNative({ ...input, activationId: input.activationId!, deps: { consent,
+      stopRetired: previous => stopRetiredRuntimeForInstall(input, previous),
+      ...(input.agents === undefined ? { setupAgent } : {}) } });
     await withSetupProgress(input.output, "phaseStart", () => startNativeConnector(input));
     // Sign in what was just set up, then say plainly what is ready and the one command for the rest.
     await closeAgentSetup(

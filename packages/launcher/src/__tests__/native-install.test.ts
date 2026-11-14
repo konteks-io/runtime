@@ -1,22 +1,47 @@
-import { createHash, sign } from "node:crypto";
+import { createHash, createPublicKey, sign } from "node:crypto";
 import { createServer } from "node:net";
-import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { bundleManifestSigningBytes, computeBundleManifestDigest, RemoteInstanceError, writeSecretFile } from "@konteks/remote-common";
+import { bundleManifestSigningBytes, computeBundleManifestDigest, RemoteInstanceError, verifyInstanceProof, writeSecretFile } from "@konteks/remote-common";
 import { buildReleaseFixture } from "@konteks/remote-release";
-import { acquireNativeRootLock, hostAgentInstallAdapter, loadNativeInstallation, OPENCODE_MIN_BINARY_BYTES, SupervisorStore, verifyInstalledNativeConnector } from "@konteks/remote-supervisor";
+import { acquireNativeRootLock, CORE_AUDIENCE, hostAgentInstallAdapter, loadNativeInstallation, OPENCODE_MIN_BINARY_BYTES, SupervisorStore, verifyInstalledNativeConnector } from "@konteks/remote-supervisor";
 import { addNativeAgent, completeNativeEnrollment, installNative, prepareNativeReenrollment, readNativeEnrollment, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, removeNativeAgent, restoreNativeRecord } from "../native/install.js";
 import { startNativeConnector } from "../native/commands.js";
 import { SupervisorControl } from "../control.js";
+import { uninstallNative } from "../native/uninstall.js";
+import { readNativeReinstall } from "../native/reinstall.js";
 import { createOutput } from "../output.js";
 import { terminalFetchConsent } from "../native/consent.js";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
 import { resolveBridgeSpawnSpec, resolveToolingCommand, resolveBridgeFamily } from "@konteks/remote-agent-runner";
 
+const renameFault = vi.hoisted(() => ({ match: null as null | ((source: string, destination: string) => "before" | "after" | null) }));
+vi.mock("node:fs/promises", async importOriginal => {
+  const original = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...original, rename: async (source: string, destination: string) => {
+    const fault = renameFault.match?.(String(source).replaceAll("\\", "/"), String(destination).replaceAll("\\", "/"));
+    if (fault === "before") throw new Error("interrupted-native-reinstall-rename");
+    await original.rename(source, destination);
+    if (fault === "after") throw new Error("interrupted-native-reinstall-rename");
+  } };
+});
+
+const checkpointFault = vi.hoisted(() => ({ phase: "", timing: "" }));
+vi.mock("@konteks/remote-common", async importOriginal => {
+  const original = await importOriginal<typeof import("@konteks/remote-common")>();
+  return { ...original, writeSecretFile: async (path: string, value: string | Uint8Array) => {
+    const phase = path.endsWith("reinstall.json") ? JSON.parse(String(value)).phase : "";
+    const match = phase && phase === checkpointFault.phase;
+    if (match && checkpointFault.timing === "before") throw new Error("interrupted-native-reinstall-checkpoint");
+    await original.writeSecretFile(path, value);
+    if (match && checkpointFault.timing === "after") throw new Error("interrupted-native-reinstall-checkpoint");
+  } };
+});
+
 const roots: string[] = [];
-afterEach(async () => { vi.unstubAllEnvs(); for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
+afterEach(async () => { checkpointFault.phase = ""; checkpointFault.timing = ""; renameFault.match = null; vi.unstubAllEnvs(); for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "native-cli-install-")); roots.push(root);
   const profile = join(root, "operator-codex");
@@ -37,15 +62,32 @@ async function fixture() {
   const olderManifest = signed({ ...base, bundleVersion: "0.9.0", nativeArtifacts: [artifact, claude.artifact, agent.artifact] });
   const trust = [{ ...keys.root, coreControlKeys: [{ keyId: keys.keyId, publicKeyJwk: keys.root.publicKeyJwk }] }];
   const platform = { os: "macos", architecture: "arm64", deploymentKind: "native_connector", containerBackend: "none" } as const;
-  const activate = vi.fn(async ({ release }: { release: { manifest: typeof manifest } }) => {
+  const activate = vi.fn(async ({ release, activationId, dataDir = join(root, "supervisor") }: { release: { manifest: typeof manifest }; activationId: string; dataDir?: string }) => {
     const activatedManifest = release.manifest;
-    await writeSecretFile(join(root, "supervisor", "identity.json"), JSON.stringify({ instanceId: "instance", workspaceId: "tenant", activationId: "activation-123", activatedAt: new Date().toISOString(), administrativeStatus: "provisioning", exchangeNonce: "nonce" }));
-    await writeSecretFile(join(root, "supervisor", "manifest.json"), JSON.stringify({ manifest: activatedManifest, manifestDigest: activatedManifest.digest }));
-    return { instanceId: "instance", manifest: activatedManifest, manifestDigest: activatedManifest.digest, provisioningWindowExpiresAt: "2026-10-01T00:00:00Z" };
+    const instanceId = activationId === "activation-123" ? "instance" : "replacement-instance";
+    await new SupervisorStore(dataDir).loadOrCreateInstanceKey();
+    await writeSecretFile(join(dataDir, "identity.json"), JSON.stringify({ instanceId, workspaceId: "tenant", activationId, activatedAt: new Date().toISOString(), administrativeStatus: "provisioning", exchangeNonce: "nonce" }));
+    await writeSecretFile(join(dataDir, "manifest.json"), JSON.stringify({ manifest: activatedManifest, manifestDigest: activatedManifest.digest }));
+    return { instanceId, manifest: activatedManifest, manifestDigest: activatedManifest.digest, provisioningWindowExpiresAt: "2026-10-01T00:00:00Z" };
   });
-  const fetchFn = vi.fn(async (url: string) => new Response(url === agent.artifact.url ? agent.archive : url === claude.artifact.url ? claude.archive : bytes));
+  const fetchFn = vi.fn(async (url: string, _init?: RequestInit) => new Response(url === agent.artifact.url ? agent.archive : url === claude.artifact.url ? claude.archive : bytes));
   const options = { root, activationId: "activation-123", coreUrl: "https://core.example", relayUrl: "wss://relay.example/runtime", agents: ["codex"], output: createOutput({ json: true }), deps: { roots: trust, platform, manifest, activate, fetchFn, git: null } };
   return { root, options, activate, trust, platform, manifest, oldManifest, olderManifest, fetchFn };
+}
+
+async function replacementFixture() {
+  const f = await fixture();
+  const previous = await installNative(f.options as never);
+  const originalFetch = f.fetchFn.getMockImplementation()!;
+  const owner = { reply: () => new Response(JSON.stringify({ code: "instance_revoked", message: "Identity cannot be recovered" }), { status: 422 }) };
+  f.fetchFn.mockImplementation(async (url: string) => String(url).endsWith("/runtime-owner/resolve") ? owner.reply() : originalFetch(url));
+  const record = await readFile(join(f.root, "native-runtime.json"), "utf8");
+  const identity = await readFile(join(f.root, "supervisor", "identity.json"), "utf8");
+  const key = await readFile(join(f.root, "supervisor", "instance-key.jwk"), "utf8");
+  f.activate.mockClear();
+  f.fetchFn.mockClear();
+  const options = { ...f.options, activationId: "replacement-activation" };
+  return { ...f, options, previous, owner, record, identity, key };
 }
 
 /** The person's own DeepSeek Harness and Node, as npm installs them (the Node only answers --version). */
@@ -79,6 +121,407 @@ async function personOpenCode(root: string, version = "2.0.18", name = "@opencod
 }
 
 describe("native install composition", () => {
+  it("installs a replacement activation after Core verifies the previous runtime is revoked, without uninstall", async () => {
+    const f = await fixture();
+    const previous = await installNative(f.options as never);
+    await new SupervisorStore(join(f.root, "supervisor")).loadOrCreateInstanceKey();
+    const originalFetch = f.fetchFn.getMockImplementation()!;
+    f.fetchFn.mockImplementation(async (url: string) => {
+      if (String(url).endsWith("/runtime-owner/resolve")) return new Response(JSON.stringify({ code: "instance_revoked", message: "Identity cannot be recovered" }), { status: 422 });
+      return originalFetch(url);
+    });
+    const credential = join(f.root, "credentials", "codex", "preserved-profile-state");
+    await writeSecretFile(credential, "synthetic-profile-state");
+    const replacement = await installNative({ ...f.options, activationId: "replacement-activation" } as never);
+    expect(replacement.workspaceId).toBe(previous.workspaceId);
+    expect(replacement.instanceId).not.toBe(previous.instanceId);
+    expect(await readFile(credential, "utf8")).toBe("synthetic-profile-state");
+    expect(JSON.parse(await readFile(join(f.root, "supervisor", "identity.json"), "utf8"))).toMatchObject({ activationId: "replacement-activation" });
+    expect(f.activate).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["active", "revoked", "provisioning"])("preserves a retained %s identity when its original key is unavailable", async administrativeStatus => {
+    const f = await fixture();
+    await installNative(f.options as never);
+    const identityPath = join(f.root, "supervisor", "identity.json");
+    const identity = JSON.parse(await readFile(identityPath, "utf8"));
+    await writeSecretFile(identityPath, JSON.stringify({ ...identity, administrativeStatus }));
+    await rm(join(f.root, "supervisor", "instance-key.jwk"));
+    const credential = join(f.root, "credentials", "codex", "retained-test-state");
+    const work = join(f.root, "workspaces", "codex", "retained-work");
+    await writeSecretFile(credential, "synthetic-agent-state");
+    await writeSecretFile(work, "synthetic-unfinished-work");
+    const paths = [join(f.root, "native-runtime.json"), identityPath, credential, work];
+    const before = await Promise.all(paths.map(path => readFile(path)));
+    f.activate.mockClear();
+    f.fetchFn.mockClear();
+    const readActivationCode = vi.fn(async () => "unused-test-input");
+    await expect(installNative({ ...f.options, activationId: "replacement-activation", deps: { ...f.options.deps, readActivationCode } } as never)).rejects.toMatchObject({
+      code: "registration_mismatch",
+      message: "The existing runtime key is unavailable; private data was preserved. Run konteks-remote doctor.",
+    });
+    expect(readActivationCode).not.toHaveBeenCalled();
+    expect(f.activate).not.toHaveBeenCalled();
+    expect(f.fetchFn).not.toHaveBeenCalled();
+    expect(await Promise.all(paths.map(path => readFile(path)))).toEqual(before);
+  });
+
+  it("characterizes a fresh activation succeeding after fixture-only uninstall", async () => {
+    const f = await fixture();
+    const profile = await mkdtemp(join(tmpdir(), "native-reinstall-profile-"));
+    roots.push(profile);
+    vi.stubEnv("CODEX_HOME", profile);
+    await installNative(f.options as never);
+    const execute = vi.fn(async () => 0);
+    const removed = await uninstallNative({ root: f.root, output: f.options.output }, {
+      control: async () => null, serviceDefinition: async () => null, execute,
+      sleep: async () => undefined, now: () => Date.now(),
+    });
+    expect(removed.state).toBe("uninstalled");
+    expect(execute).not.toHaveBeenCalled();
+    const fresh = await installNative({ ...f.options, activationId: "replacement-activation" } as never);
+    expect(fresh.instanceId).toBe("replacement-instance");
+    expect(f.activate).toHaveBeenCalledTimes(2);
+    expect(f.activate.mock.calls[1]?.[0]).toMatchObject({ activationId: "replacement-activation" });
+    expect(JSON.parse(await readFile(join(f.root, "supervisor", "identity.json"), "utf8"))).toMatchObject({ activationId: "replacement-activation" });
+  });
+
+  it.each([
+    [401, "activation_invalid"], [403, "permission_denied"], [404, "not_found"],
+    [409, "registration_mismatch"], [422, "instance_suspended"], [403, "instance_revoked"],
+  ])("does not infer retirement from HTTP %s with code %s", async (status, code) => {
+    const f = await replacementFixture();
+    f.owner.reply = () => new Response(JSON.stringify({ code, message: "refused" }), { status: Number(status) });
+    await expect(installNative(f.options as never)).rejects.toMatchObject({ code: "recovery_required" });
+    expect(await readFile(join(f.root, "native-runtime.json"), "utf8")).toBe(f.record);
+    expect(await readFile(join(f.root, "supervisor", "identity.json"), "utf8")).toBe(f.identity);
+    expect(f.activate).not.toHaveBeenCalled();
+    expect(await readNativeReinstall(f.root)).toBeNull();
+  });
+
+  it("does not trust a locally revoked status when Core still accepts its owner", async () => {
+    const f = await replacementFixture();
+    await writeSecretFile(join(f.root, "supervisor", "identity.json"), JSON.stringify({ ...JSON.parse(f.identity), administrativeStatus: "revoked" }));
+    f.owner.reply = () => new Response(JSON.stringify({ instanceId: f.previous.instanceId, ownerRevision: 0, currentIncarnation: null, acceptedHeartbeatSequence: 0, heartbeatSequenceFloor: 0 }));
+    await expect(installNative(f.options as never)).rejects.toMatchObject({ code: "registration_mismatch" });
+    expect(f.activate).not.toHaveBeenCalled();
+    expect(await readNativeRecord(f.root)).toEqual(f.previous);
+  });
+
+  it.each(["core", "relay", "agents"])("refuses a changed %s before contacting either server", async field => {
+    const f = await replacementFixture();
+    const patch = { core: { coreUrl: "https://other.example" }, relay: { relayUrl: "wss://other.example/runtime" }, agents: { agents: [] } }[field];
+    await expect(installNative({ ...f.options, ...patch } as never)).rejects.toMatchObject({ code: "registration_mismatch" });
+    expect(f.fetchFn).not.toHaveBeenCalled();
+    expect(f.activate).not.toHaveBeenCalled();
+    expect(await readNativeRecord(f.root)).toEqual(f.previous);
+  });
+
+  it("verifies retirement without a bearer and refuses redirects", async () => {
+    const f = await replacementFixture();
+    await installNative(f.options as never);
+    const calls = f.fetchFn.mock.calls as unknown as Array<[string | URL, RequestInit]>;
+    const request = calls.find(([url]) => String(url).endsWith("/runtime-owner/resolve"))!;
+    expect(new Headers(request[1]?.headers).has("authorization")).toBe(false);
+    expect(request[1]?.redirect).toBe("error");
+    expect(JSON.parse(String(request[1]?.body))).toMatchObject({ instanceId: f.previous.instanceId, proof: { algorithm: "ES256" } });
+  });
+
+  it("privately retains old identity and key while the replacement uses a different key", async () => {
+    const f = await replacementFixture();
+    await installNative(f.options as never);
+    const retired = await readdir(join(f.root, "retired"));
+    expect(retired).toHaveLength(1);
+    const archive = join(f.root, "retired", retired[0]!);
+    expect(await readFile(join(archive, "native-runtime.json"), "utf8")).toBe(f.record);
+    expect(await readFile(join(archive, "supervisor", "identity.json"), "utf8")).toBe(f.identity);
+    expect(await readFile(join(archive, "supervisor", "instance-key.jwk"), "utf8")).toBe(f.key);
+    expect(await readFile(join(f.root, "supervisor", "instance-key.jwk"), "utf8")).not.toBe(f.key);
+    expect(await readNativeReinstall(f.root)).toBeNull();
+  });
+
+  it("retains the verified original profile instead of substituting another CODEX_HOME", async () => {
+    const f = await replacementFixture();
+    const other = join(f.root, "other-profile");
+    await mkdir(other, { mode: 0o700 });
+    vi.stubEnv("CODEX_HOME", other);
+    const replacement = await installNative(f.options as never);
+    expect(replacement.codexHome).toBe(f.previous.codexHome);
+  });
+
+  it("reuses the verified installed release without downloading it again", async () => {
+    const f = await replacementFixture();
+    const replacement = await installNative(f.options as never);
+    expect(replacement.releaseId).toBe(f.previous.releaseId);
+    expect(f.fetchFn.mock.calls.every(([url]) => String(url).endsWith("/runtime-owner/resolve"))).toBe(true);
+  });
+
+  it("does not replace an installation while its supervisor lock is held", async () => {
+    const f = await replacementFixture();
+    const owner = acquireNativeRootLock(join(f.root, "supervisor"));
+    try {
+      await expect(installNative(f.options as never)).rejects.toMatchObject({ code: "temporarily_unavailable" });
+      expect(f.fetchFn).not.toHaveBeenCalled();
+      expect(f.activate).not.toHaveBeenCalled();
+      expect(await readNativeRecord(f.root)).toEqual(f.previous);
+    } finally { owner.release(); }
+  });
+
+  it("stops only the verified retired predecessor before reacquiring its supervisor ownership", async () => {
+    const f = await replacementFixture();
+    const owner = acquireNativeRootLock(join(f.root, "supervisor"));
+    const stopRetired = vi.fn(async (record: { instanceId: string }) => {
+      expect(record.instanceId).toBe(f.previous.instanceId);
+      expect(f.fetchFn.mock.calls.some(([url]) => String(url).endsWith("/runtime-owner/resolve"))).toBe(true);
+      owner.release();
+    });
+    try {
+      const result = await installNative({ ...f.options, deps: { ...f.options.deps, stopRetired } } as never);
+      expect(result.instanceId).toBe("replacement-instance");
+      expect(stopRetired).toHaveBeenCalledTimes(1);
+    } finally { owner.release(); }
+  });
+
+  it("never stops a running predecessor on an unverified retirement response", async () => {
+    const f = await replacementFixture();
+    const owner = acquireNativeRootLock(join(f.root, "supervisor"));
+    const stopRetired = vi.fn(async () => owner.release());
+    f.owner.reply = () => new Response(JSON.stringify({ code: "permission_denied", message: "refused" }), { status: 403 });
+    try {
+      await expect(installNative({ ...f.options, deps: { ...f.options.deps, stopRetired } } as never)).rejects.toMatchObject({ code: "recovery_required" });
+      expect(stopRetired).not.toHaveBeenCalled();
+      expect(await readNativeRecord(f.root)).toEqual(f.previous);
+    } finally { owner.release(); }
+  });
+
+  it("rejects another installer without consuming the replacement code", async () => {
+    const f = await replacementFixture();
+    const owner = acquireNativeRootLock(join(f.root, "installer"));
+    try {
+      await expect(installNative(f.options as never)).rejects.toMatchObject({ code: "temporarily_unavailable" });
+      expect(f.fetchFn).not.toHaveBeenCalled();
+      expect(f.activate).not.toHaveBeenCalled();
+    } finally { owner.release(); }
+  });
+
+  it("rechecks retirement before retrying a verified-but-uncommitted successor", async () => {
+    const f = await replacementFixture();
+    const output = { ...f.options.output, line: (text: string) => {
+      if (text.startsWith("Keeping the previous")) throw new Error("interrupted-before-archive");
+    } };
+    await expect(installNative({ ...f.options, output } as never)).rejects.toThrow("interrupted-before-archive");
+    expect((await readNativeReinstall(f.root))?.phase).toBe("activated");
+    f.owner.reply = () => new Response(JSON.stringify({ code: "permission_denied", message: "refused" }), { status: 403 });
+    await expect(installNative(f.options as never)).rejects.toMatchObject({ code: "recovery_required" });
+    expect(await readFile(join(f.root, "native-runtime.json"), "utf8")).toBe(f.record);
+    expect(f.activate).toHaveBeenCalledTimes(1);
+  });
+
+  it("resumes after activation without another exchange or deleting prior data", async () => {
+    const f = await replacementFixture();
+    const output = { ...f.options.output, line: (text: string) => {
+      if (text.startsWith("Keeping the previous")) throw new Error("interrupted-before-archive");
+    } };
+    await expect(installNative({ ...f.options, output } as never)).rejects.toThrow("interrupted-before-archive");
+    const resumed = await installNative(f.options as never);
+    expect(resumed.instanceId).toBe("replacement-instance");
+    expect(f.activate).toHaveBeenCalledTimes(1);
+    expect(await readNativeReinstall(f.root)).toBeNull();
+  });
+
+  it.each(["activation_invalid", "activation_expired", "activation_consumed", "limit_exceeded"] as const)("permits a new activation after definitive %s before any successor was bound", async code => {
+    const f = await replacementFixture();
+    f.activate.mockRejectedValueOnce(new RemoteInstanceError(code, "Activation was not accepted"));
+    await expect(installNative(f.options as never)).rejects.toMatchObject({ code });
+    expect(await readNativeReinstall(f.root)).toBeNull();
+    expect(await readFile(join(f.root, "native-runtime.json"), "utf8")).toBe(f.record);
+    const result = await installNative({ ...f.options, activationId: "another-replacement" } as never);
+    expect(result.instanceId).toBe("replacement-instance");
+  });
+
+  it("does not overwrite a pending installation with a different activation", async () => {
+    const f = await replacementFixture();
+    f.activate.mockRejectedValueOnce(new RemoteInstanceError("temporarily_unavailable", "connection interrupted"));
+    await expect(installNative(f.options as never)).rejects.toMatchObject({ code: "temporarily_unavailable" });
+    await expect(installNative({ ...f.options, activationId: "different-activation" } as never)).rejects.toMatchObject({ code: "registration_mismatch" });
+    expect(await readFile(join(f.root, "native-runtime.json"), "utf8")).toBe(f.record);
+    expect(f.activate).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not archive prior state when activation resolves to another workspace", async () => {
+    const f = await replacementFixture();
+    const activate = f.activate.getMockImplementation()!;
+    f.activate.mockImplementationOnce(async args => {
+      const outcome = await activate(args);
+      const path = join(args.dataDir!, "identity.json");
+      await writeSecretFile(path, JSON.stringify({ ...JSON.parse(await readFile(path, "utf8")), workspaceId: "other-tenant" }));
+      return outcome;
+    });
+    await expect(installNative(f.options as never)).rejects.toMatchObject({ code: "registration_mismatch" });
+    expect(await readFile(join(f.root, "native-runtime.json"), "utf8")).toBe(f.record);
+    expect(await readFile(join(f.root, "supervisor", "identity.json"), "utf8")).toBe(f.identity);
+  });
+
+  it("finishes an interrupted final record write without a second activation", async () => {
+    const f = await replacementFixture();
+    const output = { ...f.options.output, line: (text: string) => {
+      if (text.startsWith("Installed.")) throw new Error("interrupted-after-record");
+    } };
+    await expect(installNative({ ...f.options, output } as never)).rejects.toThrow("interrupted-after-record");
+    expect((await readNativeReinstall(f.root))?.phase).toBe("promoted");
+    const resumed = await installNative(f.options as never);
+    expect(resumed.instanceId).toBe("replacement-instance");
+    expect(f.activate).toHaveBeenCalledTimes(1);
+    expect(await readNativeReinstall(f.root)).toBeNull();
+  });
+
+  it("finalizes a completed replacement even when the new supervisor is already running", async () => {
+    const f = await replacementFixture();
+    const output = { ...f.options.output, line: (text: string) => {
+      if (text.startsWith("Installed.")) throw new Error("interrupted-after-record");
+    } };
+    await expect(installNative({ ...f.options, output } as never)).rejects.toThrow("interrupted-after-record");
+    const owner = acquireNativeRootLock(join(f.root, "supervisor"));
+    try {
+      const result = await installNative(f.options as never);
+      expect(result.instanceId).toBe("replacement-instance");
+      expect(await readNativeReinstall(f.root)).toBeNull();
+      expect(f.activate).toHaveBeenCalledTimes(1);
+    } finally { owner.release(); }
+  });
+
+  it("refuses a successor already known locally to be revoked before moving previous data", async () => {
+    const f = await replacementFixture();
+    const activate = f.activate.getMockImplementation()!;
+    f.activate.mockImplementationOnce(async args => {
+      const outcome = await activate(args);
+      const path = join(args.dataDir!, "identity.json");
+      await writeSecretFile(path, JSON.stringify({ ...JSON.parse(await readFile(path, "utf8")), administrativeStatus: "revoked" }));
+      return outcome;
+    });
+    await expect(installNative(f.options as never)).rejects.toMatchObject({ code: "registration_mismatch" });
+    expect(await readFile(join(f.root, "native-runtime.json"), "utf8")).toBe(f.record);
+  });
+
+  it.runIf(process.platform !== "win32").each(["symlink", "hardlink", "public-mode"])("refuses an unsafe %s predecessor key before contacting Core", async kind => {
+    const f = await replacementFixture();
+    const path = join(f.root, "supervisor", "instance-key.jwk");
+    const outside = await mkdtemp(join(tmpdir(), "native-key-outside-"));
+    roots.push(outside);
+    const target = join(outside, "key.jwk");
+    await writeSecretFile(target, f.key);
+    if (kind === "public-mode") await chmod(path, 0o644);
+    else {
+      await rm(path);
+      if (kind === "symlink") await symlink(target, path);
+      else await link(target, path);
+    }
+    await expect(installNative(f.options as never)).rejects.toMatchObject({ code: "registration_mismatch" });
+    expect(f.fetchFn).not.toHaveBeenCalled();
+    expect(f.activate).not.toHaveBeenCalled();
+    expect(await readFile(target, "utf8")).toBe(f.key);
+  });
+
+  it.each(["malformed", "traversal", "duplicate", "lock-file", "oversized"])("refuses a %s checkpoint without modifying previous state", async kind => {
+    const f = await replacementFixture();
+    f.activate.mockRejectedValueOnce(new RemoteInstanceError("temporarily_unavailable", "interrupted"));
+    await expect(installNative(f.options as never)).rejects.toMatchObject({ code: "temporarily_unavailable" });
+    const path = join(f.root, "installer", "reinstall.json");
+    const state = JSON.parse(await readFile(path, "utf8"));
+    const mutations: Record<string, string> = {
+      malformed: "{", traversal: JSON.stringify({ ...state, previousEntries: ["../outside"] }),
+      duplicate: JSON.stringify({ ...state, previousEntries: ["identity.json", "identity.json"] }),
+      "lock-file": JSON.stringify({ ...state, previousEntries: ["connector-owner.sqlite"] }),
+      oversized: "x".repeat(1024 * 1024 + 1),
+    };
+    await writeFile(path, mutations[kind]!);
+    await expect(installNative(f.options as never)).rejects.toMatchObject({ code: "registration_mismatch" });
+    expect(await readFile(join(f.root, "native-runtime.json"), "utf8")).toBe(f.record);
+    expect(f.activate).toHaveBeenCalledTimes(1);
+  });
+
+  describe.each(["before", "after"] as const)("interruption %s a durable state move", timing => {
+    it.each([
+      ["native-runtime.json", "archive"], ["identity.json", "archive"],
+      ["instance-key.jwk", "archive"], ["manifest.json", "archive"],
+      ["identity.json", "promote"], ["instance-key.jwk", "promote"], ["manifest.json", "promote"],
+    ])("resumes %s %s without another activation", async (name, phase) => {
+      const f = await replacementFixture();
+      let interrupted = false;
+      renameFault.match = (source, destination) => {
+        const move = phase === "archive" ? destination.includes("/retired/reinstall-") : source.includes("/installer/reinstall-");
+        if (interrupted || !move || !source.endsWith(`/${name}`)) return null;
+        interrupted = true;
+        return timing;
+      };
+      await expect(installNative(f.options as never)).rejects.toThrow("interrupted-native-reinstall-rename");
+      expect(interrupted).toBe(true);
+      expect(await readNativeReinstall(f.root)).not.toBeNull();
+      renameFault.match = null;
+      const resumed = await installNative(f.options as never);
+      expect(resumed.instanceId).toBe("replacement-instance");
+      expect(f.activate).toHaveBeenCalledTimes(1);
+      const [retired] = await readdir(join(f.root, "retired"));
+      expect(await readFile(join(f.root, "retired", retired!, "supervisor", "instance-key.jwk"), "utf8")).toBe(f.key);
+      expect(await readNativeReinstall(f.root)).toBeNull();
+    });
+  });
+
+  describe.each(["before", "after"])("interruption %s checkpoint commit", timing => {
+    it.each(["prepared", "activated", "archiving", "promoting", "promoted"])("recovers the %s phase without losing either identity", async phase => {
+      const f = await replacementFixture();
+      checkpointFault.phase = phase;
+      checkpointFault.timing = timing;
+      await expect(installNative(f.options as never)).rejects.toThrow("interrupted-native-reinstall-checkpoint");
+      checkpointFault.phase = "";
+      checkpointFault.timing = "";
+      const resumed = await installNative(f.options as never);
+      expect(resumed.instanceId).toBe("replacement-instance");
+      expect(await readNativeReinstall(f.root)).toBeNull();
+      const [retired] = await readdir(join(f.root, "retired"));
+      expect(await readFile(join(f.root, "retired", retired!, "native-runtime.json"), "utf8")).toBe(f.record);
+      expect(await readFile(join(f.root, "retired", retired!, "supervisor", "instance-key.jwk"), "utf8")).toBe(f.key);
+    });
+  });
+
+  it.each([false, true])("runs the real activation exchange with one successor, including lost response: %s", async loseResponse => {
+    const f = await replacementFixture();
+    const artifactFetch = f.fetchFn.getMockImplementation()!;
+    const requests: unknown[] = [];
+    const instances = new Set<string>();
+    let disconnected = loseResponse;
+    f.fetchFn.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (!String(url).endsWith("/activation-exchange")) return artifactFetch(url);
+      const request = JSON.parse(String(init?.body));
+      const publicKey = createPublicKey({ key: request.publicKeyJwk, format: "jwk" });
+      expect(verifyInstanceProof(publicKey, { method: "activation_exchange", audience: CORE_AUDIENCE, subject: request.activationId, body: request }, request.proof)).toBe(true);
+      requests.push(request);
+      instances.add(JSON.stringify([request.activationId, request.publicKeyJwk, request.proof.nonce]));
+      if (disconnected) throw new Error("synthetic-lost-response-after-server-commit");
+      return new Response(JSON.stringify({ instanceId: "replacement-instance", workspaceId: "tenant", administrativeStatus: "provisioning",
+        provisioningCredential: "synthetic-provisioning-only", provisioningCredentialExpiresAt: new Date(Date.now() + 3600000).toISOString(),
+        provisioningWindowExpiresAt: new Date(Date.now() + 86400000).toISOString(), bundleManifest: f.manifest,
+      }), { headers: { "content-type": "application/json" } });
+    });
+    const code = "synthetic-local-reinstall-code";
+    const readActivationCode = vi.fn(async () => code);
+    const options = { ...f.options, deps: { ...f.options.deps, activate: undefined, readActivationCode } };
+    if (loseResponse) {
+      await expect(installNative(options as never)).rejects.toMatchObject({ code: "temporarily_unavailable" });
+      expect(await readNativeRecord(f.root)).toEqual(f.previous);
+      expect((await readNativeReinstall(f.root))?.phase).toBe("prepared");
+      disconnected = false;
+    }
+    const installed = await installNative(options as never);
+    expect(installed.instanceId).toBe("replacement-instance");
+    expect(instances.size).toBe(1);
+    expect(readActivationCode).toHaveBeenCalledTimes(loseResponse ? 2 : 1);
+    expect(requests.length).toBe(loseResponse ? 5 : 1);
+    const files = [join(f.root, "supervisor", "identity.json"), join(f.root, "supervisor", "activation-attempt.json"), join(f.root, "supervisor", "provisioning.json")];
+    for (const file of files) expect(await readFile(file, "utf8")).not.toContain(code);
+    expect(await readNativeReinstall(f.root)).toBeNull();
+  });
+
   it.each([false, true])("keeps the original Codex profile during re-enrollment, without substituting a default (missing: %s)", async missing => {
     const f = await fixture();
     const installed = await installNative(f.options as never);
