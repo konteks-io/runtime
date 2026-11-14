@@ -22,6 +22,7 @@ import { nativePlatform, type NativePlatform } from "./service.js";
 import { releaseStaged, writeStagingProgress } from "./enrollment-staging.js";
 import type { FetchConsent } from "./consent.js";
 import { readActivationCodePipe } from "./activation-input.js";
+import { readNativeReinstall, reinstallNative } from "./reinstall.js";
 
 interface NativeInstallOptions {
   root: string; activationId: string; activationCodeStdin?: boolean; coreUrl: string; relayUrl: string;
@@ -30,6 +31,7 @@ interface NativeInstallOptions {
     roots?: readonly EmbeddedReleaseRoot[]; platform?: NativePlatform;
     manifest?: unknown; fetchFn?: typeof fetch; activate?: typeof runNativeActivationExchange;
     readActivationCode?: () => Promise<string>;
+    stopRetired?: (record: NativeRuntimeRecord) => Promise<void>;
     git?: NativeRuntimeRecord["git"] | null;
     /** A fetched agent's consent line answered; without it nothing is downloaded. */
     consent?: FetchConsent;
@@ -73,6 +75,7 @@ export async function installNative(options: NativeInstallOptions): Promise<Nati
   const lock = acquireNativeRootLock(installLockDir);
   try {
     const install = { options, root, roots, platform, draft, lock };
+    if (await readNativeReinstall(root)) return await recoverInstall(install);
     const existing = await lstat(join(root, "native-runtime.json")).catch(error => { if (error.code === "ENOENT") return null; throw error; });
     if (existing) return await reinstallExisting(install, explicit ? requested : null);
     const agents = explicit ? requested : await findOrOfferAgents(root, options.deps?.setupAgent);
@@ -98,9 +101,50 @@ async function reinstallExisting(install: InstallContext, explicitAgents: string
   const installation = await loadNativeInstallation(root, { roots, platform });
   const identity = await new SupervisorStore(join(root, "supervisor")).identity();
   const record = installation.record;
-  if (!sameInstall(install, record, identity?.activationId, explicitAgents)) throw invalid();
+  if (!sameInstall(install, record, identity?.activationId, explicitAgents)) return recoverInstall(install, record);
   if (!record.agents.includes("codex") || record.codexHome !== undefined) return record;
   return bindCodexProfile(install, installation);
+}
+
+async function recoverInstall(install: InstallContext, previous?: NativeRuntimeRecord): Promise<NativeRuntimeRecord> {
+  const prior = previous ?? (await readNativeReinstall(install.root))?.previous;
+  if (!prior) throw invalid();
+  const { options, root, roots, platform, draft } = install;
+  const fetchFn = fetchOf(options.deps);
+  return reinstallNative({
+    root, activationId: options.activationId, coreUrl: draft.coreUrl, relayUrl: draft.relayUrl,
+    agents: options.agents ?? null, installer: install.lock, roots, platform, fetchFn,
+    ...(options.deps?.stopRetired ? { stopRetired: options.deps.stopRetired } : {}),
+    progress: stage => setupLine(options.output, ({ checking: "reinstallChecking", resuming: "reinstallResuming", preserving: "reinstallPreserving" } as const)[stage]),
+    release: async () => {
+      const release = verifyNativeRelease(options.deps?.manifest ?? await fetchNativeManifest(fetchFn), roots);
+      assertOfflinePackages(selectNativeArtifacts(release, { ...platform, agentIds: prior.agents.filter(agent => !isHostAgentId(agent)) }));
+      return release;
+    },
+    activate: (dataDir, release) => activate(install, release, fetchFn, dataDir),
+    finish: (release, identity, prior) => finishReinstall(install, release, identity, prior),
+  }, previous);
+}
+
+async function finishReinstall(install: InstallContext, release: ReturnType<typeof verifyNativeRelease>, identity: NonNullable<Awaited<ReturnType<SupervisorStore["identity"]>>>, previous: NativeRuntimeRecord): Promise<NativeRuntimeRecord> {
+  const { root, platform, roots } = install;
+  const existing = await lstat(join(root, "native-runtime.json")).catch(error => { if (error.code === "ENOENT") return null; throw error; });
+  if (existing) {
+    const installed = (await loadNativeInstallation(root, { roots, platform })).record;
+    if (installed.instanceId !== identity.instanceId || installed.manifestDigest !== release.manifest.digest) throw invalid();
+    await publishInstalledEnrollment(root, installed, release.manifest);
+    return installed;
+  }
+  const bundled = previous.agents.filter(agent => !isHostAgentId(agent));
+  const releaseId = previous.manifestDigest === release.manifest.digest ? previous.releaseId : await stageAgents({ root, release, platform, agents: previous.agents, bundled, fetchFn: fetchOf(install.options.deps), afterAgent: agent => agentFolders(root, agent) });
+  const record = NativeRuntimeRecordSchema.parse({ ...previous, instanceId: identity.instanceId, workspaceId: identity.workspaceId,
+    releaseId, bundleVersion: release.manifest.bundleVersion, manifestDigest: release.manifest.digest });
+  install.lock.assertOwned();
+  await publishInstalledEnrollment(root, record, release.manifest);
+  await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify(record));
+  await loadNativeInstallation(root, { roots, platform });
+  setupLine(install.options.output, "installComplete");
+  return record;
 }
 
 /** The same activation and endpoints, and the same agents when they were listed. */
@@ -188,13 +232,13 @@ function assertOfflinePackages(artifacts: ReturnType<typeof selectNativeArtifact
 }
 
 /** The one-time code exchanged for this machine's identity, bound to this exact release. */
-async function activate(install: InstallContext, release: ReturnType<typeof verifyNativeRelease>, fetchFn: typeof fetch) {
-  const { options, root, roots, platform, draft } = install;
+async function activate(install: InstallContext, release: ReturnType<typeof verifyNativeRelease>, fetchFn: typeof fetch, dataDir = join(install.root, "supervisor")) {
+  const { options, roots, platform, draft } = install;
   setupLine(options.output, "installConnecting");
   const readActivationCode = activationCodeReader(options);
-  const activated = await (options.deps?.activate ?? runNativeActivationExchange)({ dataDir: join(root, "supervisor"), coreUrl: draft.coreUrl, activationId: options.activationId, platform, release, roots, clock: new SystemClock(), readActivationCode, fetchFn });
+  const activated = await (options.deps?.activate ?? runNativeActivationExchange)({ dataDir, coreUrl: draft.coreUrl, activationId: options.activationId, platform, release, roots, clock: new SystemClock(), readActivationCode, fetchFn });
   install.lock.assertOwned();
-  const identity = await new SupervisorStore(join(root, "supervisor")).identity();
+  const identity = await new SupervisorStore(dataDir).identity();
   if (!identity || identity.instanceId !== activated.instanceId || activated.manifestDigest !== release.manifest.digest) throw invalid();
   return identity;
 }
