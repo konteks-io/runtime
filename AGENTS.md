@@ -101,7 +101,7 @@ Node 22 (`.nvmrc`; CI and releases use 22.23.2). From the repo root:
   connector follows. Details: `release/AGENTS.md`.
 - **Bridge patches need review on every bump.** The Claude and Codex ACP
   bridges are patched at build time against pinned upstream hashes
-  (`konteks-claude-project-settings-v5` in `scripts/claude-acp-settings-patch.mjs`,
+  (`konteks-claude-project-settings-v6` in `scripts/claude-acp-settings-patch.mjs`,
   `konteks-codex-acp-live-user-v12` in `scripts/codex-acp-live-user-patch.mjs`).
   A bridge version bump must re-review the upstream files and update id,
   version and hashes together. Details: `scripts/AGENTS.md`.
