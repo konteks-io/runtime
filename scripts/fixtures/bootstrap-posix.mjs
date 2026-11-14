@@ -38,6 +38,7 @@ function signature() {
 }
 
 function launcher() {
+  if (args[0] === "install") appendFileSync(join(fixture.directory, "manifests.txt"), `${process.env.KONTEKS_RELEASE_MANIFEST_URL ?? ""}\n`);
   appendFileSync(
     join(fixture.directory, "calls.jsonl"),
     `${JSON.stringify({ args, locale: process.env.KONTEKS_SETUP_LOCALE })}\n`,

@@ -627,8 +627,20 @@ try {
       (Get-SetupText 'Enter the activation code when asked.'),
       (Get-SetupText 'It is hidden while you type.')
     )
-    & $launcher install --activation-id $ActivationId
-    $code = $LASTEXITCODE
+    $previousManifestUrl = $env:KONTEKS_RELEASE_MANIFEST_URL
+    try {
+      if (-not $env:KONTEKS_RELEASE_MANIFEST_URL) {
+        $env:KONTEKS_RELEASE_MANIFEST_URL = "$ReleaseBase/native-manifest.json"
+      }
+      & $launcher install --activation-id $ActivationId
+      $code = $LASTEXITCODE
+    } finally {
+      if ($null -eq $previousManifestUrl) {
+        Remove-Item Env:KONTEKS_RELEASE_MANIFEST_URL -ErrorAction SilentlyContinue
+      } else {
+        $env:KONTEKS_RELEASE_MANIFEST_URL = $previousManifestUrl
+      }
+    }
     $failedStage = 'Connect this computer'
   }
 } catch {
