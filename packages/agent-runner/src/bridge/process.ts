@@ -20,6 +20,7 @@ import {
   createLogger,
   spawnPiped,
   stopProcessGroupLeaderFirst,
+  stopRetainedProcessOwner,
   type Logger,
   type PipedChildProcess,
   type RetainedProcessOwner,
@@ -109,7 +110,7 @@ export async function spawnBridge(options: SpawnBridgeOptions): Promise<BridgePr
     Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
   );
   const connection = new ClientSideConnection(() => bridgeClient(options.handlers), stream);
-  const initializeResult = await initializeBridge(connection, options, child);
+  const initializeResult = await initializeBridge(connection, options, processOwner);
   logger.info({ agentId: options.spec.family.agentId }, "bridge initialized");
   return {
     connection,
@@ -227,9 +228,14 @@ function bridgeStopOwner(child: PipedChildProcess, state: { exited: boolean }, r
     get exited() { return state.exited; },
     ...(retainedProcessOwner ? { retainedProcessOwner } : {}),
     stop: async () => {
-      await stopProcessGroupLeaderFirst({ child, timeoutMs: 5_000, killGraceMs: 2_000 });
-      // The bounded group helper may finish on its grace timeout. Require
-      // actual leader-exit observation; this still does not prove tool/MCP
+      // Windows has no POSIX group: a direct leader kill leaves its native
+      // children alive. Use the captured creation identity and tree fence.
+      if (retainedProcessOwner?.platform === "win32") {
+        await stopRetainedProcessOwner(retainedProcessOwner);
+        await observeBridgeLeaderExit(child, state);
+      } else await stopProcessGroupLeaderFirst({ child, timeoutMs: 5_000, killGraceMs: 2_000 });
+      // Require actual leader-exit observation as well as the lifecycle
+      // helper's check; this still does not prove tool/MCP
       // quiescence or authorize release of retained execution capacity.
       if (!leaderExited(child, state)) {
         throw new RemoteInstanceError("recovery_required", "Bridge process exit remains unconfirmed.");
@@ -239,6 +245,22 @@ function bridgeStopOwner(child: PipedChildProcess, state: { exited: boolean }, r
       }
     },
   };
+}
+
+/** Synchronous Windows identity/tree queries can finish before libuv delivers
+ * the child's exit notification. Await that independent fact, boundedly. */
+async function observeBridgeLeaderExit(child: PipedChildProcess, state: { exited: boolean }): Promise<void> {
+  if (leaderExited(child, state)) return;
+  await new Promise<void>(resolve => {
+    const finish = () => {
+      clearTimeout(timer);
+      child.off("exit", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, 2_000);
+    child.once("exit", finish);
+    timer.unref();
+  });
 }
 
 function bridgeClient(handlers: BridgeClientHandlers): Client {
@@ -262,7 +284,7 @@ function bridgeClient(handlers: BridgeClientHandlers): Client {
 }
 
 /** ACP `initialize`, once, within its deadline and at the pinned protocol version; the process is stopped otherwise. */
-async function initializeBridge(connection: ClientSideConnection, options: SpawnBridgeOptions, child: PipedChildProcess): Promise<InitializeResponse> {
+async function initializeBridge(connection: ClientSideConnection, options: SpawnBridgeOptions, processOwner: BridgeStopOwner): Promise<InitializeResponse> {
   const timeout = new Promise<never>((_resolve, reject) => {
     setTimeout(
       () => reject(new RemoteInstanceError("agent_unavailable", `bridge did not answer initialize within ${options.initializeTimeoutMs}ms`, { recoveryActions: [{ kind: "run_doctor" }] })),
@@ -280,12 +302,12 @@ async function initializeBridge(connection: ClientSideConnection, options: Spawn
       timeout,
     ]);
   } catch (error) {
-    await stopProcessGroupLeaderFirst({ child, timeoutMs: 2_000, killGraceMs: 1_000 });
+    await processOwner.stop();
     if (error instanceof RemoteInstanceError) throw error;
     throw new RemoteInstanceError("agent_unavailable", "bridge initialize failed", { cause: error, recoveryActions: [{ kind: "update" }] });
   }
   if (initializeResult.protocolVersion !== PROTOCOL_VERSION) {
-    await stopProcessGroupLeaderFirst({ child, timeoutMs: 2_000, killGraceMs: 1_000 });
+    await processOwner.stop();
     throw new RemoteInstanceError("protocol_incompatible", `bridge speaks ACP protocol ${initializeResult.protocolVersion}, runner pins ${PROTOCOL_VERSION}`, {
       recoveryActions: [{ kind: "update" }],
     });

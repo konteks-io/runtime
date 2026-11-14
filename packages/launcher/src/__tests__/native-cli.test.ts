@@ -121,7 +121,7 @@ describe("native customer entry point", () => {
     await program.parseAsync(["auth", "status", "antigravity"], { from: "user" });
     expect(actions.control).toHaveBeenLastCalledWith(expect.objectContaining({ operation: "auth.status", agent: "antigravity" }));
     const agentCommand = program.commands.find(c => c.name() === "agent")!;
-    expect(agentCommand.commands.find(c => c.name() === "add")!.helpInformation().replace(/\s+/g, " ")).toMatch(/Google Antigravity, downloaded from Google \(dl\.google\.com, about 110 MB\) after you say yes/);
+    expect(agentCommand.commands.find(c => c.name() === "add")!.helpInformation().replace(/\s+/g, " ")).toMatch(/Google Antigravity, downloaded from Google \(dl\.google\.com, up to 350 MB\) after you say yes/);
     expect(agentCommand.commands.find(c => c.name() === "remove")!.helpInformation().replace(/\s+/g, " ")).toMatch(/remove Google Antigravity from this computer/);
     expect(program.commands.find(c => c.name() === "install")!.helpInformation().replace(/\s+/g, " ")).toContain("claude-code, codex, dsh, opencode, antigravity");
   });

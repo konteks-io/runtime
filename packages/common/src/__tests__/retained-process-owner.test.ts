@@ -1,8 +1,24 @@
 import { spawn } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
-import { captureRetainedProcessOwner, readLinuxProcessIdentity, readWindowsProcessIdentity, stopRetainedProcessOwner, type ProcessIdentity } from "../retained-process-owner.js";
+import { captureRetainedProcessOwner, readLinuxProcessIdentity, readWindowsProcessIdentity, stopRetainedProcessOwner, windowsProcessTreePresent, type ProcessIdentity } from "../retained-process-owner.js";
 
 const identity: ProcessIdentity = { pid: 123, processGroupId: 123, startToken: "Thu Sep 11 10:00:00 2026", commandDigest: "A".repeat(43) };
+
+describe("Windows process-tree birth fence", () => {
+  const row=(pid:number,parent:number,born:string)=>({ProcessId:pid,ParentProcessId:parent,CreationDate:born,CommandLine:"",ExecutablePath:""});
+  it("ignores orphan ancestry older than the captured root PID's creation",()=>{
+    expect(windowsProcessTreePresent(123,"2000",[row(456,123,"1000"),row(789,456,"3000")])).toBe(false);
+  });
+  it("observes real surviving descendants after their root exits",()=>{
+    expect(windowsProcessTreePresent(123,"2000",[row(789,456,"4000"),row(456,123,"3000")])).toBe(true);
+    expect(windowsProcessTreePresent(123,"2000",[row(123,1,"2000")])).toBe(true);
+  });
+  it("refuses a reused root or incomplete related creation identity",()=>{
+    expect(()=>windowsProcessTreePresent(123,"2000",[row(123,1,"3000")])).toThrow();
+    expect(()=>windowsProcessTreePresent(123,"2000",[row(456,123,"")])).toThrow();
+    expect(()=>windowsProcessTreePresent(123,"not-ticks",[])).toThrow();
+  });
+});
 
 describe("retained macOS process owner", () => {
   it("captures only a detached bridge whose exact identity is observable", () => {

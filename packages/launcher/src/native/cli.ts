@@ -113,7 +113,7 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     .option("--yes", "you agree to disconnect the current workspace (asked otherwise)", false)
     .action(async (options: { yes: boolean }) => actions.switchWorkspace({ ...context(), yes: options.yes }));
   const agentLifecycle = program.command("agent").description("add or remove agents on this computer");
-  agentLifecycle.command("add").description("add one agent without reactivation: Claude Code (Anthropic's installer is offered when it is missing) or Codex (ships with Konteks), then their sign-in, your own DeepSeek Harness or OpenCode 2 install (nothing downloaded), or Google Antigravity, downloaded from Google (dl.google.com, about 110 MB) after you say yes")
+  agentLifecycle.command("add").description("add one agent without reactivation: Claude Code (Anthropic's installer is offered when it is missing) or Codex (ships with Konteks), then their sign-in, your own DeepSeek Harness or OpenCode 2 install (nothing downloaded), or Google Antigravity, downloaded from Google (dl.google.com, up to 350 MB) after you say yes")
     .argument("<agent>", "agent family: claude-code, codex, dsh, opencode or antigravity", agent)
     .option("--yes", "Google Antigravity: you read the download question and agree (it is asked otherwise)", false)
     .action(async (value: NativeAgentId, options: { yes: boolean }) => {

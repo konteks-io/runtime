@@ -91,8 +91,8 @@ konteks-remote agent add antigravity
 konteks-remote auth login antigravity --api-key
 ```
 
-The first command asks before it downloads anything from Google (about
-110 MB, 400 MB on disk). Sign in with a Gemini API key (typed without echo),
+The first command asks before it downloads anything from Google (up to
+350 MB, about 1 GB on disk; keep 3 GB free for installation and updates). Sign in with a Gemini API key (typed without echo),
 or with Gemini Enterprise:
 `konteks-remote auth login antigravity --enterprise --project <your Google Cloud project ID> --location global`
 (the project needs Google's Business AI Code API:

@@ -1303,7 +1303,7 @@ describe("onboard", () => {
   });
   it("offers Google Antigravity in one line only to a person with no agent, and names it once added: sign-in, or doctor", async () => {
     await writeOnboardState(root, { step: "done", tenantId: "acme" } as never);
-    const offer = "If you want Gemini: konteks-remote agent add antigravity downloads Google Antigravity from Google (about 110 MB) after you say yes, then: konteks-remote auth login antigravity";
+    const offer = "If you want Gemini: konteks-remote agent add antigravity downloads Google Antigravity from Google (up to 350 MB) after you say yes, then: konteks-remote auth login antigravity";
     const none = await step({ families: async () => [], agentReadiness: async () => ({}), recordedAgents: async () => [] });
     expect(none.done?.remedies).toContain(offer);
     // Never detected (an Antigravity app or `agy` CLI is another product), never pushed on a person with an agent.

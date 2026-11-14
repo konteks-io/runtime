@@ -28,7 +28,7 @@ const result = (stdout: string, status: number | null = 0) => ({
 });
 const absent = () => result(JSON.stringify({ complete: true, first: null, second: null }));
 const present = () => result(JSON.stringify({ complete: true, first: record, second: record }));
-const noTree = () => result(JSON.stringify({ present: false }));
+const noTree = () => result(JSON.stringify({ complete: true, processes: [] }));
 
 beforeEach(() => {
   query.mockReset();
@@ -68,6 +68,8 @@ describe("default Windows retained observations", () => {
     result(""),
     result("{}"),
     result('{"present":"false"}'),
+    result('{"complete":true,"processes":"unavailable"}'),
+    result('{"complete":true,"processes":[null]}'),
   ])("requires a successful structured descendant observation", async (observation) => {
     query.mockReturnValueOnce(absent()).mockReturnValueOnce(observation);
     const terminateTree = vi.fn();
@@ -79,6 +81,16 @@ describe("default Windows retained observations", () => {
 
   it("accepts confirmed absent leader and descendants without signaling", async () => {
     query.mockReturnValueOnce(absent()).mockReturnValueOnce(noTree());
+    const terminateTree = vi.fn();
+    await expect(stopRetainedProcessOwner(owner, { terminateTree })).resolves.toBeUndefined();
+    expect(terminateTree).not.toHaveBeenCalled();
+  });
+
+  it("does not mistake an older orphan's parent PID for the captured tree", async () => {
+    query.mockReturnValueOnce(absent()).mockReturnValueOnce(result(JSON.stringify({
+      complete: true,
+      processes: [{ ...record, ProcessId: 555, ParentProcessId: 123, CreationDate: "1000" }],
+    })));
     const terminateTree = vi.fn();
     await expect(stopRetainedProcessOwner(owner, { terminateTree })).resolves.toBeUndefined();
     expect(terminateTree).not.toHaveBeenCalled();

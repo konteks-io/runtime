@@ -53,7 +53,7 @@ release carries. Covers `release/`, `packaging/`, `packages/release/` and
   - Playwright MCP: `native-agent-builds.json` `browser` and
     `BROWSER_MCP_PACKAGE` in `packages/release/src/browser.ts`.
   - The Antigravity pin is bundled into the connector executable, so only a
-    runtime release changes it; only `darwin-arm64` is pinned so far.
+    runtime release changes it; macOS ARM64, Linux x64/ARM64 and Windows x64/ARM64 are pinned.
 - **Publisher signing is opt-in per OS** (`scripts/sign-connector.mjs`,
   called by `sign-launcher.mjs` on the shipped executable in place, before
   `release-assets.mjs stage`). macOS: `APPLE_DEVELOPER_ID_P12`,

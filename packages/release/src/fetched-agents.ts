@@ -22,8 +22,8 @@ const archivePath = z.string().min(1).max(255)
 export const FetchedAgentSignerSchema = z.discriminatedUnion("kind", [
   /** macOS: `codesign --verify --strict` under Apple's anchor with this Team ID. */
   z.object({ kind: z.literal("apple_team_id"), teamId: z.string().regex(/^[A-Z0-9]{10}$/) }).strict(),
-  /** Windows: Authenticode status `Valid` with exactly this signer subject. */
-  z.object({ kind: z.literal("authenticode"), subject: z.string().min(1).max(512) }).strict(),
+  /** Windows: Authenticode status `Valid` and this exact public signing certificate. */
+  z.object({ kind: z.literal("authenticode"), certificateSha256: sha256 }).strict(),
   /** Linux: no OS signature; the pinned hashes are the whole check. */
   z.object({ kind: z.literal("none") }).strict(),
 ]);

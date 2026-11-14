@@ -439,11 +439,11 @@ export async function verifyFetchedSignature(file: string, signer: FetchedAgentS
   }
   if (platform !== "win32") return false;
   const quoted = file.replace(/'/g, "''");
-  const script = `$s = Get-AuthenticodeSignature -LiteralPath '${quoted}'; [Console]::Out.Write($s.Status.ToString() + "|" + $s.SignerCertificate.Subject)`;
+  const script = `$s = Get-AuthenticodeSignature -LiteralPath '${quoted}'; $fingerprint = ''; if ($s.SignerCertificate) { $hash = [Security.Cryptography.SHA256]::Create(); try { $fingerprint = ([BitConverter]::ToString($hash.ComputeHash($s.SignerCertificate.RawData))).Replace('-', '').ToLowerInvariant() } finally { $hash.Dispose() } }; [Console]::Out.Write($s.Status.ToString() + "|" + $fingerprint)`;
   const windowsRoot = process.env.SystemRoot ?? "C:\\Windows";
   const powershell = join(windowsRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-  const result = await run(powershell, ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")]);
-  return result.ok && result.stdout === `Valid|${signer.subject}`;
+  const result = await run(powershell, ["-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")]);
+  return result.ok && result.stdout === `Valid|${signer.certificateSha256}`;
 }
 
 function run(command: string, args: string[]): Promise<{ ok: boolean; stdout: string }> {
