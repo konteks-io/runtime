@@ -201,14 +201,65 @@ describe("native activation and resumable exchange", () => {
     expect(f.args.readActivationCode).toHaveBeenCalledOnce();
   });
 
-  it("refuses a changed activation after an uncertain exchange", async () => {
-    const f = fixture();
-    f.args.fetchFn.mockRejectedValue(new Error("lost"));
+  it.each(["unsupported", "wrong_previous", "wrong_replacement", "malformed"])("preserves an uncertain enrollment when recovery is %s", async refusal => {
+    const f = fixture(); f.args.dataDir = join(dir, "fresh");
+    f.args.fetchFn.mockRejectedValue(new Error("response lost"));
     await expect(runNativeActivationExchange(f.args)).rejects.toThrow();
-    f.args.fetchFn.mockReset().mockImplementation(fixture().args.fetchFn.getMockImplementation()!);
-    f.args.readActivationCode.mockClear();
-    await expect(runNativeActivationExchange({ ...f.args, activationId: "different" })).rejects.toMatchObject({ code: "registration_mismatch" });
-    expect(f.args.readActivationCode).not.toHaveBeenCalled();
+    const store = new SupervisorStore(f.args.dataDir);
+    const key = await readFile(store.path("instance-key.jwk"), "utf8");
+    const attempt = await store.activationAttempt();
+    f.args.fetchFn.mockImplementation(async () => {
+      if (refusal === "unsupported") return new Response(JSON.stringify({ code: "not_found", message: "unsupported" }), { status: 404 });
+      if (refusal === "malformed") return new Response(JSON.stringify({ state: "retired" }), { status: 200 });
+      return new Response(JSON.stringify({ state: "retired", previousActivationId: refusal === "wrong_previous" ? "another" : f.args.activationId, activationId: refusal === "wrong_replacement" ? "another" : "replacement" }), { status: 200 });
+    });
+    await expect(runNativeActivationExchange({ ...f.args, activationId: "replacement" })).rejects.toThrow();
+    expect(await readFile(store.path("instance-key.jwk"), "utf8")).toBe(key);
+    expect(await store.activationAttempt()).toEqual(attempt);
+    expect(await store.identity()).toBeNull();
+    expect(await readdir(f.args.dataDir)).not.toContain("retired-enrollments");
+  });
+
+  it("recovers a pending legacy registration with a new owner-issued activation without changing its key or lineage", async () => {
+    const f = fixture(); f.args.dataDir = join(dir, "fresh");
+    const exchange = f.args.fetchFn.getMockImplementation()!;
+    f.args.fetchFn.mockRejectedValue(new Error("response lost"));
+    await expect(runNativeActivationExchange(f.args)).rejects.toThrow();
+    const store = new SupervisorStore(f.args.dataDir);
+    const key = await readFile(store.path("instance-key.jwk"), "utf8");
+    const originalAttempt = await store.activationAttempt();
+    const response = await exchange("https://core.example", { body: "{}" });
+    const result = await response.json();
+    const calls: Record<string, unknown>[] = [];
+    f.args.fetchFn.mockImplementation(async (_url, init) => {
+      const body = JSON.parse(String(init?.body)); calls.push(body);
+      return new Response(JSON.stringify({ state: "recovered", previousActivationId: f.args.activationId, activationId: "replacement", exchange: result }), { status: 200 });
+    });
+    await expect(runNativeActivationExchange({ ...f.args, activationId: "replacement" })).resolves.toMatchObject({ instanceId: "instance-native" });
+    expect(await readFile(store.path("instance-key.jwk"), "utf8")).toBe(key);
+    expect(await store.identity()).toMatchObject({ activationId: f.args.activationId, exchangeNonce: originalAttempt!.nonce });
+    const journal = new SupervisorJournal(store.path("journal")); await journal.load();
+    expect(journal.execution.enrollment()).toMatchObject({ activationId: f.args.activationId, instanceId: "instance-native" });
+    expect(calls[0]).toMatchObject({ previousActivationId: f.args.activationId, activationId: "replacement", exchangeNonce: originalAttempt!.nonce });
+  });
+
+  it("archives a server-retired unconnected attempt before enrolling with a new key", async () => {
+    const f = fixture(); f.args.dataDir = join(dir, "fresh");
+    const exchange = f.args.fetchFn.getMockImplementation()!;
+    f.args.fetchFn.mockRejectedValue(new Error("unconfirmed request"));
+    await expect(runNativeActivationExchange(f.args)).rejects.toThrow();
+    const store = new SupervisorStore(f.args.dataDir);
+    const key = await readFile(store.path("instance-key.jwk"), "utf8");
+    f.args.fetchFn.mockImplementation(async (url, init) => String(url).endsWith("/activation-recovery")
+      ? new Response(JSON.stringify({ state: "retired", previousActivationId: f.args.activationId, activationId: "replacement" }), { status: 200 })
+      : exchange(url, init));
+    await expect(runNativeActivationExchange({ ...f.args, activationId: "replacement" })).resolves.toMatchObject({ instanceId: "instance-native" });
+    expect(await readFile(store.path("instance-key.jwk"), "utf8")).not.toBe(key);
+    const archives = await readdir(store.path("retired-enrollments"));
+    expect(archives).toHaveLength(1);
+    expect(await readFile(join(store.path("retired-enrollments"), archives[0]!, "data", "instance-key.jwk"), "utf8")).toBe(key);
+    const journal = new SupervisorJournal(store.path("journal")); await journal.load();
+    expect(journal.execution.enrollment()).toMatchObject({ activationId: "replacement", instanceId: "instance-native" });
   });
 
   it("retains an uncertain exchange when a later local code read fails", async () => {

@@ -1,3 +1,5 @@
+import { recoverChangedActivation } from "./activation-recovery.js";
+import { resumeActivationRetirement, completeActivationRetirement } from "./activation-retirement.js";
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, readdir, rm } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
@@ -10,7 +12,7 @@ import { SupervisorJournal } from "../state/journal.js";
 import { StateMutationGate } from "../state/mutation-gate.js";
 import { acquireNativeRootLock, NATIVE_ROOT_LOCK_FILE } from "./root-lock.js";
 
-interface NativeActivationArgs {
+export interface NativeActivationArgs {
   dataDir: string;
   coreUrl: string;
   activationId: string;
@@ -34,11 +36,24 @@ interface PriorActivation {
 
 /** Install's native exchange phase: owns state before creating a key or nonce. */
 export async function runNativeActivationExchange(args: NativeActivationArgs): Promise<ActivationExchangeOutcome> {
+  let code: string | undefined;
+  const cached = { ...args, readActivationCode: async () => code ??= await args.readActivationCode() };
+  try {
+    const first = await ownedActivation(cached);
+    if (!("restart" in first)) return first;
+    const second = await ownedActivation(cached);
+    if ("restart" in second) throw new RemoteInstanceError("recovery_required", "Enrollment retirement did not settle; the private archive was preserved.");
+    return second;
+  } finally { code = undefined; }
+}
+
+async function ownedActivation(args: NativeActivationArgs): Promise<ActivationExchangeOutcome | { restart: true }> {
   const { platform, release } = verifiedActivationTarget(args);
   const fresh = await createPrivateRoot(args.dataDir);
   const owner = acquireNativeRootLock(args.dataDir);
   const mutations = new StateMutationGate(() => owner.assertOwned());
   try {
+    const retirement = await resumeActivationRetirement(args.dataDir, args.activationId, owner);
     const store = new SupervisorStore(args.dataDir, mutations.run);
     await store.init();
     const journal = new SupervisorJournal(store.path("journal"), mutations.run); await journal.load();
@@ -48,10 +63,18 @@ export async function runNativeActivationExchange(args: NativeActivationArgs): P
     const firstCode = needsFirstCode(prior, journal) ? await args.readActivationCode() : undefined;
     owner.assertOwned();
     const key = await store.loadOrCreateInstanceKey();
-    const enrollment = await enrollmentLineage(journal, args, { fresh, prior, keyDigest: jcsDigest(key.publicKeyJwk as never) });
     let requests = 0;
     const fetchFn: FetchFn = (...input) => { requests++; return (args.fetchFn ?? fetch)(...input); };
     const core = new CoreClient({ baseUrl: args.coreUrl, clock: args.clock, key: () => key, credential: () => null, fetchFn });
+    const previous = journal.execution.enrollment();
+    if (previous && previous.activationId !== args.activationId) {
+      const outcome = await recoverChangedActivation({ args, store, journal, key, core, owner });
+      if (!outcome) return { restart: true };
+      await bindEnrollment(store, journal, previous, outcome, owner);
+      return outcome;
+    }
+    const enrollment = await enrollmentLineage(journal, args, { fresh, prior, keyDigest: jcsDigest(key.publicKeyJwk as never), retiredKeyDigest: retirement?.keyDigest });
+    if (enrollment) await completeActivationRetirement(args.dataDir, enrollment, owner);
     const outcome = await exchangeOrForget(() => runActivationExchange({ store, core, key, clock: args.clock, activationId: args.activationId, platform: { ...platform, containerBackend: "none", deploymentKind: "native_connector" }, deploymentKind: "native_connector", release, roots: args.roots,
       // The person reads this terminal: its progress lines say what happens,
       // and a JSON log line in between read as noise. Warnings stay.
@@ -113,10 +136,10 @@ async function priorActivation(store: SupervisorStore, journal: SupervisorJourna
 async function enrollmentLineage(
   journal: SupervisorJournal,
   args: Pick<NativeActivationArgs, "activationId" | "clock">,
-  state: { fresh: boolean; prior: PriorActivation; keyDigest: string },
+  state: { fresh: boolean; prior: PriorActivation; keyDigest: string; retiredKeyDigest?: string | undefined },
 ): Promise<Enrollment | undefined> {
   const { prior, keyDigest } = state;
-  if (untouchedRoot(state.fresh, prior)) {
+  if (untouchedRoot(state.fresh, prior) || retiredFreshRoot(state)) {
     await journal.execution.seedEnrollment({ enrollmentId: randomUUID(), activationId: args.activationId, keyDigest, createdAt: args.clock.nowIso() });
   }
   const enrollment = journal.execution.enrollment();
@@ -127,6 +150,11 @@ async function enrollmentLineage(
 /** A root this call created, holding no key, attempt or identity of an earlier enrollment. */
 function untouchedRoot(fresh: boolean, prior: PriorActivation): boolean {
   return fresh && !prior.keyFile && !prior.attempt && !prior.identity;
+}
+
+/** The retired root has no identity or attempt, and its replacement key differs from the archived key. */
+function retiredFreshRoot(state: { prior: PriorActivation; keyDigest: string; retiredKeyDigest?: string | undefined }): boolean {
+  return state.retiredKeyDigest !== undefined && state.retiredKeyDigest !== state.keyDigest && !state.prior.attempt && !state.prior.identity;
 }
 
 /**
