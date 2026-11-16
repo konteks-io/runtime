@@ -28,7 +28,10 @@ const RecordSchema = z.discriminatedUnion("state", [
 export type NativeOutputRecord = z.infer<typeof RecordSchema>;
 const TurnIdentitySchema = z.object({ sessionId: z.string().min(1).max(256), invocationId: z.string().min(1).max(256), claimId: z.string().min(1).max(256) }).strict();
 const ExpectedAcceptanceSchema = TurnIdentitySchema.omit({ sessionId: true }).extend({ acceptanceId: z.string().min(1).max(256), resultDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/) });
-const RecoveredAcceptanceSchema = z.object({ acceptance: ExpectedAcceptanceSchema, checkpointDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/) }).strict();
+/** Core's signed acceptance of the latest turn when this computer holds no
+ * receipt for it: proven by a restored checkpoint (`checkpointDigest`), or by
+ * the exact candidate retained here when the acceptance reply was lost. */
+const RecoveredAcceptanceSchema = z.object({ acceptance: ExpectedAcceptanceSchema, checkpointDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/).optional() }).strict();
 const SessionHeadSchema = z.object({ version: z.literal(1), recovered: RecoveredAcceptanceSchema.optional(), latest: TurnIdentitySchema.optional(),
   pending: TurnIdentitySchema.optional(), cleanup: TurnIdentitySchema.optional() }).strict()
   .refine(value => value.latest !== undefined || value.pending !== undefined,
@@ -216,7 +219,7 @@ export class NativeOutputSessionHeadStore {
     const head = await this.read();
     if (!head?.latest) return null;
     const record = await this.record({ invocationId: head.latest.invocationId, claimId: head.latest.claimId }).read();
-    if (record?.state !== "accepted") return null;
+    if (record?.state !== "accepted" && !retainedLostAcceptance(head, record)) return null;
     return { treeDigest: record.candidate.files.treeDigest, deletions: [...record.candidate.deletions], files: record.candidate.files };
   }
 
@@ -224,11 +227,7 @@ export class NativeOutputSessionHeadStore {
     let head = await this.required();
     await this.cleanup(head);
     head = await this.required();
-    if (turnIs(head.pending, expected)) {
-      await this.assertAccepted(expected);
-      await this.promote({ invocationId: expected.invocationId, claimId: expected.claimId });
-      head = await this.required();
-    }
+    if (turnIs(head.pending, expected)) head = await this.settleExpectedPending(head, expected);
     if (turnIs(head.latest, current)) {
       const replay = await this.record(current).read();
       if (replay?.state === "accepted") return;
@@ -236,6 +235,22 @@ export class NativeOutputSessionHeadStore {
     }
     if (!turnIs(head.latest, expected)) throw unavailable();
     await this.assertAccepted(expected);
+  }
+
+  /** Core's signed selection names the pending turn as its accepted result. */
+  private async settleExpectedPending(head: SessionHead, expected: ExpectedAcceptance): Promise<SessionHead> {
+    const turn = { invocationId: expected.invocationId, claimId: expected.claimId };
+    const record = await this.record(turn).read();
+    if (record?.state === "pending" && record.candidate.resultDigest === expected.resultDigest) {
+      const next = SessionHeadSchema.parse({ version: 1, latest: head.pending, recovered: { acceptance: expected },
+        ...(head.latest ? { cleanup: head.latest } : {}) });
+      await this.write(next);
+      await this.cleanup(next);
+      return this.required();
+    }
+    await this.assertAccepted(expected);
+    await this.promote(turn);
+    return this.required();
   }
 
   private async required(): Promise<SessionHead> {
@@ -286,8 +301,16 @@ export class NativeOutputSessionHeadStore {
     const record = await this.record(current).read();
     if (record?.state !== "accepted") throw unavailable();
     const next = SessionHeadSchema.parse({ version: 1, latest: identity, ...(before!.latest ? { cleanup: before!.latest } : {}) });
+    await this.releaseLostAcceptance(before!);
     await this.write(next);
     await this.cleanup(next);
+  }
+
+  /** The retained candidate of a lost acceptance reply goes once a successor is accepted. */
+  private async releaseLostAcceptance(head: SessionHead): Promise<void> {
+    if (!head.latest) return;
+    const store = this.record(head.latest);
+    if (retainedLostAcceptance(head, await store.read())) await store.removePending();
   }
 
   private async cleanup(head: z.infer<typeof SessionHeadSchema>): Promise<void> {
@@ -298,8 +321,7 @@ export class NativeOutputSessionHeadStore {
     if (retained) await record.removeAccepted({ invocationId: retained.receipt.invocationRef,
       claimId: retained.receipt.claimId, acceptanceId: retained.receipt.acceptanceId,
       resultDigest: retained.receipt.resultDigest });
-    await this.write({ version: 1, ...(head.latest ? { latest: head.latest } : {}),
-      ...(head.pending ? { pending: head.pending } : {}) });
+    await this.write({ version: 1, ...latestOf(head), ...(head.pending ? { pending: head.pending } : {}) });
   }
 
   private async read(): Promise<SessionHead | null> {
@@ -396,6 +418,20 @@ function receiptMatches(receipt: RemoteDeliveryAcceptanceReceipt, candidate: Rem
   return receipt.invocationRef === candidate.invocationRef && receipt.claimId === candidate.claimId && receipt.resultId === candidate.resultId &&
     receipt.resultDigest === candidate.resultDigest && receipt.inputSelectionDigest === candidate.inputSelectionDigest && receipt.baseRevision === candidate.baseRevision &&
     canonicalize(receipt.binding as never) === canonicalize(candidate.binding as never);
+}
+
+/**
+ * Harness accepted the latest turn's output, but the acceptance reply never
+ * reached this computer (a fenced relay, D112c; TKT-4, 2026-11-16), so its
+ * exact candidate is still pending here with no receipt. Core's signed
+ * acceptance is the proof, as a verified checkpoint's is; no receipt is
+ * invented, and the candidate stays the previous output the next turn
+ * captures against.
+ */
+function retainedLostAcceptance(head: SessionHead, record: NativeOutputRecord | null): record is NativeOutputRecord {
+  return Boolean(record?.state === "pending" && head.recovered && head.latest && !head.recovered.checkpointDigest &&
+    turnIs(head.latest, head.recovered.acceptance) && candidateOfTurn(record.candidate, head.latest) &&
+    record.candidate.resultDigest === head.recovered.acceptance.resultDigest);
 }
 
 function recoveredAcceptanceMatches(head: SessionHead | null, expected: ExpectedAcceptance): boolean {

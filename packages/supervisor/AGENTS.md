@@ -189,3 +189,9 @@ QA browser, structured results, updates and doctor/support.
   `workspace_capture_file_hardlinked` (`native/workspace-checkpoint-failure.ts`).
   A stop waits only for `capture()`; sending the copy runs after the stop has
   settled, because it can take an hour and the next attempt waits on the stop.
+- A turn whose output Harness accepted but whose acceptance reply never
+  arrived stays `pending` here. When Core's signed selection names that exact
+  candidate (same result digest) as the accepted result, the session head
+  keeps Core's acceptance as its proof (`recovered`, no `checkpointDigest`)
+  and the candidate stays the next turn's previous output until a successor
+  is accepted (`native/output-store.ts`). A receipt is never invented.
