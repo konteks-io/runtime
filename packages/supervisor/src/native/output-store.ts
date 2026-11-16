@@ -193,11 +193,22 @@ export class NativeOutputSessionHeadStore {
     const recovered = RecoveredAcceptanceSchema.parse({ acceptance: expected, checkpointDigest });
     const before = await this.settled();
     if (turnIs(before?.latest, current)) { await this.verifyExpected(expected, current); return; }
-    assertRecoveryCompatible(before, expected, current);
+    const pending = await this.pendingFor(before?.pending, current);
+    assertRecoveryCompatible(before ? { ...before, pending } : null, expected, current);
     if (before?.latest) await this.assertAccepted(expected);
     const latest = TurnIdentitySchema.parse({ sessionId: this.sessionId, invocationId: expected.invocationId, claimId: expected.claimId });
-    const pending = before?.pending;
     await this.write({ version: 1, latest, recovered, ...(pending ? { pending } : {}) });
+  }
+
+  /**
+   * The pending turn a Core-fenced turn keeps: its own, or none once another
+   * turn's abandoned pending record is discarded as `begin` discards it. An
+   * accepted record may only have lost its promotion, and still refuses.
+   */
+  private async pendingFor(pending: TurnIdentity | undefined, current: Omit<TurnIdentity, "sessionId">): Promise<TurnIdentity | undefined> {
+    if (!pending || turnIs(pending, current)) return pending;
+    await this.discardAbandoned(pending);
+    return undefined;
   }
 
   /** The output this session's last accepted turn produced here, when this computer still records one. Read-only. */
