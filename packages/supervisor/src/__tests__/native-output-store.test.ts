@@ -116,6 +116,45 @@ describe("durable native output state", () => {
     await expect(head.verifyExpected({ ...expected, resultDigest: `sha256:${"b".repeat(64)}` }, current)).rejects.toBeDefined();
   });
 
+  // Production 2026-11-16 (TKT-4): a repair turn stopped early with its output
+  // still pending here and never accepted by Core. Core fenced a new
+  // invocation that recovers the round-0 checkpoint; recovery refused on the
+  // abandoned pending turn on every dispatch, so the delivery retried forever.
+  it("recovers past an abandoned pending turn Core fenced, as begin() discards it", async () => {
+    const head = new NativeOutputSessionHeadStore(dir, "session");
+    const first = { invocationId: "first", claimId: "claim-first" };
+    const accepted = fixture(first.invocationId, first.claimId);
+    await head.begin(first); await head.record(first).savePending(accepted.candidate, accepted.completion);
+    await head.record(first).saveAccepted(accepted.candidate, accepted.receipt); await head.promote(first);
+    const stopped = { invocationId: "stopped", claimId: "claim-stopped" };
+    const abandoned = fixture(stopped.invocationId, stopped.claimId);
+    await head.begin(stopped); await head.record(stopped).savePending(abandoned.candidate, abandoned.completion);
+
+    const expected = { ...first, acceptanceId: accepted.receipt.acceptanceId, resultDigest: accepted.receipt.resultDigest };
+    const current = { invocationId: "next", claimId: "claim-next" };
+    await head.recoverVerifiedAcceptance(expected, current, `sha256:${"a".repeat(64)}`);
+
+    expect(await head.record(stopped).read()).toBeNull();
+    await expect(head.verifyExpected(expected, current)).resolves.toBeUndefined();
+    await expect(head.begin(current)).resolves.toBeUndefined();
+  });
+
+  it("still refuses recovery past a pending turn whose output was accepted", async () => {
+    const head = new NativeOutputSessionHeadStore(dir, "session");
+    const first = { invocationId: "first", claimId: "claim-first" };
+    const accepted = fixture(first.invocationId, first.claimId);
+    await head.begin(first); await head.record(first).savePending(accepted.candidate, accepted.completion);
+    await head.record(first).saveAccepted(accepted.candidate, accepted.receipt); await head.promote(first);
+    const lostPromotion = { invocationId: "later", claimId: "claim-later" };
+    const later = fixture(lostPromotion.invocationId, lostPromotion.claimId);
+    await head.begin(lostPromotion); await head.record(lostPromotion).savePending(later.candidate, later.completion);
+    await head.record(lostPromotion).saveAccepted(later.candidate, later.receipt);
+
+    const expected = { ...first, acceptanceId: accepted.receipt.acceptanceId, resultDigest: accepted.receipt.resultDigest };
+    await expect(head.recoverVerifiedAcceptance(expected, { invocationId: "next", claimId: "claim-next" }, `sha256:${"a".repeat(64)}`)).rejects.toThrow();
+    expect((await head.record(lostPromotion).read())?.state).toBe("accepted");
+  });
+
   it("repairs a crash after durable acceptance but before session-head promotion", async () => {
     const head = new NativeOutputSessionHeadStore(dir, "session");
     const first = fixture("first", "claim-first");
