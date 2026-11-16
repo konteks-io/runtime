@@ -190,6 +190,17 @@ export class LocalExecutionJournal {
     return record?.kind === "enrollment_seed" || record?.kind === "enrollment_bound" ? structuredClone(record.value) : undefined;
   }
 
+  /** A failed install may retire only before any execution or assignment stream activity. */
+  canRetireEnrollment(): boolean {
+    const enrollment = this.enrollment();
+    if (!enrollment) return false;
+    return this.index().every(record => {
+      if (record.kind === "enrollment_seed" || record.kind === "enrollment_bound") return true;
+      if (record.kind !== "assignment_stream" || !("instanceId" in enrollment)) return false;
+      return equal(record.value, initialAssignmentStream({ instanceId: enrollment.instanceId, workspaceId: enrollment.workspaceId, enrollmentId: enrollment.enrollmentId }));
+    });
+  }
+
   coverage(instanceId: string, workspaceId: string): "complete_from_enrollment" | "legacy_unknown" {
     return this.index().some(row => row.kind === "enrollment_bound" && row.value.instanceId === instanceId && row.value.workspaceId === workspaceId) ? "complete_from_enrollment" : "legacy_unknown";
   }

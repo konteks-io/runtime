@@ -72,6 +72,8 @@ export type {
   // Provisioning, readiness, lease
   RemoteInstanceActivationExchangeRequest,
   RemoteInstanceActivationExchangeResult,
+  RemoteInstanceActivationRecoveryRequest,
+  RemoteInstanceActivationRecoveryResult,
   RemoteSignedBundleManifest,
   RemoteNativeArtifact,
   AgentModelCapabilityMapping,
@@ -328,6 +330,7 @@ export {
   validateRemoteTransfer,
   // Strict parsers for every trust boundary the runtime validates.
   RemoteInstanceActivationExchangeResultSchema,
+  RemoteInstanceActivationRecoveryResultSchema,
   RemoteSignedBundleManifestSchema,
   computeBundleManifestDigest,
   bundleManifestSigningBytes,

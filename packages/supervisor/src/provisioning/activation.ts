@@ -38,7 +38,7 @@ interface ActivationExchangeBase {
   logger?: Logger;
 }
 
-type ActivationExchangeArgs = ActivationExchangeBase & {
+export type ActivationExchangeArgs = ActivationExchangeBase & {
   deploymentKind: "native_connector";
   platform: { os: "macos" | "windows" | "debian"; architecture: "amd64" | "arm64"; containerBackend: "none"; deploymentKind: "native_connector" };
   release: VerifiedNativeRelease;
@@ -53,6 +53,15 @@ export interface ActivationExchangeOutcome {
 
 export async function runActivationExchange(args: ActivationExchangeArgs): Promise<ActivationExchangeOutcome> {
   const logger = args.logger ?? createLogger({ name: "provisioning" });
+  const { existing, binding, nonce } = await prepareActivationExchange(args);
+  const resumed = await resumedProvisioning(args, existing, binding);
+  if (resumed) return resumed;
+  const result = await exchanged(args, nonce);
+  return recordActivationExchange(args, result, nonce, logger);
+}
+
+/** Persist the original retry binding before either exchange or owner-authorized recovery sends it. */
+export async function prepareActivationExchange(args: ActivationExchangeArgs) {
   const existing = await args.store.identity();
   assertActivatable(existing, args.activationId);
   const independent = verifyNativeRelease(args.release.manifest, args.roots, args.clock.now());
@@ -60,10 +69,7 @@ export async function runActivationExchange(args: ActivationExchangeArgs): Promi
   if (existing && !attempt) throw new RemoteInstanceError("registration_mismatch", "Existing identity requires an explicit native migration; it cannot be relabelled during activation.");
   const binding: ActivationBinding = { activationId: args.activationId, keyDigest: jcsDigest(args.key.publicKeyJwk as unknown as JsonValue), platformDigest: jcsDigest(args.platform), manifestDigest: independent.manifest.digest };
   const nonce = await activationNonce(args, existing, attempt, binding);
-  const resumed = await resumedProvisioning(args, existing, binding);
-  if (resumed) return resumed;
-  const result = await exchanged(args, nonce);
-  return recordExchange(args, result, nonce, logger);
+  return { existing, binding, nonce };
 }
 
 type Identity = Awaited<ReturnType<SupervisorStore["identity"]>>;
@@ -134,7 +140,7 @@ async function exchanged(args: ActivationExchangeArgs, nonce: string) {
   }
 }
 
-async function recordExchange(args: ActivationExchangeArgs, result: Awaited<ReturnType<typeof exchanged>>, nonce: string, logger: Logger): Promise<ActivationExchangeOutcome> {
+export async function recordActivationExchange(args: ActivationExchangeArgs, result: Awaited<ReturnType<typeof exchanged>>, nonce: string, logger: Logger): Promise<ActivationExchangeOutcome> {
   const exchange = verifyNativeRelease(result.bundleManifest, args.roots, args.clock.now());
   if (exchange.manifest.digest !== args.release.manifest.digest) throw new RemoteInstanceError("bundle_untrusted", "Native exchange differs from the independently verified release.");
   const manifestDigest = exchange.manifest.digest;

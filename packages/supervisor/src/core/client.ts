@@ -1,3 +1,4 @@
+import { RemoteInstanceActivationRecoveryResultSchema, type RemoteInstanceActivationRecoveryRequest, type RemoteInstanceActivationRecoveryResult } from "@konteks/remote-common";
 import { AgentTurnUsageObservationSchema, RuntimeAgentLoginReportSchema, RuntimeUpdateReportSchema,
   RuntimeUpdateLocalBeginRequestSchema,
   RuntimeUpdateLocalBeginResultSchema,
@@ -130,6 +131,7 @@ const instancePath = (instanceId: string, suffix: string): string => `${CORE_BAS
 const CORE_PATHS = Object.freeze({
   jwks: `${CORE_BASE}/jwks`,
   activationExchange: `${CORE_BASE}/activation-exchange`,
+  activationRecovery: `${CORE_BASE}/activation-recovery`,
   provisioningCredential: (instanceId: string) => instancePath(instanceId, "provisioning-credential"),
   readiness: (instanceId: string) => instancePath(instanceId, "readiness"),
   executionReady: (instanceId: string) => instancePath(instanceId, "executions/ready"),
@@ -403,6 +405,16 @@ export class CoreClient {
     return this.http.request({ method: "POST", path: CORE_PATHS.activationExchange,
       bodyFactory: () => ({ ...request, proof: this.proof("activation_exchange", request.activationId, request as unknown as { [key: string]: JsonValue }, nonce) }),
       schema: RemoteInstanceActivationExchangeResultSchema, idempotencyKey: `activation:${request.activationId}:${nonce}` });
+  }
+
+  async recoverActivation(request: Omit<RemoteInstanceActivationRecoveryRequest, "proof" | "issuedAt">): Promise<RemoteInstanceActivationRecoveryResult> {
+    return this.http.request({ method: "POST", path: CORE_PATHS.activationRecovery,
+      bodyFactory: () => {
+        const body = { ...request, issuedAt: Math.floor(this.options.clock.coreNow() / 1000) };
+        return { ...body, proof: this.proof("activation_recover", request.previousActivationId, body as unknown as { [key: string]: JsonValue }) };
+      },
+      schema: RemoteInstanceActivationRecoveryResultSchema,
+      idempotencyKey: `activation-recovery:${request.previousActivationId}:${request.activationId}:${request.exchangeNonce}` });
   }
 
   async refreshProvisioningCredential(request: Omit<RemoteInstanceProvisioningCredentialRefreshRequest, "proof">): Promise<RemoteInstanceProvisioningCredentialRefreshResult> {
