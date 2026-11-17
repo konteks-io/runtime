@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * Release pipeline: pin this release's connector executables inside the POSIX
- * bootstrap.
+ * Release pipeline: pin both bootstraps to this release and bake the POSIX
+ * executable digests.
  *
  * `install.sh --user` runs on machines whose `openssl` may not speak Ed25519
  * (macOS ships LibreSSL, which refuses the key), so the user-local path cannot
@@ -34,20 +34,28 @@ const pubDigest = createHash("sha256").update(readFileSync(args.pub)).digest("he
 // be refused by every installer, so it fails here instead.
 const releaseKey = createPublicKey(readFileSync(args.pub)).export({ type: "spki", format: "der" }).toString("base64");
 const pinned = {
-  "install.sh": readFileSync(args.in, "utf8").match(/^PINNED_RELEASE_PUBKEY="([^"]+)"$/m)?.[1],
+  "install.sh": readFileSync(join(dirname(args.in), "install.sh"), "utf8").match(/^PINNED_RELEASE_PUBKEY="([^"]+)"$/m)?.[1],
   "install.ps1": readFileSync(join(dirname(args.in), "install.ps1"), "utf8").match(/^\$PinnedReleaseKey = '([^']+)'$/m)?.[1],
 };
 for (const [name, key] of Object.entries(pinned)) if (key !== releaseKey) throw new Error(`${name} pins ${key ?? "no release key"}, but this release is signed by ${releaseKey}; update the pinned key in both bootstraps`);
 
 if (!/^v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?$/.test(args.tag)) throw new Error("invalid release tag");
 let script = readFileSync(args.in, "utf8");
-// Bind artifact downloads to the same immutable release as the baked digests.
-const releaseBase = 'RELEASE_BASE="${KONTEKS_RELEASE_BASE:-https://github.com/konteks-io/runtime/releases/latest/download}"';
-if (!script.includes(releaseBase)) throw new Error("bootstrap is missing the release base placeholder");
-script = script.replace(releaseBase, `RELEASE_BASE="\${KONTEKS_RELEASE_BASE:-https://github.com/konteks-io/runtime/releases/download/${args.tag}}"`);
-const marker = { sums: 'BAKED_EXECUTABLE_SUMS=""', pub: 'BAKED_RELEASE_PUBKEY_SHA256=""' };
-for (const value of Object.values(marker)) if (!script.includes(value)) throw new Error(`bootstrap is missing the ${value} placeholder`);
-script = script.replace(marker.sums, `BAKED_EXECUTABLE_SUMS="${lines.map(([digest, name]) => `${digest}  ${name}`).join("\\n")}"`);
-script = script.replace(marker.pub, `BAKED_RELEASE_PUBKEY_SHA256="${pubDigest}"`);
-writeFileSync(args.out, script, { mode: 0o755 });
-console.log(`baked ${lines.length} executable digests and the signing key digest into ${args.out}`);
+if (args.in.endsWith(".ps1")) {
+  const placeholder = "'https://github.com/konteks-io/runtime/releases/latest/download'";
+  if (!script.includes(placeholder)) throw new Error("Windows bootstrap is missing the release base placeholder");
+  script = script.replaceAll(placeholder, `'https://github.com/konteks-io/runtime/releases/download/${args.tag}'`);
+  writeFileSync(args.out, script);
+  console.log(`pinned Windows bootstrap to ${args.tag}`);
+} else {
+  // Bind artifact downloads to the same immutable release as the baked digests.
+  const releaseBase = 'RELEASE_BASE="${KONTEKS_RELEASE_BASE:-https://github.com/konteks-io/runtime/releases/latest/download}"';
+  if (!script.includes(releaseBase)) throw new Error("bootstrap is missing the release base placeholder");
+  script = script.replace(releaseBase, `RELEASE_BASE="\${KONTEKS_RELEASE_BASE:-https://github.com/konteks-io/runtime/releases/download/${args.tag}}"`);
+  const marker = { sums: 'BAKED_EXECUTABLE_SUMS=""', pub: 'BAKED_RELEASE_PUBKEY_SHA256=""' };
+  for (const value of Object.values(marker)) if (!script.includes(value)) throw new Error(`bootstrap is missing the ${value} placeholder`);
+  script = script.replace(marker.sums, `BAKED_EXECUTABLE_SUMS="${lines.map(([digest, name]) => `${digest}  ${name}`).join("\\n")}"`);
+  script = script.replace(marker.pub, `BAKED_RELEASE_PUBKEY_SHA256="${pubDigest}"`);
+  writeFileSync(args.out, script, { mode: 0o755 });
+  console.log(`baked ${lines.length} executable digests and the signing key digest into ${args.out}`);
+}

@@ -214,6 +214,7 @@ function runPosixBootstrap(options = {}) {
     output: `${result.stdout}${result.stderr}`,
     calls: fixtureLines(join(fixture, "calls.jsonl")).map(JSON.parse),
     effects: fixtureLines(join(fixture, "effects.txt")),
+    manifests: fixtureLines(join(fixture, "manifests.txt")),
     temporary: readdirSync(join(fixture, "temporary")),
   };
 }
@@ -515,6 +516,7 @@ function runWindowsBootstrap(options = {}) {
   const callsPath = join(fixture, "launcher-calls.jsonl");
   const effectsPath = join(fixture, "effect-calls.txt");
   const downloadsPath = join(fixture, "downloads.txt");
+  const manifestsPath = join(fixture, "manifests.txt");
   const localesPath = join(fixture, "launcher-locales.txt");
   const msiCallPath = join(fixture, "msi-call.json");
   const securityDiscoveryPath = join(fixture, "security-discovery.txt");
@@ -575,6 +577,7 @@ function Start-Process {
   return [PSCustomObject]@{ ExitCode = ${msiCode} }
 }
 function konteks-remote {
+  if ($args[0] -eq 'install') { $env:KONTEKS_RELEASE_MANIFEST_URL | Add-Content -LiteralPath ${psLiteral(manifestsPath)} -Encoding UTF8 }
   ConvertTo-Json -InputObject @($args) -Compress | Add-Content -LiteralPath ${psLiteral(callsPath)} -Encoding UTF8
   $env:KONTEKS_SETUP_LOCALE | Add-Content -LiteralPath ${psLiteral(localesPath)} -Encoding UTF8
   if ($args[0] -eq ${psLiteral(launcherThrow)}) { throw 'Fixture launcher could not start' }
@@ -584,17 +587,7 @@ function konteks-remote {
 & ([scriptblock]::Create([IO.File]::ReadAllText(${psLiteral(join(process.cwd(), "bootstrap", "install.ps1"))}))) ${fixtureInvocation({ verifyOnly, update })}
 `,
   );
-  const command = `& ([scriptblock]::Create([IO.File]::ReadAllText(${psLiteral(harnessPath)})))`;
-  const childArgs = ["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command];
-  const invocation = windowsBootstrapEntry(entryShell, childArgs);
-  const result = spawnSync(invocation.command, invocation.args, {
-    encoding: "utf8",
-    timeout: 60_000,
-    windowsHide: true,
-    windowsVerbatimArguments: entryShell === "cmd",
-    env: { ...process.env, TEMP: temporaryPath, TMP: temporaryPath },
-  });
-  if (result.error) throw result.error;
+  const result = executeWindowsBootstrap(entryShell, harnessPath, temporaryPath);
   const output = `${result.stdout}${result.stderr}`.replaceAll("\r\n", "\n");
   const scenario = `msi-${msiCode}-cancel-${cancelled}-tampered-${tampered}-download-failed-${downloadFailed}-update-${update}-update-exit-${updateCode}-start-exit-${startCode}-${sha256(JSON.stringify(options)).slice(0, 8)}`;
   saveFixtureTranscript(scenario, output, result.status);
@@ -608,6 +601,7 @@ function konteks-remote {
     calls: fixtureLines(callsPath).map((line) => JSON.parse(line.replace(/^\uFEFF/, ""))),
     effects: fixtureLines(effectsPath),
     downloads: fixtureLines(downloadsPath),
+    manifests: fixtureLines(manifestsPath),
     launcherLocales: fixtureLines(localesPath),
     msiCall: fixtureJson(msiCallPath),
     securityDiscovery: fixtureText(securityDiscoveryPath),
@@ -615,6 +609,21 @@ function konteks-remote {
     runtimeRoot,
     profile,
   };
+}
+
+function executeWindowsBootstrap(entryShell, harnessPath, temporaryPath) {
+  const command = `& ([scriptblock]::Create([IO.File]::ReadAllText(${psLiteral(harnessPath)})))`;
+  const childArgs = ["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command];
+  const invocation = windowsBootstrapEntry(entryShell, childArgs);
+  const result = spawnSync(invocation.command, invocation.args, {
+    encoding: "utf8",
+    timeout: 60_000,
+    windowsHide: true,
+    windowsVerbatimArguments: entryShell === "cmd",
+    env: { ...process.env, TEMP: temporaryPath, TMP: temporaryPath },
+  });
+  if (result.error) throw result.error;
+  return result;
 }
 
 function windowsBootstrapEntry(shell, args) {
@@ -1255,4 +1264,31 @@ test("release bootstrap keeps downloads on its own tag when latest advances", { 
   const resolve = override => execFileSync("sh", ["-c", `${assignment}\nprintf '%s' "$RELEASE_BASE"`], {encoding: "utf8", env: {...process.env, KONTEKS_RELEASE_BASE: override}});
   assert.equal(resolve(""), "https://github.com/konteks-io/runtime/releases/download/v0.12.8");
   assert.equal(resolve("https://example.test/release"), "https://example.test/release");
+});
+
+test("Windows release bootstrap pins artifact downloads when latest advances", () => {
+  const sums = join(root, "windows-SHA256SUMS");
+  const pub = join(root, "windows-release-signing.pub");
+  const output = join(root, "baked-install.ps1");
+  const names = ["debian-amd64", "debian-arm64", "macos-amd64", "macos-arm64", "windows-amd64.exe"];
+  writeFileSync(sums, names.map(name => `${"a".repeat(64)}  konteks-remote-${name}`).join("\n") + "\n");
+  const source = readFileSync("bootstrap/install.sh", "utf8");
+  const key = source.match(/^PINNED_RELEASE_PUBKEY="([^"]+)"$/m)[1];
+  writeFileSync(pub, `-----BEGIN PUBLIC KEY-----\n${key}\n-----END PUBLIC KEY-----\n`);
+  execFileSync(process.execPath, ["scripts/bake-bootstrap.mjs", "--sums", sums, "--pub", pub, "--in", "bootstrap/install.ps1", "--out", output, "--tag", "v0.19.26"]);
+  const baked = readFileSync(output, "utf8");
+  assert.match(baked, /releases\/download\/v0\.19\.26/);
+  assert.doesNotMatch(baked.split("\n").find(line => line.startsWith("$ReleaseBase =")), /latest/);
+});
+
+test("activation bootstrap binds the launcher manifest to its download release", posixOnly, () => {
+  const result = runPosixBootstrap();
+  assert.equal(result.status, 0, result.output);
+  assert.deepEqual(result.manifests, ["https://fixture.invalid/release/native-manifest.json"]);
+});
+
+test("Windows activation bootstrap binds the launcher manifest to its download release", windowsOnly, () => {
+  const result = runWindowsBootstrap({ update: false });
+  assert.equal(result.status, 0, result.output);
+  assert.deepEqual(result.manifests, ["https://fixture.invalid/release/native-manifest.json"]);
 });
