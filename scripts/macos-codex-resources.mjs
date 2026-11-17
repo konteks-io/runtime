@@ -99,9 +99,14 @@ async function inputProof(root, discovered) {
   return result;
 }
 
+function failureCause(receipt) {
+  if (typeof receipt.failedStage !== 'string') return '';
+  return ` at stage ${receipt.failedStage}: ${String(receipt.error ?? 'no error recorded').slice(0, 4096)}`;
+}
+
 function buildIdentity(receipt, architecture, target) {
   check(receipt.schema === 1 && receipt.candidateOnly === true, 'Resource build receipt identity refused');
-  check(receipt.buildAndProbeCompleted === true, 'Verified resource build did not complete');
+  check(receipt.buildAndProbeCompleted === true, `Verified resource build did not complete${failureCause(receipt)}`);
   check(receipt.architecture === architecture && receipt.target === target, 'Resource build coordinate mismatch');
 }
 

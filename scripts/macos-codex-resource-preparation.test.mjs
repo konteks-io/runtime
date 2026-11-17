@@ -218,6 +218,13 @@ function changeManifest(c, change) {
   c.outputs.voice.members[c.outputs.voice.members.findIndex(value => value.path === 'runtime.json')] = row(file, 'runtime.json');
 }
 
+test('names the failed probe stage and its error when the resource build did not complete', async t => {
+  const f = fixture(t);
+  await assert.rejects(prepare(f, c => {
+    Object.assign(c.receipt, { buildAndProbeCompleted: false, failedStage: 'voice-build', error: 'cargo exited 101' });
+  })(f.input), /did not complete at stage voice-build: cargo exited 101/);
+});
+
 for (const [name, change] of refused) test(`refuses ${name} without publishing package provenance`, async t => {
   const f = fixture(t);
   await assert.rejects(prepare(f, change)(f.input), productRefusal);
