@@ -155,6 +155,47 @@ describe("durable native output state", () => {
     expect((await head.record(lostPromotion).read())?.state).toBe("accepted");
   });
 
+  // Production 2026-11-16 (TKT-4): Harness accepted a repair turn's output,
+  // but the acceptance reply never reached this computer (a fenced relay,
+  // D112c), so the turn stayed pending here. Core's signed selection named it
+  // as the accepted result, and every continuation refused because the record
+  // had no receipt, so the delivery retried forever.
+  it("continues from a pending turn Core names as accepted when its acceptance reply was lost", async () => {
+    const head = new NativeOutputSessionHeadStore(dir, "session");
+    const first = { invocationId: "first", claimId: "claim-first" };
+    const accepted = fixture(first.invocationId, first.claimId);
+    await head.begin(first); await head.record(first).savePending(accepted.candidate, accepted.completion);
+    await head.record(first).saveAccepted(accepted.candidate, accepted.receipt); await head.promote(first);
+    const repair = { invocationId: "repair", claimId: "claim-repair" };
+    const lost = fixture(repair.invocationId, repair.claimId);
+    await head.begin(repair); await head.record(repair).savePending(lost.candidate, lost.completion);
+
+    const expected = { ...repair, acceptanceId: lost.receipt.acceptanceId, resultDigest: lost.candidate.resultDigest };
+    const current = { invocationId: "next", claimId: "claim-next" };
+    await expect(head.verifyExpected(expected, current)).resolves.toBeUndefined();
+    await expect(head.verifyExpected(expected, current)).resolves.toBeUndefined();
+    expect(await head.record(first).read()).toBeNull();
+    expect((await head.latestAccepted())?.treeDigest).toBe(lost.candidate.files.treeDigest);
+
+    const next = fixture(current.invocationId, current.claimId);
+    await head.begin(current); await head.record(current).savePending(next.candidate, next.completion);
+    await head.record(current).saveAccepted(next.candidate, next.receipt);
+    await expect(head.promote(current)).resolves.toBeUndefined();
+    expect(await head.record(repair).read()).toBeNull();
+    expect((await head.latestAccepted())?.treeDigest).toBe(next.candidate.files.treeDigest);
+  });
+
+  it("still refuses a pending turn whose bytes differ from the result Core accepted", async () => {
+    const head = new NativeOutputSessionHeadStore(dir, "session");
+    const repair = { invocationId: "repair", claimId: "claim-repair" };
+    const lost = fixture(repair.invocationId, repair.claimId);
+    await head.begin(repair); await head.record(repair).savePending(lost.candidate, lost.completion);
+
+    const expected = { ...repair, acceptanceId: lost.receipt.acceptanceId, resultDigest: `sha256:${"b".repeat(64)}` };
+    await expect(head.verifyExpected(expected, { invocationId: "next", claimId: "claim-next" })).rejects.toThrow();
+    expect((await head.record(repair).read())?.state).toBe("pending");
+  });
+
   it("repairs a crash after durable acceptance but before session-head promotion", async () => {
     const head = new NativeOutputSessionHeadStore(dir, "session");
     const first = fixture("first", "claim-first");
