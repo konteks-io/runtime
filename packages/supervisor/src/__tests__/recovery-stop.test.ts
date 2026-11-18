@@ -50,8 +50,9 @@ async function sessionFixture(overrides: Partial<RelayedSessionDeps> = {}, mutat
   return { session, runner, transport, onClosed, deps, journal, outbox };
 }
 
-async function realOwnedWork(completeStart = false) {
+async function realOwnedWork(completeStart = false, kind: "assistant_execution" | "delivery" = "assistant_execution") {
   let failWrite = false;
+  let authority: string | null = "accepted-A";
   const m = managerFixture();
   const f = await sessionFixture({}, async operation => { if (failWrite) throw new Error("disk unavailable"); return operation(); });
   f.deps.registerReady = async (_assignment, binding, ref) => ({ ...binding, claimId: "claim", recoveryEpoch: 0, runnerIncarnation: "process", channelId: "session:cloud-session", agentId: "codex", acpSessionRef: ref, readyRevision: 1, registeredAt: clock.nowIso() });
@@ -66,8 +67,8 @@ async function realOwnedWork(completeStart = false) {
   };
   const work = new WorkOrchestrator({ journal: f.journal, outbox: f.outbox, transport: f.transport, clock,
     recoveryEvidence,
-    runners: new Map([["codex", f.runner]]), sessionDeps: () => f.deps, onUsage: async () => undefined, instanceId: () => "instance", workspaceId: () => "workspace", runnerIncarnation: () => "process", assertOwned: () => undefined, recoveryAuthority: () => "accepted-A", reportDeliveryAllowed: () => false } as never);
-  const entry = { assignmentId: "assignment", attempt: 1, claimId: "claim", kind: "assistant_execution" as const, placementId: "placement", workspaceId: "workspace", agentId: "codex", state: "claimed" as const, recoveryEpoch: 0, reports: { nextSequence: 1, durableWatermark: 0 }, evidenceUpload: "structured_only" as const, expiresAt: assignment.expiresAt, latestResumeAt: assignment.policy.latestResumeAt, updatedAt: clock.nowIso() };
+    runners: new Map([["codex", f.runner]]), sessionDeps: () => f.deps, onUsage: async () => undefined, instanceId: () => "instance", workspaceId: () => "workspace", runnerIncarnation: () => "process", assertOwned: () => undefined, recoveryAuthority: () => authority, reportDeliveryAllowed: () => false } as never);
+  const entry = { assignmentId: "assignment", attempt: 1, claimId: "claim", kind, placementId: "placement", workspaceId: "workspace", agentId: "codex", state: "claimed" as const, recoveryEpoch: 0, reports: { nextSequence: 1, durableWatermark: 0 }, evidenceUpload: "structured_only" as const, expiresAt: assignment.expiresAt, latestResumeAt: assignment.policy.latestResumeAt, updatedAt: clock.nowIso() };
   await f.journal.assignments.put(entry);
   const admission = { instanceId: "instance", workspaceId: "workspace", runnerIncarnation: "process", assignmentId: "assignment", attempt: 1, claimId: "claim", agentId: "codex", executionGeneration: "generation", openedAt: clock.nowIso() };
   if (completeStart) {
@@ -80,8 +81,10 @@ async function realOwnedWork(completeStart = false) {
   } else await f.journal.execution.admit(admission, () => undefined);
   const internal = work as unknown as { captureNativeAuthority(id: string, attempt: number): () => void; dispatch(a: RemoteWorkAssignment, e: typeof entry, check: () => void): Promise<void> };
   const originalAuthority = internal.captureNativeAuthority(assignment.id, assignment.attempt);
-  const dispatch = () => internal.dispatch(assignment, entry, originalAuthority);
-  return { ...f, ...m, work, dispatch, admission, recoveryEvidence, evidenceAtSubmission: () => evidenceAtSubmission, failWrites: (value: boolean) => { failWrite = value; } };
+  const dispatch = () => internal.dispatch({ ...assignment, kind }, entry, originalAuthority);
+  return { ...f, ...m, work, dispatch, admission, recoveryEvidence, evidenceAtSubmission: () => evidenceAtSubmission, failWrites: (value: boolean) => { failWrite = value; },
+    /** The connector's accepted recovery generation lapses (Core unreachable past the lease) or comes back. */
+    lapseAuthority: (lapsed: boolean) => { authority = lapsed ? null : "accepted-A"; } };
 }
 
 describe("proven per-session recovery stop", () => {
@@ -724,13 +727,14 @@ describe("settling an execution whose authority was lost (production 2026-10-02)
     recoverLostExecutionAuthority(id: string, attempt: number): Promise<void>;
     retryLostAuthoritySettlements(): void;
     lostAuthority: Map<string, { failures: number; nextAt: number; running: Promise<void> | null }>;
-    deps: { verifyCancellation?: (directive: CancelDirective) => boolean };
+    sessions: Map<string, RelayedSession>;
+    deps: { verifyCancellation?: (directive: CancelDirective) => boolean; assertOwned: () => void };
   };
   const processOwner = { version: 1 as const, platform: "darwin" as const, pid: 321, processGroupId: 321, startToken: "start", commandDigest: "A".repeat(43) };
 
   /** A running turn whose agent will not settle its cancelled prompt, as on the loaded Mac. */
-  async function fencedRun(stopRetainedExecution: ReturnType<typeof vi.fn>, completeStart = false) {
-    const f = await realOwnedWork(completeStart); await f.dispatch();
+  async function fencedRun(stopRetainedExecution: ReturnType<typeof vi.fn>, completeStart = false, kind: "assistant_execution" | "delivery" = "assistant_execution") {
+    const f = await realOwnedWork(completeStart, kind); await f.dispatch();
     await vi.waitFor(() => expect(f.journal.assignments.get("assignment:1")?.state).toBe("running"));
     await f.journal.execution.bindProcessOwner(f.admission, processOwner, () => undefined);
     Object.assign(f.runner, { stopRetainedExecution });
@@ -928,6 +932,117 @@ describe("settling an execution whose authority was lost (production 2026-10-02)
     expect(journal.assignments.get("assignment:1")?.reports.terminalAck?.outcome).toBe("accepted");
     expect(outbox.depth).toBe(0);
     expect(() => journal.execution.assertQuiescent(f.admission)).toThrow();
+  });
+
+  describe("a delivery whose session closed without reporting (production 2026-11-18)", () => {
+    const cancellation = (reason: CancelDirective["reason"]): CancelDirective =>
+      ({ assignmentId: "assignment", attempt: 1, reason, issuedAt: clock.nowIso(), signature: "AA" });
+    /** The delivery turn's session closes (its output hand-in gave up) after Core went unreachable past the lease. */
+    async function lapsedClose(stop: ReturnType<typeof vi.fn>) {
+      const f = await fencedRun(stop, false, "delivery");
+      f.internal.deps.verifyCancellation = () => true;
+      const session = f.internal.sessions.get("assignment:1")!;
+      f.lapseAuthority(true);
+      await expect(session.close("agent_exited")).rejects.toMatchObject({ code: "recovery_required" });
+      expect(terminal(f)).toBeUndefined();
+      return { ...f, session };
+    }
+    const settled = async (f: Awaited<ReturnType<typeof fencedRun>>, failures: number) => {
+      await vi.waitFor(() => expect(f.internal.lostAuthority.get("assignment:1")?.failures).toBe(failures));
+      await f.internal.lostAuthority.get("assignment:1")?.running?.catch(() => undefined);
+    };
+
+    it("Core's signed cancellation settles it cancelled with the directive's reason, and a repeat does nothing more", async () => {
+      let fail = true;
+      const stop = vi.fn(async () => { if (fail) throw new RemoteInstanceError("recovery_required", "process stop unconfirmed"); });
+      const f = await lapsedClose(stop);
+      // The claim's own settlement could not prove the process gone yet.
+      await settled(f, 1);
+      f.lapseAuthority(false);
+      fail = false;
+      await f.work.onCancel(cancellation("policy_denied"));
+      expect(terminal(f)).toMatchObject({ class: "cancelled", reason: "policy_denied" });
+      expect(f.journal.execution.execution(f.admission)?.phase).toBe("interrupted_unqualified");
+      expect(f.internal.lostAuthority.size).toBe(0);
+      await f.work.onCancel(cancellation("policy_denied"));
+      expect(stop).toHaveBeenCalledTimes(2);
+      expect(f.outbox.depth).toBe(1);
+    });
+
+    it("a close that failed to report for another reason is settled by the cancellation instead of being refused", async () => {
+      const stop = vi.fn(async () => undefined);
+      const f = await fencedRun(stop, false, "delivery");
+      f.internal.deps.verifyCancellation = () => true;
+      const session = f.internal.sessions.get("assignment:1")!;
+      f.failWrites(true);
+      await expect(session.close("agent_exited")).rejects.toThrow("disk unavailable");
+      f.failWrites(false);
+      expect(terminal(f)).toBeUndefined();
+      await f.work.onCancel(cancellation("user_cancelled"));
+      expect(stop).toHaveBeenCalledWith(processOwner);
+      expect(terminal(f)).toMatchObject({ class: "cancelled", reason: "user_cancelled" });
+      await f.work.onCancel(cancellation("user_cancelled"));
+      expect(stop).toHaveBeenCalledOnce();
+      expect(f.outbox.depth).toBe(1);
+    });
+
+    it("an open delivery session still closes cancelled, without a recovery stop", async () => {
+      const stop = vi.fn(async () => undefined);
+      const f = await fencedRun(stop, false, "delivery");
+      f.internal.deps.verifyCancellation = () => true;
+      await f.work.onCancel(cancellation("policy_denied"));
+      expect(terminal(f)).toMatchObject({ class: "cancelled", reason: "user_cancelled" });
+      expect(stop).not.toHaveBeenCalled();
+      expect(f.journal.execution.execution(f.admission)?.phase).not.toBe("interrupted_unqualified");
+      expect(f.internal.lostAuthority.size).toBe(0);
+      expect(f.internal.sessions.size).toBe(0);
+      await f.work.onCancel(cancellation("policy_denied"));
+      expect(f.outbox.depth).toBe(1);
+    });
+
+    it("settles on its own, reported interrupted once native ownership is current again", async () => {
+      const stop = vi.fn(async () => undefined);
+      let owned = false;
+      const f = await fencedRun(stop, false, "delivery");
+      f.internal.deps.assertOwned = () => { if (!owned) throw new RemoteInstanceError("temporarily_unavailable", "Native state ownership is unavailable."); };
+      const session = f.internal.sessions.get("assignment:1")!;
+      f.lapseAuthority(true);
+      await expect(session.close("agent_exited")).rejects.toMatchObject({ code: "recovery_required" });
+      await settled(f, 1);
+      expect(stop).not.toHaveBeenCalled();
+      expect(terminal(f)).toBeUndefined();
+      owned = true;
+      clock.advance(5_000);
+      await f.tick();
+      expect(stop).toHaveBeenCalledWith(processOwner);
+      expect(terminal(f)).toMatchObject({ class: "interrupted", reason: "agent_session_lost" });
+      expect(f.internal.lostAuthority.size).toBe(0);
+      // Settled once: later ticks and a late cancellation change nothing.
+      clock.advance(60_000);
+      await f.tick();
+      f.internal.deps.verifyCancellation = () => true;
+      await f.work.onCancel(cancellation("user_cancelled"));
+      expect(stop).toHaveBeenCalledOnce();
+      expect(f.outbox.depth).toBe(1);
+    });
+
+    it("leaves a turn whose output Core accepted to Core's cancellation, never reporting it interrupted on its own", async () => {
+      const stop = vi.fn(async () => undefined);
+      const f = await fencedRun(stop, false, "delivery");
+      f.internal.deps.verifyCancellation = () => true;
+      const session = f.internal.sessions.get("assignment:1")!;
+      (session as unknown as { deliveryAcceptance: unknown }).deliveryAcceptance = { accepted: true };
+      f.lapseAuthority(true);
+      await expect(session.close("agent_exited")).rejects.toMatchObject({ code: "recovery_required" });
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(f.internal.lostAuthority.size).toBe(0);
+      expect(stop).not.toHaveBeenCalled();
+      f.lapseAuthority(false);
+      await f.work.onCancel(cancellation("user_cancelled"));
+      expect(terminal(f)).toMatchObject({ class: "cancelled", reason: "user_cancelled" });
+      expect(stop).toHaveBeenCalledOnce();
+      expect(f.outbox.depth).toBe(1);
+    });
   });
 
   it("after a restart, settles the execution a failed live stop left `stopping`", async () => {

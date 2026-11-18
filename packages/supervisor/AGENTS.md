@@ -179,6 +179,13 @@ QA browser, structured results, updates and doctor/support.
   Core's output endpoints authorize the acceptance, and reads keep honouring the
   stamps. Once a turn's output is on its way, the MCP owner stopping
   no longer closes the session (`capabilityOwnerStopped`).
+- A claim is never left unreported with no owner (2026-11-18: Core refused the
+  delivery's next turns `pending_stop_unproven` for 50 minutes). A session
+  fenced because its recovery authority lapsed (`fenceLostAuthority`) hands its
+  claim to `recoverLostExecutionAuthority`, which proves the process gone and
+  reports it `interrupted`; Core's signed cancellation of a session whose close
+  did not report settles it there too, `cancelled` with Core's reason. A turn
+  whose output Core accepted is left to restart recovery or that cancellation.
 - The delivery-output path names every refusal: capture throws
   `OutputCaptureRefusal` with a diagnostic and Git step, and `DeliveryOutput`
   tags each step (`native/delivery-output-failure.ts`). A retained retry
