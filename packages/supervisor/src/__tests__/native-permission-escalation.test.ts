@@ -14,11 +14,11 @@ const codexOptions = [
 const claudeContext = { assignmentId: "a", agentId: "claude-code", cwd: "/work/session", workspaceRoot: "/work/session", readOnlyRoots: [] };
 const codexContext = { assignmentId: "a", agentId: "codex", cwd: "/work/session", workspaceRoot: "/work/session", readOnlyRoots: [] };
 
-function claudeRequest(toolName: string, command: string) {
+function claudeRequest(toolName: string, command: string, locations = [{ path: "/tmp/outside.txt" }]) {
   return {
     sessionId: "acp-1",
     options: claudeOptions,
-    toolCall: { toolCallId: "tool-1", title: "Size of memory files", kind: "execute", locations: [{ path: "/tmp/outside.txt" }],
+    toolCall: { toolCallId: "tool-1", title: "Size of memory files", kind: "execute", locations,
       rawInput: { command }, _meta: { claudeCode: { toolName } } },
   };
 }
@@ -54,6 +54,9 @@ describe("a native escalation the person reads on the card", () => {
   it.each([
     ["Outside this session's folder", () => nativePermissionEscalation(
       claudeRequest("Bash", "c".repeat(400)) as never, claudeContext as never, { kind: "native", tool: "Bash" } as never, () => true)],
+    ["Wants to run a shell command", () => nativePermissionEscalation(
+      claudeRequest("Bash", "c".repeat(400), [{ path: "/work/session/src/a.ts" }]) as never, claudeContext as never,
+      { kind: "native", tool: "Bash" } as never, () => true)],
     ["Needs the network", () => nativePermissionEscalation(
       claudeRequest("SandboxNetworkAccess", "c".repeat(400)) as never, claudeContext as never,
       { kind: "native", tool: "SandboxNetworkAccess" } as never, () => true)],
@@ -119,9 +122,13 @@ describe("a Claude shell command that reaches only into the session context fold
   });
 
   it("still asks a person for anything beyond it: other folders, skill folders, or no known context folder", () => {
-    expect(decide([`${contextRoot}/memory/conversation.md`, "/tmp/outside.txt"])).toMatchObject({ kind: "defer" });
-    expect(decide([`${skillRoot}/scripts/run.sh`])).toMatchObject({ kind: "defer" });
-    expect(decide(["/work/session/src/a.ts"])).toMatchObject({ kind: "defer" });
-    expect(decide([`${contextRoot}/memory/conversation.md`], { ...context, sessionContextRoot: undefined })).toMatchObject({ kind: "defer" });
+    expect(decide([`${contextRoot}/memory/conversation.md`, "/tmp/outside.txt"]))
+      .toMatchObject({ kind: "defer", title: "Outside this session's folder: wc -l memory/conversation.md" });
+    expect(decide([`${skillRoot}/scripts/run.sh`]))
+      .toMatchObject({ kind: "defer", title: "Wants to run a shell command: wc -l memory/conversation.md" });
+    expect(decide(["/work/session/src/a.ts"])).toMatchObject({ kind: "defer", allowOnceOnly: true, optionIds: ["allow-once", "reject"],
+      title: "Wants to run a shell command: wc -l memory/conversation.md" });
+    expect(decide([`${contextRoot}/memory/conversation.md`], { ...context, sessionContextRoot: undefined }))
+      .toMatchObject({ kind: "defer", title: "Wants to run a shell command: wc -l memory/conversation.md" });
   });
 });

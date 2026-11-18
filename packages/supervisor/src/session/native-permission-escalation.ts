@@ -33,6 +33,7 @@ export function nativePermissionEscalation(
 
 /** What the person reads on the card, before the agent's own words for the call. */
 const OUTSIDE_FOLDER = "Outside this session's folder";
+const SHELL_COMMAND = "Wants to run a shell command";
 
 /**
  * The connector tells every agent to read its session context folder, and
@@ -62,11 +63,22 @@ function providerEscalation(request: RequestPermissionRequest, context: Permissi
   return tool === "Bash" || tool === "PowerShell" ? claudeShellEscalation(request, context, tool) : null;
 }
 
-/** Claude names the path its shell would reach outside the working copy in `locations`. */
+/**
+ * Claude's bridge lists `locations` for every shell call it must ask about,
+ * because its shell runs outside the working copy, so the heading was driven
+ * by Claude asking about a shell command, not by a path being outside: an estimate
+ * session reading its own checkout and the staged session-context snapshots
+ * met "Outside this session's folder" on calls entirely inside its verified
+ * roots. The heading now names the shell call unless a path is genuinely
+ * outside. The fix changes only the wording, never what is permitted, and
+ * every deferral stays allow-once.
+ */
 function claudeShellEscalation(request: RequestPermissionRequest, context: PermissionContext, tool: string): Escalation | null {
   const locations = request.toolCall.locations ?? [];
   if (locations.length === 0) return null;
-  const escalation: Escalation = { allowOptionId: "allow-once", title: escalationTitle(request, OUTSIDE_FOLDER, tool) };
+  const cwd = context.cwd ?? context.workspaceRoot;
+  const outside = locations.some(location => !isWithinReadRoots(location.path, cwd, context.readOnlyRoots));
+  const escalation: Escalation = { allowOptionId: "allow-once", title: escalationTitle(request, outside ? OUTSIDE_FOLDER : SHELL_COMMAND, tool) };
   return onlySessionContext(locations, context) ? { ...escalation, contextShell: true } : escalation;
 }
 
