@@ -127,6 +127,11 @@ export interface RelayedSessionDeps {
    * legacy local tests; a production session always registers.
    */
   registerDeferral?: (body: DeferredPermissionBody) => Promise<PendingPermissionView>;
+  /**
+   * Core's contract stores and serves a deferred permission's `requestDetail`.
+   * Absent or false, the deferral body keeps today's shape for an older Core.
+   */
+  requestDetailSupported?: () => boolean;
   instanceId: string;
   /**
    * Redeems/renews one logical `mcpCapabilityTokenRef`; bearer stays in memory.
@@ -2005,7 +2010,7 @@ export class RelayedSession {
    */
   private logPolicyRefusal(request: RequestPermissionRequest, decision: Exclude<PolicyDecision, { kind: "allow" }>): void {
     this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: request.toolCall.toolCallId,
-      title: sanitizePermissionRequest(request).params.title, decision: decision.kind,
+      title: sanitizePermissionRequest(request, false).params.title, decision: decision.kind,
       ...(decision.kind === "deny" && decision.refusal ? { refusal: decision.refusal } : {}),
       humanDeferralAllowed: this.assignment.policy.humanDeferralAllowed }, "tool permission not allowed by policy");
   }
@@ -2027,9 +2032,10 @@ export class RelayedSession {
   private async deferPermission(ref: string, requestId: string, request: RequestPermissionRequest, decision: Extract<PolicyDecision, { kind: "defer" }>): Promise<void> {
     if (!this.assignment.policy.humanDeferralAllowed) return void (await this.answerPermission(ref, requestId, cancelledPermission()));
     const asked = deferredPermissionRequest(request, decision);
-    const sanitized = sanitizePermissionRequest(asked);
+    const sanitized = sanitizePermissionRequest(asked, this.deps.requestDetailSupported?.() === true);
     const pending = await this.deferToHuman(ref, requestId, "session/request_permission", sanitized);
     if (!pending) return void (await this.answerPermission(ref, requestId, cancelledPermission()));
+    // The person reads the detail from Core's registered pending view; the relayed ACP frame keeps today's shape.
     await this.sendToCore({ kind: "acp", method: "session/request_permission", id: requestId, params: { sessionId: ref, toolCall: { toolCallId: asked.toolCall.toolCallId, title: sanitized.params.title, ...(sanitized.params.toolKind ? { kind: sanitized.params.toolKind } : {}) }, options: sanitized.params.options } as never });
   }
 
