@@ -199,6 +199,8 @@ export const LIVENESS_MIN_BUDGET_MS = 5 * 60_000;
 const LEASE_LAPSE_RESTART_MS = 2 * 60_000;
 /** How often a runtime Core refuses as too old re-reads the release channel. */
 const REFUSED_BUNDLE_UPDATE_INTERVAL_MS = 10 * 60_000;
+/** The Core contract that accepts a deferred permission's `requestDetail` (TKT-5). */
+const PERMISSION_REQUEST_DETAIL_MIN_CORE_CONTRACT_VERSION = "7.17";
 
 export interface SupervisorOptions {
   /** Native only: called once when no heartbeat has been attempted for longer
@@ -1270,6 +1272,7 @@ export class Supervisor {
         policy: new EvaluatorPolicyResponder(assignmentToolPolicy(assignment), () => this.configuration.humanDeferralAllowed && assignment.policy.humanDeferralAllowed),
         broker: this.broker,
         registerDeferral: (body) => this.core.deferPermission(this.instanceId ?? "", body),
+        requestDetailSupported: () => coreContractAtLeast(this.coreContractVersion, PERMISSION_REQUEST_DETAIL_MIN_CORE_CONTRACT_VERSION),
         instanceId: this.instanceId ?? "",
         redeemCapabilityToken: async (target, liveUntil) => {
           // Renewal supplies the execution's live authority; the single first

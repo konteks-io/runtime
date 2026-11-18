@@ -3,19 +3,22 @@ import type { CreateElicitationRequest, RequestPermissionRequest } from "@agentc
 import { BoundedJsonValueSchema, createLogger, jcsDigest, RemoteInstanceError, type BoundedJsonValue, type Clock, type JsonValue, type Logger, type PendingPermissionView } from "@konteks/remote-common";
 import type { DeferredPermissionBody } from "../core/client.js";
 import { isSignInElicitation } from "./policy-responder.js";
+import { permissionRequestDetail } from "./permission-request-detail.js";
 
 /**
- * Sanitized pending-permission facts. The supervisor forwards ONLY
- * these fields for a policy-deferred request — title, tool kind, options, or
- * a bounded elicitation message + schema — plus the `requestDigest` Core and
+ * Sanitized pending-permission facts. The supervisor forwards ONLY these
+ * fields for a policy-deferred request — title, tool kind, options, the
+ * bounded redacted `requestDetail` when Core's contract carries it, or a
+ * bounded elicitation message + schema — plus the `requestDigest` Core and
  * the answerer must echo. Raw tool input and `_meta` never leave; an
- * execute-kind deferral's title carries the redacted, bounded command from
- * that input, which can include absolute host paths.
+ * execute-kind deferral carries the redacted, bounded command as
+ * `requestDetail` (a native escalation's title names it too), which can
+ * include absolute host paths.
  */
 export interface SanitizedPermission {
   kind: "permission";
   requestDigest: string;
-  params: { title: string; toolKind?: string; options: Array<{ optionId: string; name: string; kind: string }> };
+  params: { title: string; toolKind?: string; options: Array<{ optionId: string; name: string; kind: string }>; requestDetail?: string };
 }
 
 export interface SanitizedElicitation {
@@ -30,12 +33,14 @@ const MAX_MESSAGE = 4_096;
 
 const OptionSchema = z.object({ optionId: z.string().min(1).max(128), name: z.string().min(1).max(MAX_TITLE), kind: z.enum(["allow_once", "allow_always", "reject_once", "reject_always"]) }).strict();
 
-export function sanitizePermissionRequest(request: RequestPermissionRequest): SanitizedPermission {
+export function sanitizePermissionRequest(request: RequestPermissionRequest, includeRequestDetail = true): SanitizedPermission {
   const params: SanitizedPermission["params"] = {
     title: plainText(request.toolCall.title ?? "Tool call", MAX_TITLE),
     options: request.options.slice(0, 16).map((option) => OptionSchema.parse({ optionId: option.optionId, name: plainText(option.name, MAX_TITLE), kind: option.kind })),
   };
   if (request.toolCall.kind) params.toolKind = String(request.toolCall.kind).slice(0, 32);
+  const requestDetail = includeRequestDetail ? permissionRequestDetail(request) : undefined;
+  if (requestDetail !== undefined) params.requestDetail = requestDetail;
   return { kind: "permission", requestDigest: jcsDigest(params as unknown as JsonValue), params };
 }
 
@@ -169,8 +174,8 @@ export class PermissionBroker {
 export function deferredPermissionBody(args: { sessionId: string; assignmentId: string; attempt: number; agentId: string; requestId: string; sanitized: SanitizedPermission | SanitizedElicitation }): DeferredPermissionBody {
   const common = { sessionId: args.sessionId, assignmentId: args.assignmentId, attempt: args.attempt, agentId: args.agentId, requestId: args.requestId };
   if (args.sanitized.kind === "permission") {
-    const { title, toolKind, options } = args.sanitized.params;
-    return { kind: "permission", ...common, permission: { title, ...(toolKind ? { toolKind } : {}), options } };
+    const { title, toolKind, options, requestDetail } = args.sanitized.params;
+    return { kind: "permission", ...common, ...(requestDetail ? { requestDetail } : {}), permission: { title, ...(toolKind ? { toolKind } : {}), options } };
   }
   return { kind: "elicitation", ...common, elicitation: { message: args.sanitized.params.message, requestedSchema: args.sanitized.params.requestedSchema, isSignIn: args.sanitized.isSignIn } };
 }

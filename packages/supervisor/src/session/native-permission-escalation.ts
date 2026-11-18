@@ -1,6 +1,7 @@
 import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
-import { plainRecord, redactText } from "@konteks/remote-common";
+import { plainRecord } from "@konteks/remote-common";
 import { boundTitle } from "./activity.js";
+import { oneLine } from "./permission-request-detail.js";
 import type { PermissionToolIdentity } from "./permission-tool-identity.js";
 import type { PermissionContext, PolicyDecision } from "./policy-responder.js";
 import { isWithinReadRoots, isWithinWorkspace, POLICY_REFUSAL_PREFIX } from "./workspace-tool-policy.js";
@@ -161,20 +162,4 @@ function executeCommand(request: RequestPermissionRequest): string | undefined {
   if (typeof command !== "string" || command.trim().length === 0) return undefined;
   const line = oneLine(command);
   return line.length > 0 ? line : undefined;
-}
-
-/** Redact first, then flatten and space out what the card sanitizer drops; the cut runs last. */
-function oneLine(command: string): string {
-  const flattened = redactText(command).replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ");
-  return [...flattened].map(point => droppedByCard(point) ? " " : point).join("").replace(/\s+/g, " ").trim();
-}
-
-/** The code-point ranges `sanitizePermissionRequest`'s `plainText` drops. */
-const CARD_DROPPED_RANGES: ReadonlyArray<readonly [number, number]> = [
-  [0x00, 0x1f], [0x7f, 0x7f], [0x200e, 0x200f], [0x202a, 0x202e], [0x2066, 0x2069],
-];
-
-function droppedByCard(point: string): boolean {
-  const code = point.codePointAt(0) ?? 0;
-  return CARD_DROPPED_RANGES.some(([from, to]) => code >= from && code <= to);
 }

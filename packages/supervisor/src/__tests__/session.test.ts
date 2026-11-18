@@ -10,6 +10,7 @@ import { FixedClock, RemoteInstanceError, SECRET_CANARIES, generateInstanceKey, 
 import { ChannelMux } from "../relay/channel-mux.js";
 import { SupervisorJournal } from "../state/journal.js";
 import { PermissionBroker, answerIsValid, registerDeferral, sanitizeElicitationRequest, sanitizePermissionRequest } from "../session/permissions.js";
+import { PERMISSION_REQUEST_DETAIL_MAX } from "../session/permission-request-detail.js";
 import type { DeferredPermissionBody } from "../core/client.js";
 import { EvaluatorPolicyResponder, isSignInElicitation } from "../session/policy-responder.js";
 import { createWorkspaceToolPolicy } from "../session/workspace-tool-policy.js";
@@ -50,13 +51,29 @@ async function pastArrivalBound(ask: () => Promise<void>): Promise<void> {
 }
 
 describe("sanitized permission facts", () => {
-  it("keeps title/kind/options only, strips directional overrides, and digests the sanitized view", () => {
+  it("keeps title/kind/options plus the captured detail, strips directional overrides, and digests the sanitized view", () => {
     const sanitized = sanitizePermissionRequest(permissionRequest as never);
     expect(sanitized.params.title).not.toContain("‮");
+    expect(sanitized.params.requestDetail).toBe("rm");
     expect(JSON.stringify(sanitized)).not.toContain("rawInput");
     expect(sanitized.requestDigest).toHaveLength(43);
     expect(answerIsValid(sanitized, { outcome: { outcome: "selected", optionId: "allow" } })).toBe(true);
     expect(answerIsValid(sanitized, { outcome: { outcome: "selected", optionId: "not-listed" } })).toBe(false);
+  });
+
+  it("binds the captured detail into the digest without changing which answers are valid", () => {
+    const command = { ...permissionRequest, toolCall: { ...permissionRequest.toolCall, rawInput: { command: "npm run build" } } };
+    const other = { ...permissionRequest, toolCall: { ...permissionRequest.toolCall, rawInput: { command: "npm test" } } };
+    const withDetail = sanitizePermissionRequest(command as never);
+    const withoutDetail = sanitizePermissionRequest(command as never, false);
+    expect(withDetail.params.requestDetail).toBe("npm run build");
+    expect(withoutDetail.params).not.toHaveProperty("requestDetail");
+    expect(withDetail.requestDigest).not.toBe(withoutDetail.requestDigest);
+    expect(sanitizePermissionRequest(other as never).requestDigest).not.toBe(withDetail.requestDigest);
+    for (const sanitized of [withDetail, withoutDetail]) {
+      expect(answerIsValid(sanitized, { outcome: { outcome: "selected", optionId: "allow" } })).toBe(true);
+      expect(answerIsValid(sanitized, { outcome: { outcome: "selected", optionId: "not-listed" } })).toBe(false);
+    }
   });
 
   it("marks sign-in elicitations and never accepts an answer for them", () => {
@@ -2546,6 +2563,121 @@ describe("relayed session", () => {
       expect(title).not.toContain("…");
       expect(title.endsWith(": ")).toBe(false);
     }
+  });
+
+  describe("deferred permission request detail", () => {
+    const detailOptions = [{ optionId: "allow", name: "Allow", kind: "allow_once" as const }, { optionId: "reject", name: "Reject", kind: "reject_once" as const }];
+    const ask = (session: RelayedSession, requestId: string, toolCall: Record<string, unknown>) =>
+      session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId,
+        params: { sessionId: "acp-1", toolCall: { toolCallId: requestId, ...toolCall }, options: detailOptions } } as never);
+
+    it("sends the command line a deferred shell request will run", async () => {
+      const registered = registeredCard();
+      const { session } = await build({ registerDeferral: registered, requestDetailSupported: () => true });
+      await session.bootstrap();
+      await ask(session, "shell", { kind: "execute", title: "Run build", rawInput: { command: "npm run build -- --watch" } });
+      expect(cardBody(registered).requestDetail).toBe("npm run build -- --watch");
+      await session.close("cancelled");
+    });
+
+    it("sends the path a deferred file request will read or write", async () => {
+      const registered = registeredCard();
+      const { session } = await build({ registerDeferral: registered, requestDetailSupported: () => true });
+      await session.bootstrap();
+      await ask(session, "edit", { kind: "edit", title: "Write notes", rawInput: { file_path: "/private/native/checkout/notes.txt" } });
+      expect(cardBody(registered).requestDetail).toBe("/private/native/checkout/notes.txt");
+      await session.close("cancelled");
+    });
+
+    it("redacts and bounds the detail before it leaves the machine", async () => {
+      const registered = registeredCard();
+      const { session } = await build({ registerDeferral: registered, requestDetailSupported: () => true });
+      await session.bootstrap();
+      const command = `echo ${SECRET_CANARIES.anthropicKey} ${"a".repeat(900)}`;
+      await ask(session, "secret", { kind: "execute", title: "Run command", rawInput: { command } });
+      const detail = cardBody(registered).requestDetail!;
+      expect(detail).toContain("[redacted]");
+      expect(detail).not.toContain(SECRET_CANARIES.anthropicKey);
+      expect([...detail].length).toBeLessThanOrEqual(PERMISSION_REQUEST_DETAIL_MAX);
+      expect(detail.endsWith("…")).toBe(true);
+      await session.close("cancelled");
+    });
+
+    it("still registers and answers a request with no determinable detail", async () => {
+      const registered = registeredCard();
+      const { session, runner } = await build({ registerDeferral: registered, requestDetailSupported: () => true }, validation);
+      await session.bootstrap();
+      await ask(session, "none", { kind: "execute", title: "Size of memory files", rawInput: { command: ["size", "--memory"] } });
+      expect(registered).toHaveBeenCalledOnce();
+      expect(cardBody(registered)).not.toHaveProperty("requestDetail");
+      await session.onToRuntime({ kind: "acp_result", id: "none", method: "session/request_permission",
+        result: { outcome: { outcome: "selected", optionId: "allow" } } });
+      expect(runner.answer).toHaveBeenCalledWith("acp-1", "none", { outcome: { outcome: "selected", optionId: "allow" } });
+      await session.close("cancelled");
+    });
+
+    it("defers the same requests and delivers the same answers with or without the detail", async () => {
+      const run = async (supported: boolean) => {
+        const registered = registeredCard();
+        const { session, runner } = await build({ registerDeferral: registered, requestDetailSupported: () => supported }, validation);
+        await session.bootstrap();
+        const asks = [["shell", { kind: "execute", title: "Run build", rawInput: { command: "npm run build" } }],
+          ["edit", { kind: "edit", title: "Write notes", rawInput: { file_path: "/private/native/checkout/notes.txt" } }],
+          ["read", { kind: "read", title: "Read notes", rawInput: { file_path: "/private/native/checkout/README.md" } }]] as const;
+        for (const [requestId, toolCall] of asks) await ask(session, requestId, toolCall);
+        for (const [requestId] of asks) {
+          await session.onToRuntime({ kind: "acp_result", id: requestId, method: "session/request_permission",
+            result: { outcome: { outcome: "selected", optionId: "allow" } } });
+        }
+        const result = {
+          requestIds: registered.mock.calls.map(call => (call[0] as Extract<DeferredPermissionBody, { kind: "permission" }>).requestId),
+          answers: vi.mocked(runner.answer).mock.calls.slice(),
+          details: registered.mock.calls.map(call => (call[0] as Extract<DeferredPermissionBody, { kind: "permission" }>).requestDetail),
+        };
+        await session.close("cancelled");
+        return result;
+      };
+      const before = await run(false);
+      const after = await run(true);
+      expect(after.requestIds).toEqual(before.requestIds);
+      expect(after.answers).toEqual(before.answers);
+      expect(before.details).toEqual([undefined, undefined, undefined]);
+      expect(after.details).toEqual(["npm run build", "/private/native/checkout/notes.txt", "/private/native/checkout/README.md"]);
+    });
+
+    it("keeps the detail out of the deferral body below the Core contract version", async () => {
+      const registered = registeredCard();
+      const { session } = await build({ registerDeferral: registered });
+      await session.bootstrap();
+      await ask(session, "old-core", { kind: "execute", title: "Run build", rawInput: { command: "npm run build" } });
+      expect(cardBody(registered)).not.toHaveProperty("requestDetail");
+      await session.close("cancelled");
+    });
+
+    it("leaves policy decisions and answers unchanged with the detail on or off", async () => {
+      const own = join(dir, "detail-policy");
+      await mkdir(own, { recursive: true });
+      const run = async (supported: boolean) => {
+        const registered = registeredCard();
+        const { session, runner } = await build({
+          workspaceRoot: dir,
+          registerDeferral: registered,
+          requestDetailSupported: () => supported,
+          policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true),
+          prepareInputs: async (target: RemoteWorkAssignment) => ({ binding: { workspaceId: target.workspaceId, sessionId: "s", assignmentId: target.id,
+            instanceId: target.instanceId, attempt: target.attempt }, cwd: own, skillInstructions: "", beforePrompt: async () => undefined }),
+        }, validation);
+        await session.bootstrap();
+        await ask(session, "ordinary", { kind: "execute", title: "Build", rawInput: { command: "npm run build" } });
+        await ask(session, "push", { kind: "execute", title: "Push", rawInput: { command: "git push origin main" } });
+        await ask(session, "inside", { kind: "edit", title: "Write", rawInput: { file_path: join(own, "notes.txt") } });
+        await ask(session, "outside", { kind: "edit", title: "Write", rawInput: { file_path: join(dir, "outside.txt") } });
+        const result = { answers: vi.mocked(runner.answer).mock.calls.slice(), deferred: registered.mock.calls.length };
+        await session.close("cancelled");
+        return result;
+      };
+      expect(await run(true)).toEqual(await run(false));
+    });
   });
 
   it("threads a native delivery's deferral onto its execution session", async () => {
