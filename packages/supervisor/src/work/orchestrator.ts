@@ -793,9 +793,39 @@ export class WorkOrchestrator {
     };
   }
 
+  /**
+   * The fence ends the session, so a dispatched session's claim is handed to
+   * the lost-authority settlement here: nothing else would ever report it, and
+   * Core refuses the next turn until this one's stop is proven. It starts
+   * after the failed check returns, never inside it.
+   */
   private fenceLostAuthority(key: string): void {
     this.recoveryFences.add(key);
-    this.sessions.get(key)?.fenceForRecovery();
+    const session = this.sessions.get(key);
+    if (!session) return;
+    session.fenceForRecovery();
+    void Promise.resolve().then(() => this.settleUnownedFence(key)).catch(() => undefined);
+  }
+
+  /**
+   * Settle a fenced session's claim that no recovery owns yet. A turn whose
+   * output Core accepted is left to restart recovery, which reports it
+   * succeeded, or to Core's cancellation.
+   */
+  private settleUnownedFence(key: string): Promise<void> | undefined {
+    const session = this.unownedFencedSession(key);
+    if (!session || session.deliveryAcceptanceReceipt() !== null) return undefined;
+    const { id: assignmentId, attempt } = session.assignment;
+    this.logger.warn({ event: "execution.unowned_fence_settling", assignmentId, attempt },
+      "Execution authority lapsed with the claim unreported; settling it");
+    return this.recoverLostExecutionAuthority(assignmentId, attempt);
+  }
+
+  /** The fenced session of a claim it reports on close, still unreported, while no recovery stop or settlement owns it. */
+  private unownedFencedSession(key: string): RelayedSession | undefined {
+    const session = this.sessions.get(key);
+    if (!session || !this.recoveryFences.has(key) || this.recoveryStops.has(key) || this.lostAuthority.has(key)) return undefined;
+    return reportsOnClose(this.deps.journal.assignments.get(key)) ? session : undefined;
   }
 
   private dispatch(assignment: RemoteWorkAssignment, entry: JournalEntry, assertAuthority: () => void): Promise<void> {
@@ -2164,12 +2194,24 @@ export class WorkOrchestrator {
     if (isAssistantTurnKind(entry.kind)) return this.cancelAssistantExecution(directive);
     if (this.recoveryFences.has(key)) return this.cancelFencedExecution(key, directive);
     const session = this.sessions.get(key);
-    if (session) {
-      await session.close("cancelled");
-      return;
-    }
+    if (session) return this.cancelSession(session, directive);
     if (entry.kind === "planning") return; // Hosted settlement supplies the directive-bound terminal winner.
     await this.reportCancelledAssignment(directive, entry);
+  }
+
+  /**
+   * Close the session cancelled. A claim it reports on close that is still
+   * unreported afterwards (its close failed, or it had already closed without
+   * reporting) settles through the lost-authority owner with Core's reason, as
+   * a fenced one does. A controller-owned claim's close stays its only effect.
+   */
+  private async cancelSession(session: RelayedSession, directive: CancelDirective): Promise<void> {
+    const key = `${directive.assignmentId}:${directive.attempt}`;
+    if (!reportsOnClose(this.deps.journal.assignments.get(key))) return session.close("cancelled");
+    // An in-flight close may still report; its failure is settled below.
+    await session.close("cancelled").catch(() => undefined);
+    if (!reportsOnClose(this.deps.journal.assignments.get(key))) return;
+    await this.recoverLostExecutionAuthority(directive.assignmentId, directive.attempt, directive.reason);
   }
 
   /** A conversation cancellation settles through the exact-process recovery
@@ -2213,14 +2255,15 @@ export class WorkOrchestrator {
 
   /**
    * An execution whose authority was lost and that is not settled yet (its
-   * stop did not finish): Core's stop ends it the same way, now, with the
-   * cancellation as its result; a failure keeps retrying. Any other fence
-   * belongs to a recovery that reports the claim itself.
+   * stop did not finish, or no settlement owns its fence): Core's stop ends
+   * it the same way, now, with the cancellation as its result; a failure
+   * keeps retrying. Any other fence belongs to a recovery that reports the
+   * claim itself.
    */
   private async cancelFencedExecution(key: string, directive: CancelDirective): Promise<void> {
     const settlement = this.lostAuthority.get(key);
-    if (!settlement) return;
-    settlement.nextAt = 0;
+    if (settlement) settlement.nextAt = 0;
+    else if (!this.unownedFencedSession(key)) return;
     await this.recoverLostExecutionAuthority(directive.assignmentId, directive.attempt, directive.reason).catch(() => undefined);
   }
 
