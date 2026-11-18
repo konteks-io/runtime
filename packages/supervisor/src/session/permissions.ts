@@ -33,7 +33,8 @@ const MAX_MESSAGE = 4_096;
 
 const OptionSchema = z.object({ optionId: z.string().min(1).max(128), name: z.string().min(1).max(MAX_TITLE), kind: z.enum(["allow_once", "allow_always", "reject_once", "reject_always"]) }).strict();
 
-export function sanitizePermissionRequest(request: RequestPermissionRequest, includeRequestDetail = true): SanitizedPermission {
+/** `includeRequestDetail` is opt-in: a caller that omits it cannot put a host command or path into the digest without the Core gate. */
+export function sanitizePermissionRequest(request: RequestPermissionRequest, includeRequestDetail = false): SanitizedPermission {
   const params: SanitizedPermission["params"] = {
     title: plainText(request.toolCall.title ?? "Tool call", MAX_TITLE),
     options: request.options.slice(0, 16).map((option) => OptionSchema.parse({ optionId: option.optionId, name: plainText(option.name, MAX_TITLE), kind: option.kind })),

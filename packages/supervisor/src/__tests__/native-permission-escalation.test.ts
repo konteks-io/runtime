@@ -87,7 +87,7 @@ describe("a native escalation the person reads on the card", () => {
     expect(title.length).toBeLessThanOrEqual(256);
     expect(title.endsWith("…")).toBe(true);
     const request = { ...claudeRequest("Bash", command), toolCall: { ...claudeRequest("Bash", command).toolCall, title } };
-    expect(sanitizePermissionRequest(request as never).params.title).toBe(title);
+    expect(sanitizePermissionRequest(request as never, false).params.title).toBe(title);
   });
 
   it("removes control and directional characters before the cut, so the card keeps the whole bounded title", () => {
@@ -97,7 +97,7 @@ describe("a native escalation the person reads on the card", () => {
     expect(title).not.toContain("\u202E");
     expect(title).toContain("echo hidden b");
     const request = { ...claudeRequest("Bash", command), toolCall: { ...claudeRequest("Bash", command).toolCall, title } };
-    expect(sanitizePermissionRequest(request as never).params.title).toBe(title);
+    expect(sanitizePermissionRequest(request as never, false).params.title).toBe(title);
   });
 });
 

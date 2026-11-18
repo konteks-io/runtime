@@ -52,7 +52,7 @@ async function pastArrivalBound(ask: () => Promise<void>): Promise<void> {
 
 describe("sanitized permission facts", () => {
   it("keeps title/kind/options plus the captured detail, strips directional overrides, and digests the sanitized view", () => {
-    const sanitized = sanitizePermissionRequest(permissionRequest as never);
+    const sanitized = sanitizePermissionRequest(permissionRequest as never, true);
     expect(sanitized.params.title).not.toContain("‮");
     expect(sanitized.params.requestDetail).toBe("rm");
     expect(JSON.stringify(sanitized)).not.toContain("rawInput");
@@ -61,15 +61,21 @@ describe("sanitized permission facts", () => {
     expect(answerIsValid(sanitized, { outcome: { outcome: "selected", optionId: "not-listed" } })).toBe(false);
   });
 
+  it("keeps the detail opt-in so a caller cannot send it without the Core gate", () => {
+    const ungated = sanitizePermissionRequest(permissionRequest as never);
+    expect(ungated.params).not.toHaveProperty("requestDetail");
+    expect(ungated.requestDigest).toBe(sanitizePermissionRequest(permissionRequest as never, false).requestDigest);
+  });
+
   it("binds the captured detail into the digest without changing which answers are valid", () => {
     const command = { ...permissionRequest, toolCall: { ...permissionRequest.toolCall, rawInput: { command: "npm run build" } } };
     const other = { ...permissionRequest, toolCall: { ...permissionRequest.toolCall, rawInput: { command: "npm test" } } };
-    const withDetail = sanitizePermissionRequest(command as never);
+    const withDetail = sanitizePermissionRequest(command as never, true);
     const withoutDetail = sanitizePermissionRequest(command as never, false);
     expect(withDetail.params.requestDetail).toBe("npm run build");
     expect(withoutDetail.params).not.toHaveProperty("requestDetail");
     expect(withDetail.requestDigest).not.toBe(withoutDetail.requestDigest);
-    expect(sanitizePermissionRequest(other as never).requestDigest).not.toBe(withDetail.requestDigest);
+    expect(sanitizePermissionRequest(other as never, true).requestDigest).not.toBe(withDetail.requestDigest);
     for (const sanitized of [withDetail, withoutDetail]) {
       expect(answerIsValid(sanitized, { outcome: { outcome: "selected", optionId: "allow" } })).toBe(true);
       expect(answerIsValid(sanitized, { outcome: { outcome: "selected", optionId: "not-listed" } })).toBe(false);
@@ -114,7 +120,7 @@ describe("permission broker", () => {
     try {
       const timeouts: string[] = [];
       const broker = new PermissionBroker({ clock, deadlineSeconds: () => 1, onTimeout: async (request) => void timeouts.push(request.requestId) });
-      const sanitized = sanitizePermissionRequest(permissionRequest as never);
+      const sanitized = sanitizePermissionRequest(permissionRequest as never, false);
       broker.defer({ acpSessionRef: "acp", requestId: "r1", assignmentId: "a", attempt: 1, agentId: "codex", sanitized });
       broker.defer({ acpSessionRef: "acp", requestId: "r2", assignmentId: "a", attempt: 1, agentId: "codex", sanitized });
       expect(broker.answer("acp", "r1", { outcome: { outcome: "selected", optionId: "nope" } })).toEqual({ ok: false, reason: "permission_schema_mismatch" });

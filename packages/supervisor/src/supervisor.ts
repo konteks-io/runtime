@@ -199,8 +199,20 @@ export const LIVENESS_MIN_BUDGET_MS = 5 * 60_000;
 const LEASE_LAPSE_RESTART_MS = 2 * 60_000;
 /** How often a runtime Core refuses as too old re-reads the release channel. */
 const REFUSED_BUNDLE_UPDATE_INTERVAL_MS = 10 * 60_000;
-/** The Core contract that accepts a deferred permission's `requestDetail` (TKT-5). */
-const PERMISSION_REQUEST_DETAIL_MIN_CORE_CONTRACT_VERSION = "7.17";
+/**
+ * The first Core contract after the versions this connector already gates on
+ * that may accept a deferred permission's top-level `requestDetail`. TKT-5's
+ * Core change (commit a11a1bb2, "fix: Carry, bound and redact the requested
+ * command or path on a pending") declares optional `requestDetail?: string` on
+ * the `kind: "permission"` branch of `DeferredPermission` and accepts it in
+ * `DeferredPermissionSchema` (`plugins/remote-instance-backend/src/services/
+ * PendingPermissionService.ts`), but it shipped without bumping the shared
+ * contract: 7.17 remains the heartbeat `availability` contract. A Core signing
+ * 7.17 can predate that change, and its strict deferral schema would refuse
+ * the unknown field, so the detail goes only to a Core advertising the next
+ * contract (7.18); a 7.17 Core keeps today's body.
+ */
+const PERMISSION_REQUEST_DETAIL_MIN_CORE_CONTRACT_VERSION = "7.18";
 
 export interface SupervisorOptions {
   /** Native only: called once when no heartbeat has been attempted for longer

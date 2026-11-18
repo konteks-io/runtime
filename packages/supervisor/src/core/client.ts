@@ -265,7 +265,18 @@ const GitKeyListResultSchema = z.object({
   })).max(64),
 }).strict();
 
-/** Core's `DeferredPermission` (Core's `PendingPermissionService`): what the supervisor posts for a component-raised deferral. */
+/**
+ * Core's `DeferredPermission` (Core's `PendingPermissionService`): what the
+ * supervisor posts for a component-raised deferral.
+ *
+ * `requestDetail` is a top-level sibling of `permission` on the
+ * `kind: "permission"` branch, never inside `permission`, matching TKT-5's
+ * accepted record (Core commit a11a1bb2): `DeferredPermission` and
+ * `DeferredPermissionSchema` in Core's
+ * `plugins/remote-instance-backend/src/services/PendingPermissionService.ts`
+ * declare `requestDetail?: string` there and accept it as
+ * `z.string().transform(value => value.slice(0, MAX_TEXT)).optional()`.
+ */
 export type DeferredPermissionBody =
   | { kind: "permission"; sessionId: string; assignmentId: string; attempt: number; agentId: string; requestId: string; requestDetail?: string; permission: { title: string; toolKind?: string; options: Array<{ optionId: string; name: string; kind: string }> } }
   | { kind: "elicitation"; sessionId: string; assignmentId: string; attempt: number; agentId: string; requestId: string; elicitation: { message: string; requestedSchema: BoundedJsonValue; isSignIn: boolean } };
