@@ -281,6 +281,22 @@ export type DeferredPermissionBody =
   | { kind: "permission"; sessionId: string; assignmentId: string; attempt: number; agentId: string; requestId: string; requestDetail?: string; permission: { title: string; toolKind?: string; options: Array<{ optionId: string; name: string; kind: string }> } }
   | { kind: "elicitation"; sessionId: string; assignmentId: string; attempt: number; agentId: string; requestId: string; elicitation: { message: string; requestedSchema: BoundedJsonValue; isSignIn: boolean } };
 
+/**
+ * Core's reply to a deferral. A Core that accepts a request detail echoes its
+ * Core-local top-level `requestDetail` on the stored view, which the shared
+ * strict `PendingPermissionViewSchema` does not admit: parsed as is, every
+ * deferral that carried a detail would fail and the prompt would fail closed.
+ * Only that field is dropped; the `requestDigest` Core issued still binds it,
+ * so answer permits match unchanged. Every other unknown key is still refused.
+ */
+export const DeferredPermissionReplySchema = z.unknown().transform(withoutRequestDetail).pipe(PendingPermissionViewSchema);
+
+function withoutRequestDetail(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value) || !("requestDetail" in value)) return value;
+  const { requestDetail: _requestDetail, ...view } = value as Record<string, unknown>;
+  return view;
+}
+
 interface CoreClientOptions {
   baseUrl: string;
   clock: Clock;
@@ -1013,7 +1029,7 @@ export class CoreClient {
 
   /** A policy deferral (session- or component-raised), posted in Core's own `DeferredPermission` shape; Core answers the sanitized `PendingPermissionView`. Idempotent per assignment attempt and request id. */
   async deferPermission(instanceId: string, deferral: DeferredPermissionBody): Promise<PendingPermissionView> {
-    return this.http.request({ method: "POST", path: CORE_PATHS.permissionsDeferred(instanceId), body: deferral, schema: PendingPermissionViewSchema,
+    return this.http.request({ method: "POST", path: CORE_PATHS.permissionsDeferred(instanceId), body: deferral, schema: DeferredPermissionReplySchema,
       idempotencyKey: `permission-deferral:${instanceId}:${deferral.assignmentId}:${deferral.attempt}:${deferral.requestId}` });
   }
 }
