@@ -320,6 +320,21 @@ describe("relayed session", () => {
     await session.close("cancelled");
   });
 
+  it("keeps the first close's reason when a second caller closes the same closing session", async () => {
+    const { session } = await build();
+    const first = session.close("cancelled", "superseded");
+    // First close wins: this caller cannot rewrite what the session reports.
+    await session.close("cancelled", "policy_denied");
+    await first;
+    expect(session.cancelledReason()).toBe("superseded");
+  });
+
+  it("names no reason for a person's close, so it keeps reporting user_cancelled", async () => {
+    const { session } = await build();
+    await session.close("cancelled");
+    expect(session.cancelledReason()).toBeNull();
+  });
+
   it.each(["live", "restored"] as const)("keeps a %s Codex thread's MCP transport bound to only the current fenced turn", async continuation => {
     const seen: string[] = [];
     let holdNext = false;

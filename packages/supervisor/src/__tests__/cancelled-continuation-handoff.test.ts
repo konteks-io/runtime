@@ -126,7 +126,7 @@ it("stops a cancelled review continuation's process at close so the next review 
   let finishClose!: () => void;
   const closeTask = new Promise<void>(resolve => { finishClose = resolve; });
   const session = { assignment: review(f.cancelled, "qa-2", "qa-1"), acpSessionRef: "qa-ref", isClosed: true,
-    usage: () => undefined, close: vi.fn(() => closeTask) };
+    cancelledReason: () => null, usage: () => undefined, close: vi.fn(() => closeTask) };
   internal.sessions.set("cancelled:1", session);
 
   await internal.onSessionClosed(session, "cancelled", current);
@@ -170,7 +170,7 @@ it("a next review placed while the cancelled turn is still closing waits for its
   let finishClose!: () => void;
   const closeTask = new Promise<void>(resolve => { finishClose = resolve; });
   const session = { assignment: review(f.cancelled, "qa-2", "qa-1"), acpSessionRef: "qa-ref", isClosed: true,
-    usage: () => undefined, close: vi.fn(() => closeTask) };
+    cancelledReason: () => null, usage: () => undefined, close: vi.fn(() => closeTask) };
   internal.sessions.set("cancelled:1", session);
   await internal.onSessionClosed(session, "cancelled", current);
   await acknowledge(f.journal, f.cancelled);

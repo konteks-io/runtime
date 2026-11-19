@@ -25,7 +25,9 @@ beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "kr-work-"));
 });
 afterEach(async () => {
-  await rm(dir, { recursive: true, force: true });
+  // A retained session can still journal as teardown starts; retry the race
+  // instead of failing the test with ENOTEMPTY.
+  await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 });
 
 function fakeTransport(): { sent: OutboundMessage[]; transport: TransportManager } {
@@ -550,8 +552,11 @@ describe("work orchestrator claim validation", () => {
     await f.work.onAssignmentMessage(signed(1));
     expect(close).not.toHaveBeenCalled();
     await f.work.onAssignmentMessage(signed(2));
-    expect(close).toHaveBeenCalledExactlyOnceWith('cancelled');
+    // A Core-initiated stop carries Core's own reason through the close.
+    expect(close).toHaveBeenNthCalledWith(1, 'cancelled', 'policy_denied');
     await f.work.cancelLocalSession('cancel-target', 2);
+    // The local drain path is not directive-driven and keeps the default.
+    expect(close).toHaveBeenNthCalledWith(2, 'cancelled');
     expect(close).toHaveBeenCalledTimes(2);
     // The receiver requests cancellation; this spy is not quiescence evidence.
     expect(f.sent).toEqual([]);

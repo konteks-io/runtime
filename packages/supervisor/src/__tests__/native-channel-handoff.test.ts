@@ -315,7 +315,8 @@ it("supersedes a previous turn that is still live here when Core places a new tu
   const predecessor = f.predecessor as unknown as { isClosed: boolean; close: ReturnType<typeof vi.fn> };
   predecessor.close = vi.fn(async () => { predecessor.isClosed = true; f.internal.channelOwners.delete("session:session"); });
   await expect(f.internal.takeOverCompletedChannel(work(next, "ref"), next, current)).resolves.toBeUndefined();
-  expect(predecessor.close).toHaveBeenCalledWith("cancelled");
+  // A takeover ended it, so its terminal report must not read user_cancelled.
+  expect(predecessor.close).toHaveBeenCalledWith("cancelled", "superseded");
   expect(f.internal.channelOwners.has("session:session")).toBe(false);
   expect(f.internal.sessions.has("prior:1")).toBe(false);
   expect(f.runner.releaseSealedSession).not.toHaveBeenCalled();
