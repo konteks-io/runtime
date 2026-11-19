@@ -121,7 +121,7 @@ function konteksIntegrationMeta(admission: IntegrationSessionAdmission) {
 }
 
 function runtimeConnectorMeta(admitted: true | undefined) {
-  return admitted ? konteksIntegrationMeta({ admittedMcpServerNames: [], accountConnectors: true }) : {};
+  return admitted ? { ...konteksIntegrationMeta({ admittedMcpServerNames: [], accountConnectors: true }), konteksPersonalMcp: { version: 1 as const } } : {};
 }
 
 /**

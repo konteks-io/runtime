@@ -55,3 +55,39 @@ test('only an integration session admits the account connectors, and still runs 
     assert.equal(konteksAccountConnectors(meta), false);
   }
 });
+
+
+test('owner direct sessions load only user-scope MCP definitions without personal settings', async () => {
+  const { writeFile } = await import('node:fs/promises');
+  const { ownerClaudeMcpServers, ownerClaudeMcpToolServer } = await import('./claude-instruction-scope.mjs');
+  const root = mkdtempSync(join(tmpdir(), 'claude-personal-mcp-'));
+  const previous = process.env.CLAUDE_CONFIG_DIR;
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const meta = { konteksIntegration: { version: 1, accountConnectors: true }, konteksPersonalMcp: { version: 1 } };
+  try {
+    const user = join(root, '.claude');
+    mkdirSync(user);
+    await writeFile(join(root, '.claude.json'), JSON.stringify({
+      mcpServers: { 'asana-recrebox': { type: 'http', url: 'https://mcp.asana.com/v2/mcp', oauth: { clientId: 'test-client', callbackPort: 45432 } } },
+      projects: { '/repo': { mcpServers: { untrusted: { command: 'never-run' } } } },
+      hooks: { SessionStart: ['never-run'] }, permissions: { defaultMode: 'bypassPermissions' },
+    }));
+    const expected = { 'asana-recrebox': { type: 'http', url: 'https://mcp.asana.com/v2/mcp', oauth: { clientId: 'test-client', callbackPort: 45432 } } };
+    assert.deepEqual(await ownerClaudeMcpServers(meta, user, []), expected);
+    assert.equal(await ownerClaudeMcpToolServer(meta, user, 'mcp__asana-recrebox__get_tasks'), 'asana-recrebox');
+    assert.equal(await ownerClaudeMcpToolServer(meta, user, 'mcp__repository__get_tasks'), undefined);
+    assert.equal(await ownerClaudeMcpToolServer({ konteksIntegration: meta.konteksIntegration }, user, 'mcp__asana-recrebox__get_tasks'), undefined);
+    assert.equal(await ownerClaudeMcpToolServer(meta, user, 'Bash'), undefined);
+    assert.deepEqual(await ownerClaudeMcpServers({ konteksIntegration: meta.konteksIntegration }, user, []), {});
+    assert.deepEqual(await ownerClaudeMcpServers({ konteksPersonalMcp: { version: 1 } }, user, []), {});
+    await assert.rejects(ownerClaudeMcpServers(meta, user, ['asana-recrebox']), /conflicts with a Konteks session server/);
+    await writeFile(join(user, '.claude.json'), JSON.stringify({ mcpServers: { privateProfile: { command: 'personal-mcp' } } }));
+    process.env.CLAUDE_CONFIG_DIR = user;
+    assert.deepEqual(await ownerClaudeMcpServers(meta, user, []), { privateProfile: { command: 'personal-mcp' } });
+    await writeFile(join(user, '.claude.json'), '{invalid');
+    await assert.rejects(ownerClaudeMcpServers(meta, user, []), /personal MCP configuration/);
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+});

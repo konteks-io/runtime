@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { patchClaudeSettings, claudeAcpSettingsPatch } from "./claude-acp-settings-patch.mjs";
 
 test("the reviewed change is identified as the session-hardening revision", () => {
-  assert.equal(claudeAcpSettingsPatch.id, "konteks-claude-project-settings-v5");
+  assert.equal(claudeAcpSettingsPatch.id, "konteks-claude-project-settings-v6");
 });
 
 test("settings isolation rejects unreviewed versions and modified artifacts", () => {
@@ -22,6 +22,7 @@ test("reviewed bridge uses project settings in both SDK resolution and query", {
   assert.match(settings, /resolveSettings\(\{ cwd: this.cwd, settingSources: \["project"\] \}\)/);
   assert.doesNotMatch(settings, /path.join\(CLAUDE_CONFIG_DIR, "settings.json"\)/);
   const agent = load("acp-agent.js");
+  assert.match(agent, /mcpServers: \{\s+\.\.\.await ownerClaudeMcpServers\(params\._meta, CLAUDE_CONFIG_DIR,/);
   // An admitted session (`_meta.konteksIntegration`)
   // loads the account connectors, with no setting sources at all so no
   // repository .mcp.json server starts; every other session is as Stage 0.
@@ -30,10 +31,10 @@ test("reviewed bridge uses project settings in both SDK resolution and query", {
   // load; the repository's .mcp.json is ignored. Flag settings switch the
   // repository's hooks off on new, loaded and resumed sessions alike.
   assert.match(agent, /settings = hardenClaudeSession\(await isolateClaudeInstructions\(settings, params.cwd, CLAUDE_CONFIG_DIR\), konteksAccountConnectors\(params\._meta\)\)/);
-  assert.match(agent, /^import \{ hardenClaudeSession, isolateClaudeInstructions, konteksAccountConnectors \} from "\.\/konteks-instruction-scope\.mjs";/);
+  assert.match(agent, /^import \{ hardenClaudeSession, isolateClaudeInstructions, konteksAccountConnectors, ownerClaudeMcpServers, ownerClaudeMcpToolServer \} from "\.\/konteks-instruction-scope\.mjs";/);
   // Every permission request names its tool in a structured field the
   // connector reads (never the display title), set where the bridge asks.
-  assert.match(agent, /async requestPermissionFromClient\(params, toolName, signal, parentToolUseId, ownerSessionId = params.sessionId\) \{\n        params = \{ \.\.\.params, toolCall: \{ \.\.\.params\.toolCall, _meta: \{ \.\.\.params\.toolCall\._meta, claudeCode: \{ \.\.\.params\.toolCall\._meta\?\.claudeCode, toolName \} \} \} \};/);
+  assert.match(agent, /personalMcpServer: await ownerClaudeMcpToolServer\(this\.sessions\[ownerSessionId\]\?\.creationParams\?\._meta, CLAUDE_CONFIG_DIR, toolName\)/);
   assert.match(agent, /\[konteks\] instruction_scope version=4 settings=\$\{konteksAccountConnectors\(params\._meta\) \? "none" : "project"\} .* hooks=disabled repository_mcp=excluded account_connectors=\$\{konteksAccountConnectors\(params\._meta\) \? "integration" : "excluded"\}/);
 });
 
@@ -97,4 +98,31 @@ test("a stored title without the prefix gains it; an engineering session's title
   assert.equal(renamed.length, 1);
   assert.deepEqual(engineering.published, [customTitle]);
   assert.deepEqual(engineering.asked, []);
+});
+
+
+test('the patched bridge identifies personal tools from the owner session, never caller metadata', { skip: !fixture }, async () => {
+  const source = patchClaudeSettings(readFileSync(join(fixture, 'acp-agent.js'), 'utf8'), 'acp-agent.js', '0.75.1').source;
+  const start = source.indexOf('    async requestPermissionFromClient(');
+  const end = source.indexOf('    /** Emit the `tool_call`', start);
+  assert.ok(start > 0 && end > start);
+  const calls = [];
+  const classify = async (meta, directory, tool) => {
+    calls.push({ meta, directory, tool });
+    return meta?.konteksPersonalMcp?.version === 1 ? 'asana-recrebox' : undefined;
+  };
+  const Bridge = new Function('ownerClaudeMcpToolServer', 'CLAUDE_CONFIG_DIR', 'raceWithAbort', `return class { ${source.slice(start, end)} }`)(classify, '/profile', promise => promise);
+  const bridge = new Bridge();
+  const meta = { konteksPersonalMcp: { version: 1 } };
+  bridge.sessions = { owner: { creationParams: { _meta: meta } } };
+  bridge.ensureToolCallEmitted = async () => {};
+  bridge.withPendingUserInput = async (_session, work) => work();
+  bridge.client = { requestPermission: async request => request };
+  const request = { sessionId: 'child', toolCall: { toolCallId: 't', _meta: { claudeCode: { personalMcpServer: 'forged' } } } };
+  const signal = new AbortController().signal;
+  const result = await bridge.requestPermissionFromClient(request, 'mcp__asana-recrebox__get_tasks', signal, undefined, 'owner');
+  assert.deepEqual(result.toolCall._meta.claudeCode, { toolName: 'mcp__asana-recrebox__get_tasks', personalMcpServer: 'asana-recrebox' });
+  assert.deepEqual(calls[0], { meta, directory: '/profile', tool: 'mcp__asana-recrebox__get_tasks' });
+  const unadmitted = await bridge.requestPermissionFromClient(request, 'mcp__asana-recrebox__get_tasks', signal);
+  assert.equal(unadmitted.toolCall._meta.claudeCode.personalMcpServer, undefined);
 });
