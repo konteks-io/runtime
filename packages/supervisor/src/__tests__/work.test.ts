@@ -25,7 +25,9 @@ beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "kr-work-"));
 });
 afterEach(async () => {
-  await rm(dir, { recursive: true, force: true });
+  // A retained session can still journal as teardown starts; retry the race
+  // instead of failing the test with ENOTEMPTY.
+  await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 });
 
 function fakeTransport(): { sent: OutboundMessage[]; transport: TransportManager } {
