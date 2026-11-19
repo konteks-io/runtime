@@ -986,12 +986,13 @@ describe("settling an execution whose authority was lost (production 2026-10-02)
       expect(f.outbox.depth).toBe(1);
     });
 
-    it("an open delivery session still closes cancelled, without a recovery stop", async () => {
+    it("an open delivery session reports Core's reason, without a recovery stop", async () => {
       const stop = vi.fn(async () => undefined);
       const f = await fencedRun(stop, false, "delivery");
       f.internal.deps.verifyCancellation = () => true;
       await f.work.onCancel(cancellation("policy_denied"));
-      expect(terminal(f)).toMatchObject({ class: "cancelled", reason: "user_cancelled" });
+      // The close itself reports, so Core's reason is not discarded.
+      expect(terminal(f)).toMatchObject({ class: "cancelled", reason: "policy_denied" });
       expect(stop).not.toHaveBeenCalled();
       expect(f.journal.execution.execution(f.admission)?.phase).not.toBe("interrupted_unqualified");
       expect(f.internal.lostAuthority.size).toBe(0);

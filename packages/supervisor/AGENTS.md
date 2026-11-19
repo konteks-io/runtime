@@ -184,7 +184,9 @@ QA browser, structured results, updates and doctor/support.
   fenced because its recovery authority lapsed (`fenceLostAuthority`) hands its
   claim to `recoverLostExecutionAuthority`, which proves the process gone and
   reports it `interrupted`; Core's signed cancellation of a session whose close
-  did not report settles it there too, `cancelled` with Core's reason. A turn
+  did not report settles it there too, `cancelled` with Core's reason. A takeover
+  or assignment-conflict close reports `superseded`; a directive-driven close
+  carries Core's reason; only a person's stop reports `user_cancelled`. A turn
   whose output Core accepted is left to restart recovery or that cancellation.
 - The delivery-output path names every refusal: capture throws
   `OutputCaptureRefusal` with a diagnostic and Git step, and `DeliveryOutput`

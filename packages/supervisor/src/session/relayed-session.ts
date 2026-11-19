@@ -18,6 +18,7 @@ import {
   type AcpJsonRpcError,
   type AcpRouteUnavailable,
   type AgentTurnUsageObservation,
+  type CancelDirective,
   type Clock,
   type DirectModelSelection,
   type Logger,
@@ -270,6 +271,8 @@ export class RelayedSession {
   private closed = false;
   /** The agent's own failure class when its request error closed the session. */
   private agentFailure: AgentFailureReason | null = null;
+  /** Core's reason when its directive closed the session, else null (a person's close). */
+  private cancelReason: CancelDirective["reason"] | null = null;
   /** Ends a transient input preparation's backoff wait at once on close or recovery. */
   private wakeDeferral: (() => void) | null = null;
   private recoveryStopping = false;
@@ -1706,6 +1709,11 @@ export class RelayedSession {
     return this.agentFailure;
   }
 
+  /** What Core said ended a cancelled session, for the terminal result (null: a person cancelled it). */
+  cancelledReason(): CancelDirective["reason"] | null {
+    return this.cancelReason;
+  }
+
   private async onRequestError(event: RunnerEventOf<"request_error">): Promise<void> {
     this.recordRequestFailure(event);
     if (event.method === "session/prompt" && (await this.settledPromptError(event.requestId))) return;
@@ -2321,13 +2329,14 @@ export class RelayedSession {
     this.releaseChannel = null;
   }
 
-  close(reason: SessionClosedReason): Promise<void> {
+  close(reason: SessionClosedReason, cancelReason?: CancelDirective["reason"]): Promise<void> {
     this.executionGate?.stop();
     this.folderAccess.stop();
     this.wakeDeferral?.();
     this.toolCallArrivals.release();
     if (this.closeTask) return this.closeTask;
     if (this.closed) return Promise.resolve();
+    this.cancelReason = cancelReason ?? null;
     this.completedSettlementInProgress = reason === "completed";
     this.closed = true;
     this.closeTask = Promise.resolve().then(() => this.finishClose(reason));

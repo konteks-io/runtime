@@ -50,7 +50,7 @@ import type { TransportManager } from "../transport/relay-transport.js";
 import { RecoveryAuthority } from "../transport/recovery-authority.js";
 import { checkpointCause } from "../native/workspace-checkpoint-failure.js";
 import type { RunnerPort } from "../runner-port.js";
-import { RelayedSession, type RelayedSessionDeps, type SessionClosedReason } from "../session/relayed-session.js";
+import { RelayedSession, type AgentFailureReason, type RelayedSessionDeps, type SessionClosedReason } from "../session/relayed-session.js";
 import type { PendingHumanRequest } from "../session/permissions.js";
 import { intersectEvidencePolicy } from "./evidence.js";
 import { ReportSender } from "./report-sender.js";
@@ -1584,7 +1584,7 @@ export class WorkOrchestrator {
     this.logger.warn({ assignmentId: assignment.id, attempt: assignment.attempt, predecessorAssignmentId: predecessor.assignment.id,
       stage: "channel_handoff", outcome: "superseded_live_predecessor" },
       "Core placed a new turn for this conversation while the previous one is still live here; cancelling it and starting a fresh session");
-    await predecessor.close("cancelled");
+    await predecessor.close("cancelled", "superseded");
     assertCurrent();
     if (this.channelOwners.get(channelId) === predecessor) this.channelOwners.delete(channelId);
     if (this.sessions.get(key) === predecessor) this.sessions.delete(key);
@@ -2207,9 +2207,9 @@ export class WorkOrchestrator {
    */
   private async cancelSession(session: RelayedSession, directive: CancelDirective): Promise<void> {
     const key = `${directive.assignmentId}:${directive.attempt}`;
-    if (!reportsOnClose(this.deps.journal.assignments.get(key))) return session.close("cancelled");
+    if (!reportsOnClose(this.deps.journal.assignments.get(key))) return session.close("cancelled", directive.reason);
     // An in-flight close may still report; its failure is settled below.
-    await session.close("cancelled").catch(() => undefined);
+    await session.close("cancelled", directive.reason).catch(() => undefined);
     if (!reportsOnClose(this.deps.journal.assignments.get(key))) return;
     await this.recoverLostExecutionAuthority(directive.assignmentId, directive.attempt, directive.reason);
   }
@@ -2219,7 +2219,7 @@ export class WorkOrchestrator {
   private async cancelAssistantExecution(directive: CancelDirective): Promise<void> {
     const key = `${directive.assignmentId}:${directive.attempt}`;
     const session = this.sessions.get(key);
-    if (session && !this.recoveryFences.has(key)) return session.close("cancelled");
+    if (session && !this.recoveryFences.has(key)) return session.close("cancelled", directive.reason);
     const observed = this.ownedClaim(directive.assignmentId, directive.attempt);
     const assertCurrent = () => {
       this.requireNativeOwner();
@@ -2813,7 +2813,7 @@ export class WorkOrchestrator {
 
   private async abandon(assignmentId: string, attempt: number, reason: "assignment_conflict"): Promise<void> {
     const session = this.sessions.get(`${assignmentId}:${attempt}`);
-    if (session) await session.close("cancelled");
+    if (session) await session.close("cancelled", "superseded");
     this.logger.error({ assignmentId, attempt, reason }, "claim halted into recovery_required");
   }
 
@@ -3059,12 +3059,11 @@ function reportsOnClose(entry: JournalEntry | undefined): entry is JournalEntry 
 
 /** Terminal results of a session that closed without completing, with the exact fields each hash covers. */
 const UNCOMPLETED_CLOSES = {
-  cancelled: { result: { class: "cancelled", reason: "user_cancelled" }, hashed: { class: "cancelled" } },
   agent_exited: { result: { class: "failed", reason: "agent_failed" }, hashed: { class: "failed", reason: "agent_failed" } },
   lease_lost: { result: { class: "interrupted", reason: "lease_lost" }, hashed: { class: "interrupted", reason: "lease_lost" } },
   drain: { result: { class: "interrupted", reason: "drain" }, hashed: { class: "interrupted", reason: "drain" } },
   relay_replay_gap: { result: { class: "interrupted", reason: "relay_replay_gap" }, hashed: { class: "interrupted", reason: "relay_replay_gap" } },
-} as const satisfies Record<Exclude<SessionClosedReason, "completed">, { result: object; hashed: JsonValue }>;
+} as const satisfies Record<Exclude<SessionClosedReason, "completed" | "cancelled">, { result: object; hashed: JsonValue }>;
 
 /** An older Core's closed enum knows no `route_unavailable`, so it gets `provider_failure`. */
 function routeUnavailableAccepted(coreContractVersion: string | undefined): boolean {
@@ -3083,15 +3082,31 @@ export function routeUnavailableCauseAccepted(coreContractVersion: string | unde
   return coreContractAtLeast(coreContractVersion, ROUTE_UNAVAILABLE_CAUSE_MIN_CORE_CONTRACT_VERSION[cause]);
 }
 
-export function closedSessionResult(session: Pick<RelayedSession, "agentFailureReason" | "deliveryAcceptanceReceipt" | "acpSessionRef">, reason: SessionClosedReason, coreContractVersion?: string) {
+export function closedSessionResult(session: Pick<RelayedSession, "agentFailureReason" | "cancelledReason" | "deliveryAcceptanceReceipt" | "acpSessionRef">, reason: SessionClosedReason, coreContractVersion?: string) {
   // An agent that failed on its provider or its sign-in says which, so the page can (10-16).
-  const reported = reason === "agent_exited" ? session.agentFailureReason() : null;
-  const failure = reported === "route_unavailable" && !routeUnavailableAccepted(coreContractVersion) ? "provider_failure" : reported;
+  const failure = sessionFailureReason(session, reason, coreContractVersion);
   if (failure) return { class: "failed" as const, reason: failure, terminalResultHash: jcsDigest({ class: "failed", reason: failure }) };
+  if (reason === "cancelled") return cancelledSessionResult(session);
   if (reason !== "completed") {
     const { result, hashed } = UNCOMPLETED_CLOSES[reason];
     return { ...result, terminalResultHash: jcsDigest(hashed) };
   }
+  return completedSessionResult(session);
+}
+
+/** An agent's own failure reason, or the older Core's name for a route that cannot serve the turn. */
+function sessionFailureReason(session: Pick<RelayedSession, "agentFailureReason">, reason: SessionClosedReason, coreContractVersion: string | undefined): AgentFailureReason | null {
+  const reported = reason === "agent_exited" ? session.agentFailureReason() : null;
+  return reported === "route_unavailable" && !routeUnavailableAccepted(coreContractVersion) ? "provider_failure" : reported;
+}
+
+/** A takeover or Core stop names what ended it; only a person's close is unnamed. The reason stays outside the hash. */
+function cancelledSessionResult(session: Pick<RelayedSession, "cancelledReason">) {
+  const cancelled = { class: "cancelled" as const, reason: session.cancelledReason() ?? "user_cancelled" };
+  return { ...cancelled, terminalResultHash: jcsDigest({ class: "cancelled" }) };
+}
+
+function completedSessionResult(session: Pick<RelayedSession, "deliveryAcceptanceReceipt" | "acpSessionRef">) {
   const receipt = session.deliveryAcceptanceReceipt();
   const semantic = { class: "succeeded" as const, ...(receipt ? { structuredOutput: { nativeDeliveryAcceptance: receipt } } : {}) };
   return { ...semantic, terminalResultHash: jcsDigest({ ...semantic, acpSessionRef: session.acpSessionRef }) };

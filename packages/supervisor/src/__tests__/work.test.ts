@@ -550,8 +550,11 @@ describe("work orchestrator claim validation", () => {
     await f.work.onAssignmentMessage(signed(1));
     expect(close).not.toHaveBeenCalled();
     await f.work.onAssignmentMessage(signed(2));
-    expect(close).toHaveBeenCalledExactlyOnceWith('cancelled');
+    // A Core-initiated stop carries Core's own reason through the close.
+    expect(close).toHaveBeenNthCalledWith(1, 'cancelled', 'policy_denied');
     await f.work.cancelLocalSession('cancel-target', 2);
+    // The local drain path is not directive-driven and keeps the default.
+    expect(close).toHaveBeenNthCalledWith(2, 'cancelled');
     expect(close).toHaveBeenCalledTimes(2);
     // The receiver requests cancellation; this spy is not quiescence evidence.
     expect(f.sent).toEqual([]);

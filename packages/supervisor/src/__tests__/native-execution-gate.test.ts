@@ -32,7 +32,7 @@ import { dshCoordinationArguments, dshCoordinationCall, dshCoordinationPermissio
 import { RunnerEventBus } from "../../../agent-runner/src/events.js";
 import { SessionManager, InMemorySessionRefStore } from "../../../agent-runner/src/sessions/manager.js";
 import type { BridgeProcess } from "../../../agent-runner/src/bridge/process.js";
-import { WorkOrchestrator, routeUnavailableCauseAccepted } from "../work/orchestrator.js";
+import { WorkOrchestrator, closedSessionResult, routeUnavailableCauseAccepted } from "../work/orchestrator.js";
 
 let root: string;
 const gates: NativeExecutionGate[] = [];
@@ -1628,6 +1628,9 @@ describe("native session dispatch uses genuine execution admission", () => {
     await vi.waitFor(() => expect(f.journal.pendingRequests.get("acp:received:request")?.authorization?.state).toBe("denied"));
     expect(f.runner.prompt).not.toHaveBeenCalled();
     expect(f.send.mock.calls.map(call => call[0].body)).toEqual([{ kind: "session_closed", assignmentId: "assignment", reason: "cancelled" }]);
+    // A person stopped it, so the close named no cause and the report keeps user_cancelled.
+    expect(f.session.cancelledReason()).toBeNull();
+    expect(closedSessionResult(f.session, "cancelled")).toMatchObject({ class: "cancelled", reason: "user_cancelled" });
     await vi.advanceTimersByTimeAsync(120_000);
     expect(check).toHaveBeenCalledTimes(asked);
   });
