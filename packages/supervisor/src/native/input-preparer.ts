@@ -688,6 +688,12 @@ function failureFields(error: unknown, fallback: string): { code: string; retrya
 }
 
 /** One assignment's input preparation, stage by stage, each stage logged as it finishes. */
+function preparedSourceFlags(selection: AuthorizedInputs["selection"], direct: boolean):
+  Pick<PreparedSessionInputs, "hasDirectAttachments" | "managedRepository"> {
+  if (direct) return selection.source.fileCount > 0 ? { hasDirectAttachments: true } : {};
+  return selection.repository ? { managedRepository: true } : {};
+}
+
 class InputPreparation {
   stage = "claim";
   private stageStartedAt = Date.now();
@@ -734,8 +740,7 @@ class InputPreparation {
     const outputHead = await this.outputHead(inputs, root, source);
     return {
       ...prepared,
-      ...(direct && inputs.selection.source.fileCount > 0 ? { hasDirectAttachments: true as const } : {}),
-      ...(inputs.selection.repository && !direct ? { managedRepository: true as const } : {}),
+      ...preparedSourceFlags(inputs.selection, direct),
       skillInstructions: skillInstructions(current, inputs.selection.repository, prepared.skillInstructions),
       beforePrompt: this.beforePrompt(inputs, source, prepared),
       ...this.deliveryOutput(inputs, source, outputHead),
