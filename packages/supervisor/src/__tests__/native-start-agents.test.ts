@@ -40,6 +40,16 @@ describe("startNativeAgents", () => {
     expect(result.codexOwnerStarted).toBe(true);
   });
 
+  it("starts independent agents without waiting for a slow bridge", async () => {
+    let finish!: () => void;
+    const slow = { agentId: "antigravity", start: vi.fn(() => new Promise<void>(resolve => { finish = resolve; })) };
+    const ready = runner("claude-code");
+    const pending = startNativeAgents({ codexOwner: null, runners: [slow, ready] });
+    expect(ready.start).toHaveBeenCalledOnce();
+    finish();
+    expect((await pending).started).toEqual([slow, ready]);
+  });
+
   it("leaves out any agent whose runner cannot start and starts the rest, keeping Codex's server up", async () => {
     const codexOwner = { start: vi.fn(async () => {}), stop: vi.fn(async () => {}) };
     const codex = runner("codex"), claude = runner("claude-code", true), dsh = runner("dsh", true);

@@ -37,9 +37,22 @@ export async function startNativeAgents<R extends StartableRunner>(input: Native
     ? input.codexOwner.start().then(() => ({ started: true as const }), (error: unknown) => ({ started: false as const, error }))
     : Promise.resolve(null);
   const behindOwner = (runner: R) => runner.agentId === "codex" && input.codexOwner !== null;
-  for (const runner of input.runners) if (!behindOwner(runner)) await startRunner(runner, input, outcome);
+  const independent = Promise.all(input.runners.filter(runner => !behindOwner(runner)).map(startRunner));
   const codexOwnerStarted = await settleCodexOwner(owner, input, outcome);
-  if (codexOwnerStarted) for (const runner of input.runners) if (behindOwner(runner)) await startRunner(runner, input, outcome);
+  const codex = codexOwnerStarted
+    ? Promise.all(input.runners.filter(behindOwner).map(startRunner))
+    : Promise.resolve([]);
+  const groups = await Promise.all([independent, codex]);
+  for (const result of groups.flat()) {
+    if (result.started) {
+      outcome.started.push(result.runner);
+    } else {
+      const { runner, error } = result;
+      input.onUnavailable?.(runner.agentId, error);
+      outcome.unavailable.push({ agentId: runner.agentId, reason: error instanceof Error ? error.message : `${runner.agentId} could not start.` });
+      outcome.failed.push(runner);
+    }
+  }
   return { ...outcome, codexOwnerStarted };
 }
 
@@ -51,14 +64,12 @@ interface NativeAgentsStartInput<R extends StartableRunner> {
 
 type StartOutcome<R extends StartableRunner> = Omit<NativeAgentsStartResult<R>, "codexOwnerStarted">;
 
-async function startRunner<R extends StartableRunner>(runner: R, input: NativeAgentsStartInput<R>, outcome: StartOutcome<R>): Promise<void> {
+async function startRunner<R extends StartableRunner>(runner: R) {
   try {
     await runner.start();
-    outcome.started.push(runner);
+    return { started: true as const, runner };
   } catch (error) {
-    input.onUnavailable?.(runner.agentId, error);
-    outcome.unavailable.push({ agentId: runner.agentId, reason: error instanceof Error ? error.message : `${runner.agentId} could not start.` });
-    outcome.failed.push(runner);
+    return { started: false as const, runner, error };
   }
 }
 
