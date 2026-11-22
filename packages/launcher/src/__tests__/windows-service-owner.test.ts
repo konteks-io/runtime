@@ -108,6 +108,23 @@ describe("Windows connector service ownership", () => {
     await owner?.terminate();
     expect(terminate).toHaveBeenCalledWith([child, connector]);
   });
+  it("ignores an unreadable process that predates the current owner of its parent PID", async () => {
+    const unrelated = { ...child, pid: 44, startToken: "9000", executable: "", command: "" };
+    let processes = [connector, child, unrelated];
+    const terminate = vi.fn(async () => { processes = [unrelated]; });
+    const owner = await captureWindowsServiceOwner(root, { read: async () => processes, terminate });
+    await owner?.terminate();
+    expect(terminate).toHaveBeenCalledWith([child, connector]);
+  });
+
+  it("still refuses an unreadable process that might belong to the connector", async () => {
+    const unreadable = { ...child, executable: "", command: "" };
+    const terminate = vi.fn();
+    await expect(captureWindowsServiceOwner(root, { read: async () => [connector, unreadable], terminate }))
+      .rejects.toThrow(/descendant cannot be identified safely/);
+    expect(terminate).not.toHaveBeenCalled();
+  });
+
   it("refuses a live owned PID whose executable identity becomes unreadable", async () => {
     let processes = [connector];
     const owner = await captureWindowsServiceOwner(root, { read: async () => processes, terminate: vi.fn() });
