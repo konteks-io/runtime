@@ -14,6 +14,8 @@ export interface PreparedSessionInputs {
   /** The verified session context folder, also in `readOnlyRoots`; data only. */
   sessionContextRoot?: string;
   skillInstructions: string;
+  /** True when this turn staged user attachments beneath its private workspace. */
+  hasDirectAttachments?: true;
   beforePrompt: () => Promise<void>;
   /** Delivery-only terminal barrier. Public ACP completion waits for its durable cloud receipt. */
   acceptDeliveryOutput?: (authority: { claimId: string; invocationRef: string; completion: SessionToCoreMessage }) => Promise<RemoteDeliveryAcceptanceReceipt>;
