@@ -829,6 +829,7 @@ describe("native authorized input composition", () => {
       source: { kind: "direct_session", portability: "instance_bound", ownerInstanceId: "instance", sessionId: "session", turnRef: "turn" } };
     const prepared = await createNativeInputPreparer(f.options)(direct);
     expect(prepared.skillInstructions).toBe("");
+    expect(prepared.hasDirectAttachments).toBeUndefined();
     expect(await readdir(prepared.cwd)).toEqual([]);
     // The session's folder, stable across its prompts: the same one a later prompt gets.
     expect(prepared.cwd.startsWith(join(await realRoot(f.root), "session-"))).toBe(true);
@@ -839,10 +840,11 @@ describe("native authorized input composition", () => {
     expect(again.cwd).toBe(prepared.cwd);
   });
   it("keeps what the agent wrote in a direct session's folder when the next turn brings newer inputs", async () => {
-    const f = await fixture({ "README.md": "from Core" });
+    const f = await fixture({ "attachments/1/sample.txt": "from Core" });
     const direct: RemoteWorkAssignment = { ...assignment, kind: "direct",
       source: { kind: "direct_session", portability: "instance_bound", ownerInstanceId: "instance", sessionId: "session", turnRef: "turn" } };
     const first = await createNativeInputPreparer(f.options)(direct);
+    expect(first.hasDirectAttachments).toBe(true);
     await writeFile(join(first.cwd, "notes.md"), "hello from Konteks");
     // The next prompt is a new claim, so a new signed selection.
     f.selection.claimId = "claim-2";
@@ -850,7 +852,7 @@ describe("native authorized input composition", () => {
     const second = await createNativeInputPreparer(f.options)(direct);
     expect(second.cwd).toBe(first.cwd);
     expect(await readFile(join(second.cwd, "notes.md"), "utf8")).toBe("hello from Konteks");
-    expect(await readFile(join(second.cwd, "README.md"), "utf8")).toBe("from Core");
+    expect(await readFile(join(second.cwd, "attachments", "1", "sample.txt"), "utf8")).toBe("from Core");
     await second.beforePrompt();
   });
 

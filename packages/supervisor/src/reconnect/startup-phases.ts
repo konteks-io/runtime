@@ -76,7 +76,7 @@ export class StartupPhases {
    * the exact step a slow startup is sitting in. Nested steps keep the outer
    * step as the phase's own duration.
    */
-  async step<T>(phase: StartupPhase, step: string, run: () => Promise<T>): Promise<T> {
+  async step<T>(phase: StartupPhase, step: string, run: () => Promise<T>, { stepOnly = false }: { stepOnly?: boolean } = {}): Promise<T> {
     // Only startup recovery is timed; the same hook fires for late retirement.
     if (this.promoted && phase !== "capability_discovery") return run();
     const since = Date.now();
@@ -91,8 +91,7 @@ export class StartupPhases {
       this.remove(frame);
       const stepMs = Math.max(0, now - since);
       this.stepsMs[`${phase}:${step}`] = stepMs;
-      if (!nested) this.phasesMs[phase] = (this.phasesMs[phase] ?? 0) + stepMs;
-      this.lastCheckpoint = now;
+      if (!stepOnly) this.recordCheckpoint(phase, stepMs, nested, now);
       this.log({ event: "startup.phase", phase, step, phaseMs: stepMs, sinceStartMs: Math.max(0, now - this.startedAt) },
         "startup phase step completed");
       this.stopWhenDone();
@@ -107,6 +106,11 @@ export class StartupPhases {
       stepsMs: bounded(this.stepsMs, STARTUP_STEP_LIMIT),
       totalMs: Math.max(0, Date.now() - this.startedAt),
     };
+  }
+
+  private recordCheckpoint(phase: StartupPhase, stepMs: number, nested: boolean, now: number): void {
+    if (!nested) this.phasesMs[phase] = (this.phasesMs[phase] ?? 0) + stepMs;
+    this.lastCheckpoint = now;
   }
 
   private reportWaiting(): void {

@@ -1496,10 +1496,16 @@ describe("native session dispatch uses genuine execution admission", () => {
     }));
   });
 
-  it("admits a direct session prompt only with Core's permit, with nothing put in front of the person's text, and ends the assignment at end_turn", async () => {
+  it.each([false, true])("admits a direct prompt only with Core's permit and keeps its text first (attachments: %s)", async (attachments) => {
     const direct: RemoteWorkAssignment = { ...assignment, kind: "direct", agentRoute: { agentId: "codex", requiredRole: "assistant" },
       source: { kind: "direct_session", portability: "instance_bound", ownerInstanceId: "instance", sessionId: "session", turnRef: "turn" } };
-    const f = await sessionFixture(direct);
+    const inputs: Partial<RelayedSessionDeps> = attachments ? {
+      prepareInputs: async () => ({
+        binding: { workspaceId: "tenant", instanceId: "instance", sessionId: "session", assignmentId: "assignment", attempt: 1 },
+        cwd: root, skillInstructions: "trusted local skill", hasDirectAttachments: true, beforePrompt: async () => undefined,
+      }),
+    } : {};
+    const f = await sessionFixture(direct, undefined, undefined, {}, inputs);
     // No platform tools and no result tool: the agent is given no MCP server.
     expect(f.runner.createSession).toHaveBeenCalledWith(expect.objectContaining({ mcpServers: [] }), undefined);
     const typed = { kind: "acp" as const, method: "session/prompt" as const, id: "request", params: { sessionId: "acp", prompt: [{ type: "text" as const, text: "/review the last change" }] } };
@@ -1508,8 +1514,13 @@ describe("native session dispatch uses genuine execution admission", () => {
     f.client.consumeExecution.mockResolvedValueOnce({ outcome: "admitted", admissionId: "admission",
       receipt: signed({ ...claims, aud: "konteks:remote-execution-admission", admissionId: "admission", admittedAt: f.clock.nowIso(), checkExpiresAt: "2026-09-10T00:00:30Z" }) });
     await f.session.onToRuntime({ kind: "authorized_operation", operationId: "operation", permit: signed(claims), message: typed });
-    // The fixture's inputs carry a skills line; a direct prompt never gets it, so the slash command stays first.
-    expect(f.runner.prompt).toHaveBeenCalledExactlyOnceWith("acp", "request", { sessionId: "acp", prompt: [{ type: "text", text: "/review the last change" }] });
+    // Direct prompts never receive organization skill instructions. A staged file
+    // notice follows the original message, so the slash command stays first.
+    const prompt = [...typed.params.prompt];
+    if (attachments) prompt.push({
+      type: "text", text: "The user attached files for this turn. They are under attachments/ in the working directory.",
+    });
+    expect(f.runner.prompt).toHaveBeenCalledExactlyOnceWith("acp", "request", { sessionId: "acp", prompt });
     await f.session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp", requestId: "request", result: { stopReason: "end_turn" } } as never);
     expect(f.send.mock.calls.map(call => call[0].body)).toContainEqual({ kind: "session_closed", assignmentId: "assignment", reason: "completed" });
   });

@@ -1828,9 +1828,14 @@ export class RelayedSession {
    */
   private async prepareAgentPrompt<B extends PromptBlock>(requestId: string, prompt: B[]): Promise<B[]> {
     const prepared = await this.prepareStructuredPrompt(requestId, prompt);
+    if (isDirectAssignment(this.assignment)) {
+      if (!this.preparedInputs?.hasDirectAttachments) return prepared;
+      return [...prepared, {
+        type: "text", text: "The user attached files for this turn. They are under attachments/ in the working directory.",
+      } as unknown as B];
+    }
     const agentId = this.assignment.agentRoute.agentId;
-    // A direct session has no Konteks tools to tell its agent about.
-    if ((agentId !== "opencode" && agentId !== "antigravity") || this.toolFormTold || isDirectAssignment(this.assignment)) return prepared;
+    if ((agentId !== "opencode" && agentId !== "antigravity") || this.toolFormTold) return prepared;
     this.toolFormTold = true;
     const line = agentId === "opencode" ? openCodeKonteksToolsLine(this.sessionServers) : antigravityKonteksToolsLine(this.sessionServers);
     return [{ type: "text", text: line } as unknown as B, ...prepared];

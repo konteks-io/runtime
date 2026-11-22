@@ -144,8 +144,9 @@ function validParent(child: WindowsServiceProcess, parent: WindowsServiceProcess
 }
 
 function verifiedDescendant(child: WindowsServiceProcess, parent: WindowsServiceProcess): boolean {
+  if (predatesParent(child, parent)) return false;
   if (!validStartToken(child.startToken) || !child.executable || !child.command) throw uncertain("A connector descendant cannot be identified safely; its stop remains unconfirmed.");
-  return BigInt(child.startToken) >= BigInt(parent.startToken);
+  return true;
 }
 
 function excludedBranch(pid: number | null, processes: WindowsServiceProcess[], byPid: Map<number, WindowsServiceProcess>): Set<number> {

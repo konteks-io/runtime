@@ -688,6 +688,12 @@ function failureFields(error: unknown, fallback: string): { code: string; retrya
 }
 
 /** One assignment's input preparation, stage by stage, each stage logged as it finishes. */
+function preparedSourceFlags(selection: AuthorizedInputs["selection"], direct: boolean):
+  Pick<PreparedSessionInputs, "hasDirectAttachments" | "managedRepository"> {
+  if (direct) return selection.source.fileCount > 0 ? { hasDirectAttachments: true } : {};
+  return selection.repository ? { managedRepository: true } : {};
+}
+
 class InputPreparation {
   stage = "claim";
   private stageStartedAt = Date.now();
@@ -714,7 +720,7 @@ class InputPreparation {
     this.enter("selection");
     const inputs = new AuthorizedInputs(this.options, client, current, claimId, await client.prepare(current, claimId));
     this.logStage("selection", this.elapsed());
-    // A direct session works in its own empty private folder only; a
+    // A direct session works in its own private folder only; a
     // repository for it is a later decision.
     const direct = isDirectAssignment(current);
     if (direct && inputs.selection.repository) throw unavailable();
@@ -734,7 +740,7 @@ class InputPreparation {
     const outputHead = await this.outputHead(inputs, root, source);
     return {
       ...prepared,
-      ...(inputs.selection.repository && !direct ? { managedRepository: true as const } : {}),
+      ...preparedSourceFlags(inputs.selection, direct),
       skillInstructions: skillInstructions(current, inputs.selection.repository, prepared.skillInstructions),
       beforePrompt: this.beforePrompt(inputs, source, prepared),
       ...this.deliveryOutput(inputs, source, outputHead),

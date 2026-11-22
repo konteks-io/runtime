@@ -504,8 +504,8 @@ export class Supervisor {
     this.composeWork(native, verifier);
     this.composeRecovery(verifier);
     this.composeHeartbeat();
-    await this.startLocalAgents(native);
-    this.lastSnapshot = await this.inventory.collect();
+    await this.timeStartupStep("relay_connected", "start_local_agents", () => this.startLocalAgents(native), { stepOnly: true });
+    this.lastSnapshot = await this.timeStartupStep("relay_connected", "collect_initial_inventory", () => this.inventory.collect(), { stepOnly: true });
     if (this.stopping) return;
     await this.enterLifecycle();
     this.startChannelTimers();
@@ -2002,8 +2002,8 @@ export class Supervisor {
   }
 
   /** Time one startup phase or recovery step when the service supplied the shared recorder. */
-  private timeStartupStep<T>(phase: TimedStartupPhase, step: string, run: () => Promise<T>): Promise<T> {
-    return this.options.startupPhases?.step(phase, step, run) ?? run();
+  private timeStartupStep<T>(phase: TimedStartupPhase, step: string, run: () => Promise<T>, options?: { stepOnly?: boolean }): Promise<T> {
+    return this.options.startupPhases?.step(phase, step, run, options) ?? run();
   }
 
   /** The promotion is the "started" phase; its summary is the startup record a person reads. */
