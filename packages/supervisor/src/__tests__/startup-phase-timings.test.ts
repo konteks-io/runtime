@@ -89,6 +89,23 @@ function phaseLines(f: ReturnType<typeof fixture>): CapturedLine[] {
 
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); });
 
+it("times slow prerequisites without marking the relay connected early", async () => {
+  const f = fixture();
+  f.phases.complete("process_start");
+  await vi.advanceTimersByTimeAsync(10);
+  f.phases.complete("control_channel");
+  await f.phases.step("relay_connected", "start_local_agents", () => vi.advanceTimersByTimeAsync(200), { stepOnly: true });
+  await f.phases.step("relay_connected", "collect_initial_inventory", () => vi.advanceTimersByTimeAsync(30), { stepOnly: true });
+  expect(f.phases.summary().phasesMs).not.toHaveProperty("relay_connected");
+  await vi.advanceTimersByTimeAsync(70);
+  f.phases.complete("relay_connected");
+  expect(f.phases.summary()).toMatchObject({
+    phasesMs: { relay_connected: 300 },
+    stepsMs: { "relay_connected:start_local_agents": 200, "relay_connected:collect_initial_inventory": 30 },
+  });
+  expect(phaseLines(f).filter(line => line.fields.phase === "relay_connected" && line.fields.step === undefined)).toHaveLength(1);
+});
+
 it("emits every startup phase once, ordered, with the started summary and a non-decreasing clock", async () => {
   const f = fixture();
   const supervisorInfo = vi.spyOn(f.supervisor.logger, "info");

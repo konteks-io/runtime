@@ -76,7 +76,7 @@ export class StartupPhases {
    * the exact step a slow startup is sitting in. Nested steps keep the outer
    * step as the phase's own duration.
    */
-  async step<T>(phase: StartupPhase, step: string, run: () => Promise<T>): Promise<T> {
+  async step<T>(phase: StartupPhase, step: string, run: () => Promise<T>, options?: { stepOnly?: boolean }): Promise<T> {
     // Only startup recovery is timed; the same hook fires for late retirement.
     if (this.promoted && phase !== "capability_discovery") return run();
     const since = Date.now();
@@ -91,8 +91,11 @@ export class StartupPhases {
       this.remove(frame);
       const stepMs = Math.max(0, now - since);
       this.stepsMs[`${phase}:${step}`] = stepMs;
-      if (!nested) this.phasesMs[phase] = (this.phasesMs[phase] ?? 0) + stepMs;
-      this.lastCheckpoint = now;
+      // Relay prerequisites explain the wait without moving its connection checkpoint.
+      if (!options?.stepOnly) {
+        if (!nested) this.phasesMs[phase] = (this.phasesMs[phase] ?? 0) + stepMs;
+        this.lastCheckpoint = now;
+      }
       this.log({ event: "startup.phase", phase, step, phaseMs: stepMs, sinceStartMs: Math.max(0, now - this.startedAt) },
         "startup phase step completed");
       this.stopWhenDone();
