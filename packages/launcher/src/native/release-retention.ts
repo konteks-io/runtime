@@ -131,7 +131,13 @@ async function nativeReleaseReferences(root: string, platform: NativePlatform): 
 }
 
 async function windowsReferences(): Promise<readonly string[]> {
-  const script = "$ErrorActionPreference='Stop'; ConvertTo-Json -InputObject @(Get-CimInstance Win32_Process -ErrorAction Stop | Select-Object CommandLine,ExecutablePath) -Compress";
+  const script = [
+    "$ErrorActionPreference='Stop'",
+    // CIM module loading writes progress even when the process inventory succeeds.
+    "$ProgressPreference='SilentlyContinue'",
+    "[Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false)",
+    "ConvertTo-Json -InputObject @(Get-CimInstance Win32_Process -ErrorAction Stop | Select-Object CommandLine,ExecutablePath) -Compress",
+  ].join("; ");
   const output = await checkedOutput("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")]);
   const row = z.object({ CommandLine: z.string().nullable(), ExecutablePath: z.string().nullable() }).strict();
   const records = z.array(row).nonempty().parse(JSON.parse(output.trim().replace(/^\uFEFF/, "")));
