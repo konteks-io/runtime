@@ -250,6 +250,11 @@ describe("repository session continuity inputs", () => {
       // Named apart from the skill folders: a shell command reaching only into it is refused at once.
       expect(prepared.sessionContextRoot).toBe(contextRoot);
       expect(prepared.skillInstructions).toContain("Use a file-reading tool for them");
+      expect(prepared.skillInstructions).toContain("rg --files skip hidden entries like .assistant/");
+      // Only Claude's shell reads of the folder are refused; any other agent may read it with shell.
+      if (agentId === "claude-code") expect(prepared.skillInstructions).toContain("a shell command reaching only into that directory is refused");
+      else expect(prepared.skillInstructions).toContain("otherwise read them with read-only shell commands");
+      expect(prepared.skillInstructions).not.toContain("may be refused");
       const policy = createWorkspaceToolPolicy();
       const authority = { repoPath: prepared.cwd, workspaceRoot: prepared.cwd, readOnlyRoots: prepared.readOnlyRoots,
         sessionId: binding.sessionId, toolUseId: "context", agentId, input: { file_path: join(contextRoot!, "memory/conversation.md") } };
