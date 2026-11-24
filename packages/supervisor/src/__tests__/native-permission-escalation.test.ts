@@ -106,7 +106,8 @@ describe("a native escalation the person reads on the card", () => {
 
 describe("a planning estimate's Claude shell call", () => {
   const contextRoot = "/work/session-context/session-1/source";
-  const planning = { ...claudeContext, assignmentKind: "planning", readOnlyRoots: [contextRoot], sessionContextRoot: contextRoot };
+  const skillRoot = "/work/skills/org-1";
+  const planning = { ...claudeContext, assignmentKind: "planning", readOnlyRoots: [skillRoot, contextRoot], sessionContextRoot: contextRoot };
   const decide = (paths: string[], ctx: object = planning, canDefer = true) => nativePermissionEscalation({
     sessionId: "acp-1", options: claudeOptions,
     toolCall: { toolCallId: "tool-1", title: "Size of memory files", kind: "execute", locations: paths.map(path => ({ path })),
@@ -122,6 +123,13 @@ describe("a planning estimate's Claude shell call", () => {
 
   it("is refused at once when it reaches the operator's own Claude memory, and asks no person", () => {
     expect(decide(["/home/operator/.claude/projects/-work/memory/MEMORY.md"])).toEqual({
+      kind: "deny", optionId: "reject", refusal: { reason: "planning_outside_shell" },
+      message: expect.stringMatching(/^Konteks refused this shell command: .*Read tool/),
+    });
+  });
+
+  it("is refused at once when it reaches a staged organization skill folder too", () => {
+    expect(decide([`${skillRoot}/scripts/run.sh`])).toEqual({
       kind: "deny", optionId: "reject", refusal: { reason: "planning_outside_shell" },
       message: expect.stringMatching(/^Konteks refused this shell command: .*Read tool/),
     });

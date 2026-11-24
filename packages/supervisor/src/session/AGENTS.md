@@ -42,9 +42,10 @@ whole permission path.
   read): it is refused at once with a note naming the Read tool, never put to
   a person and never allowed. A `planning` assignment goes further: a Claude
   shell call with any flagged path outside the working copy and this session's
-  context folder is refused at once, never deferred, because an estimate's
-  result is `submit_result` and nothing reads a shell result. Other assignment
-  kinds keep the allow-once deferral. Skill folders still ask. If human
+  context folder — including a required organization skill folder — is refused
+  at once, never deferred, because an estimate's result is `submit_result` and
+  nothing reads a shell result. Other assignment kinds keep the allow-once
+  deferral, and a skill folder still asks for them. If human
   deferral or the exact safe options are unavailable, refuse. Codex's manual
   standalone grant is turn-scoped; session grants and strict automatic review
   are excluded from the broker and Core view. Ordinary same-authority commands
@@ -134,4 +135,6 @@ cross-reference.
   denied, so nothing was read.
 - **Nothing consumed the result.** An estimate's output is `submit_result`;
   no code reads the shell result. That is why a planning shell call is now
-  refused instead of deferred.
+  refused instead of deferred, including one that reaches a staged
+  organization skill folder: the Read tool reaches those roots, and a
+  planning estimate never needs a shell there.
