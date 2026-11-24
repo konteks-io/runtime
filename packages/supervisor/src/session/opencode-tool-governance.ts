@@ -1,5 +1,6 @@
 import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
-import { isDeniedBrowserTool } from "@konteks/remote-agent-runner";
+import { basename, join } from "node:path";
+import { isDeniedBrowserTool, openCodeStagedSkillRoots } from "@konteks/remote-agent-runner";
 import { isWithinReadRoots, isWithinWorkspace } from "./workspace-tool-policy.js";
 import { rebuiltRequest, refusal, resolveIn } from "./host-decisions.js";
 import { CODE_MODE_ACCEPTED_FORM, parseKonteksCodeModeBlock, type CodeModeCall } from "./opencode-code-mode.js";
@@ -54,6 +55,7 @@ export const OPENCODE_TOOL_KINDS: Readonly<Record<string, string>> = Object.free
   webfetch: "fetch", websearch: "fetch",
   subagent: "think", task: "think", todowrite: "think", todoread: "think",
   execute: "other",
+  skill: "other",
 });
 
 const SHELL = new Set(["shell", "bash"]);
@@ -234,6 +236,16 @@ function fetchDecision(r: AskedRequest, tool: string): HostPermissionDecision {
   return rebuiltRequest(r.request, r.toolCallId, { kind: "fetch", title: tool, rawInput: { url: target } });
 }
 
+function skillDecision(r: AskedRequest): HostPermissionDecision {
+  const id = agreed(r, "id");
+  if (!id) return refusal("the Skill request has no matching Skill ID");
+  const roots = openCodeStagedSkillRoots(r.context.readOnlyRoots ?? []).filter(root => basename(root) === id);
+  if (roots.length !== 1) return refusal("the Skill is outside this execution's selected Skill folders");
+  const path = join(roots[0]!, "SKILL.md");
+  if (!isWithinReadRoots(path, roots[0]!)) return refusal("the Skill file is outside its selected folder");
+  return rebuiltRequest(r.request, r.toolCallId, { kind: "read", title: "skill", rawInput: {}, locations: [{ path }] });
+}
+
 /** The path Code Mode lists for an approved call. */
 function codeModeCallPath(call: CodeModeCall): string { return `${call.server}.${call.tool}`; }
 
@@ -312,6 +324,7 @@ export class OpenCodeToolGovernance implements HostToolGovernance {
     if (SHELL.has(tool)) return shellDecision(r);
     if (EDIT.has(tool)) return editDecision(r, tool);
     if (tool === "execute") return this.codeModeDecision(r);
+    if (tool === "skill") return skillDecision(r);
     if (SEARCH.has(tool)) return searchDecision(r, tool);
     if (kind === "fetch") return fetchDecision(r, tool);
     // A subagent's own calls ask and are judged like these; a todo list touches nothing.

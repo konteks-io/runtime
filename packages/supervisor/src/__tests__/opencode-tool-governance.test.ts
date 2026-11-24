@@ -220,6 +220,21 @@ describe("Code Mode parser", () => {
 });
 
 
+it("evaluates native Skill calls as reads of the exact selected Skill", () => {
+  const governance = new OpenCodeToolGovernance();
+  const root = `/rt/skills-${"a".repeat(64)}/review`;
+  const scoped = { ...context, readOnlyRoots: [root, "/rt/session/context"] };
+  for (const id of ["selected", "other", "mismatch", "stale"]) {
+    governance.observe(call(id, "skill"), WC);
+    governance.observe(input(id, { id: "review" }), WC);
+  }
+  expect(governance.decide(ask("selected", "other", "skill", { id: "review" }), scoped))
+    .toMatchObject({ kind: "evaluate", request: { toolCall: { kind: "read", locations: [{ path: `${root}/SKILL.md` }] } } });
+  expect(governance.decide(ask("other", "other", "skill", { id: "context" }), scoped)).toMatchObject({ kind: "deny" });
+  expect(governance.decide(ask("mismatch", "other", "skill", { id: "another-skill" }), scoped)).toMatchObject({ kind: "deny" });
+  expect(governance.decide(ask("stale", "other", "skill", { id: "review" }), context)).toMatchObject({ kind: "deny" });
+});
+
 it("uses selected read roots for asked OpenCode reads and trips on unasked reads", () => {
   const governance = new OpenCodeToolGovernance();
   const skill = "/rt/selected-skills/review", file = `${skill}/SKILL.md`;

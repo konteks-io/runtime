@@ -1,7 +1,7 @@
 import { existsSync, type Stats } from "node:fs";
 import { createHash } from "node:crypto";
 import { copyFile, lstat, mkdir, readlink, rm, symlink } from "node:fs/promises";
-import { isAbsolute, posix, resolve, win32 } from "node:path";
+import { basename, dirname, isAbsolute, posix, resolve, win32 } from "node:path";
 import { OpenCodeLoginOptionIdSchema, RemoteInstanceError, keyedFingerprint, readOrCreateSecretFile } from "@konteks/remote-common";
 import type { AgentBridgeFamily } from "@konteks/remote-release";
 import type { RunnerConfig } from "../config.js";
@@ -141,7 +141,12 @@ export const OPENCODE_DISABLED_AGENTS: readonly string[] = Object.freeze(["title
  * OpenCode 2's own key names. It is passed as `OPENCODE_CONFIG_CONTENT` and
  * never read from the person's home or the repository.
  */
-export function renderOpenCodeKonteksConfig(): Record<string, unknown> {
+export function openCodeStagedSkillRoots(readOnlyRoots: readonly string[]): string[] {
+  return readOnlyRoots.filter(root => isAbsolute(root) && !CONTROL.test(root) &&
+    /^skills-[a-f0-9]{64}$/u.test(basename(dirname(root))));
+}
+
+export function renderOpenCodeKonteksConfig(skillRoots: readonly string[] = []): Record<string, unknown> {
   return {
     $schema: "https://opencode.ai/config.json",
     permissions: OPENCODE_KONTEKS_PERMISSIONS.map(rule => ({ ...rule })),
@@ -151,6 +156,7 @@ export function renderOpenCodeKonteksConfig(): Record<string, unknown> {
     lsp: false,
     formatter: false,
     plugins: [],
+    ...(skillRoots.length ? { skills: [...skillRoots] } : {}),
     agents: Object.fromEntries(OPENCODE_DISABLED_AGENTS.map(agent => [agent, { disabled: true }])),
   };
 }
@@ -161,19 +167,19 @@ export function renderOpenCodeKonteksConfig(): Record<string, unknown> {
  * `opencode.json` or `.opencode/agent` would otherwise re-allow everything), and no
  * file watcher (it otherwise watches every parent folder up to `/`).
  */
-export function openCodeKonteksSettings(): Record<string, string> {
+export function openCodeKonteksSettings(skillRoots: readonly string[] = []): Record<string, string> {
   return {
-    OPENCODE_CONFIG_CONTENT: JSON.stringify(renderOpenCodeKonteksConfig()),
+    OPENCODE_CONFIG_CONTENT: JSON.stringify(renderOpenCodeKonteksConfig(skillRoots)),
     OPENCODE_CONFIG_PROJECT_DISABLE: "1",
     OPENCODE_FILEWATCHER_DISABLE: "1",
   };
 }
 
 /** The complete environment of an OpenCode process of this runner whose config folder is `configHome`. */
-export function openCodeProcessEnvironment(credentialDir: string, configHome: string, inherited?: NodeJS.ProcessEnv, platform: NodeJS.Platform = process.platform): NodeJS.ProcessEnv {
+export function openCodeProcessEnvironment(credentialDir: string, configHome: string, inherited?: NodeJS.ProcessEnv, platform: NodeJS.Platform = process.platform, skillRoots: readonly string[] = []): NodeJS.ProcessEnv {
   const paths = openCodeRuntimePaths(credentialDir, platform);
   return openCodeEnvironment({ home: { home: paths.home, data: paths.data, state: paths.state, cache: paths.cache, config: configHome },
-    settings: openCodeKonteksSettings(), platform, ...(inherited === undefined ? {} : { inherited }) });
+    settings: openCodeKonteksSettings(skillRoots), platform, ...(inherited === undefined ? {} : { inherited }) });
 }
 
 /**
@@ -273,10 +279,10 @@ function serial<T>(configHome: string, work: (hold: { count: number }) => Promis
 }
 
 /** Prepare the config folder of one OpenCode execution process for `workingCopy`. */
-export async function bindOpenCodeWorkingCopy(credentialDir: string, workingCopy: string, deps: OpenCodeInstructionsDeps & { inherited?: NodeJS.ProcessEnv } = {}): Promise<HostWorkingCopyBinding> {
+export async function bindOpenCodeWorkingCopy(credentialDir: string, workingCopy: string, deps: OpenCodeInstructionsDeps & { inherited?: NodeJS.ProcessEnv; skillRoots?: readonly string[] } = {}): Promise<HostWorkingCopyBinding> {
   if (!isAbsolute(workingCopy) || CONTROL.test(workingCopy)) throw new RemoteInstanceError("agent_unavailable", "An OpenCode working copy must be an absolute local path.");
   const configHome = openCodeWorkingCopyConfig(credentialDir, workingCopy);
-  const env = openCodeProcessEnvironment(credentialDir, configHome, deps.inherited);
+  const env = openCodeProcessEnvironment(credentialDir, configHome, deps.inherited, process.platform, deps.skillRoots);
   await serial(configHome, async hold => {
     hold.count += 1;
     try { await syncOpenCodeInstructions(configHome, workingCopy, deps); }
@@ -370,9 +376,11 @@ export const openCodeRunnerAdapter: HostAgentRunnerAdapter = {
     }
     await prepareOpenCodeHome(config);
   },
-  bindWorkingCopy: async (config, family, workingCopy) => {
+  bindWorkingCopy: async (config, family, workingCopy, readOnlyRoots = []) => {
     binary(config, family);
-    return bindOpenCodeWorkingCopy(config.RUNNER_CREDENTIAL_DIR, workingCopy);
+    return bindOpenCodeWorkingCopy(config.RUNNER_CREDENTIAL_DIR, workingCopy, {
+      skillRoots: openCodeStagedSkillRoots(readOnlyRoots),
+    });
   },
   // OpenCode's own `auth login`, driven and relayed (link and code for a
   // subscription, OpenCode's own key prompt for an API key); the one-time

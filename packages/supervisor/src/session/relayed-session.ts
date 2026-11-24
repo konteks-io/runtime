@@ -495,15 +495,21 @@ export class RelayedSession {
     this.deps.assertExecutionOwned?.();
     if (this.closed) throw sessionClosed();
     const prepared = await this.preparedInputsResumingTransient();
-    this.deps.assertExecutionOwned?.();
-    const binding = this.verifiedBinding(prepared);
+    let binding: RemoteTransferBinding;
+    try {
+      this.deps.assertExecutionOwned?.();
+      if (this.closed) throw sessionClosed();
+      binding = this.verifiedBinding(prepared);
+    } catch (error) {
+      await prepared.disposeSkillInputs?.().catch(() => undefined);
+      throw error;
+    }
     const readOnlyRoots = Object.freeze([...(prepared.readOnlyRoots ?? [])]);
     this.preparedInputs = prepared;
     this.readOnlyRoots = readOnlyRoots;
     // Input preparation verifies Core's claim-bound selection. Use its logical
     // session identity, never a bridge ref or an assignment-local random ID.
     this.boundChannelId = `session:${binding.sessionId}`;
-    if (this.closed) throw sessionClosed();
     return { prepared, binding };
   }
 
@@ -1829,10 +1835,7 @@ export class RelayedSession {
   private async prepareAgentPrompt<B extends PromptBlock>(requestId: string, prompt: B[]): Promise<B[]> {
     const prepared = await this.prepareStructuredPrompt(requestId, prompt);
     if (isDirectAssignment(this.assignment)) {
-      if (!this.preparedInputs?.hasDirectAttachments) return prepared;
-      return [...prepared, {
-        type: "text", text: "The user attached files for this turn. They are under attachments/ in the working directory.",
-      } as unknown as B];
+      return this.withDirectInputInstructions(prepared);
     }
     const agentId = this.assignment.agentRoute.agentId;
     if ((agentId !== "opencode" && agentId !== "antigravity") || this.toolFormTold) return prepared;
@@ -2114,6 +2117,20 @@ export class RelayedSession {
     return this.sessionCwd();
   }
 
+  private withDirectInputInstructions<B extends PromptBlock>(prompt: B[]): B[] {
+    const blocks = [...prompt];
+    const inputs = this.preparedInputs;
+    if (inputs?.hasDirectAttachments) {
+      blocks.push({
+        type: "text", text: "The user attached files for this turn. They are under attachments/ in the working directory.",
+      } as unknown as B);
+    }
+    if (inputs?.disposeSkillInputs && inputs.skillInstructions) {
+      blocks.push({ type: "text", text: inputs.skillInstructions } as unknown as B);
+    }
+    return blocks;
+  }
+
   /** What goes in front of the person's text: the staged skills line; nothing for a direct session, so a leading `/command` stays first. */
   private promptInstructions(): string | undefined {
     return isDirectAssignment(this.assignment) ? undefined : this.preparedInputs?.skillInstructions || undefined;
@@ -2322,8 +2339,15 @@ export class RelayedSession {
       // No readiness announcement means there is no remote session to close.
       if (this.channelOpened) await this.sendToCore({ kind: "session_closed", assignmentId: this.assignment.id, reason: "agent_exited" });
     } finally {
+      await this.releaseSkillInputs();
       this.releaseUnlessRecovering();
     }
+  }
+
+  private async releaseSkillInputs(): Promise<void> {
+    await this.preparedInputs?.disposeSkillInputs?.().catch(() => {
+      this.logger.warn({ event: "session.skill_input_cleanup_failed", assignmentId: this.assignment.id }, "Local Skill input cleanup failed");
+    });
   }
 
   /** Recovery keeps the channel; any other end releases it. */
@@ -2427,6 +2451,7 @@ export class RelayedSession {
    * has been persisted.
    */
   private async afterClose(reason: SessionClosedReason, nativeCompletion: boolean): Promise<void> {
+    await this.releaseSkillInputs();
     await this.closeMcpFacade();
     if (!nativeCompletion) await this.stopPreview(reason);
     this.completedSettlementInProgress = false;

@@ -210,6 +210,25 @@ describe("one OpenCode process per working copy", () => {
     await expect(lstat(folder)).rejects.toThrow();
   });
 
+  it("registers only the staged Skill folders from the current execution", async () => {
+    const f = await workingCopy(null);
+    const firstSkill = join(f.root, `skills-${"a".repeat(64)}`, "review");
+    const nextSkill = join(f.root, `skills-${"b".repeat(64)}`, "review");
+    const runner = config({ RUNNER_CREDENTIAL_DIR: f.credentials });
+    const bridge = findAgentBridge("opencode")!;
+    const first = await openCodeRunnerAdapter.bindWorkingCopy!(
+      runner, bridge, f.wc, [firstSkill, join(f.root, "context")], {},
+    );
+    const next = await openCodeRunnerAdapter.bindWorkingCopy!(runner, bridge, f.wc, [nextSkill], {});
+    try {
+      expect(JSON.parse(first.env.OPENCODE_CONFIG_CONTENT!).skills).toEqual([firstSkill]);
+      expect(JSON.parse(next.env.OPENCODE_CONFIG_CONTENT!).skills).toEqual([nextSkill]);
+    } finally {
+      await first.release();
+      await next.release();
+    }
+  });
+
   it("keeps the folder while another process of the same working copy runs, and never shares it across working copies", async () => {
     const f = await workingCopy("rules");
     const other = join(f.root, "other");

@@ -1,3 +1,4 @@
+import { localSkillExportSigningBytes, type LocalSkillExportCommand } from "@konteks/backstage-plugin-common/remote-instance-internal";
 import type { KeyObject } from "node:crypto";
 import { PlanningControllerTerminalDirectiveSchema, RemoteControlSigningKeySchema, planningControllerTerminalDirectiveSigningBytes, remoteControlSigningBytes, ed25519PublicKeyFromJwk, ed25519Verify, type JsonValue, type PlanningControllerTerminalDirective } from "@konteks/remote-common";
 import type { EmbeddedReleaseRoot } from "@konteks/remote-release";
@@ -139,6 +140,13 @@ export class CoreSignatureVerifier {
     try {
       return ed25519Verify(key, diagnosticCarrierCompanionSigningBytes(request), request.signature);
     } catch { return false; }
+  }
+
+  verifyLocalSkillExport(command: LocalSkillExportCommand): boolean {
+    const key = this.keys.get(command.keyId);
+    if (!key || Buffer.from(command.signature, "base64url").toString("base64url") !== command.signature) return false;
+    try { return ed25519Verify(key, localSkillExportSigningBytes(command), command.signature); }
+    catch { return false; }
   }
 
   verify(body: { [key: string]: JsonValue }, signature: string): boolean {
