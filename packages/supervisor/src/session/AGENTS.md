@@ -45,6 +45,12 @@ whole permission path.
   standalone grant is turn-scoped; session grants and strict automatic review
   are excluded from the broker and Core view. Ordinary same-authority commands
   retain the command policy; these checks do not attest OS confinement.
+  `src/__tests__/outside-folder-command-human-gate.test.ts` guards this: it
+  drives Claude Bash/PowerShell and Codex execute through every evaluator and
+  deferral mode, checks the host adapters' shell folders and the broker's hold
+  and deadline. Any new allow branch or host adapter must extend that guard's
+  matrix; `src/__tests__/session.test.ts` holds the end-to-end answer to the
+  runner until the person's own answer arrives through the broker.
 - **Only the session's own MCP servers.** A tool whose server is not in the
   session's `sessionServers` is refused without asking. `konteks-browser` is
   allowed only on a session given the browser, and never a hidden browser tool.

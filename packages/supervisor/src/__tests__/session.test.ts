@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FixedClock, RemoteInstanceError, SECRET_CANARIES, generateInstanceKey, gitXcodeLicenseError, type PendingPermissionView, type RemoteWorkAssignment, type RelayAck, type ToCoreRelayFrame } from "@konteks/remote-common";
 import { ChannelMux } from "../relay/channel-mux.js";
 import { SupervisorJournal } from "../state/journal.js";
-import { PermissionBroker, answerIsValid, registerDeferral, sanitizeElicitationRequest, sanitizePermissionRequest } from "../session/permissions.js";
+import { PermissionBroker, answerIsValid, registerDeferral, sanitizeElicitationRequest, sanitizePermissionRequest, type PendingHumanRequest } from "../session/permissions.js";
 import { PERMISSION_REQUEST_DETAIL_MAX } from "../session/permission-request-detail.js";
 import type { DeferredPermissionBody } from "../core/client.js";
 import { EvaluatorPolicyResponder, isSignInElicitation } from "../session/policy-responder.js";
@@ -2584,6 +2584,82 @@ describe("relayed session", () => {
       expect(title).not.toContain("…");
       expect(title.endsWith(": ")).toBe(false);
     }
+  });
+
+  // TKT-2/R4: an out-of-folder command reaches the runner as an allow only
+  // after the person's own answer arrives through the broker, and a deadline
+  // answers it cancelled (see outside-folder-command-human-gate.test.ts).
+  describe("outside-folder command human gate (TKT-2/R4)", () => {
+    const RULE = "RULE (TKT-2/R4): a command outside the session's folder always waits for a person";
+    const ruleMessage = (caseName: string, decision: string) => `${RULE} — ${caseName} was ${decision}`;
+    const claudeOptions = [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" as const },
+      { optionId: "allow-always", name: "Always allow", kind: "allow_always" as const },
+      { optionId: "reject", name: "Reject", kind: "reject_once" as const }];
+    const codexOptions = [{ optionId: "allow_once", name: "Allow once", kind: "allow_once" as const },
+      { optionId: "allow_always", name: "Always allow", kind: "allow_always" as const },
+      { optionId: "decline", name: "Decline", kind: "reject_once" as const }];
+    const outsideRequests = [
+      { caseName: "Claude Bash outside the folder", agentId: "claude-code", allowOptionId: "allow-once", rejectOptionId: "reject",
+        request: { sessionId: "acp-1", options: claudeOptions,
+          toolCall: { toolCallId: "t-claude", kind: "execute", title: "Size of memory files", locations: [{ path: "/tmp/outside.txt" }],
+            rawInput: { command: "wc -l memory/conversation.md" }, _meta: { claudeCode: { toolName: "Bash" } } } } },
+      { caseName: "Codex execute outside the folder", agentId: "codex", allowOptionId: "allow_once", rejectOptionId: "decline",
+        request: { sessionId: "acp-1", options: codexOptions,
+          toolCall: { toolCallId: "t-codex", kind: "execute", title: "Run command", locations: [{ path: "/tmp/outside.txt" }],
+            rawInput: { command: "ls /tmp" } } } },
+    ] as const;
+
+    function permissionFrames(sent: OutboundMessage[]) {
+      return sent.map(message => message.body as { method?: string; params?: { options: Array<{ optionId: string }> } })
+        .filter(body => body.method === "session/request_permission");
+    }
+
+    it.each(outsideRequests)(`${RULE} — $caseName was held until a person answers through the broker`, async ({ caseName, agentId, allowOptionId, rejectOptionId, request }) => {
+      const registered = registeredCard();
+      const f = await build({ registerDeferral: registered, policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true) },
+        { ...validation, agentRoute: { ...validation.agentRoute, agentId } });
+      await f.session.bootstrap();
+      const requestId = `gate-${agentId}`;
+      await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId, params: request } as never);
+      expect(vi.mocked(f.runner.answer).mock.calls, ruleMessage(caseName, "answered before any person")).toEqual([]);
+      const frame = permissionFrames(f.sent).at(-1)!;
+      expect(frame.params!.options.map(option => option.optionId), ruleMessage(caseName, `options ${frame.params!.options.map(option => option.optionId).join(", ")}`))
+        .toEqual([allowOptionId, rejectOptionId]);
+      // The person's answer, delivered through the broker, is the first allow.
+      await f.session.onToRuntime({ kind: "acp_result", id: requestId, method: "session/request_permission",
+        result: { outcome: { outcome: "selected", optionId: allowOptionId } } });
+      expect(vi.mocked(f.runner.answer).mock.calls.map(call => call[2]), ruleMessage(caseName, "the person's answer"))
+        .toEqual([{ outcome: { outcome: "selected", optionId: allowOptionId } }]);
+      await f.session.close("cancelled");
+    });
+
+    it(`${RULE} — an unanswered Claude Bash permission was cancelled at the broker deadline`, async () => {
+      let session: RelayedSession | null = null;
+      const timedOut: PendingHumanRequest[] = [];
+      const deadline: { settled: Promise<void> | null } = { settled: null };
+      const broker = new PermissionBroker({ clock, deadlineSeconds: () => 60,
+        onTimeout: async request => { timedOut.push(request); deadline.settled = session!.onDeadline(request); await deadline.settled; } });
+      const f = await build({ broker, registerDeferral: registeredCard(), policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true) },
+        { ...validation, agentRoute: { ...validation.agentRoute, agentId: "claude-code" } });
+      session = f.session;
+      await f.session.bootstrap();
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        const { request } = outsideRequests[0];
+        await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: "gate-timeout", params: request } as never);
+        const before = vi.mocked(f.runner.answer).mock.calls;
+        expect(before, ruleMessage("an unanswered Claude Bash permission before the deadline", "answered")).toEqual([]);
+        await vi.advanceTimersByTimeAsync(29_999);
+        expect(vi.mocked(f.runner.answer).mock.calls, ruleMessage("an unanswered Claude Bash permission after 29.999 s", "answered")).toEqual([]);
+        await vi.advanceTimersByTimeAsync(1);
+        await deadline.settled;
+        expect(timedOut.map(pending => pending.requestId), ruleMessage("an unanswered Claude Bash permission at 30 s", `onTimeout(${timedOut.length})`))
+          .toEqual(["gate-timeout"]);
+        expect(vi.mocked(f.runner.answer).mock.calls.map(call => call[2]), ruleMessage("an unanswered Claude Bash permission at 30 s", "the answer"))
+          .toEqual([{ outcome: { outcome: "cancelled" } }]);
+      } finally { vi.useRealTimers(); }
+      await f.session.close("cancelled");
+    });
   });
 
   describe("deferred permission request detail", () => {

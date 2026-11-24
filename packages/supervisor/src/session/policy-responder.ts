@@ -76,7 +76,7 @@ function preferredOption(request: RequestPermissionRequest, kinds: readonly stri
  * relay display, so a withheld native option can never be selected later. */
 export function deferredPermissionRequest(request: RequestPermissionRequest, decision: Extract<PolicyDecision, { kind: "defer" }>): RequestPermissionRequest {
   const options = request.options.filter(option => {
-    if (decision.allowOnceOnly && option.kind === "allow_always") return false;
+    if (decision.allowOnceOnly && (option.kind === "allow_always" || option.kind === "reject_always")) return false;
     return decision.optionIds?.includes(option.optionId) ?? true;
   });
   return { ...request, options, toolCall: { ...request.toolCall, ...(decision.title ? { title: decision.title } : {}) } };
