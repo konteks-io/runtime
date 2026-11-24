@@ -117,7 +117,7 @@ export interface RefusedPath {
 
 /** Why a tool call was refused: what the connector logs (no secrets, no host paths). */
 export interface PolicyRefusal {
-  reason: "outside_workspace" | "outside_read_roots" | "unresolved_read" | "unresolved_write" | "bash_blocklist" | "session_context_shell";
+  reason: "outside_workspace" | "outside_read_roots" | "unresolved_read" | "unresolved_write" | "bash_blocklist" | "session_context_shell" | "planning_outside_shell";
   /** File changes: how many paths the call named, and the ones outside. */
   pathCount?: number;
   outside?: RefusedPath[];

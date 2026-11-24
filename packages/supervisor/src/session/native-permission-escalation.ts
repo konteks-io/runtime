@@ -6,8 +6,9 @@ import type { PermissionToolIdentity } from "./permission-tool-identity.js";
 import type { PermissionContext, PolicyDecision } from "./policy-responder.js";
 import { isWithinReadRoots, isWithinWorkspace, POLICY_REFUSAL_PREFIX } from "./workspace-tool-policy.js";
 
-/** `contextShell`: a shell command that reaches only into the session's context folder. */
-interface Escalation { allowOptionId: string; valid?: boolean; title: string; contextShell?: true }
+/** `contextShell`: a shell command that reaches only into the session's context folder.
+ * `planningOutside`: a planning estimate's shell call beyond its working copy and context folder. */
+interface Escalation { allowOptionId: string; valid?: boolean; title: string; contextShell?: true; planningOutside?: true }
 export type NativeEscalationDecision = Extract<PolicyDecision, { kind: "deny" | "defer" }>;
 
 const REJECT_OPTION_IDS: Readonly<Record<string, readonly string[]>> = {
@@ -27,6 +28,7 @@ export function nativePermissionEscalation(
   const deny = safeRejectOption(request, escalation.allowOptionId);
   if (escalation.valid === false) return { kind: "deny", optionId: deny };
   if (escalation.contextShell) return { kind: "deny", optionId: deny, message: CONTEXT_SHELL_MESSAGE, refusal: { reason: "session_context_shell" } };
+  if (escalation.planningOutside) return { kind: "deny", optionId: deny, message: PLANNING_SHELL_MESSAGE, refusal: { reason: "planning_outside_shell" } };
   const optionIds = safeOptionIds(request, escalation.allowOptionId);
   if (optionIds === null || !canDefer()) return { kind: "deny", optionId: deny };
   return { kind: "defer", allowOnceOnly: true, optionIds, title: escalation.title };
@@ -44,6 +46,16 @@ const SHELL_COMMAND = "Wants to run a shell command";
  * readable with the Read tool, so the command is refused at once instead.
  */
 const CONTEXT_SHELL_MESSAGE = `${POLICY_REFUSAL_PREFIX} shell command: it reads this session's context folder, which is outside the working copy. Read those files with the Read tool (or Grep and Glob) instead.`;
+
+/**
+ * An estimate's output is its structured result, never a shell result. A
+ * planning turn that reaches beyond its working copy and its own context
+ * folder is therefore refused at once: on 11-04 four such cards held people
+ * for a path the estimate did not need, and every estimate finished after the
+ * denial. Other assignments keep their deferral (a delivered change may need
+ * a tool outside its checkout).
+ */
+const PLANNING_SHELL_MESSAGE = `${POLICY_REFUSAL_PREFIX} shell command: it reaches outside this session's working copy and its context folder, which an estimate does not need. Read this session's context files with the Read tool (or Grep and Glob) instead.`;
 const NEEDS_NETWORK = "Needs the network";
 
 /** The permission title's contract limit, counted in code points and UTF-16 units. */
@@ -80,7 +92,16 @@ function claudeShellEscalation(request: RequestPermissionRequest, context: Permi
   const cwd = context.cwd ?? context.workspaceRoot;
   const outside = locations.some(location => !isWithinReadRoots(location.path, cwd, context.readOnlyRoots));
   const escalation: Escalation = { allowOptionId: "allow-once", title: escalationTitle(request, outside ? OUTSIDE_FOLDER : SHELL_COMMAND, tool) };
-  return onlySessionContext(locations, context) ? { ...escalation, contextShell: true } : escalation;
+  if (onlySessionContext(locations, context)) return { ...escalation, contextShell: true };
+  return planningOutsideSession(locations, context) ? { ...escalation, planningOutside: true } : escalation;
+}
+
+/** A planning estimate never asks a person to widen its shell beyond its working copy and its own context folder. */
+function planningOutsideSession(locations: ReadonlyArray<{ path: string }>, context: PermissionContext): boolean {
+  if (context.assignmentKind !== "planning") return false;
+  const cwd = context.cwd ?? context.workspaceRoot;
+  const contextRoots = context.sessionContextRoot === undefined ? [] : [context.sessionContextRoot];
+  return locations.some(location => !isWithinReadRoots(location.path, cwd, contextRoots));
 }
 
 /** Every path Claude flagged lies in the working copy or the session context folder, and one in the latter. */

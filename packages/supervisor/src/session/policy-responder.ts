@@ -1,5 +1,6 @@
 import type { CreateElicitationRequest, RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import type { PolicyEvaluator } from "@konteks/agent-core";
+import type { RemoteWorkKind } from "@konteks/remote-common";
 import { nativePermissionEscalation, type NativeEscalationDecision } from "./native-permission-escalation.js";
 import { BROWSER_MCP_SERVER_NAME, browserToolFromTitle, isDeniedBrowserTool } from "@konteks/remote-agent-runner";
 import { permissionToolIdentity, type McpToolCallLedger, type PermissionToolIdentity } from "./permission-tool-identity.js";
@@ -43,6 +44,8 @@ export interface AdmittedMcpTool { server: string; tools: readonly string[] }
  */
 export interface PermissionContext {
   assignmentId: string;
+  /** The assignment's work kind: a `planning` estimate is refused an out-of-folder shell prompt rather than asked. */
+  assignmentKind?: RemoteWorkKind;
   agentId: string;
   workspaceRoot: string;
   cwd?: string;
