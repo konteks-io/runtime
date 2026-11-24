@@ -1496,13 +1496,15 @@ describe("native session dispatch uses genuine execution admission", () => {
     }));
   });
 
-  it.each([false, true])("admits a direct prompt only with Core's permit and keeps its text first (attachments: %s)", async (attachments) => {
+  it.each([[false, false], [true, false], [true, true]])("admits a direct prompt only with Core's permit and keeps its text first (attachments: %s, scoped Skill: %s)", async (attachments, scoped) => {
     const direct: RemoteWorkAssignment = { ...assignment, kind: "direct", agentRoute: { agentId: "codex", requiredRole: "assistant" },
       source: { kind: "direct_session", portability: "instance_bound", ownerInstanceId: "instance", sessionId: "session", turnRef: "turn" } };
+    const disposeSkillInputs = vi.fn(async () => undefined);
     const inputs: Partial<RelayedSessionDeps> = attachments ? {
       prepareInputs: async () => ({
         binding: { workspaceId: "tenant", instanceId: "instance", sessionId: "session", assignmentId: "assignment", attempt: 1 },
         cwd: root, skillInstructions: "trusted local skill", hasDirectAttachments: true, beforePrompt: async () => undefined,
+        ...(scoped ? { disposeSkillInputs } : {}),
       }),
     } : {};
     const f = await sessionFixture(direct, undefined, undefined, {}, inputs);
@@ -1514,12 +1516,12 @@ describe("native session dispatch uses genuine execution admission", () => {
     f.client.consumeExecution.mockResolvedValueOnce({ outcome: "admitted", admissionId: "admission",
       receipt: signed({ ...claims, aud: "konteks:remote-execution-admission", admissionId: "admission", admittedAt: f.clock.nowIso(), checkExpiresAt: "2026-09-10T00:00:30Z" }) });
     await f.session.onToRuntime({ kind: "authorized_operation", operationId: "operation", permit: signed(claims), message: typed });
-    // Direct prompts never receive organization skill instructions. A staged file
-    // notice follows the original message, so the slash command stays first.
+    // Attachments and explicitly scoped Skills follow the original slash command.
     const prompt = [...typed.params.prompt];
     if (attachments) prompt.push({
       type: "text", text: "The user attached files for this turn. They are under attachments/ in the working directory.",
     });
+    if (scoped) prompt.push({ type: "text", text: "trusted local skill" });
     expect(f.runner.prompt).toHaveBeenCalledExactlyOnceWith("acp", "request", { sessionId: "acp", prompt });
     await f.session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp", requestId: "request", result: { stopReason: "end_turn" } } as never);
     expect(f.send.mock.calls.map(call => call[0].body)).toContainEqual({ kind: "session_closed", assignmentId: "assignment", reason: "completed" });

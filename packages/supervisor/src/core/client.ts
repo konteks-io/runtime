@@ -1,3 +1,7 @@
+import {
+  LocalSkillExportAckSchema, LocalSkillExportPollSchema, LocalSkillExportResultSchema,
+  LocalSkillInventorySchema,
+} from "@konteks/backstage-plugin-common/remote-instance-internal";
 import { RemoteInstanceActivationRecoveryResultSchema, type RemoteInstanceActivationRecoveryRequest, type RemoteInstanceActivationRecoveryResult } from "@konteks/remote-common";
 import { AgentTurnUsageObservationSchema, RuntimeAgentLoginReportSchema, RuntimeUpdateReportSchema,
   RuntimeUpdateLocalBeginRequestSchema,
@@ -726,6 +730,27 @@ export class CoreClient {
       throw new RemoteInstanceError("registration_mismatch", "Execution revision fence receipt does not match the submitted fence.");
     }
     return result;
+  }
+
+  async reportLocalSkillInventory(instanceId: string, inventory: unknown, signal: AbortSignal) {
+    return this.http.request({
+      method: "POST", path: instancePath(instanceId, "local-skills/inventory"),
+      body: LocalSkillInventorySchema.parse(inventory), schema: LocalSkillExportAckSchema, signal,
+    });
+  }
+
+  async pollLocalSkillExport(instanceId: string, signal: AbortSignal) {
+    return this.http.request({
+      method: "GET", path: instancePath(instanceId, "local-skills/export"), schema: LocalSkillExportPollSchema, signal,
+    });
+  }
+
+  async reportLocalSkillExport(instanceId: string, value: unknown, signal: AbortSignal) {
+    const body = LocalSkillExportResultSchema.parse(value);
+    return this.http.request({
+      method: "POST", path: instancePath(instanceId, "local-skills/export"), body, schema: LocalSkillExportAckSchema,
+      idempotencyKey: `local-skill-export:${instanceId}:${body.requestId}`, signal,
+    });
   }
 
   /**

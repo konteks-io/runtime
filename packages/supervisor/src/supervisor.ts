@@ -1,3 +1,6 @@
+import { homedir } from "node:os";
+import { DIRECT_SCOPED_SKILL_INPUT_CAPABILITY, LOCAL_SKILL_EXPORT_MIN_CORE_CONTRACT_VERSION, LOCAL_SKILL_EXPORT_RUNTIME_CAPABILITY } from "@konteks/backstage-plugin-common/remote-instance-internal";
+import { LocalSkillExchange } from "./native/local-skill-exchange.js";
 import { NativeWorkspaceCheckpointStore } from "./native/workspace-preservation.js";
 import { checkpointCause } from "./native/workspace-checkpoint-failure.js";
 import { logicalSessionId } from "./work/continued-session.js";
@@ -301,6 +304,7 @@ export class Supervisor {
   private configuration: ConfigRecord["configuration"] = DEFAULT_CONFIG;
   private hostSettings = { openCodeFreeModels: false, coreAcceptsRouteBilling: false };
   /** The Core wire-contract version from the applied desired configuration (absent before one is applied). */
+  private localSkillExchange?: LocalSkillExchange;
   private coreContractVersion: string | undefined;
   /** Runs `integration` work; composed with the native runners. */
   private integrationCarrier: IntegrationWorkCarrier | undefined;
@@ -695,6 +699,24 @@ export class Supervisor {
   }
 
   private composeInventory(native: NativeOptions): void {
+    const homes = native.runners.flatMap(runner => {
+      if (runner.RUNNER_AGENT_ID === "claude-code") return [join(homedir(), ".claude")];
+      if (runner.RUNNER_AGENT_ID === "opencode") {
+        const config = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
+        return [join(config, "opencode")];
+      }
+      return runner.RUNNER_NATIVE_CODEX_HOME ? [runner.RUNNER_NATIVE_CODEX_HOME] : [];
+    });
+    const skillVerifier = new CoreSignatureVerifier(this.roots);
+    if (homes.length && skillVerifier.configured) {
+      this.localSkillExchange = new LocalSkillExchange({
+        core: this.core,
+        verifier: skillVerifier,
+        homes: () => homes,
+        now: () => this.clock.coreNow(),
+        identity: () => this.localSkillOwner(),
+      });
+    }
     // The personal Claude Code executable a claude-code runner runs: its
     // version and digest ride the capabilities.
     const claudeExecutable = native.runners.find(runner => runner.RUNNER_AGENT_ID === "claude-code")?.RUNNER_NATIVE_CLAUDE_EXECUTABLE;
@@ -720,7 +742,8 @@ export class Supervisor {
       agentLoginBrowserReady: () => this.runners.has("claude-code") && !this.stopping && this.relay !== null && this.relay !== undefined && machineHasDesktop(),
       additionalCapabilities: () => [...this.openCodeCapabilities(), ...this.antigravityCapabilities(), ...this.onComputerCapabilities(), ...(this.browserToolReady() ? [BROWSER_TOOL_CAPABILITY] : []),
         ...(this.integrationCarrier ? integrationTaskCapabilities(this.runners.keys(), this.coreContractVersion) : []), ...this.runtimeUpdateCapabilities(),
-        ...this.assignmentNudgeCapabilities()],
+        ...this.assignmentNudgeCapabilities(), ...this.localSkillCapabilities(),
+        ...this.directSkillCapabilities(native)],
       decorateAgents: agents => this.withAntigravityDownload(agents),
       // Previews reach a viewer only over the relay's preview channel.
       previewReady: () => this.previewCapable(),
@@ -1321,6 +1344,7 @@ export class Supervisor {
           },
         }),
         prepareInputs: native.prepareInputs ?? createNativeInputPreparer({
+          scopedSkillInputs: () => coreContractAtLeast(this.coreContractVersion, LOCAL_SKILL_EXPORT_MIN_CORE_CONTRACT_VERSION),
           onRuntimeFailure: (fact, context) => this.recordRuntimeFailure(assignment, fact, context),
           workspaceRecovery: () => coreContractAtLeast(this.coreContractVersion, REMOTE_WORKSPACE_CHECKPOINT_MIN_CORE_CONTRACT_VERSION),
           workspaceChunks: () => coreContractAtLeast(this.coreContractVersion, REMOTE_WORKSPACE_CHUNK_MIN_CORE_CONTRACT_VERSION),
@@ -2227,6 +2251,22 @@ export class Supervisor {
     });
   }
 
+  private directSkillCapabilities(native: NativeOptions): string[] {
+    return !native.prepareInputs && coreContractAtLeast(this.coreContractVersion, LOCAL_SKILL_EXPORT_MIN_CORE_CONTRACT_VERSION)
+      ? [DIRECT_SCOPED_SKILL_INPUT_CAPABILITY] : [];
+  }
+
+  private localSkillCapabilities(): string[] {
+    return this.localSkillExchange && coreContractAtLeast(this.coreContractVersion, LOCAL_SKILL_EXPORT_MIN_CORE_CONTRACT_VERSION)
+      ? [LOCAL_SKILL_EXPORT_RUNTIME_CAPABILITY] : [];
+  }
+
+  private localSkillOwner(): { workspaceId: string; instanceId: string } | null {
+    if (this.stopping || this.draining || !this.instanceId || !this.workspaceId ||
+      this.lease.mode() !== "active" || this.localSkillCapabilities().length === 0) return null;
+    return { workspaceId: this.workspaceId, instanceId: this.instanceId };
+  }
+
   private async adoptHeartbeat(result: HeartbeatResult, assertCurrent: () => void): Promise<void> {
     if (this.stopping) return;
     const claims = decodeLeaseClaims(result.lease, { instanceId: this.instanceId ?? "", audience: LEASE_AUDIENCE });
@@ -2236,6 +2276,7 @@ export class Supervisor {
     if (claims.exp * 1000 <= this.clock.coreNow()) throw new RemoteInstanceError("temporarily_unavailable", "Heartbeat returned an expired lease.");
     await this.adoptLease(result.lease, assertCurrent);
     if (!this.stopping) this.heartbeatIntervalSeconds = result.heartbeatIntervalSeconds;
+    this.localSkillExchange?.kick();
   }
 
   private async onHeartbeatFailure(error: unknown): Promise<void> {
@@ -3507,6 +3548,7 @@ export class Supervisor {
   stop(): Promise<void> {
     this.leaseAuthorityEpoch++;
     this.stopping = true;
+    this.localSkillExchange?.stop();
     // Before anything that can outlast the daemon's exit watchdog.
     this.nativeCodexOwner?.shutdownRequested();
     this.draining = true;

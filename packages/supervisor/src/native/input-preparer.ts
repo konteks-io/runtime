@@ -50,6 +50,7 @@ import { reportRuntimeFailure, type RuntimeFailureFact, type RuntimeFailureRepor
 import { deliveryStep, tagDeliveryOutputStage, type DeliveryOutputStage } from "./delivery-output-failure.js";
 
 interface NativeInputPreparerOptions {
+  scopedSkillInputs?: () => boolean;
   /** Signed Core contract gate; older Core never receives checkpoint requests. */
   workspaceRecovery?: () => boolean;
   workspaceChunks?: () => boolean;
@@ -732,20 +733,25 @@ class InputPreparation {
     await this.beginWorkspacePreservation(inputs, source);
     this.enter("organization_skills");
     const prepared = withSessionContext(source, await this.skills(inputs, root, source.cwd, direct));
-    await this.grantSandboxRead(current.agentRoute.agentId, prepared);
-    this.logStage("skills", this.elapsed());
-    this.enter("source_verification");
-    await source.verify();
-    this.logStage("verify", this.elapsed());
-    const outputHead = await this.outputHead(inputs, root, source);
-    return {
-      ...prepared,
-      ...preparedSourceFlags(inputs.selection, direct),
-      skillInstructions: skillInstructions(current, inputs.selection.repository, prepared.skillInstructions),
-      beforePrompt: this.beforePrompt(inputs, source, prepared),
-      ...this.deliveryOutput(inputs, source, outputHead),
-      ...(wiringOf.task ? { toolWiring: wiringOf.task } : {}),
-    };
+    try {
+      await this.grantSandboxRead(current.agentRoute.agentId, prepared);
+      this.logStage("skills", this.elapsed());
+      this.enter("source_verification");
+      await source.verify();
+      this.logStage("verify", this.elapsed());
+      const outputHead = await this.outputHead(inputs, root, source);
+      return {
+        ...prepared,
+        ...preparedSourceFlags(inputs.selection, direct),
+        skillInstructions: skillInstructions(current, inputs.selection.repository, prepared.skillInstructions),
+        beforePrompt: this.beforePrompt(inputs, source, prepared),
+        ...this.deliveryOutput(inputs, source, outputHead),
+        ...(wiringOf.task ? { toolWiring: wiringOf.task } : {}),
+      };
+    } catch (error) {
+      await prepared.disposeSkillInputs?.().catch(() => undefined);
+      throw error;
+    }
   }
 
   recordFailure(error: unknown): void {
@@ -895,12 +901,16 @@ class InputPreparation {
       ...(this.options.logger ? { logger: this.options.logger } : {}) });
   }
 
-  /** No skills and no instructions for a direct session: the person's text reaches the agent as typed. */
+  /** Direct sessions only stage Skills when Core selected explicit scoped shares. */
   private skills(inputs: AuthorizedInputs, root: string, cwd: string, direct: boolean): Promise<PreparedSessionInputs> {
-    if (direct) return prepareDirectSessionInputs({ cwd, binding: inputs.selection.binding });
+    const isolated = this.options.scopedSkillInputs?.() ?? false;
+    if (direct && (!isolated || inputs.selection.skills.skills.length === 0)) {
+      return prepareDirectSessionInputs({ cwd, binding: inputs.selection.binding });
+    }
     return prepareOrganizationSkillSession({
       cwd,
       scratchRoot: join(root, "skills"),
+      isolated,
       catalog: inputs.selection.skills,
       authority: { binding: inputs.selection.binding, catalogDigest: inputs.selection.skills.catalogDigest },
       now: () => this.options.clock.coreNow(),
