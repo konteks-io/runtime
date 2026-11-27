@@ -326,6 +326,27 @@ describe("native shared repository cache", () => {
     expect((await testGitCommand(f.tool, refreshed.cwd, ["rev-parse", "HEAD"])).trim()).toBe(second);
   });
 
+  it("refreshes a QA worktree whose tracked files a tool wiring hid with skip-worktree", async () => {
+    const f = await fixture();
+    const input = { repositoryId: "repository:online-store", agentWorkspaceRoot: f.codexRoot,
+      worktreeId: "qa-session", mode: "reset_to_revision" as const };
+    const qa = await f.cache.prepare({ ...input, revision: f.first });
+    // Graft wiring edits tracked agent files and hides the edit from the delivered change.
+    await writeFile(join(qa.cwd, "app.txt"), "wired locally\n");
+    await testGitCommand(f.tool, qa.cwd, ["update-index", "--skip-worktree", "--", "app.txt"]);
+    await writeFile(join(f.seed, "app.txt"), "two\n");
+    await testGitCommand(f.tool, f.seed, ["add", "app.txt"]);
+    await testGitCommand(f.tool, f.seed, ["-c", "user.name=Test", "-c", "user.email=test@invalid", "commit", "-m", "two"]);
+    const second = (await testGitCommand(f.tool, f.seed, ["rev-parse", "HEAD"])).trim();
+    await testGitCommand(f.tool, f.seed, ["push", f.origin, "HEAD:refs/heads/main"]);
+
+    const refreshed = await f.cache.prepare({ ...input, revision: second });
+
+    expect(await readFile(join(refreshed.cwd, "app.txt"), "utf8")).toBe("two\n");
+    expect((await testGitCommand(f.tool, refreshed.cwd, ["rev-parse", "HEAD"])).trim()).toBe(second);
+    expect(await testGitCommand(f.tool, refreshed.cwd, ["ls-files", "-v"])).toBe("H app.txt\n");
+  });
+
   it("isolates a completed shared-store workspace without losing its dirty index", async () => {
     const { f, repositoryId, cwd, shared } = await legacyWorkspace();
     const before = await testGitCommand(f.tool, cwd, ["status", "--porcelain"]);
