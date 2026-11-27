@@ -136,21 +136,21 @@ it('restores before acknowledging the handoff and reuses later uncommitted chang
   expect(next!.cwd).toBe(recovered!.cwd); expect(await readFile(join(next!.cwd, 'file.txt'), 'utf8')).toBe('next unfinished edit');
   await expect(new NativeRecoveredWorkspaceStore({ root: targetRoot, client: () => api, tool }).prepare({ ...input,
     selection: { ...selection, workspaceRecovery: { ...workspaceRecovery, checkpointDigest: `sha256:${'b'.repeat(64)}` } },
-  })).rejects.toMatchObject({ code: 'recovery_required' });
+  })).rejects.toMatchObject({ code: 'recovery_required', diagnostic: 'recovery_reference_mismatch' });
   if (process.platform !== 'win32') {
     const configPath = join(next!.cwd, '.git', 'config'); const external = join(root, 'config-copy');
     await writeFile(external, await readFile(configPath)); await unlink(configPath); await symlink(external, configPath);
-    await expect(new NativeRecoveredWorkspaceStore({ root: targetRoot, client: () => api, tool }).prepare(input)).rejects.toMatchObject({ code: 'recovery_required' });
+    await expect(new NativeRecoveredWorkspaceStore({ root: targetRoot, client: () => api, tool }).prepare(input)).rejects.toMatchObject({ code: 'recovery_required', diagnostic: 'storage_not_a_file' });
   }
 
   const changedTool = { ...tool, digest: `sha256:${'0'.repeat(64)}` };
-  await expect(new NativeRecoveredWorkspaceStore({ root: targetRoot, client: () => api, tool: changedTool }).prepare(input)).rejects.toMatchObject({ code: 'capability_unavailable' });
+  await expect(new NativeRecoveredWorkspaceStore({ root: targetRoot, client: () => api, tool: changedTool }).prepare(input)).rejects.toMatchObject({ code: 'capability_unavailable', diagnostic: 'git_tool_changed' });
   // D105: the session comes back here at a newer published commit. Without
   // leave to continue it still waits; with it, the restored folder is kept
   // exactly as it is and the turn continues from the published commit.
   const moved = { ...selection, workspaceRecovery: undefined, repository: { ...selection.repository!, revision: 'c'.repeat(40) } };
   await expect(new NativeRecoveredWorkspaceStore({ root: targetRoot, client: () => api, tool }).prepare({ ...input, selection: moved }))
-    .rejects.toMatchObject({ code: 'recovery_required' });
+    .rejects.toMatchObject({ code: 'recovery_required', diagnostic: 'recovered_revision_changed' });
   await expect(new NativeRecoveredWorkspaceStore({ root: targetRoot, client: () => api, tool }).prepare({ ...input, selection: moved },
     { retireStale: true })).resolves.toBeNull();
   expect(await readFile(join(next!.cwd, 'file.txt'), 'utf8')).toBe('next unfinished edit');

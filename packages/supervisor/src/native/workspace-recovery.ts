@@ -1,15 +1,16 @@
 import { lstat, mkdir, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod/v4";
-import { canonicalize, createLogger, RemoteWorkspaceChunkSchema, RemoteInstanceError, RemoteWorkspaceAnyCheckpointSchema, RemoteWorkspaceRecoveryReferenceSchema, sha256Hex,
+import { canonicalize, createLogger, RemoteWorkspaceChunkSchema, RemoteWorkspaceAnyCheckpointSchema, RemoteWorkspaceRecoveryReferenceSchema, sha256Hex,
   type RemoteAssignmentInputsEnvelope, type RemoteWorkAssignment } from "@konteks/remote-common";
 import { restoreWorkspaceCheckpoint, verifyRestoredWorkspaceCheckpoint } from "./workspace-checkpoint.js";
 import { privateWorkspaceDirectory, readPrivateWorkspaceFile, readWorkspaceControlFile, writePrivateWorkspaceJson } from "./workspace-storage.js";
 import { verifyNativeGitTool, type NativeGitTool } from "./git-workspace.js";
 import type { NativeInputClient } from "./input-client.js";
+import { NamedRefusal } from "./named-refusal.js";
 
 const logger = createLogger({ name: "native-recovered-workspace" });
-const unavailable = () => new RemoteInstanceError("recovery_required", "The preserved workspace could not be restored and verified. Existing work was kept.");
+const unavailable = (diagnostic: string) => new NamedRefusal("recovery_required", "The preserved workspace could not be restored and verified. Existing work was kept.", diagnostic);
 const ReceiptSchema = z.object({ version: z.literal(1), workspaceId: z.string(), sessionId: z.string(),
   reference: RemoteWorkspaceRecoveryReferenceSchema, configDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/), writing: z.boolean(), retired: z.boolean() }).strict();
 type Receipt = z.infer<typeof ReceiptSchema>;
@@ -48,7 +49,7 @@ export class NativeRecoveredWorkspaceStore {
    */
   private async changedRevision(input: Input, pointer: string, folder: string, active: Receipt, options: { retireStale?: boolean }): Promise<null> {
     const reset = input.selection.repositoryWorkspace?.mode === "reset_to_revision";
-    if (!reset && !options.retireStale) throw unavailable();
+    if (!reset && !options.retireStale) throw unavailable("recovered_revision_changed");
     await writePrivateWorkspaceJson(folder, pointer, { ...active, retired: true });
     if (!reset) {
       logger.warn({ event: "native.repository.stale_checkout", outcome: "kept", verdict: "recovered",
@@ -65,9 +66,9 @@ export class NativeRecoveredWorkspaceStore {
 
   private async restore(input: Input, target: { folder: string; key: string; pointer: string }): Promise<Workspace> {
     const reference = RemoteWorkspaceRecoveryReferenceSchema.parse(input.selection.workspaceRecovery);
-    if (reference.repositoryId !== input.selection.repository?.repositoryId) throw unavailable();
+    if (reference.repositoryId !== input.selection.repository?.repositoryId) throw unavailable("recovery_repository_mismatch");
     const checkpoint = RemoteWorkspaceAnyCheckpointSchema.parse(await this.options.client().workspace(input.assignment, "read", this.request(input, reference.checkpointId)));
-    if (checkpoint.checkpointDigest !== reference.checkpointDigest || checkpoint.baselineCommit !== reference.baselineCommit || checkpoint.format !== (reference.format ?? "konteks-workspace-checkpoint-v1")) throw unavailable();
+    if (checkpoint.checkpointDigest !== reference.checkpointDigest || checkpoint.baselineCommit !== reference.baselineCommit || checkpoint.format !== (reference.format ?? "konteks-workspace-checkpoint-v1")) throw unavailable("recovery_checkpoint_mismatch");
     const container = join(target.folder, `${target.key}-${reference.checkpointId}`);
     const cwd = join(container, "source");
     if (!await exists(container)) await restoreWorkspaceCheckpoint({ destination: container, tool: this.options.tool, checkpoint,
@@ -84,7 +85,7 @@ export class NativeRecoveredWorkspaceStore {
   private async readChunk(input: Input, checkpointId: string, chunkDigest: string): Promise<Buffer> {
     const chunk = RemoteWorkspaceChunkSchema.parse(await this.options.client().workspace(input.assignment, "read-chunk", {
       ...this.request(input, checkpointId), chunkDigest }));
-    if (chunk.digest !== chunkDigest) throw unavailable();
+    if (chunk.digest !== chunkDigest) throw unavailable("recovery_chunk_digest_mismatch");
     return Buffer.from(chunk.contentBase64, "base64");
   }
 
@@ -96,9 +97,9 @@ export class NativeRecoveredWorkspaceStore {
     await verify();
     if (!receipt.writing) {
       const bytes = await readPrivateWorkspaceFile(join(container, "checkpoint.json"), 90 * 1024 * 1024);
-      if (!bytes) throw unavailable();
+      if (!bytes) throw unavailable("recovered_checkpoint_record_missing");
       const checkpoint = RemoteWorkspaceAnyCheckpointSchema.parse(JSON.parse(bytes.toString("utf8")));
-      if (checkpoint.checkpointDigest !== receipt.reference.checkpointDigest) throw unavailable();
+      if (checkpoint.checkpointDigest !== receipt.reference.checkpointDigest) throw unavailable("recovered_checkpoint_digest_mismatch");
       await verifyRestoredWorkspaceCheckpoint({ cwd, tool: this.options.tool, checkpoint });
       const acknowledgement = await this.options.client().workspace(input.assignment, "acknowledge", {
         ...this.request(input, receipt.reference.checkpointId), checkpointDigest: receipt.reference.checkpointDigest });
@@ -112,9 +113,9 @@ export class NativeRecoveredWorkspaceStore {
     await verifyNativeGitTool(this.options.tool);
     await privateWorkspaceDirectory(this.options.root); await privateWorkspaceDirectory(cwd); await privateWorkspaceDirectory(join(cwd, ".git"));
     const actual = await lstat(cwd);
-    if (actual.ino !== identity.ino || actual.dev !== identity.dev) throw unavailable();
+    if (actual.ino !== identity.ino || actual.dev !== identity.dev) throw unavailable("recovered_checkout_replaced");
     const config = await requiredGitConfig(cwd);
-    if (`sha256:${sha256Hex(config)}` !== receipt.configDigest) throw unavailable();
+    if (`sha256:${sha256Hex(config)}` !== receipt.configDigest) throw unavailable("recovered_git_config_changed");
   }
 }
 
@@ -127,7 +128,7 @@ async function exists(path: string): Promise<boolean> {
 
 function checkAcknowledgement(value: unknown, reference: Receipt["reference"]): void {
   const checked = z.object({ checkpointId: z.string().uuid(), checkpointDigest: z.string(), state: z.literal("restored") }).strict().parse(value);
-  if (checked.checkpointId !== reference.checkpointId || checked.checkpointDigest !== reference.checkpointDigest) throw unavailable();
+  if (checked.checkpointId !== reference.checkpointId || checked.checkpointDigest !== reference.checkpointDigest) throw unavailable("recovery_acknowledgement_mismatch");
 }
 
 function needsRestore(reference: Input["selection"]["workspaceRecovery"], active: Receipt | null): boolean {
@@ -135,15 +136,15 @@ function needsRestore(reference: Input["selection"]["workspaceRecovery"], active
 }
 
 function assertRepositoryOwner(active: Receipt, workspaceId: string, sessionId: string, repositoryId: string): void {
-  if (active.workspaceId !== workspaceId || active.sessionId !== sessionId || active.reference.repositoryId !== repositoryId) throw unavailable();
+  if (active.workspaceId !== workspaceId || active.sessionId !== sessionId || active.reference.repositoryId !== repositoryId) throw unavailable("recovered_owner_mismatch");
 }
 
 async function requiredGitConfig(cwd: string): Promise<Buffer> {
   const bytes = await readWorkspaceControlFile(join(cwd, ".git", "config"));
-  if (!bytes) throw unavailable();
+  if (!bytes) throw unavailable("recovered_git_config_missing");
   return bytes;
 }
 
 function assertSameReference(reference: Input["selection"]["workspaceRecovery"], active: Receipt["reference"]): void {
-  if (reference && canonicalize(reference as never) !== canonicalize(active as never)) throw unavailable();
+  if (reference && canonicalize(reference as never) !== canonicalize(active as never)) throw unavailable("recovery_reference_mismatch");
 }

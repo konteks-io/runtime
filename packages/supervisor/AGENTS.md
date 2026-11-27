@@ -198,6 +198,14 @@ QA browser, structured results, updates and doctor/support.
   `workspace_capture_file_hardlinked` (`native/workspace-checkpoint-failure.ts`).
   A stop waits only for `capture()`; sending the copy runs after the stop has
   settled, because it can take an hour and the next attempt waits on the stop.
+  Input preparation does the same (11-25: QA turns failed `source_workspace`
+  with a bare `capability_unavailable`): every refusal from `selection` on,
+  through the repository cache, worktree isolation, recovered workspaces,
+  output state and skill staging, is a `NamedRefusal`, and a step that
+  re-raises what it caught keeps the inner name (`innerDiagnostic`).
+  `native.inputs.prepare_failed` logs the `diagnostic`, and the preparation
+  runtime failure carries it in its stage, e.g.
+  `source_workspace_worktree_stale_checkout_refused`.
 - A turn whose output Harness accepted but whose acceptance reply never
   arrived stays `pending` here. When Core's signed selection names that exact
   candidate (same result digest) as the accepted result, the session head

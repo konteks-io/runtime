@@ -460,11 +460,11 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-function unavailable(diagnostic?: string) {
+function unavailable(diagnostic: string) {
   return new RemoteInstanceError(
     "capability_unavailable",
     "Required assignment inputs are unavailable or no longer authorized.",
-    diagnostic === undefined ? undefined : { diagnostic },
+    { diagnostic },
   );
 }
 

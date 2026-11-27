@@ -26,6 +26,11 @@ export class NamedRefusal extends RemoteInstanceError {
   }
 }
 
+/** The check an inner refusal named, for a step that re-raises everything it caught as its own refusal. */
+export function innerDiagnostic(error: unknown, fallback: string): string {
+  return error instanceof RemoteInstanceError && error.diagnostic ? error.diagnostic : fallback;
+}
+
 const IDENTIFIER = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/;
 
 /** A runtime failure's stage (96) or code (64): a stable snake_case identifier, or nothing. */
