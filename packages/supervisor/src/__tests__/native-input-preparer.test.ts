@@ -427,7 +427,7 @@ describe("native authorized input composition", () => {
     const onRuntimeFailure = vi.fn(async (_fact: unknown, _context: unknown) => undefined);
     const options = { ...f.options, root, onRuntimeFailure };
     await expect(createNativeInputPreparer(options)(assignment))
-      .rejects.toMatchObject({ code: "capability_unavailable", retryable: false });
+      .rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "input_preparation_withheld", retryable: false });
     expect(onRuntimeFailure).toHaveBeenCalledExactlyOnceWith({
       phase: "preparation", stage: "private_root", code: "local_preparation_failed",
       evidence: { kind: "runtime_exception", errno: "EEXIST" },
@@ -444,7 +444,7 @@ describe("native authorized input composition", () => {
     });
     const options = { ...f.options, root, onRuntimeFailure };
     await expect(createNativeInputPreparer(options)(assignment))
-      .rejects.toMatchObject({ code: "capability_unavailable", retryable: false });
+      .rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "input_preparation_withheld", retryable: false });
     expect(onRuntimeFailure).toHaveBeenCalledOnce();
     await Promise.resolve();
   });
@@ -463,6 +463,30 @@ describe("native authorized input composition", () => {
     expect(dispatchFailureOutcome(caught, "7.13")).toEqual({ class: "failed", reason: "workspace_policy_invalid" });
     expect(await readFile(join(prepared.cwd, "retained.txt"), "utf8")).toBe("unpublished work");
     expect((await testGitCommand(f.git, prepared.cwd, ["config", "core.hooksPath"])).trim()).toBe(".husky/_");
+  });
+
+  it.each([
+    ["worktree_receipt_malformed", (receipt: Record<string, unknown>) => ({ ...receipt, baselineCommit: "not-a-commit" })],
+    ["worktree_stale_checkout_refused", (receipt: Record<string, unknown>) => ({ ...receipt, baselineCommit: "b".repeat(40) })],
+  ])("names the source-workspace check that refused (%s) in the log, and reports Core the unchanged failure", async (diagnostic, tamper) => {
+    const f = await repositoryFixture(continuityFiles);
+    const cacheRoot = join(f.root, "cache");
+    const warn = vi.fn();
+    const onRuntimeFailure = vi.fn(async (_fact: unknown, _context: unknown) => undefined);
+    const options = { ...f.options, git: f.git, repositoryCacheRoot: cacheRoot, logger: { warn }, onRuntimeFailure };
+    const prepare = createNativeInputPreparer(options);
+    await prepare(assignment);
+    const [receiptName] = (await readdir(cacheRoot)).filter(name => name.endsWith(".konteks-worktree.json"));
+    const receiptPath = join(cacheRoot, receiptName!);
+    await writeFile(receiptPath, JSON.stringify(tamper(JSON.parse(await readFile(receiptPath, "utf8")))));
+    f.fetchFn.mockClear();
+
+    await expect(prepare(assignment)).rejects.toMatchObject({ code: "capability_unavailable", retryable: false });
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({ event: "native.inputs.prepare_failed", stage: "source_workspace",
+      code: "capability_unavailable", retryable: false, diagnostic }), "native input preparation failed");
+    expect(onRuntimeFailure).toHaveBeenCalledExactlyOnceWith({ phase: "preparation", stage: "source_workspace",
+      code: "capability_unavailable", evidence: { kind: "runtime_exception" } }, { assignmentId: assignment.id, attempt: assignment.attempt });
+    expect(f.fetchFn.mock.calls.filter(([url]) => String(url).endsWith("/fetch-repository"))).toHaveLength(0);
   });
 
   it("preserves the typed workspace policy verdict through the real input factory", async () => {
@@ -490,7 +514,7 @@ describe("native authorized input composition", () => {
     let caught: unknown;
     try { await createNativeInputPreparer({ ...f.options, client: () => client })(assignment); }
     catch (error) { caught = error; }
-    expect(caught).toMatchObject({ code: "capability_unavailable", retryable: false });
+    expect(caught).toMatchObject({ code: "capability_unavailable", diagnostic: "input_preparation_withheld", retryable: false });
     expect(caught).not.toHaveProperty("diagnostic", "workspace_policy_invalid");
     expect(dispatchFailureOutcome(caught, "7.13")).toEqual({ class: "failed", reason: "internal" });
   });
@@ -500,7 +524,7 @@ describe("native authorized input composition", () => {
     vi.spyOn(client, "prepare").mockRejectedValueOnce(new Error("EACCES at /Users/private-person/provider-token"));
     const onRuntimeFailure = vi.fn(async (_fact: unknown, _context: unknown) => undefined);
     const options = { ...f.options, client: () => client, onRuntimeFailure };
-    await expect(createNativeInputPreparer(options)(assignment)).rejects.toMatchObject({ code: "capability_unavailable" });
+    await expect(createNativeInputPreparer(options)(assignment)).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "input_preparation_withheld" });
     expect(onRuntimeFailure).toHaveBeenCalledExactlyOnceWith({
       phase: "preparation", stage: "selection", code: "local_preparation_failed",
       evidence: { kind: "runtime_exception" },
@@ -529,7 +553,7 @@ describe("native authorized input composition", () => {
       const onRuntimeFailure = vi.fn(async (_fact: unknown, _context: unknown) => undefined);
 
       await expect(createNativeInputPreparer({ ...f.options, onRuntimeFailure })(assignment))
-        .rejects.toMatchObject({ code: "capability_unavailable", retryable: false });
+        .rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "input_preparation_withheld", retryable: false });
       await expect(readFile(receipt)).rejects.toMatchObject({ code: "ENOENT" });
       expect(await readFile(join(prepared.cwd, "local-work.txt"), "utf8"))
         .toBe("retained private-receipt-path-canary");
@@ -556,7 +580,7 @@ describe("native authorized input composition", () => {
       const onRuntimeFailure = vi.fn(async (_fact: unknown, _context: unknown) => undefined);
 
       await expect(createNativeInputPreparer({ ...f.options, onRuntimeFailure })(assignment))
-        .rejects.toMatchObject({ code: "capability_unavailable", retryable: false });
+        .rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "input_preparation_withheld", retryable: false });
       expect(await readFile(receipt, "utf8")).toBe(invalidReceipt);
       expect(await readFile(join(prepared.cwd, "local-work.txt"), "utf8")).toBe("retain this work");
       expect(f.fetchFn.mock.calls.filter(([url]) => String(url).endsWith("/inputs/read"))).toHaveLength(0);
@@ -583,7 +607,7 @@ describe("native authorized input composition", () => {
       const onRuntimeFailure = vi.fn(async (_fact: unknown, _context: unknown) => undefined);
 
       await expect(createNativeInputPreparer({ ...f.options, onRuntimeFailure })(assignment))
-        .rejects.toMatchObject({ code: "capability_unavailable", retryable: false });
+        .rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "input_preparation_withheld", retryable: false });
       expect(await readdir(f.root)).toEqual([]);
       expect(f.fetchFn.mock.calls.filter(([url]) => String(url).endsWith("/inputs/read"))).toHaveLength(1);
       expectNoPrivateErrorFields(onRuntimeFailure.mock.calls[0]?.[0]);
@@ -616,7 +640,7 @@ describe("native authorized input composition", () => {
       const onRuntimeFailure = vi.fn(async (_fact: unknown, _context: unknown) => undefined);
 
       await expect(createNativeInputPreparer({ ...f.options, git, onRuntimeFailure })(target))
-        .rejects.toMatchObject({ code: "capability_unavailable", retryable: false });
+        .rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "input_preparation_withheld", retryable: false });
       expect(await readdir(f.root)).toEqual([]);
       expect(onRuntimeFailure).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
         phase: "preparation", stage: "source_transfer_read", code: "response_status_invalid",
@@ -640,7 +664,7 @@ describe("native authorized input composition", () => {
       const onRuntimeFailure = vi.fn(async (_fact: unknown, _context: unknown) => undefined);
 
       await expect(createNativeInputPreparer({ ...f.options, onRuntimeFailure })(assignment))
-        .rejects.toMatchObject({ code: "capability_unavailable", retryable: false });
+        .rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "input_preparation_withheld", retryable: false });
       expect(await readFile(receipt, "utf8")).toBe(priorReceipt);
       expect(await readFile(join(blockedFile, "agent-work.txt"), "utf8")).toBe("private-overlay-canary");
       expect(await readFile(join(prepared.cwd, "memory/conversation.md"), "utf8"))
@@ -675,7 +699,7 @@ describe("native authorized input composition", () => {
   it("ends a permanent refusal at selection as terminal", async () => {
     const f = await fixture();
     f.fetchFn.mockImplementation(async () => new Response(null, { status: 404 }));
-    await expect(createNativeInputPreparer(f.options)(assignment)).rejects.toMatchObject({ code: "capability_unavailable", retryable: false });
+    await expect(createNativeInputPreparer(f.options)(assignment)).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "input_preparation_withheld", retryable: false });
     expect(f.fetchFn).toHaveBeenCalledTimes(1);
   });
   it("initializes Git for a repository source and preserves its baseline and edits on restart", async () => {
@@ -774,7 +798,7 @@ describe("native authorized input composition", () => {
     const f = await fixture(),
       prepared = await createNativeInputPreparer(f.options)(assignment);
     f.revoke();
-    await expect(prepared.beforePrompt()).rejects.toMatchObject({ code: "capability_unavailable" });
+    await expect(prepared.beforePrompt()).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "prompt_recheck_failed" });
     const g = await fixture(),
       other = await createNativeInputPreparer(g.options)(assignment);
     g.unclaim();
@@ -791,9 +815,12 @@ describe("native authorized input composition", () => {
     "never imports repository metadata %s",
     async (path) => {
       const f = await fixture({ [path]: "unsafe" });
-      await expect(createNativeInputPreparer(f.options)(assignment)).rejects.toMatchObject({
-        code: "capability_unavailable",
+      const warn = vi.fn();
+      await expect(createNativeInputPreparer({ ...f.options, logger: { warn } })(assignment)).rejects.toMatchObject({
+        code: "capability_unavailable", diagnostic: "input_preparation_withheld",
       });
+      expect(warn).toHaveBeenCalledWith(expect.objectContaining({ event: "native.inputs.prepare_failed", stage: "source_workspace",
+        diagnostic: "source_materialize_git_metadata" }), "native input preparation failed");
     },
   );
   it("rejects a replaced or linked workspace without touching its target", async () => {

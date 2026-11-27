@@ -48,7 +48,7 @@ describe("durable native output state", () => {
 
   it("fails closed on a corrupt or overly permissive record", async () => {
     await writeFile(join(dir, "delivery-output.json"), "{}\n", { mode: 0o644 });
-    await expect(new NativeOutputStore(dir).read()).rejects.toThrow();
+    await expect(new NativeOutputStore(dir).read()).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "output_record_not_private" });
   });
 
   it("rejects an accepted record whose receipt belongs to another frozen result", async () => {
@@ -61,7 +61,7 @@ describe("durable native output state", () => {
       receipt: { ...receipt, resultId: "another-result" },
     }), { mode: 0o600 });
 
-    await expect(new NativeOutputStore(dir).read()).rejects.toThrow();
+    await expect(new NativeOutputStore(dir).read()).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "output_record_unreadable" });
   });
 
   it("never overwrites a frozen pending candidate with different bytes", async () => {
@@ -79,7 +79,7 @@ describe("durable native output state", () => {
     await head.record(old).saveAccepted(accepted.candidate, accepted.receipt); await head.promote(old);
     const current = { invocationId: "next", claimId: "next-claim" };
     const expected = { ...old, acceptanceId: accepted.receipt.acceptanceId, resultDigest: accepted.receipt.resultDigest };
-    await expect(head.recoverVerifiedAcceptance({ ...expected, invocationId: "foreign" }, current, `sha256:${"a".repeat(64)}`)).rejects.toThrow();
+    await expect(head.recoverVerifiedAcceptance({ ...expected, invocationId: "foreign" }, current, `sha256:${"a".repeat(64)}`)).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "output_recovery_latest_mismatch" });
     await head.verifyExpected(expected, current);
     expect((await head.record(old).read())?.state).toBe("accepted");
   });
@@ -151,7 +151,7 @@ describe("durable native output state", () => {
     await head.record(lostPromotion).saveAccepted(later.candidate, later.receipt);
 
     const expected = { ...first, acceptanceId: accepted.receipt.acceptanceId, resultDigest: accepted.receipt.resultDigest };
-    await expect(head.recoverVerifiedAcceptance(expected, { invocationId: "next", claimId: "claim-next" }, `sha256:${"a".repeat(64)}`)).rejects.toThrow();
+    await expect(head.recoverVerifiedAcceptance(expected, { invocationId: "next", claimId: "claim-next" }, `sha256:${"a".repeat(64)}`)).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "output_abandoned_turn_accepted" });
     expect((await head.record(lostPromotion).read())?.state).toBe("accepted");
   });
 
@@ -192,7 +192,7 @@ describe("durable native output state", () => {
     await head.begin(repair); await head.record(repair).savePending(lost.candidate, lost.completion);
 
     const expected = { ...repair, acceptanceId: lost.receipt.acceptanceId, resultDigest: `sha256:${"b".repeat(64)}` };
-    await expect(head.verifyExpected(expected, { invocationId: "next", claimId: "claim-next" })).rejects.toThrow();
+    await expect(head.verifyExpected(expected, { invocationId: "next", claimId: "claim-next" })).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "output_expected_not_accepted" });
     expect((await head.record(repair).read())?.state).toBe("pending");
   });
 

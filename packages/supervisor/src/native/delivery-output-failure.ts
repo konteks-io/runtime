@@ -1,6 +1,6 @@
 import { RemoteInstanceError } from "@konteks/remote-common";
 import type { RuntimeFailureFact } from "../runtime-failure-types.js";
-import { diagnosticIdentifier, hasSyscall, NamedRefusal, refusalEvidence, type RefusalFacts } from "./named-refusal.js";
+import { diagnosticIdentifier, hasSyscall, NamedRefusal, refusalEvidence, reportedDiagnostic, type RefusalFacts } from "./named-refusal.js";
 
 export { diagnosticIdentifier };
 
@@ -64,7 +64,7 @@ function identifier(value: string, max: number, fallback: string): string {
 
 /** The refusal's stable identifier for a log line: its diagnostic when it has one. */
 function deliveryOutputCode(error: unknown): string {
-  if (error instanceof RemoteInstanceError) return identifier(error.diagnostic ?? error.code, 64, error.code);
+  if (error instanceof RemoteInstanceError) return identifier(reportedDiagnostic(error) ?? error.code, 64, error.code);
   return hasSyscall(error) ? "filesystem_error" : "delivery_output_transfer_failed";
 }
 

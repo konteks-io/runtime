@@ -6,7 +6,6 @@ import { z } from "zod";
 import {
   RemoteDeliveryAcceptanceReceiptSchema,
   RemoteDeliveryResultCandidateSchema,
-  RemoteInstanceError,
   SessionToCoreMessageSchema,
   canonicalize,
   createLogger,
@@ -17,6 +16,7 @@ import {
   type SessionToCoreMessage,
 } from "@konteks/remote-common";
 import { readFully } from "../read-fully.js";
+import { innerDiagnostic, LoggedRefusal } from "./named-refusal.js";
 
 const MAX_RECORD_BYTES = 16 * 1024 * 1024;
 const RecordSchema = z.discriminatedUnion("state", [
@@ -37,7 +37,8 @@ const SessionHeadSchema = z.object({ version: z.literal(1), recovered: Recovered
   .refine(value => value.latest !== undefined || value.pending !== undefined,
     "An output session head must retain an accepted or pending turn");
 type TurnIdentity = z.infer<typeof TurnIdentitySchema>;
-const unavailable = () => new RemoteInstanceError("capability_unavailable", "Durable generated output state is unavailable.");
+/** Each refusal names its check; identifiers only, never paths or record contents. */
+const unavailable = (diagnostic: string) => new LoggedRefusal("capability_unavailable", "Durable generated output state is unavailable.", diagnostic);
 
 /** One private, atomic record per stable-session turn, outside its Git worktree.
  * Candidate bytes survive response loss/restart and superseded accepted turns
@@ -61,7 +62,7 @@ export class NativeOutputStore {
   async read(): Promise<NativeOutputRecord | null> {
     try {
       const before = await lstat(this.path);
-      if (!privateRecordFile(before, MAX_RECORD_BYTES)) throw unavailable();
+      if (!privateRecordFile(before, MAX_RECORD_BYTES)) throw unavailable("output_record_not_private");
       const handle = await open(this.path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
       try {
         const bytes = await readUnchanged(handle, before);
@@ -69,18 +70,18 @@ export class NativeOutputStore {
       } finally { await handle.close(); }
     } catch (error) {
       if (missing(error)) return null;
-      throw unavailable();
+      throw unavailable(innerDiagnostic(error, "output_record_unreadable"));
     }
   }
 
   async savePending(candidate: RemoteDeliveryResultCandidate, completion: SessionToCoreMessage): Promise<void> {
     const parsed = RemoteDeliveryResultCandidateSchema.parse(candidate);
     const parsedCompletion = SessionToCoreMessageSchema.parse(completion);
-    if (parsedCompletion.kind !== "acp_result" || parsedCompletion.method !== "session/prompt") throw unavailable();
-    if (this.turn && !candidateOfTurn(parsed, this.turn)) throw unavailable();
+    if (parsedCompletion.kind !== "acp_result" || parsedCompletion.method !== "session/prompt") throw unavailable("output_completion_not_prompt_result");
+    if (this.turn && !candidateOfTurn(parsed, this.turn)) throw unavailable("output_candidate_other_turn");
     const existing = await this.read();
     if (existing) {
-      if (!sameCandidate(existing, parsed, parsedCompletion)) throw unavailable();
+      if (!sameCandidate(existing, parsed, parsedCompletion)) throw unavailable("output_candidate_conflict");
       return;
     }
     await this.write({ version: 1, state: "pending", candidate: parsed, completion: parsedCompletion });
@@ -88,12 +89,12 @@ export class NativeOutputStore {
 
   async saveAccepted(candidate: RemoteDeliveryResultCandidate, receipt: RemoteDeliveryAcceptanceReceipt): Promise<void> {
     const existing = await this.read();
-    if (!existing) throw unavailable();
+    if (!existing) throw unavailable("output_accept_without_record");
     const record = RecordSchema.parse({ version: 1, state: "accepted", candidate, completion: existing.completion, receipt });
-    if (record.state !== "accepted" || !receiptMatches(record.receipt, record.candidate)) throw unavailable();
-    if (canonicalize(existing.candidate as never) !== canonicalize(record.candidate as never)) throw unavailable();
+    if (record.state !== "accepted" || !receiptMatches(record.receipt, record.candidate)) throw unavailable("output_receipt_mismatch");
+    if (canonicalize(existing.candidate as never) !== canonicalize(record.candidate as never)) throw unavailable("output_accept_candidate_changed");
     if (existing.state === "accepted") {
-      if (canonicalize(existing.receipt as never) !== canonicalize(record.receipt as never)) throw unavailable();
+      if (canonicalize(existing.receipt as never) !== canonicalize(record.receipt as never)) throw unavailable("output_receipt_conflict");
       return;
     }
     await this.write(record);
@@ -103,16 +104,16 @@ export class NativeOutputStore {
     const record = await this.read();
     if (!record || record.state !== "accepted" || record.receipt.invocationRef !== expected.invocationId ||
         record.receipt.claimId !== expected.claimId || record.receipt.acceptanceId !== expected.acceptanceId ||
-        record.receipt.resultDigest !== expected.resultDigest) throw unavailable();
+        record.receipt.resultDigest !== expected.resultDigest) throw unavailable("output_remove_receipt_mismatch");
     await this.remove();
   }
 
   /** Keep another workspace's accepted record of this exact turn here, unchanged. */
   async adopt(record: NativeOutputRecord): Promise<void> {
-    if (record.state !== "accepted" || (this.turn && !candidateOfTurn(record.candidate, this.turn))) throw unavailable();
+    if (record.state !== "accepted" || (this.turn && !candidateOfTurn(record.candidate, this.turn))) throw unavailable("output_adopt_not_accepted");
     const existing = await this.read();
     if (existing) {
-      if (canonicalize(existing as never) !== canonicalize(record as never)) throw unavailable();
+      if (canonicalize(existing as never) !== canonicalize(record as never)) throw unavailable("output_adopt_conflict");
       return;
     }
     await this.write(record);
@@ -120,14 +121,14 @@ export class NativeOutputStore {
 
   async removePending(): Promise<void> {
     const record = await this.read();
-    if (!record || record.state !== "pending") throw unavailable();
+    if (!record || record.state !== "pending") throw unavailable("output_remove_not_pending");
     await this.remove();
   }
 
   private async write(record: NativeOutputRecord): Promise<void> {
     const startedAt = Date.now();
     const bytes = Buffer.from(JSON.stringify(RecordSchema.parse(record)) + "\n");
-    if (bytes.byteLength > MAX_RECORD_BYTES) throw unavailable();
+    if (bytes.byteLength > MAX_RECORD_BYTES) throw unavailable("output_record_too_large");
     const temporary = join(dirname(this.path), `.delivery-output-${randomUUID()}.tmp`);
     let fsyncStartedAt = 0;
     try {
@@ -139,7 +140,7 @@ export class NativeOutputStore {
       this.logger.info({ event: "native.output.persisted", correlationId: record.candidate.invocationRef, stage: "store", outcome: record.state,
         bytes: bytes.byteLength, resultDigest: record.candidate.resultDigest, fsyncDurationMs: Date.now() - fsyncStartedAt,
         durationMs: Date.now() - startedAt }, "native delivery output persisted");
-    } catch { throw unavailable(); }
+    } catch { throw unavailable("output_record_write_failed"); }
     finally { await rm(temporary, { force: true }).catch(() => undefined); }
   }
 
@@ -185,7 +186,7 @@ export class NativeOutputSessionHeadStore {
   /** An abandoned pending record may go; an accepted one may only have lost its head promotion, and refuses. */
   private async discardAbandoned(pending: TurnIdentity): Promise<void> {
     const abandoned = await this.record(pending).read();
-    if (abandoned?.state === "accepted") throw unavailable();
+    if (abandoned?.state === "accepted") throw unavailable("output_abandoned_turn_accepted");
     if (abandoned) await rmRecord(this.record(pending));
   }
 
@@ -231,9 +232,9 @@ export class NativeOutputSessionHeadStore {
     if (turnIs(head.latest, current)) {
       const replay = await this.record(current).read();
       if (replay?.state === "accepted") return;
-      throw unavailable();
+      throw unavailable("output_replay_not_accepted");
     }
-    if (!turnIs(head.latest, expected)) throw unavailable();
+    if (!turnIs(head.latest, expected)) throw unavailable("output_head_unexpected_turn");
     await this.assertAccepted(expected);
   }
 
@@ -255,7 +256,7 @@ export class NativeOutputSessionHeadStore {
 
   private async required(): Promise<SessionHead> {
     const head = await this.read();
-    if (!head) throw unavailable();
+    if (!head) throw unavailable("output_head_missing");
     return head;
   }
 
@@ -263,7 +264,7 @@ export class NativeOutputSessionHeadStore {
     if (recoveredAcceptanceMatches(await this.read(), expected)) return;
     const record = await this.record({ invocationId: expected.invocationId, claimId: expected.claimId }).read();
     if (!record || record.state !== "accepted" || record.receipt.acceptanceId !== expected.acceptanceId ||
-        record.receipt.resultDigest !== expected.resultDigest) throw unavailable();
+        record.receipt.resultDigest !== expected.resultDigest) throw unavailable("output_expected_not_accepted");
   }
 
   /**
@@ -297,9 +298,9 @@ export class NativeOutputSessionHeadStore {
       await this.cleanup(before!);
       return;
     }
-    if (!isTurn(before?.pending, identity)) throw unavailable();
+    if (!isTurn(before?.pending, identity)) throw unavailable("output_promote_not_pending");
     const record = await this.record(current).read();
-    if (record?.state !== "accepted") throw unavailable();
+    if (record?.state !== "accepted") throw unavailable("output_promote_not_accepted");
     const next = SessionHeadSchema.parse({ version: 1, latest: identity, ...(before!.latest ? { cleanup: before!.latest } : {}) });
     await this.releaseLostAcceptance(before!);
     await this.write(next);
@@ -317,7 +318,7 @@ export class NativeOutputSessionHeadStore {
     if (!head.cleanup) return;
     const record = new NativeOutputStore(this.root, head.cleanup);
     const retained = await record.read();
-    if (retained?.state === "pending") throw unavailable();
+    if (retained?.state === "pending") throw unavailable("output_cleanup_pending");
     if (retained) await record.removeAccepted({ invocationId: retained.receipt.invocationRef,
       claimId: retained.receipt.claimId, acceptanceId: retained.receipt.acceptanceId,
       resultDigest: retained.receipt.resultDigest });
@@ -327,13 +328,13 @@ export class NativeOutputSessionHeadStore {
   private async read(): Promise<SessionHead | null> {
     try {
       const before = await lstat(this.path);
-      if (!privateRecordFile(before, 16 * 1024)) throw unavailable();
+      if (!privateRecordFile(before, 16 * 1024)) throw unavailable("output_head_not_private");
       const handle = await open(this.path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
       try { return SessionHeadSchema.parse(JSON.parse(await handle.readFile("utf8"))); }
       finally { await handle.close(); }
     } catch (error) {
       if (missing(error)) return null;
-      throw unavailable();
+      throw unavailable(innerDiagnostic(error, "output_head_unreadable"));
     }
   }
 
@@ -368,11 +369,11 @@ function missing(error: unknown): boolean {
 /** The opened file's bytes, when it is the file inspected and did not change while it was read. */
 async function readUnchanged(handle: FileHandle, before: Stats): Promise<Buffer> {
   const stat = await handle.stat();
-  if (stat.dev !== before.dev || stat.ino !== before.ino || stat.size !== before.size) throw unavailable();
+  if (stat.dev !== before.dev || stat.ino !== before.ino || stat.size !== before.size) throw unavailable("output_record_replaced");
   const bytes = Buffer.alloc(stat.size + 1);
   const offset = await readFully(handle, bytes);
   const after = await handle.stat();
-  if (offset !== stat.size || after.mtimeMs !== stat.mtimeMs || after.ctimeMs !== stat.ctimeMs) throw unavailable();
+  if (offset !== stat.size || after.mtimeMs !== stat.mtimeMs || after.ctimeMs !== stat.ctimeMs) throw unavailable("output_record_changed_while_read");
   return bytes.subarray(0, offset);
 }
 
@@ -410,7 +411,7 @@ function sameTurn(left: TurnIdentity, right: TurnIdentity): boolean {
 
 async function rmRecord(store: NativeOutputStore): Promise<void> {
   const record = await store.read();
-  if (!record || record.state !== "pending") throw unavailable();
+  if (!record || record.state !== "pending") throw unavailable("output_discard_not_pending");
   await store.removePending();
 }
 
@@ -440,6 +441,6 @@ function recoveredAcceptanceMatches(head: SessionHead | null, expected: Expected
 }
 
 function assertRecoveryCompatible(head: SessionHead | null, expected: ExpectedAcceptance, current: Omit<TurnIdentity, "sessionId">): void {
-  if (head?.latest && !turnIs(head.latest, expected)) throw unavailable();
-  if (head?.pending && !turnIs(head.pending, current)) throw unavailable();
+  if (head?.latest && !turnIs(head.latest, expected)) throw unavailable("output_recovery_latest_mismatch");
+  if (head?.pending && !turnIs(head.pending, current)) throw unavailable("output_recovery_pending_mismatch");
 }

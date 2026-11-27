@@ -32,6 +32,6 @@ describe("native skill-to-ACP input preparation", () => {
     expect(prepared.readOnlyRoots).not.toContain(join(root, "private"));
     await prepared.beforePrompt();
     await writeFile(file, "changed");
-    await expect(prepared.beforePrompt()).rejects.toMatchObject({ code: "capability_unavailable" });
+    await expect(prepared.beforePrompt()).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "skill_staged_tree_invalid" });
   });
 });

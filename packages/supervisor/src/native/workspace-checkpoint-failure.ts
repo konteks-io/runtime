@@ -1,7 +1,7 @@
 import { RemoteInstanceError } from "@konteks/remote-common";
 import type { RuntimeFailureFact } from "../runtime-failure-types.js";
 import { NativeInputResponseError } from "./input-client.js";
-import { diagnosticIdentifier, filesystemFailure, NamedRefusal, refusalEvidence } from "./named-refusal.js";
+import { diagnosticIdentifier, filesystemFailure, NamedRefusal, refusalEvidence, reportedDiagnostic } from "./named-refusal.js";
 
 /**
  * Names for every refusal on the recovery-checkpoint path (10-31): one shared
@@ -18,8 +18,9 @@ export type CheckpointGitStep =
 export function checkpointCause(error: unknown): string | undefined {
   if (error instanceof NativeInputResponseError) return diagnosticIdentifier(`response_status_${error.status}`);
   if (!(error instanceof RemoteInstanceError)) return filesystemFailure(error)?.diagnostic ?? schemaCause(error);
-  const gitStep = error instanceof NamedRefusal ? error.facts.gitStep : undefined;
-  return diagnosticIdentifier(gitStep ? `${error.diagnostic}_${gitStep}` : error.diagnostic);
+  const diagnostic = reportedDiagnostic(error);
+  const gitStep = diagnostic !== undefined && error instanceof NamedRefusal ? error.facts.gitStep : undefined;
+  return diagnosticIdentifier(gitStep ? `${diagnostic}_${gitStep}` : diagnostic);
 }
 
 type SchemaIssue = { message?: string; path?: PropertyKey[]; errors?: SchemaIssue[][] };

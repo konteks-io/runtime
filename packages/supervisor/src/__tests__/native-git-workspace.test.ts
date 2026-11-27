@@ -113,7 +113,7 @@ describe("private native Git baseline", () => {
     expect(await readFile(join(f.cwd, "run.sh"), "utf8")).toBe("local edits");
     await expect(
       initializeNativeGitWorkspace({ container: f.container, tool: f.tool, tree: f.tree }),
-    ).rejects.toThrow();
+    ).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "git_workspace_metadata_present" });
     expect(await f.git("rev-parse", "HEAD")).toBe(localHead);
   });
   it("rejects changed configuration and pointers without running repository code", async () => {
@@ -124,7 +124,7 @@ describe("private native Git baseline", () => {
         tree: f.tree,
       });
     await writeFile(join(f.container, "git", "config"), "[include]\n path = /private/other\n");
-    await expect(verifyNativeGitWorkspace(f.container, receipt)).rejects.toThrow();
+    await expect(verifyNativeGitWorkspace(f.container, receipt)).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "git_workspace_config_mismatch" });
     const g = await fixture(),
       second = await initializeNativeGitWorkspace({
         container: g.container,
@@ -132,18 +132,18 @@ describe("private native Git baseline", () => {
         tree: g.tree,
       });
     await writeFile(join(g.cwd, ".git"), "gitdir: /elsewhere\n");
-    await expect(verifyNativeGitWorkspace(g.container, second)).rejects.toThrow();
+    await expect(verifyNativeGitWorkspace(g.container, second)).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "git_workspace_pointer_mismatch" });
   });
   it("refuses missing, relative or changed tool executables before initialization", async () => {
     const f = await fixture();
-    for (const tool of [
-      { ...f.tool, executable: "git" },
-      { ...f.tool, executable: join(f.root, "missing") },
-      { ...f.tool, digest: "sha256:" + "f".repeat(64) },
-    ]) {
+    for (const [tool, diagnostic] of [
+      [{ ...f.tool, executable: "git" }, "git_tool_unreadable"],
+      [{ ...f.tool, executable: join(f.root, "missing") }, "git_tool_unreadable"],
+      [{ ...f.tool, digest: "sha256:" + "f".repeat(64) }, "git_tool_changed"],
+    ] as const) {
       await expect(
         initializeNativeGitWorkspace({ container: f.container, tool, tree: f.tree }),
-      ).rejects.toThrow();
+      ).rejects.toMatchObject({ code: "capability_unavailable", diagnostic });
     }
     await expect(access(join(f.cwd, ".git"))).rejects.toThrow();
   });
@@ -152,7 +152,7 @@ describe("private native Git baseline", () => {
     await writeFile(join(f.cwd, ".git"), "gitdir: ../foreign\n");
     await expect(
       initializeNativeGitWorkspace({ container: f.container, tool: f.tool, tree: f.tree }),
-    ).rejects.toThrow();
+    ).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "git_workspace_metadata_present" });
     expect(await readFile(join(f.cwd, ".git"), "utf8")).toBe("gitdir: ../foreign\n");
   });
   it("refuses added hooks and changed attribute isolation on reuse", async () => {
@@ -163,7 +163,7 @@ describe("private native Git baseline", () => {
         tree: f.tree,
       });
     await writeFile(join(f.container, "hooks-disabled", "pre-commit"), "untrusted");
-    await expect(verifyNativeGitWorkspace(f.container, receipt)).rejects.toThrow();
+    await expect(verifyNativeGitWorkspace(f.container, receipt)).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "git_workspace_hooks_present" });
     const g = await fixture(),
       second = await initializeNativeGitWorkspace({
         container: g.container,
@@ -171,6 +171,6 @@ describe("private native Git baseline", () => {
         tree: g.tree,
       });
     await writeFile(join(g.container, "git", "info", "attributes"), "* filter=external\n");
-    await expect(verifyNativeGitWorkspace(g.container, second)).rejects.toThrow();
+    await expect(verifyNativeGitWorkspace(g.container, second)).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "git_workspace_attributes_mismatch" });
   });
 });

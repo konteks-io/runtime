@@ -4,8 +4,9 @@ import { constants, type Stats } from "node:fs";
 import { chmod, lstat, mkdir, open, readdir } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import { z } from "zod";
-import { RemoteFileTreeSchema, RemoteInstanceError, connectorGitEnv, sha256Hex } from "@konteks/remote-common";
+import { RemoteFileTreeSchema, connectorGitEnv, sha256Hex } from "@konteks/remote-common";
 import { readFully } from "../read-fully.js";
+import { gitFailure, innerDiagnostic, LoggedRefusal } from "./named-refusal.js";
 
 /** Installer-selected local tool, never a field in a cloud assignment. */
 export const NativeGitToolSchema = z
@@ -32,12 +33,9 @@ const pointer = "gitdir: ../git\n";
 const attributes = "* -filter -text -ident -working-tree-encoding\n";
 const config =
   "[core]\nrepositoryformatversion = 0\nbare = false\nfilemode = true\nlogallrefupdates = true\nworktree = ../source\nhooksPath = ../hooks-disabled\nautocrlf = false\n[commit]\ngpgsign = false\n[tag]\ngpgsign = false\n";
-const unavailable = (diagnostic?: string) =>
-  new RemoteInstanceError(
-    "capability_unavailable",
-    "Private Git workspace or installer-selected Git tool is unavailable.",
-    diagnostic ? { diagnostic } : {},
-  );
+/** Each refusal names its check; identifiers only, never paths or Git output. */
+const unavailable = (diagnostic: string) =>
+  new LoggedRefusal("capability_unavailable", "Private Git workspace or installer-selected Git tool is unavailable.", diagnostic);
 
 async function directory(path: string) {
   const stat = await lstat(path);
@@ -46,19 +44,19 @@ async function directory(path: string) {
     stat.isSymbolicLink() ||
     (process.platform !== "win32" && ((stat.mode & 0o077) !== 0 || stat.uid !== process.getuid?.()))
   )
-    throw unavailable();
+    throw unavailable("git_workspace_directory_not_private");
 }
 async function boundedFile(path: string, limit: number, tool = false): Promise<Buffer> {
   const before = await lstat(path);
-  if (!boundedPlainFile(before, limit, tool)) throw unavailable();
+  if (!boundedPlainFile(before, limit, tool)) throw unavailable("git_workspace_file_not_plain");
   const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   try {
     const stat = await handle.stat();
     if (stat.ino !== before.ino || stat.dev !== before.dev || stat.size !== before.size)
-      throw unavailable();
+      throw unavailable("git_workspace_file_replaced");
     const buffer = Buffer.alloc(stat.size + 1);
     const count = await readFully(handle, buffer);
-    if (!unchangedWhileRead(count, before, await handle.stat())) throw unavailable();
+    if (!unchangedWhileRead(count, before, await handle.stat())) throw unavailable("git_workspace_file_changed_while_read");
     return buffer.subarray(0, count);
   } finally {
     await handle.close();
@@ -106,7 +104,7 @@ async function write(path: string, bytes: string, exclusive = true) {
 }
 function oid(value: string): string {
   const parsed = value.trim();
-  if (!/^[a-f0-9]{40}$/.test(parsed)) throw unavailable();
+  if (!/^[a-f0-9]{40}$/.test(parsed)) throw unavailable("git_workspace_object_id_invalid");
   return parsed;
 }
 
@@ -141,18 +139,18 @@ export async function initializeNativeGitWorkspace(options: {
       await flushTree(join(options.container, "hooks-disabled"));
     }
     return receipt;
-  } catch {
-    throw unavailable();
+  } catch (error) {
+    throw unavailable(innerDiagnostic(error, "git_workspace_init_failed"));
   }
 }
 
 /** The tree to commit, when the container is private and holds no Git metadata and the tree names none. */
 async function freshContainerTree(container: string, value: unknown): Promise<z.infer<typeof RemoteFileTreeSchema>> {
-  if (!isAbsolute(container)) throw unavailable();
+  if (!isAbsolute(container)) throw unavailable("git_workspace_container_not_absolute");
   await directory(container);
   await directory(join(container, "source"));
   const tree = RemoteFileTreeSchema.parse(value);
-  if (tree.entries.some((entry) => entry.path.split("/").some((part) => /^(?:\.git|git~[0-9]+)$/i.test(part)))) throw unavailable();
+  if (tree.entries.some((entry) => entry.path.split("/").some((part) => /^(?:\.git|git~[0-9]+)$/i.test(part)))) throw unavailable("git_workspace_tree_git_metadata");
   for (const name of ["git", "hooks-disabled", "source/.git"]) await assertAbsent(join(container, name));
   return tree;
 }
@@ -160,7 +158,7 @@ async function freshContainerTree(container: string, value: unknown): Promise<z.
 async function assertAbsent(path: string): Promise<void> {
   try {
     await lstat(path);
-    throw unavailable();
+    throw unavailable("git_workspace_metadata_present");
   } catch (error) {
     if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT"))
       throw error;
@@ -197,7 +195,7 @@ function gitRunner(tool: NativeGitTool, container: string, deadline: number): Gi
   const env = gitEnvironment(tool);
   return (args, input = "") => {
     const remaining = deadline - Date.now();
-    if (remaining <= 0) return Promise.reject(unavailable());
+    if (remaining <= 0) return Promise.reject(unavailable("git_workspace_deadline"));
     return new Promise((resolve, reject) => {
       const child = execFile(
         tool.executable,
@@ -210,7 +208,7 @@ function gitRunner(tool: NativeGitTool, container: string, deadline: number): Gi
           maxBuffer: 64 * 1024,
           windowsHide: true,
         },
-        (error, stdout) => (error ? reject(unavailable()) : resolve(stdout)),
+        (error, stdout) => (error ? reject(unavailable(`git_workspace_${gitFailure(error).diagnostic}`)) : resolve(stdout)),
       );
       child.stdin?.on("error", () => {
         /* Process exit is settled by execFile's callback. */
@@ -246,7 +244,7 @@ async function commitBaseline(git: GitRun, tree: z.infer<typeof RemoteFileTreeSc
 
 async function flushTree(path: string): Promise<void> {
   const stat = await lstat(path);
-  if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile())) throw unavailable();
+  if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile())) throw unavailable("git_workspace_flush_entry_invalid");
   if (stat.isDirectory())
     for (const name of await readdir(path)) await flushTree(join(path, name));
   const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
@@ -265,22 +263,22 @@ export async function verifyNativeGitWorkspace(container: string, value: unknown
     await directory(join(container, "source"));
     await directory(join(container, "git"));
     await directory(join(container, "hooks-disabled"));
-    if ((await readdir(join(container, "hooks-disabled"))).length !== 0) throw unavailable();
+    if ((await readdir(join(container, "hooks-disabled"))).length !== 0) throw unavailable("git_workspace_hooks_present");
     if ((await boundedFile(join(container, "source", ".git"), 4096)).toString("utf8") !== pointer)
-      throw unavailable();
+      throw unavailable("git_workspace_pointer_mismatch");
     const actual = await boundedFile(join(container, "git", "config"), 16 * 1024);
     if (
       actual.toString("utf8") !== config ||
       receipt.configDigest !== "sha256:" + sha256Hex(actual)
     )
-      throw unavailable();
+      throw unavailable("git_workspace_config_mismatch");
     await directory(join(container, "git", "info"));
     if (
       (await boundedFile(join(container, "git", "info", "attributes"), 4096)).toString("utf8") !==
       attributes
     )
-      throw unavailable();
-  } catch {
-    throw unavailable();
+      throw unavailable("git_workspace_attributes_mismatch");
+  } catch (error) {
+    throw unavailable(innerDiagnostic(error, "git_workspace_verify_failed"));
   }
 }

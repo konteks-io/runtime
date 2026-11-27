@@ -1,7 +1,8 @@
 import { lstat, realpath } from "node:fs/promises";
 import { isAbsolute } from "node:path";
-import { RemoteInstanceError, RemoteSkillCatalogSchema, type RemoteDeliveryAcceptanceReceipt, type RemoteTransferBinding, type SessionToCoreMessage } from "@konteks/remote-common";
+import { RemoteSkillCatalogSchema, type RemoteDeliveryAcceptanceReceipt, type RemoteTransferBinding, type SessionToCoreMessage } from "@konteks/remote-common";
 import { stageOrganizationSkills, type StageOrganizationSkillsOptions, type StagedOrganizationSkills } from "./staging.js";
+import { innerDiagnostic, LoggedRefusal } from "../native/named-refusal.js";
 
 /** Local-only preparation result: paths/instructions never enter relay frames. */
 export interface PreparedSessionInputs {
@@ -38,6 +39,11 @@ function organizationSkillInstructions(staged: StagedOrganizationSkills): string
   ].join("\n");
 }
 
+/** One refusal for every session-input failure, naming the inner check when it had one. */
+function sessionInputsUnavailable(error: unknown, fallback: string): LoggedRefusal {
+  return new LoggedRefusal("capability_unavailable", "Required local session inputs are unavailable.", innerDiagnostic(error, fallback));
+}
+
 async function checkedDirectory(cwd: string): Promise<string> {
   if (!isAbsolute(cwd) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(cwd)) throw new Error("invalid cwd");
   const stat = await lstat(cwd);
@@ -58,10 +64,10 @@ export async function prepareDirectSessionInputs(options: { cwd: string; binding
       binding: { ...options.binding }, cwd, skillInstructions: "",
       beforePrompt: async () => {
         try { if (await checkedDirectory(options.cwd) !== cwd) throw new Error("source moved"); }
-        catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
+        catch (error) { throw sessionInputsUnavailable(error, "direct_session_folder_moved"); }
       },
     };
-  } catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
+  } catch (error) { throw sessionInputsUnavailable(error, "direct_session_folder_invalid"); }
 }
 
 /** Caller resolves the approved source checkout and authoritative skill selection. */
@@ -83,8 +89,8 @@ export async function prepareOrganizationSkillSession(options: StageOrganization
           if (await checkedDirectory(options.cwd) !== cwd) throw new Error("source moved");
           const verified = await stageOrganizationSkills(snapshot);
           if (verified.root !== staged.root) throw new Error("skill root moved");
-        } catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
+        } catch (error) { throw sessionInputsUnavailable(error, "session_inputs_moved"); }
       },
     };
-  } catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
+  } catch (error) { throw sessionInputsUnavailable(error, "session_inputs_unavailable"); }
 }

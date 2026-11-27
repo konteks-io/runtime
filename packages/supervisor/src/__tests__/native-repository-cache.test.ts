@@ -202,7 +202,7 @@ describe("native shared repository cache", () => {
     expect((await testGitCommand(f.tool, second.cwd, ["branch", "--list", "only-session-a"])).trim()).toBe("");
     const pointer = await readFile(join(first.cwd, ".git"), "utf8");
     await writeFile(join(first.cwd, ".git"), await readFile(join(second.cwd, ".git")));
-    await expect(first.verify()).rejects.toMatchObject({ code: "capability_unavailable" });
+    await expect(first.verify()).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "worktree_common_dir_mismatch" });
     await writeFile(join(first.cwd, ".git"), pointer);
     await first.verify();
     await second.verify();
@@ -317,7 +317,7 @@ describe("native shared repository cache", () => {
     await testGitCommand(f.tool, f.seed, ["push", f.origin, "HEAD:refs/heads/main"]);
 
     await expect(f.cache.prepare({ repositoryId: "repository:online-store", revision: second,
-      agentWorkspaceRoot: f.claudeRoot, worktreeId: "generator-session", mode: "preserve" })).rejects.toThrow();
+      agentWorkspaceRoot: f.claudeRoot, worktreeId: "generator-session", mode: "preserve" })).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "worktree_stale_checkout_refused" });
     expect(await readFile(join(generator.cwd, "generator-only.txt"), "utf8")).toBe("keep\n");
     const refreshed = await f.cache.prepare({ repositoryId: "repository:online-store", revision: second,
       agentWorkspaceRoot: f.codexRoot, worktreeId: "qa-session", mode: "reset_to_revision" });
@@ -382,7 +382,7 @@ describe("native shared repository cache", () => {
     const changed = JSON.parse(original);
     changed.after.repositoryDigest = `sha256:${"0".repeat(64)}`;
     await writeFile(marker, JSON.stringify(changed));
-    await expect(f.cache.prepare(request)).rejects.toMatchObject({ code: "capability_unavailable" });
+    await expect(f.cache.prepare(request)).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "isolation_journal_mismatch" });
     expect(await readFile(join(cwd, "untracked.txt"), "utf8")).toBe("keep\n");
     await writeFile(marker, original);
     await (await f.cache.prepare(request)).verify();
@@ -393,7 +393,7 @@ describe("native shared repository cache", () => {
     const pointer = await readFile(join(cwd, ".git"), "utf8");
     const admin = (await testGitCommand(f.tool, cwd, ["rev-parse", "--absolute-git-dir"])).trim();
     await fsPromises.symlink(join(f.root, "origin.git"), join(admin, "foreign"));
-    await expect(f.cache.prepare(request)).rejects.toMatchObject({ code: "capability_unavailable" });
+    await expect(f.cache.prepare(request)).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "isolation_entry_wrong_kind" });
     expect(await readFile(join(cwd, ".git"), "utf8")).toBe(pointer);
   });
 
@@ -402,7 +402,7 @@ describe("native shared repository cache", () => {
     const pointer = await readFile(join(cwd, ".git"), "utf8");
     const admin = (await testGitCommand(f.tool, cwd, ["rev-parse", "--absolute-git-dir"])).trim();
     await writeFile(join(admin, "index.lock"), "busy");
-    await expect(f.cache.prepare(request)).rejects.toMatchObject({ code: "capability_unavailable" });
+    await expect(f.cache.prepare(request)).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "isolation_git_lock_present" });
     expect(await readFile(join(cwd, ".git"), "utf8")).toBe(pointer);
     expect(await readFile(join(cwd, "correction.txt"), "utf8")).toBe("unstaged\n");
   });
@@ -616,7 +616,7 @@ describe("a delivery session returning to a computer with its old checkout", () 
     const f = await fixture();
     await f.cache.prepare({ ...session, revision: f.first, agentWorkspaceRoot: f.claudeRoot });
     const second = await published(f, "two\n");
-    await expect(f.cache.prepare({ ...session, revision: second, agentWorkspaceRoot: f.claudeRoot })).rejects.toThrow();
+    await expect(f.cache.prepare({ ...session, revision: second, agentWorkspaceRoot: f.claudeRoot })).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "worktree_stale_checkout_refused" });
   });
 });
 

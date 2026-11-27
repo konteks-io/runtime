@@ -55,17 +55,17 @@ describe("native organization skill staging", () => {
   it("rejects a foreign binding or unapproved catalog before downloading or creating state", async () => {
     const { args, fetchTree } = await setup();
     for (const authority of [{ ...args.authority, binding: { ...binding, workspaceId: "other" } }, { ...args.authority, catalogDigest: `sha256:${"0".repeat(64)}` }]) {
-      await expect(stageOrganizationSkills({ ...args, authority })).rejects.toMatchObject({ code: "workspace_binding_invalid" });
+      await expect(stageOrganizationSkills({ ...args, authority })).rejects.toMatchObject({ code: "workspace_binding_invalid", diagnostic: "skill_catalog_binding_mismatch" });
     }
     expect(fetchTree).not.toHaveBeenCalled();
     await expect(lstat(args.scratchRoot)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("fails missing required SKILL.md, corrupted bytes and fetch errors without committing partial files", async () => {
-    for (const missing of [true, false]) {
+    for (const [missing, diagnostic] of [[true, "skill_transfer_missing_skill_md"], [false, "skill_transfer_invalid"]] as const) {
       const { args } = await setup(tree(missing));
       if (!missing) args.fetchTree.mockResolvedValue({ ...tree(), treeDigest: `sha256:${"0".repeat(64)}` });
-      await expect(stageOrganizationSkills(args)).rejects.toMatchObject({ code: "capability_unavailable" });
+      await expect(stageOrganizationSkills(args)).rejects.toMatchObject({ code: "capability_unavailable", diagnostic });
       expect(await readdir(args.scratchRoot)).toEqual([]);
     }
     const { args } = await setup(); args.fetchTree.mockRejectedValue(new Error("secret raw network details"));
@@ -78,11 +78,11 @@ describe("native organization skill staging", () => {
   it("rechecks authorization and expiry after transfer; revoked or stale content is not committed", async () => {
     const { args } = await setup();
     args.assertAuthorized.mockResolvedValueOnce(undefined).mockRejectedValue(new Error("revoked"));
-    await expect(stageOrganizationSkills(args)).rejects.toMatchObject({ code: "capability_unavailable" });
+    await expect(stageOrganizationSkills(args)).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "skill_stage_failed" });
     expect(await readdir(args.scratchRoot)).toEqual([]);
     const second = await setup(); let current = now;
     second.args.fetchTree.mockImplementation(async () => { current += 2 * 3600_000; return tree(); });
-    await expect(stageOrganizationSkills({ ...second.args, now: () => current })).rejects.toMatchObject({ code: "capability_unavailable" });
+    await expect(stageOrganizationSkills({ ...second.args, now: () => current })).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "skill_transfer_invalid" });
     expect(await readdir(second.args.scratchRoot)).toEqual([]);
   });
 
@@ -92,11 +92,12 @@ describe("native organization skill staging", () => {
     expect((await stageOrganizationSkills(args)).root).toBe(first.root);
     expect(fetchTree).toHaveBeenCalledTimes(1);
     await writeFile(first.skills[0]!.skillFile, "tampered");
-    await expect(stageOrganizationSkills(args)).rejects.toMatchObject({ code: "capability_unavailable" });
+    await expect(stageOrganizationSkills(args)).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "skill_staged_tree_invalid" });
     expect(await readFile(first.skills[0]!.skillFile, "utf8")).toBe("tampered");
   });
 
-  it.each(["symlink", "hardlink", "extra", "mode"])("rejects %s modifications to cached trees", async kind => {
+  it.each([["symlink", "skill_entry_wrong_kind"], ["hardlink", "skill_entry_wrong_kind"], ["extra", "skill_entry_not_private"],
+    ["mode", "skill_entry_not_private"]])("rejects %s modifications to cached trees", async (kind, diagnostic) => {
     const { args, root } = await setup();
     const staged = await stageOrganizationSkills(args);
     const file = staged.skills[0]!.skillFile;
@@ -106,7 +107,7 @@ describe("native organization skill staging", () => {
       const outside = join(root, "outside"); await writeFile(outside, "outside");
       await rm(file); if (kind === "symlink") await symlink(outside, file); else await link(outside, file);
     }
-    await expect(stageOrganizationSkills(args)).rejects.toMatchObject({ code: "capability_unavailable" });
+    await expect(stageOrganizationSkills(args)).rejects.toMatchObject({ code: "capability_unavailable", diagnostic });
   });
 
   it("deduplicates concurrent staging and reuses identical content across assignments without refetching", async () => {
@@ -146,14 +147,14 @@ describe("native organization skill staging", () => {
     expect(receipt.modes.review["scripts/check.sh"]).toBe(0o700);
     receipt.modes.review["scripts/check.sh"] = 0o600;
     await writeFile(path, JSON.stringify(receipt));
-    await expect(stageOrganizationSkills(args)).rejects.toMatchObject({ code: "capability_unavailable" });
+    await expect(stageOrganizationSkills(args)).rejects.toMatchObject({ code: "capability_unavailable", diagnostic: "skill_staged_tree_invalid" });
   });
 
   it("rejects symlink or broad staging roots without modifying the target", async () => {
     const { root, args } = await setup(); const outside = join(root, "outside");
     await mkdir(outside); await symlink(outside, args.scratchRoot);
-    await expect(stageOrganizationSkills(args)).rejects.toMatchObject({ code: "local_io_failure" });
+    await expect(stageOrganizationSkills(args)).rejects.toMatchObject({ code: "local_io_failure", diagnostic: "skill_entry_wrong_kind" });
     expect(await readdir(outside)).toEqual([]);
-    await expect(stageOrganizationSkills({ ...args, scratchRoot: "/" })).rejects.toMatchObject({ code: "local_io_failure" });
+    await expect(stageOrganizationSkills({ ...args, scratchRoot: "/" })).rejects.toMatchObject({ code: "local_io_failure", diagnostic: "skill_root_path_invalid" });
   });
 });

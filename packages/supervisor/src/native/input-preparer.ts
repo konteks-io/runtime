@@ -48,6 +48,7 @@ import {
 import { NativeRepositoryCache } from "./repository-cache.js";
 import { reportRuntimeFailure, type RuntimeFailureFact, type RuntimeFailureReporter } from "../runtime-failure-types.js";
 import { deliveryStep, tagDeliveryOutputStage, type DeliveryOutputStage } from "./delivery-output-failure.js";
+import { gitFailure, LoggedRefusal } from "./named-refusal.js";
 
 interface NativeInputPreparerOptions {
   /** Signed Core contract gate; older Core never receives checkpoint requests. */
@@ -88,15 +89,13 @@ const ReceiptSchema = z
     git: NativeGitReceiptSchema.optional(),
   })
   .strict();
-const unavailable = () =>
-  new RemoteInstanceError(
-    "capability_unavailable",
-    "Required assignment inputs are unavailable or no longer authorized.",
-  );
+/** Each refusal names its check; identifiers only, never paths, ids or Git output. */
+const unavailable = (diagnostic: string) =>
+  new LoggedRefusal("capability_unavailable", "Required assignment inputs are unavailable or no longer authorized.", diagnostic);
 
 function privateNode(stat: Stats, directory: boolean): void {
-  if (stat.isSymbolicLink() || !expectedKind(stat, directory)) throw unavailable();
-  if (process.platform !== "win32" && !privateMode(stat, directory)) throw unavailable();
+  if (stat.isSymbolicLink() || !expectedKind(stat, directory)) throw unavailable("private_entry_wrong_kind");
+  if (process.platform !== "win32" && !privateMode(stat, directory)) throw unavailable("private_entry_not_private");
 }
 
 function expectedKind(stat: Stats, directory: boolean): boolean {
@@ -109,7 +108,7 @@ function privateMode(stat: Stats, directory: boolean): boolean {
 async function sameDirectory(path: string, before?: Stats): Promise<Stats> {
   const stat = await lstat(path);
   privateNode(stat, true);
-  if (before && (before.ino !== stat.ino || before.dev !== stat.dev)) throw unavailable();
+  if (before && (before.ino !== stat.ino || before.dev !== stat.dev)) throw unavailable("private_directory_replaced");
   return stat;
 }
 /** The other agents' private workspaces beside this one (`workspaces/<agent>`). */
@@ -122,9 +121,9 @@ async function siblingAgentRoots(root: string): Promise<string[]> {
 }
 
 async function privateRoot(value: string): Promise<string> {
-  if (!isAbsolute(value) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(value)) throw unavailable();
+  if (!isAbsolute(value) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(value)) throw unavailable("private_root_path_invalid");
   const path = resolve(value);
-  if (path === parse(path).root || path === resolve(homedir())) throw unavailable();
+  if (path === parse(path).root || path === resolve(homedir())) throw unavailable("private_root_too_broad");
   await mkdir(path, { recursive: true, mode: 0o700 });
   await sameDirectory(path);
   return realpath(path);
@@ -149,13 +148,13 @@ async function writePrivate(path: string, bytes: Buffer, mode = 0o600): Promise<
 async function overlayPrivate(base: string, parts: string[], bytes: Buffer, mode = 0o600, onFailure?: SourceFailureObserver): Promise<void> {
   const directory = await realDirectories(base, parts.slice(0, -1));
   const name = parts.at(-1);
-  if (!name || name === "." || name === "..") throw unavailable();
+  if (!name || name === "." || name === "..") throw unavailable("overlay_name_invalid");
   const target = join(directory, name);
   const existing = await lstat(target).catch((error: unknown) => { if (isFsErrorWithCode(error, "ENOENT")) return null; throw error; });
   if (existing?.isDirectory()) {
     onFailure?.({ phase: "preparation", stage: "source_overlay", code: "overlay_directory_conflict",
       evidence: { kind: "runtime_exception" }, pathRole: "session_context" });
-    throw unavailable();
+    throw unavailable("overlay_directory_conflict");
   }
   await replacePrivate(target, bytes, mode);
 }
@@ -164,7 +163,7 @@ async function overlayPrivate(base: string, parts: string[], bytes: Buffer, mode
 async function realDirectories(base: string, parts: string[]): Promise<string> {
   let directory = base;
   for (const part of parts) {
-    if (part === "" || part === "." || part === "..") throw unavailable();
+    if (part === "" || part === "." || part === "..") throw unavailable("overlay_path_segment_invalid");
     directory = join(directory, part);
     await realDirectory(directory);
   }
@@ -174,7 +173,7 @@ async function realDirectories(base: string, parts: string[]): Promise<string> {
 async function realDirectory(directory: string): Promise<void> {
   try {
     const stat = await lstat(directory);
-    if (!stat.isDirectory()) throw unavailable();
+    if (!stat.isDirectory()) throw unavailable("overlay_parent_not_directory");
   } catch (error) {
     if (!isFsErrorWithCode(error, "ENOENT")) throw error;
     await mkdir(directory, { mode: 0o700 });
@@ -223,16 +222,16 @@ async function readReceipt(path: string, onFailure?: SourceFailureObserver) {
 async function readReceiptBytes(path: string): Promise<Buffer> {
   const before = await lstat(path);
   privateNode(before, false);
-  if (before.size > 16 * 1024) throw unavailable();
+  if (before.size > 16 * 1024) throw unavailable("source_receipt_too_large");
   const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   try {
     const stat = await handle.stat();
     privateNode(stat, false);
     if (stat.ino !== before.ino || stat.dev !== before.dev || stat.size !== before.size)
-      throw unavailable();
+      throw unavailable("source_receipt_replaced");
     const buffer = Buffer.alloc(stat.size + 1);
     const count = await readFully(handle, buffer);
-    if (count !== stat.size) throw unavailable();
+    if (count !== stat.size) throw unavailable("source_receipt_short_read");
     return buffer.subarray(0, count);
   } finally {
     await handle.close();
@@ -301,7 +300,7 @@ async function sourceWorkspace(
   gitTool?: NativeGitTool,
   onFailure?: SourceFailureObserver,
 ): Promise<SourceWorkspace> {
-  if (needsGit && !gitTool) throw unavailable();
+  if (needsGit && !gitTool) throw unavailable("git_tool_not_configured");
   // Xcode's license gate with no Command Line Tools: say so, never an unexplained failure.
   if (needsGit) await requireConnectorGit(gitTool!.executable);
   const rootStat = await sameDirectory(root);
@@ -344,12 +343,12 @@ async function refreshSessionWorkspace(folder: WorkspaceFolder, fetchSource: () 
   if (receipt.selectionDigest === expected.selectionDigest) return;
   // A different selection under the SAME claim is a substitution inside
   // one turn, not newer inputs: refuse, and leave local work untouched.
-  if (receipt.claimId === expected.claimId) throw unavailable();
+  if (receipt.claimId === expected.claimId) throw unavailable("session_selection_substituted");
   // A later turn of the same session: Core's newer inputs are laid over the
   // folder and the agent's own files stay. Rebuilding it deleted everything
   // the agent wrote in earlier turns.
   const tree = await fetchSource();
-  if (carriesGitMetadata(tree)) throw unavailable();
+  if (carriesGitMetadata(tree)) throw unavailable("source_refresh_git_metadata");
   await sameDirectory(root, rootStat);
   await sameDirectory(destination);
   for (const entry of tree.entries) {
@@ -390,7 +389,7 @@ function filesystemFailureEvidence(error: unknown): RuntimeFailureFact["evidence
 async function materializeWorkspace(folder: WorkspaceFolder, fetchSource: () => Promise<FetchedTree>, needsGit: boolean, gitTool: NativeGitTool | undefined): Promise<void> {
   const { root, rootStat, destination } = folder;
   const tree = await fetchSource();
-  if (carriesGitMetadata(tree)) throw unavailable();
+  if (carriesGitMetadata(tree)) throw unavailable("source_materialize_git_metadata");
   await sameDirectory(root, rootStat);
   let temporary: string | undefined = await mkdtemp(join(root, ".input-"));
   await chmod(temporary, 0o700);
@@ -462,7 +461,7 @@ async function publishedWorkspace(folder: WorkspaceFolder, needsGit: boolean): P
     await sameDirectory(cwd, sourceStat);
     const { git, ...receipt } = await readReceipt(join(destination, "receipt.json"));
     if (canonicalize(receipt) !== canonicalize(expected) || Boolean(git) !== needsGit)
-      throw unavailable();
+      throw unavailable("source_receipt_mismatch");
     if (git) await verifyNativeGitWorkspace(destination, git);
   };
   await verify();
@@ -519,10 +518,10 @@ class AuthorizedInputs {
   }
 
   async authorize(): Promise<void> {
-    if (this.options.claimId(this.current) !== this.claimId) throw unavailable();
+    if (this.options.claimId(this.current) !== this.claimId) throw unavailable("claim_moved_before_authorize");
     if (this.stampsCurrent()) this.envelope = await this.client.prepare(this.current, this.claimId, this.digest);
     else await this.client.recheck(this.current, this.claimId, this.digest);
-    if (this.options.claimId(this.current) !== this.claimId) throw unavailable();
+    if (this.options.claimId(this.current) !== this.claimId) throw unavailable("claim_moved_after_authorize");
   }
 
   /**
@@ -692,6 +691,7 @@ function withSessionContext(source: SourceWorkspace, prepared: PreparedSessionIn
   };
 }
 
+/** The stage carries the check that refused, as a checkpoint failure's does; the stage alone when it has none. */
 function failureFields(error: unknown, fallback: string): { code: string; retryable: boolean; diagnostic?: string; status?: number } {
   return {
     code: error instanceof RemoteInstanceError ? error.code : fallback,
@@ -729,7 +729,7 @@ class InputPreparation {
   async prepare(): Promise<PreparedSessionInputs> {
     const current = RemoteWorkAssignmentSchema.parse(this.assignment);
     const claimId = this.options.claimId(current);
-    if (!claimId) throw unavailable();
+    if (!claimId) throw unavailable("claim_missing");
     const client = this.options.client();
     this.enter("selection");
     const inputs = new AuthorizedInputs(this.options, client, current, claimId, await client.prepare(current, claimId));
@@ -737,7 +737,7 @@ class InputPreparation {
     // A direct session works in its own private folder only; a
     // repository for it is a later decision.
     const direct = isDirectAssignment(current);
-    if (direct && inputs.selection.repository) throw unavailable();
+    if (direct && inputs.selection.repository) throw unavailable("direct_repository_selected");
     this.stage = "private_root";
     const root = await privateRoot(this.options.root);
     this.enter("source_workspace");
@@ -935,7 +935,7 @@ class InputPreparation {
     const outputHead = harnessTurn ? new NativeOutputSessionHeadStore(root, inputs.selection.binding.sessionId) : undefined;
     const repositoryWorkspace = inputs.selection.repositoryWorkspace;
     if (repositoryWorkspace?.mode === "preserve" && repositoryWorkspace.expectedAcceptedResult) {
-      if (!outputHead || !harnessTurn) throw unavailable();
+      if (!outputHead || !harnessTurn) throw unavailable("expected_output_without_harness_turn");
       await this.adoptRebound(outputHead, root, repositoryWorkspace.expectedAcceptedResult, inputs.selection.binding.sessionId);
       await this.verifyOutputHead(outputHead, repositoryWorkspace.expectedAcceptedResult, { invocationId: harnessTurn.invocationId, claimId: inputs.claimId }, source.recoveredCheckpointDigest);
     }
@@ -965,7 +965,7 @@ class InputPreparation {
     return {
       acceptDeliveryOutput: async (authority: DeliveryAuthority & { completion: SessionToCoreMessage }) => {
         const result = await output.deliver(authority, authority.completion);
-        if (!result) throw unavailable();
+        if (!result) throw unavailable("delivery_output_missing");
         return result.receipt;
       },
       resumeDeliveryOutput: async (authority: DeliveryAuthority) => output.deliver(authority),
@@ -986,7 +986,7 @@ class InputPreparation {
     let prompting = false;
     return () =>
       this.mutate(async () => {
-        if (prompting) throw unavailable();
+        if (prompting) throw unavailable("prompt_recheck_concurrent");
         prompting = true;
         const progress = new RecheckProgress(this.options.logger, this.assignment, this.options.recheckWatchMs ?? RECHECK_WATCH_MS);
         try {
@@ -1003,7 +1003,7 @@ class InputPreparation {
           this.options.logger?.warn({ event: "native.inputs.recheck_failed", assignmentId: this.assignment.id,
             attempt: this.assignment.attempt, ...failureFields(error, "local_verification_failed"), ...progress.fields() },
           "Inputs could not be rechecked before the prompt");
-          throw unavailable();
+          throw unavailable("prompt_recheck_failed");
         } finally {
           progress.stop();
           prompting = false;
@@ -1019,7 +1019,7 @@ function fetchBundle(git: NativeGitTool, gitDir: string, bundlePath: string, rev
       env: { PATH: dirname(git.executable), GIT_CONFIG_NOSYSTEM: "1",
         GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null", GIT_TERMINAL_PROMPT: "0", ...connectorGitEnv() },
       timeout: 60_000, killSignal: "SIGKILL", maxBuffer: 256 * 1024, windowsHide: true,
-    }, error => error ? rejectPromise(unavailable()) : resolvePromise());
+    }, error => error ? rejectPromise(unavailable(`repository_bundle_fetch_${gitFailure(error).diagnostic}`)) : resolvePromise());
   });
 }
 
@@ -1033,7 +1033,7 @@ export function createNativeInputPreparer(
   return (assignment) =>
     mutate(async () => {
       const key = assignment.id + ":" + assignment.attempt;
-      if (busy.has(key)) throw unavailable();
+      if (busy.has(key)) throw unavailable("preparation_concurrent");
       busy.add(key);
       const preparation = new InputPreparation(options, mutate, wiring, assignment);
       try {
@@ -1042,7 +1042,7 @@ export function createNativeInputPreparer(
         preparation.recordFailure(error);
         // Keep typed policy verdicts for terminal dispatch classification, and
         // transient upstream failures for session resume; withhold anything else.
-        throw isGitXcodeLicenseError(error) || transientInputFailure(error) || isWorkspacePolicyFailure(error) ? error : unavailable();
+        throw isGitXcodeLicenseError(error) || transientInputFailure(error) || isWorkspacePolicyFailure(error) ? error : unavailable("input_preparation_withheld");
       } finally {
         busy.delete(key);
       }
