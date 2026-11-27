@@ -468,7 +468,7 @@ describe("native authorized input composition", () => {
   it.each([
     ["worktree_receipt_malformed", (receipt: Record<string, unknown>) => ({ ...receipt, baselineCommit: "not-a-commit" })],
     ["worktree_stale_checkout_refused", (receipt: Record<string, unknown>) => ({ ...receipt, baselineCommit: "b".repeat(40) })],
-  ])("names the source-workspace check that refused (%s) in the log and the runtime failure", async (diagnostic, tamper) => {
+  ])("names the source-workspace check that refused (%s) in the log, and reports Core the unchanged failure", async (diagnostic, tamper) => {
     const f = await repositoryFixture(continuityFiles);
     const cacheRoot = join(f.root, "cache");
     const warn = vi.fn();
@@ -484,7 +484,7 @@ describe("native authorized input composition", () => {
     await expect(prepare(assignment)).rejects.toMatchObject({ code: "capability_unavailable", retryable: false });
     expect(warn).toHaveBeenCalledWith(expect.objectContaining({ event: "native.inputs.prepare_failed", stage: "source_workspace",
       code: "capability_unavailable", retryable: false, diagnostic }), "native input preparation failed");
-    expect(onRuntimeFailure).toHaveBeenCalledExactlyOnceWith({ phase: "preparation", stage: `source_workspace_${diagnostic}`,
+    expect(onRuntimeFailure).toHaveBeenCalledExactlyOnceWith({ phase: "preparation", stage: "source_workspace",
       code: "capability_unavailable", evidence: { kind: "runtime_exception" } }, { assignmentId: assignment.id, attempt: assignment.attempt });
     expect(f.fetchFn.mock.calls.filter(([url]) => String(url).endsWith("/fetch-repository"))).toHaveLength(0);
   });

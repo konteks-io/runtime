@@ -48,7 +48,7 @@ import {
 import { NativeRepositoryCache } from "./repository-cache.js";
 import { reportRuntimeFailure, type RuntimeFailureFact, type RuntimeFailureReporter } from "../runtime-failure-types.js";
 import { deliveryStep, tagDeliveryOutputStage, type DeliveryOutputStage } from "./delivery-output-failure.js";
-import { diagnosticIdentifier, gitFailure, NamedRefusal } from "./named-refusal.js";
+import { gitFailure, LoggedRefusal } from "./named-refusal.js";
 
 interface NativeInputPreparerOptions {
   /** Signed Core contract gate; older Core never receives checkpoint requests. */
@@ -91,7 +91,7 @@ const ReceiptSchema = z
   .strict();
 /** Each refusal names its check; identifiers only, never paths, ids or Git output. */
 const unavailable = (diagnostic: string) =>
-  new NamedRefusal("capability_unavailable", "Required assignment inputs are unavailable or no longer authorized.", diagnostic);
+  new LoggedRefusal("capability_unavailable", "Required assignment inputs are unavailable or no longer authorized.", diagnostic);
 
 function privateNode(stat: Stats, directory: boolean): void {
   if (stat.isSymbolicLink() || !expectedKind(stat, directory)) throw unavailable("private_entry_wrong_kind");
@@ -692,11 +692,6 @@ function withSessionContext(source: SourceWorkspace, prepared: PreparedSessionIn
 }
 
 /** The stage carries the check that refused, as a checkpoint failure's does; the stage alone when it has none. */
-function failureStage(stage: string, error: unknown): string {
-  const diagnostic = error instanceof RemoteInstanceError ? error.diagnostic : undefined;
-  return (diagnostic === undefined ? undefined : diagnosticIdentifier(`${stage}_${diagnostic}`, 96)) ?? stage;
-}
-
 function failureFields(error: unknown, fallback: string): { code: string; retryable: boolean; diagnostic?: string; status?: number } {
   return {
     code: error instanceof RemoteInstanceError ? error.code : fallback,
@@ -769,7 +764,7 @@ class InputPreparation {
 
   recordFailure(error: unknown): void {
     reportRuntimeFailure(this.options.onRuntimeFailure, this.sourceFailure ?? {
-      phase: "preparation", stage: failureStage(this.stage, error),
+      phase: "preparation", stage: this.stage,
       code: error instanceof RemoteInstanceError ? error.code : "local_preparation_failed",
       evidence: this.failureEvidence(error),
     }, { assignmentId: this.assignment.id, attempt: this.assignment.attempt });

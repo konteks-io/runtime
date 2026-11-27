@@ -26,6 +26,19 @@ export class NamedRefusal extends RemoteInstanceError {
   }
 }
 
+/**
+ * A refusal named for the connector's own log only. Everything this connector
+ * reports to Core (a runtime failure's stage, code, cause and evidence) treats
+ * it exactly as the unnamed refusal it was before it was named: its name and
+ * facts never leave the log line.
+ */
+export class LoggedRefusal extends NamedRefusal {}
+
+/** The diagnostic a report to Core may carry: never a log-only name. */
+export function reportedDiagnostic(error: RemoteInstanceError): string | undefined {
+  return error instanceof LoggedRefusal ? undefined : error.diagnostic;
+}
+
 /** The check an inner refusal named, for a step that re-raises everything it caught as its own refusal. */
 export function innerDiagnostic(error: unknown, fallback: string): string {
   return error instanceof RemoteInstanceError && error.diagnostic ? error.diagnostic : fallback;
@@ -59,7 +72,7 @@ export function filesystemFailure(error: unknown): { diagnostic: string; facts: 
 }
 
 function refusalFacts(error: unknown): RefusalFacts {
-  return error instanceof NamedRefusal ? error.facts : {};
+  return error instanceof NamedRefusal && !(error instanceof LoggedRefusal) ? error.facts : {};
 }
 
 function errnoOf(error: unknown): string | undefined {

@@ -2,7 +2,7 @@ import { lstat, realpath } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { RemoteSkillCatalogSchema, type RemoteDeliveryAcceptanceReceipt, type RemoteTransferBinding, type SessionToCoreMessage } from "@konteks/remote-common";
 import { stageOrganizationSkills, type StageOrganizationSkillsOptions, type StagedOrganizationSkills } from "./staging.js";
-import { innerDiagnostic, NamedRefusal } from "../native/named-refusal.js";
+import { innerDiagnostic, LoggedRefusal } from "../native/named-refusal.js";
 
 /** Local-only preparation result: paths/instructions never enter relay frames. */
 export interface PreparedSessionInputs {
@@ -40,8 +40,8 @@ function organizationSkillInstructions(staged: StagedOrganizationSkills): string
 }
 
 /** One refusal for every session-input failure, naming the inner check when it had one. */
-function sessionInputsUnavailable(error: unknown, fallback: string): NamedRefusal {
-  return new NamedRefusal("capability_unavailable", "Required local session inputs are unavailable.", innerDiagnostic(error, fallback));
+function sessionInputsUnavailable(error: unknown, fallback: string): LoggedRefusal {
+  return new LoggedRefusal("capability_unavailable", "Required local session inputs are unavailable.", innerDiagnostic(error, fallback));
 }
 
 async function checkedDirectory(cwd: string): Promise<string> {

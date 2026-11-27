@@ -3,7 +3,7 @@ import { constants, type Stats } from "node:fs";
 import { chmod, copyFile, cp, lstat, mkdir, open, readFile, readdir, realpath, rename, rm } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { canonicalize, type JsonValue } from "@konteks/remote-common";
-import { NamedRefusal } from "./named-refusal.js";
+import { LoggedRefusal } from "./named-refusal.js";
 import type { RepositoryGitStep } from "./repository-cache.js";
 
 interface MigrationInput {
@@ -21,7 +21,7 @@ interface MigrationInput {
   exists(path: string): Promise<boolean>;
 }
 
-const unavailable = (diagnostic: string) => new NamedRefusal("capability_unavailable", "Existing Git workspace cannot be safely isolated.", diagnostic);
+const unavailable = (diagnostic: string) => new LoggedRefusal("capability_unavailable", "Existing Git workspace cannot be safely isolated.", diagnostic);
 
 function assertOwned(info: Stats): void {
   if (info.isSymbolicLink() || (!info.isDirectory() && !info.isFile())) throw unavailable("isolation_entry_wrong_kind");

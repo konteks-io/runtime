@@ -16,7 +16,7 @@ import {
   type SessionToCoreMessage,
 } from "@konteks/remote-common";
 import { readFully } from "../read-fully.js";
-import { innerDiagnostic, NamedRefusal } from "./named-refusal.js";
+import { innerDiagnostic, LoggedRefusal } from "./named-refusal.js";
 
 const MAX_RECORD_BYTES = 16 * 1024 * 1024;
 const RecordSchema = z.discriminatedUnion("state", [
@@ -38,7 +38,7 @@ const SessionHeadSchema = z.object({ version: z.literal(1), recovered: Recovered
     "An output session head must retain an accepted or pending turn");
 type TurnIdentity = z.infer<typeof TurnIdentitySchema>;
 /** Each refusal names its check; identifiers only, never paths or record contents. */
-const unavailable = (diagnostic: string) => new NamedRefusal("capability_unavailable", "Durable generated output state is unavailable.", diagnostic);
+const unavailable = (diagnostic: string) => new LoggedRefusal("capability_unavailable", "Durable generated output state is unavailable.", diagnostic);
 
 /** One private, atomic record per stable-session turn, outside its Git worktree.
  * Candidate bytes survive response loss/restart and superseded accepted turns

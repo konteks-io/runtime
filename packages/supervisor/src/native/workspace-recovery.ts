@@ -7,10 +7,10 @@ import { restoreWorkspaceCheckpoint, verifyRestoredWorkspaceCheckpoint } from ".
 import { privateWorkspaceDirectory, readPrivateWorkspaceFile, readWorkspaceControlFile, writePrivateWorkspaceJson } from "./workspace-storage.js";
 import { verifyNativeGitTool, type NativeGitTool } from "./git-workspace.js";
 import type { NativeInputClient } from "./input-client.js";
-import { NamedRefusal } from "./named-refusal.js";
+import { LoggedRefusal } from "./named-refusal.js";
 
 const logger = createLogger({ name: "native-recovered-workspace" });
-const unavailable = (diagnostic: string) => new NamedRefusal("recovery_required", "The preserved workspace could not be restored and verified. Existing work was kept.", diagnostic);
+const unavailable = (diagnostic: string) => new LoggedRefusal("recovery_required", "The preserved workspace could not be restored and verified. Existing work was kept.", diagnostic);
 const ReceiptSchema = z.object({ version: z.literal(1), workspaceId: z.string(), sessionId: z.string(),
   reference: RemoteWorkspaceRecoveryReferenceSchema, configDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/), writing: z.boolean(), retired: z.boolean() }).strict();
 type Receipt = z.infer<typeof ReceiptSchema>;

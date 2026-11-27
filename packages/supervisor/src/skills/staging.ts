@@ -12,7 +12,7 @@ import {
   type RemoteFileEntry, type RemoteFileTree,
 } from "@konteks/remote-common";
 import { readFully } from "../read-fully.js";
-import { innerDiagnostic, NamedRefusal } from "../native/named-refusal.js";
+import { innerDiagnostic, LoggedRefusal } from "../native/named-refusal.js";
 
 /**
  * Content-addressed private staging follows bb's injected-skills pattern:
@@ -44,7 +44,7 @@ export interface StagedOrganizationSkills {
 }
 
 /** Each refusal names its check; identifiers only, never paths, skill names or provider text. */
-const unavailable = (diagnostic: string) => new NamedRefusal("capability_unavailable", "Required organization skills could not be staged safely.", diagnostic);
+const unavailable = (diagnostic: string) => new LoggedRefusal("capability_unavailable", "Required organization skills could not be staged safely.", diagnostic);
 /** What a catalog IS, independent of the assignment that carries it. */
 function skillContentIdentity(catalog: RemoteSkillCatalog): string {
   return sha256Hex(canonicalize(
@@ -52,7 +52,7 @@ function skillContentIdentity(catalog: RemoteSkillCatalog): string {
       .map(s => ({ skillId: s.skillId, version: s.version, name: s.name, treeDigest: s.transfer.treeDigest })),
   ));
 }
-const invalidRoot = (diagnostic: string) => new NamedRefusal("local_io_failure", "Organization skill staging requires a private connector-owned directory.", diagnostic);
+const invalidRoot = (diagnostic: string) => new LoggedRefusal("local_io_failure", "Organization skill staging requires a private connector-owned directory.", diagnostic);
 const ReceiptSchema = z.object({
   catalog: RemoteSkillCatalogSchema,
   modes: z.record(z.string(), z.record(z.string(), z.union([z.literal(0o600), z.literal(0o700)]))),
@@ -188,7 +188,7 @@ function authorizedCatalog(options: StageOrganizationSkillsOptions): AuthorizedC
   const parsed = RemoteSkillCatalogSchema.safeParse(options.catalog);
   const authority = RemoteTransferBindingSchema.safeParse(options.authority.binding);
   if (!parsed.success || !authority.success || canonicalize(parsed.data.binding) !== canonicalize(authority.data) || parsed.data.catalogDigest !== options.authority.catalogDigest) {
-    throw new NamedRefusal("workspace_binding_invalid", "Organization skill selection does not match the authorized assignment.", "skill_catalog_binding_mismatch");
+    throw new LoggedRefusal("workspace_binding_invalid", "Organization skill selection does not match the authorized assignment.", "skill_catalog_binding_mismatch");
   }
   return { catalog: parsed.data, binding: authority.data };
 }

@@ -203,9 +203,10 @@ QA browser, structured results, updates and doctor/support.
   through the repository cache, worktree isolation, recovered workspaces,
   output state and skill staging, is a `NamedRefusal`, and a step that
   re-raises what it caught keeps the inner name (`innerDiagnostic`).
-  `native.inputs.prepare_failed` logs the `diagnostic`, and the preparation
-  runtime failure carries it in its stage, e.g.
-  `source_workspace_worktree_stale_checkout_refused`.
+  `native.inputs.prepare_failed` logs the `diagnostic`. These are
+  `LoggedRefusal`s: the name is for the connector log only, and every report
+  to Core (a runtime failure's stage, code, cause and evidence) stays exactly
+  what the unnamed refusal sent (`reportedDiagnostic`, `refusalFacts`).
 - A turn whose output Harness accepted but whose acceptance reply never
   arrived stays `pending` here. When Core's signed selection names that exact
   candidate (same result digest) as the accepted result, the session head

@@ -6,7 +6,7 @@ import { dirname, isAbsolute, join } from "node:path";
 import { z } from "zod";
 import { RemoteFileTreeSchema, connectorGitEnv, sha256Hex } from "@konteks/remote-common";
 import { readFully } from "../read-fully.js";
-import { gitFailure, innerDiagnostic, NamedRefusal } from "./named-refusal.js";
+import { gitFailure, innerDiagnostic, LoggedRefusal } from "./named-refusal.js";
 
 /** Installer-selected local tool, never a field in a cloud assignment. */
 export const NativeGitToolSchema = z
@@ -35,7 +35,7 @@ const config =
   "[core]\nrepositoryformatversion = 0\nbare = false\nfilemode = true\nlogallrefupdates = true\nworktree = ../source\nhooksPath = ../hooks-disabled\nautocrlf = false\n[commit]\ngpgsign = false\n[tag]\ngpgsign = false\n";
 /** Each refusal names its check; identifiers only, never paths or Git output. */
 const unavailable = (diagnostic: string) =>
-  new NamedRefusal("capability_unavailable", "Private Git workspace or installer-selected Git tool is unavailable.", diagnostic);
+  new LoggedRefusal("capability_unavailable", "Private Git workspace or installer-selected Git tool is unavailable.", diagnostic);
 
 async function directory(path: string) {
   const stat = await lstat(path);

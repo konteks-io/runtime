@@ -5,7 +5,7 @@ import { constants, type Stats } from "node:fs";
 import { chmod, lstat, mkdir, open, readFile, realpath, rename, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, parse, resolve } from "node:path";
 import { RemoteInstanceError, canonicalize, createLogger, sha256Hex, type JsonValue } from "@konteks/remote-common";
-import { gitFailure, NamedRefusal } from "./named-refusal.js";
+import { gitFailure, LoggedRefusal } from "./named-refusal.js";
 import { verifyNativeGitTool, type NativeGitTool } from "./git-workspace.js";
 import { staleCheckoutVerdict } from "./output-capture.js";
 import { filesystemKeepsExecutableBit } from "./executable-bit.js";
@@ -21,7 +21,7 @@ const INTENT_SUFFIX = ".konteks-worktree-intent.json";
 
 /** Each refusal names its check; identifiers only, never paths, ids or Git output. */
 const unavailable = (diagnostic: string) =>
-  new NamedRefusal("capability_unavailable", "Private Git repository cache or worktree is unavailable.", diagnostic);
+  new LoggedRefusal("capability_unavailable", "Private Git repository cache or worktree is unavailable.", diagnostic);
 
 /** The Git call a cache or worktree refusal came from. */
 export type RepositoryGitStep =
