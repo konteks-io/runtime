@@ -2391,6 +2391,39 @@ describe("relayed session", () => {
       expect(sent.at(-1)?.body).toEqual({ kind: "acp_result", id: "p2", method: "session/prompt", result: { stopReason: "end_turn" } });
       await session.close("cancelled");
     });
+
+    it("refuses a planning estimate's sibling session read at once and still completes with its structured result", async () => {
+      const registered = registeredCard();
+      const contextRoot = "/private/native/session-context/session-1/source";
+      const planning: RemoteWorkAssignment = { ...validation, kind: "planning",
+        agentRoute: { ...validation.agentRoute, agentId: "claude-code" } };
+      const { session, sent, runner, runnerCalls } = await build({
+        registerDeferral: registered,
+        prepareInputs: async (target: RemoteWorkAssignment) => ({
+          binding: { workspaceId: target.workspaceId, sessionId: "s", assignmentId: target.id, instanceId: target.instanceId, attempt: target.attempt },
+          cwd: "/private/native/checkout", readOnlyRoots: [contextRoot], sessionContextRoot: contextRoot,
+          skillInstructions: "", beforePrompt: async () => undefined,
+        }),
+      }, planning);
+      await session.bootstrap();
+      const agent = await resultTool(runnerCalls, true);
+      await session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p1", params: promptWithContract });
+      await session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: "perm-plan", params: {
+        sessionId: "acp-1", options: escalationOptions,
+        toolCall: { toolCallId: "t-plan", kind: "execute", title: "Size of memory files",
+          locations: [{ path: "/private/native/session-context/session-2/source/memory/conversation.md" }],
+          rawInput: { command: "wc -l ../session-2/source/memory/conversation.md" }, _meta: { claudeCode: { toolName: "Bash" } } },
+      } } as never);
+      // Nothing goes to a person, and the refusal names the session context Read tool.
+      expect(registered).not.toHaveBeenCalled();
+      expect(runner.answer).toHaveBeenCalledWith("acp-1", "perm-plan", { outcome: { outcome: "selected", optionId: "reject" } });
+      await agent.submit({ verdict: "pass" });
+      await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p1", result: { stopReason: "end_turn" } });
+      expect(sent.at(-1)?.body).toMatchObject({ kind: "acp_result", id: "p1",
+        result: { structuredOutput: { source: "tool", value: { verdict: "pass" } } } });
+      await agent.stop();
+      await session.close("cancelled");
+    });
   });
 
   it("backpressures a terminal-fenced prompt before journaling or emitting any transcript frame", async () => {

@@ -40,7 +40,12 @@ whole permission path.
   a Claude shell command whose blocked paths lie only in the working copy and
   the session context folder (`sessionContextRoot`, data the agent is told to
   read): it is refused at once with a note naming the Read tool, never put to
-  a person and never allowed. Skill folders still ask. If human
+  a person and never allowed. A `planning` assignment goes further: a Claude
+  shell call with any flagged path outside the working copy and this session's
+  context folder — including a required organization skill folder — is refused
+  at once, never deferred, because an estimate's result is `submit_result` and
+  nothing reads a shell result. Other assignment kinds keep the allow-once
+  deferral, and a skill folder still asks for them. If human
   deferral or the exact safe options are unavailable, refuse. Codex's manual
   standalone grant is turn-scoped; session grants and strict automatic review
   are excluded from the broker and Core view. Ordinary same-authority commands
@@ -96,3 +101,40 @@ whole permission path.
 - Code Mode asks at a block's first MCP call, not before the block runs;
   OpenCode's own tools are denied in its locked config instead.
 - Integration task sessions do not use this policy: see `../integration/AGENTS.md`.
+
+## Finding: the four 2026-11-04 estimate cards
+
+The TKT-3 delivery description carries the full write-up; this is the code
+cross-reference.
+
+- **One path raised all four.** `withSessionContext`/`contextReadHint`
+  (`../native/input-preparer.ts`) tells every agent to read this session's
+  context folder and adds only that folder to `readOnlyRoots`.
+  `repositoryContext` → `sourceWorkspace` stage it at
+  `<RUNNER_WORKSPACE_DIR>/session-context/session-<hash>/source`, where
+  `hash = sha256(JCS({workspaceId, instanceId, sessionId}))` and
+  `RUNNER_WORKSPACE_DIR` is `<connector root>/workspaces/<agentId>`
+  (`packages/launcher/src/native/install.ts`, `native/installation.ts`).
+  The working copy is a different checkout, so a shell `wc`/`ls`/`cat`/`sed`
+  over the context folder is outside it and asked a person.
+- **The heading did not prove the location.** On 11-04 `escalationTitle`
+  embedded the model-written tool title and every located Claude shell call
+  read "Outside this session's folder"; the command is embedded only since
+  2026-11-05. The four titles name the staged context/memory files, not
+  `~/.claude`.
+- **No card resolved into the operator's home.** A bundled runner's `HOME` is
+  its private `RUNNER_CREDENTIAL_DIR`; a personal Claude profile sets `HOME`
+  to the operator's home (`packages/agent-runner/src/bridge/spec.ts`), and the
+  Claude bridge patch excludes auto memory. `~/.claude` was reachable under a
+  personal profile, but it is not what these four commands named.
+- **Sibling memory was reachable, outside the roots.** `readOnlyRoots` holds
+  only this session's context folder, so a sibling
+  `session-context/session-<other>/` and the `session-context/` parent are
+  outside it. These checks do not provide process/OS confinement: a shell
+  naming a sibling would have run had a person allowed it. All four were
+  denied, so nothing was read.
+- **Nothing consumed the result.** An estimate's output is `submit_result`;
+  no code reads the shell result. That is why a planning shell call is now
+  refused instead of deferred, including one that reaches a staged
+  organization skill folder: the Read tool reaches those roots, and a
+  planning estimate never needs a shell there.

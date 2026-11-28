@@ -104,6 +104,56 @@ describe("a native escalation the person reads on the card", () => {
   });
 });
 
+describe("a planning estimate's Claude shell call", () => {
+  const contextRoot = "/work/session-context/session-1/source";
+  const skillRoot = "/work/skills/org-1";
+  const planning = { ...claudeContext, assignmentKind: "planning", readOnlyRoots: [skillRoot, contextRoot], sessionContextRoot: contextRoot };
+  const decide = (paths: string[], ctx: object = planning, canDefer = true) => nativePermissionEscalation({
+    sessionId: "acp-1", options: claudeOptions,
+    toolCall: { toolCallId: "tool-1", title: "Size of memory files", kind: "execute", locations: paths.map(path => ({ path })),
+      rawInput: { command: "wc -l memory/conversation.md" }, _meta: { claudeCode: { toolName: "Bash" } } },
+  } as never, ctx as never, { kind: "native", tool: "Bash" } as never, () => canDefer);
+
+  it("is refused at once when it reaches a sibling session's context folder, and asks no person", () => {
+    expect(decide(["/work/session-context/session-2/source/memory/conversation.md"])).toEqual({
+      kind: "deny", optionId: "reject", refusal: { reason: "planning_outside_shell" },
+      message: expect.stringMatching(/^Konteks refused this shell command: .*Read tool/),
+    });
+  });
+
+  it("is refused at once when it reaches the operator's own Claude memory, and asks no person", () => {
+    expect(decide(["/home/operator/.claude/projects/-work/memory/MEMORY.md"])).toEqual({
+      kind: "deny", optionId: "reject", refusal: { reason: "planning_outside_shell" },
+      message: expect.stringMatching(/^Konteks refused this shell command: .*Read tool/),
+    });
+  });
+
+  it("is refused at once when it reaches a staged organization skill folder too", () => {
+    expect(decide([`${skillRoot}/scripts/run.sh`])).toEqual({
+      kind: "deny", optionId: "reject", refusal: { reason: "planning_outside_shell" },
+      message: expect.stringMatching(/^Konteks refused this shell command: .*Read tool/),
+    });
+  });
+
+  it("keeps the current deferral on a delivery assignment", () => {
+    expect(decide(["/home/operator/.claude/projects/-work/memory/MEMORY.md"], { ...planning, assignmentKind: "delivery" }))
+      .toMatchObject({ kind: "defer", allowOnceOnly: true, optionIds: ["allow-once", "reject"],
+        title: "Outside this session's folder: wc -l memory/conversation.md" });
+  });
+
+  it("still names a context-only call as the session context read", () => {
+    expect(decide([`${contextRoot}/memory/conversation.md`])).toMatchObject({
+      kind: "deny", refusal: { reason: "session_context_shell" },
+    });
+  });
+
+  it("keeps its deferral when every flagged path is inside the working copy", () => {
+    expect(decide(["/work/session/src/a.ts"])).toMatchObject({
+      kind: "defer", title: "Wants to run a shell command: wc -l memory/conversation.md",
+    });
+  });
+});
+
 describe("a Claude shell command that reaches only into the session context folder", () => {
   const contextRoot = "/work/session-context/session-1/source";
   const skillRoot = "/work/skills/org-1";
