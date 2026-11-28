@@ -96,6 +96,35 @@ describe("the private Codex home overlay", () => {
     expect(sanitized).toContain('[projects."/tmp/example"]');
   });
 
+  it("strips quoted, dotted, inline and profile-scoped instruction keys", () => {
+    const sanitized = sanitizeCodexConfig([
+      'profile = "work"',
+      '"model_instructions_file" = "/operator/quoted.md"',
+      'profiles.work.experimental_instructions_file = "/operator/dotted.md"',
+      'profiles = { work = { developer_instructions = "INLINE" } }',
+      "[profiles.work]",
+      'model = "approved"',
+      'model_instructions_file = "/operator/profile.md"',
+      'instructions = "PROFILE_INSTRUCTIONS"',
+      '[skills.personal]',
+      'path = "/operator/skill"',
+      '["plugins"."personal"]',
+      "enabled = true",
+      "[features]",
+      "memories = false",
+      "",
+    ].join("\n"));
+    expect(sanitized).toContain('profile = "work"');
+    expect(sanitized).toContain('model = "approved"');
+    expect(sanitized).toContain("[features]");
+    expect(sanitized).toContain("memories = false");
+    for (const gone of ["quoted.md", "dotted.md", "INLINE", "profile.md", "PROFILE_INSTRUCTIONS", "[skills", "/operator/skill", "[plugins"]) {
+      expect(sanitized).not.toContain(gone);
+    }
+    // An unparseable table header drops the whole operator config (minimal).
+    expect(sanitizeCodexConfig('[broken\nmodel = "approved"')).toBe("");
+  });
+
   it("picks up a new real entry, drops one that disappeared, and never deletes a connector-created store", async () => {
     const f = await homes();
     await prepareCodexHomeOverlay(f.real, f.overlay);

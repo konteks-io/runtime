@@ -66,7 +66,7 @@ and the agent-on-every-OS proof. Most are called from `.github/workflows/`
   and `instructions/` folders. It writes a sanitized `config.toml` copy without
   `developer_instructions`, `model_instructions_file`,
   `experimental_instructions_file`, `instructions`, `base_instructions` or
-  `compact_prompt`, instead of linking the operator's file. The overlay carries
+  `compact_prompt`, in any TOML spelling (bare, quoted, dotted, table-scoped) instead of linking the operator's file. The overlay carries
   a marker; the patch (`v13`) refuses any `CODEX_HOME` without it and any
   marked overlay that still exposes `AGENTS.md` or `AGENTS.override.md`. The
   thread config also sets `project_doc_max_bytes: 0` (no parent/nested

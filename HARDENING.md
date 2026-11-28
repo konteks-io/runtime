@@ -114,7 +114,7 @@ way: Claude excludes the user `CLAUDE.md`, rules, parent files and auto memory
 `CODEX_HOME` overlay that keeps the login and thread store but not
 `AGENTS.md`, `AGENTS.override.md`, any `memories*` entry, or the personal
 `skills/`, `prompts/`, `plugins/` and `instructions/` folders; its `config.toml`
-is a sanitized copy without the instruction-source keys
+is a sanitized copy without the instruction-source keys in any TOML spelling (bare, quoted, dotted, table-scoped)
 (`packages/supervisor/src/native/codex-home-overlay.ts`). The patch (`v13`)
 refuses any `CODEX_HOME` that is not that marked overlay, and any marked
 overlay that still exposes an instruction file. The thread config sets

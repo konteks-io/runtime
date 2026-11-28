@@ -138,7 +138,7 @@ whole permission path.
   `prompts/`, `plugins/` and `instructions/` folders. Its `config.toml` is a
   sanitized copy without `developer_instructions`, `model_instructions_file`,
   `experimental_instructions_file`, `instructions`, `base_instructions` or
-  `compact_prompt`. The thread config also sets `project_doc_max_bytes: 0` (no
+  `compact_prompt` in any TOML spelling (bare, quoted, dotted, table-scoped). The thread config also sets `project_doc_max_bytes: 0` (no
   parent or nested project-doc walk) and always sets `developer_instructions`
   (empty when the working copy has none, otherwise its root `AGENTS.md`); this
   intentionally drops nested files and replaces an operator value. The patch

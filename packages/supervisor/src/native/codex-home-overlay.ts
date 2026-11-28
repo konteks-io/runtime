@@ -23,10 +23,6 @@ const CODEX_HOME_SOURCE = ".konteks-codex-home";
 
 /** Codex's config carries instruction sources that would otherwise steer a session. */
 const CODEX_CONFIG = "config.toml";
-const CODEX_CONFIG_INSTRUCTION_KEYS: ReadonlySet<string> = new Set([
-  "developer_instructions", "model_instructions_file", "experimental_instructions_file",
-  "instructions", "base_instructions", "compact_prompt",
-]);
 /** Tables that can name skills, prompts or plugins by an absolute path outside the overlay. */
 const CODEX_CONFIG_BLOCKED_TABLES: ReadonlySet<string> = new Set(["plugins", "marketplaces", "skills", "prompts", "instructions"]);
 
@@ -88,36 +84,127 @@ export async function codexHomeBehindOverlay(overlay: string): Promise<string | 
   return null;
 }
 
-/** Drop top-level instruction keys and skill/prompt/plugin tables. */
+/** Drop instruction keys in any TOML spelling and skill/prompt/plugin tables. */
 export function sanitizeCodexConfig(text: string): string {
+  const cleaned = stripCodexConfig(text);
+  return cleaned === null || containsInstructionSource(cleaned) ? "" : cleaned;
+}
+
+/**
+ * Remove every assignment whose key path ends in an instruction source, and
+ * every skill/prompt/plugin table. Any header this cannot parse fails the
+ * whole sanitizer closed (an empty config is returned by the caller).
+ */
+function stripCodexConfig(text: string): string | null {
   const lines = text.split(/\r?\n/);
   const kept: string[] = [];
-  let table: "none" | "keep" | "denied" = "none";
+  let denyTable = false;
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index]!;
-    if (isTableHeader(line)) table = deniedTable(line) ? "denied" : "keep";
-    if (table === "denied") continue;
-    if (table === "none" && instructionKey(line)) {
+    if (/^\s*\[/.test(line)) {
+      const denied = tableDecision(line);
+      if (denied === null) return null;
+      denyTable = denied;
+      if (!denyTable) kept.push(line);
+      continue;
+    }
+    if (denyTable) continue;
+    if (instructionAssignment(line)) {
       index = skipValue(lines, index);
       continue;
     }
-    kept.push(line);
+    index = keepValue(lines, index, kept);
   }
   return kept.join("\n");
 }
 
-function isTableHeader(line: string): boolean {
-  return /^\s*\[/.test(line);
+function tableDecision(line: string): boolean | null {
+  const path = tablePath(line);
+  return path === null ? null : CODEX_CONFIG_BLOCKED_TABLES.has(path[0]!.toLowerCase());
 }
 
-function deniedTable(line: string): boolean {
-  const name = /^\s*\[\s*([A-Za-z0-9_-]+)/.exec(line)?.[1]?.toLowerCase();
-  return name !== undefined && CODEX_CONFIG_BLOCKED_TABLES.has(name);
+/** Keep an assignment's line and any multi-line value without judging its contents. */
+function keepValue(lines: readonly string[], index: number, kept: string[]): number {
+  const end = skipValue(lines, index);
+  kept.push(lines[index]!);
+  for (let next = index + 1; next <= end; next++) kept.push(lines[next]!);
+  return end;
 }
 
-function instructionKey(line: string): boolean {
-  const match = /^\s*([A-Za-z0-9_-]+)\s*=/.exec(line);
-  return match !== null && CODEX_CONFIG_INSTRUCTION_KEYS.has(match[1]!);
+const INSTRUCTION_ASSIGNMENT =
+  /(?:^|[\s.[{,"'])(?:["'])?(?:developer_instructions|model_instructions_file|experimental_instructions_file|base_instructions|compact_prompt|instructions)(?:["'])?\s*=/i;
+
+/** Recognizes bare, quoted, dotted, inline-table and table-scoped instruction keys. */
+function instructionAssignment(line: string): boolean {
+  return INSTRUCTION_ASSIGNMENT.test(line);
+}
+
+function containsInstructionSource(text: string): boolean {
+  for (const line of text.split(/\r?\n/)) {
+    if (/^\s*\[/.test(line)) {
+      const denied = tableDecision(line);
+      if (denied === null || denied) return true;
+      continue;
+    }
+    if (instructionAssignment(line)) return true;
+  }
+  return false;
+}
+
+function tablePath(line: string): string[] | null {
+  const match = /^\s*\[\[?\s*(.+?)\s*\]\]?\s*(?:#.*)?$/.exec(line);
+  return match === null ? null : splitKeyPath(match[1]!);
+}
+
+/** Split a dotted TOML key path, keeping quoted segments and their dots intact. */
+function splitKeyPath(raw: string): string[] | null {
+  const parts: string[] = [];
+  let current = "";
+  let quote: string | null = null;
+  for (let index = 0; index < raw.length; index++) {
+    const char = raw[index]!;
+    if (quote !== null) {
+      quote = char === quote && raw[index - 1] !== "\\" ? null : quote;
+      current += char;
+      continue;
+    }
+    if (isQuote(char)) {
+      quote = char;
+      current += char;
+    } else if (char === ".") {
+      if (!pushPart(parts, current)) return null;
+      current = "";
+    } else {
+      current += char;
+    }
+  }
+  return finishPath(parts, current, quote);
+}
+
+function isQuote(char: string): boolean {
+  return char === '"' || char === "'";
+}
+
+function pushPart(parts: string[], current: string): boolean {
+  const part = takePart(current);
+  if (part === null) return false;
+  parts.push(part);
+  return true;
+}
+
+function finishPath(parts: string[], current: string, quote: string | null): string[] | null {
+  if (quote !== null) return null;
+  const last = takePart(current);
+  return last === null ? null : [...parts, last];
+}
+
+function takePart(value: string): string | null {
+  const trimmed = value.trim();
+  return trimmed.length === 0 ? null : unquoteKey(trimmed);
+}
+
+function unquoteKey(value: string): string {
+  return value.replace(/^["']|["']$/g, "");
 }
 
 /** The last line of the denied key's value: a multi-line string or array, else its own line. */
