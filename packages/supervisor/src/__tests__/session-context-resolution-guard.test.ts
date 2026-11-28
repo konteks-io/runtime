@@ -158,7 +158,7 @@ describe("a Claude shell call outside this session's own context folder never au
 describe("the instruction scopes are driven by the session folder, never the operator's home", () => {
   type ClaudeScope = (settings: Record<string, unknown>, cwd: string, userConfigDir: string) =>
     Promise<{ claudeMdExcludes: string[]; autoMemoryEnabled: boolean }>;
-  type CodexScope = { konteksCodexInstructionScope: (workingCopy: string) => Record<string, unknown> };
+  type CodexGuard = { konteksCodexHomeGuard: (env: Record<string, string | undefined>) => void };
 
   it(`${RULE} — under a personal Claude profile the user rules, ancestors and auto memory stay excluded`, async () => {
     const { isolateClaudeInstructions } = (await import("../../../../scripts/claude-instruction-scope.mjs")) as unknown as {
@@ -182,23 +182,30 @@ describe("the instruction scopes are driven by the session folder, never the ope
     expect((await isolateClaudeInstructions({}, cwd, user)).claudeMdExcludes).toEqual(result.claudeMdExcludes);
   });
 
-  it(`${RULE} — the Codex thread scope carries only the working copy's instructions`, async () => {
-    // The fixture-backed test in scripts/codex-acp-live-user-patch.test.mjs
-    // drives the patched upstream createSessionConfig and checks the config
-    // that reaches thread/start. This guard checks the scope's contract.
-    const { konteksCodexInstructionScope } = (await import("../../../../scripts/codex-acp-live-user-patch.mjs")) as unknown as CodexScope;
+  it(`${RULE} — the Codex bridge refuses a home that is not its marked overlay or leaks instructions`, async () => {
+    // The overlay itself is tested in native-codex-home-overlay.test.ts; the
+    // real Codex prompt input is characterized in
+    // __characterization__/codex-instruction-overlay.test.ts. This guard checks
+    // the bridge's fail-closed contract.
+    const { konteksCodexHomeGuard } = (await import("../../../../scripts/codex-acp-live-user-patch.mjs")) as unknown as CodexGuard;
     const root = await realpath(await mkdtemp(join(tmpdir(), "instruction-scope-codex-")));
     roots.push(root);
-    const workingCopy = join(root, "work");
-    const sharedHome = join(root, "operator", ".codex");
-    await mkdir(workingCopy, { recursive: true });
-    await mkdir(sharedHome, { recursive: true });
-    await writeFile(join(workingCopy, "AGENTS.md"), "# working copy rules\n");
-    await writeFile(join(sharedHome, "AGENTS.md"), "# operator private rules\n");
-    await writeFile(join(sharedHome, "AGENTS.override.md"), "# operator private override\n");
-    const scope = konteksCodexInstructionScope(workingCopy);
-    expect(scope).toMatchObject({ project_doc_max_bytes: 0, features: { memories: false }, developer_instructions: "# working copy rules\n" });
-    // Nothing in the thread scope names the shared profile or its files.
-    expect(JSON.stringify(scope)).not.toMatch(/operator private|\.codex|CODEX_HOME/);
+    const clean = join(root, "overlay");
+    const dirty = join(root, "operator", ".codex");
+    await mkdir(clean, { recursive: true });
+    await mkdir(dirty, { recursive: true });
+    await writeFile(join(clean, "auth.json"), "{}\n");
+    await writeFile(join(clean, ".konteks-codex-overlay"), "konteks-codex-home-overlay-v1\n");
+    expect(() => konteksCodexHomeGuard({ CODEX_HOME: clean })).not.toThrow();
+    // The operator's real home is unmarked, so it is refused before any read.
+    await writeFile(join(dirty, "AGENTS.md"), "# operator private rules\n");
+    expect(() => konteksCodexHomeGuard({ CODEX_HOME: dirty })).toThrow(/private home overlay/);
+    // Even a marked overlay that somehow exposes an instruction file is refused.
+    await writeFile(join(dirty, ".konteks-codex-overlay"), "konteks-codex-home-overlay-v1\n");
+    for (const entry of ["AGENTS.md", "AGENTS.override.md"]) {
+      await writeFile(join(dirty, entry), "# operator private rules\n");
+      expect(() => konteksCodexHomeGuard({ CODEX_HOME: dirty })).toThrow(new RegExp(entry.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      await rm(join(dirty, entry));
+    }
   });
 });

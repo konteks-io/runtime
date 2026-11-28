@@ -130,15 +130,19 @@ whole permission path.
   rules folder, every parent `CLAUDE.md` and auto memory, including under a
   personal profile whose `HOME` is the operator's home
   (`scripts/claude-instruction-scope.mjs`, marker
-  `instruction_scope version=4`). The Codex patch (`v13`) sets
-  `project_doc_max_bytes: 0` (no user-level `$CODEX_HOME/AGENTS.md`, override
-  file, parent or project docs), `features.memories: false`, and carries only
-  the working copy's root `AGENTS.md` as `developer_instructions`, so a shared
-  `CODEX_HOME` never supplies instructions or memories. Nested working-copy
-  `AGENTS.md` files are therefore not discovered, and the thread's
-  `developer_instructions` replaces any operator value; both are intentional.
-  Host agents (dsh/OpenCode/Antigravity) take `AGENTS.md` only from the working
-  copy (`packages/agent-runner/src/host/working-copy-instructions.ts`).
+  `instruction_scope version=4`). Codex reads `$CODEX_HOME/AGENTS.md` and
+  `AGENTS.override.md` into `Config.user_instructions` independently of project
+  docs, so the supervisor gives it a private home overlay
+  (`../native/codex-home-overlay.ts`) that links the official login and thread
+  store but omits those files and every `memories*` entry. The thread config
+  also sets `project_doc_max_bytes: 0` (no parent or nested project-doc walk)
+  and carries the working copy's root `AGENTS.md` as `developer_instructions`;
+  this intentionally drops nested files and replaces an operator
+  `developer_instructions` for the thread. The patch (`v13`) refuses any
+  `CODEX_HOME` that is not the marked overlay, and any marked overlay that
+  still exposes those files. Host agents (dsh/OpenCode/Antigravity) take
+  `AGENTS.md` only from the working copy
+  (`packages/agent-runner/src/host/working-copy-instructions.ts`).
 - **Out-of-folder locations that remain.** Two are genuinely required: the
   session's own context folder, and the selected organization skill folders
   staged by input preparation outside the working copy. The context folder is

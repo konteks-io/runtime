@@ -13,6 +13,7 @@ import { IdentitySchema, ManifestRecordSchema } from "../state/store.js";
 import { NativeBridgeVerification } from "./bridge-verification.js";
 import { NativeGitToolSchema, verifyNativeGitTool } from "./git-workspace.js";
 import { resolveNativeCodexHome } from "./codex-home.js";
+import { prepareCodexHomeOverlay } from "./codex-home-overlay.js";
 import { resolveNativeClaudeExecutable } from "./claude-executable.js";
 import { hostAgentInstallAdapter, nativeAgentOffered } from "./host-agents.js";
 import { antigravityUpdateNeeded, updateNativeAntigravity } from "./antigravity-update.js";
@@ -214,7 +215,7 @@ class InstallationLoader {
     for (const path of [prefix, credentials, workspace]) await this.directory(path);
     const artifact = artifacts.find(candidate => candidate.agentId === agent)!;
     const profile = await this.bridges.verifyPackage(prefix, artifact);
-    const { codexHome, claudeExecutable } = await agentExecutables(agent, record);
+    const { codexHome, claudeExecutable } = await agentExecutables(agent, record, root);
     return RunnerConfigSchema.parse({
       RUNNER_AGENT_ID: agent, RUNNER_AUTH_MODE: "agent_local_subscription",
       RUNNER_CREDENTIAL_DIR: credentials, RUNNER_WORKSPACE_DIR: workspace,
@@ -278,8 +279,10 @@ function antigravityUnavailable(root: string, record: NativeRuntimeRecord, error
 }
 
 /** Codex's home and Claude Code's executable, located again from the record for the agent that needs one. */
-async function agentExecutables(agent: string, record: NativeRuntimeRecord): Promise<{ codexHome: string | undefined; claudeExecutable: string | undefined }> {
-  const codexHome = agent === "codex" ? await resolveNativeCodexHome(record.codexHome === undefined ? process.env : { CODEX_HOME: record.codexHome }) : undefined;
+async function agentExecutables(agent: string, record: NativeRuntimeRecord, root: string): Promise<{ codexHome: string | undefined; claudeExecutable: string | undefined }> {
+  const realCodexHome = agent === "codex" ? await resolveNativeCodexHome(record.codexHome === undefined ? process.env : { CODEX_HOME: record.codexHome }) : undefined;
+  const codexHome = realCodexHome === undefined ? undefined
+    : await prepareCodexHomeOverlay(realCodexHome, join(root, "credentials", "codex", "codex-home"));
   const claudeExecutable = agent === "claude-code" ? await resolveNativeClaudeExecutable(process.env, undefined, undefined, record.claudeExecutable) : undefined;
   return { codexHome, claudeExecutable };
 }

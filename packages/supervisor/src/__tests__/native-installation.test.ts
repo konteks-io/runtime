@@ -238,7 +238,7 @@ describe("closed native runtime installation", () => {
     vi.stubEnv("SUPERVISOR_DEPLOYMENT_KIND", "appliance");
     vi.stubEnv("SUPERVISOR_CORE_URL", "https://wrong.example");
     const loaded = await loadNativeInstallation(root, f.options);
-    expect(loaded.runners[0]?.RUNNER_NATIVE_CODEX_HOME).toBe(join(root, "operator-codex"));
+    expect(loaded.runners[0]?.RUNNER_NATIVE_CODEX_HOME).toBe(join(root, "credentials", "codex", "codex-home"));
     expect(loaded.config).toMatchObject({ SUPERVISOR_DEPLOYMENT_KIND: "native_connector", SUPERVISOR_DATA_DIR: join(root, "supervisor"), SUPERVISOR_ONBOARD_GIT_KEY_DIR: join(root, "supervisor", "git-keys"), SUPERVISOR_ONBOARD_SCRATCH_ROOT: join(root, "supervisor", "onboard"), SUPERVISOR_CORE_URL: "https://core.example", SUPERVISOR_BUNDLE_VERSION: "1.0.0",
       // R5-O22: answers from Core's one named producer are accepted.
       SUPERVISOR_CORE_PERMISSION_ANSWER_PRODUCER: "konteks-core-permission-answers" });

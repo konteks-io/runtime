@@ -156,10 +156,9 @@ function sameInstall(install: InstallContext, record: NativeRuntimeRecord, activ
   );
 }
 
-/** A record from before the Codex profile was recorded binds the one its runner already uses. */
+/** A record from before the Codex profile was recorded binds the operator's real profile, never the private overlay. */
 async function bindCodexProfile(install: InstallContext, installation: Awaited<ReturnType<typeof loadNativeInstallation>>): Promise<NativeRuntimeRecord> {
-  const codexHome = installation.runners.find(runner => runner.RUNNER_AGENT_ID === "codex")?.RUNNER_NATIVE_CODEX_HOME;
-  if (!codexHome) throw invalid();
+  const codexHome = await resolveNativeCodexHome();
   const bound = NativeRuntimeRecordSchema.parse({ ...installation.record, codexHome });
   install.lock.assertOwned();
   await writeSecretFile(join(install.root, "native-runtime.json"), JSON.stringify(bound));

@@ -55,16 +55,23 @@ and the agent-on-every-OS proof. Most are called from `.github/workflows/`
   calls require a one-time human decision. The bridge names the tool in
   `toolCall._meta.claudeCode.toolName`; the Codex patch turns the person's and
   trusted projects' MCP servers off per thread and admits only
-  `admittedMcpServerNames` for an integration session. The Codex patch also
-  sets `project_doc_max_bytes: 0` (Codex returns before reading the user-level
-  `$CODEX_HOME/AGENTS.md`, any `AGENTS.override.md` and project docs),
-  `features.memories: false` (the `features` table `codex-config` deserializes
-  through `codex-features`; the source-bound Codex fixtures carry the
-  `codex-memories-*` crates), and carries only the working copy's root
-  `AGENTS.md` as `developer_instructions`, so a shared `CODEX_HOME` never
-  supplies instructions or memories. Two consequences are intentional and
-  documented here: nested working-copy `AGENTS.md` files are not discovered,
-  and a Konteks thread's `developer_instructions` replaces any operator value.
+  `admittedMcpServerNames` for an integration session. A Konteks Codex session
+  never reads the operator's own instructions or memories: Codex reads
+  `$CODEX_HOME/AGENTS.md` and `AGENTS.override.md` into `Config.user_instructions`
+  independently of project docs (`project_doc_max_bytes: 0` does not suppress
+  them), so the supervisor gives Codex a private home overlay
+  (`packages/supervisor/src/native/codex-home-overlay.ts`) that links the
+  official login and thread store but omits `AGENTS.md`, `AGENTS.override.md`
+  and every `memories*` entry. The overlay carries a marker; the patch (`v13`)
+  refuses any `CODEX_HOME` without it and any marked overlay that still exposes
+  `AGENTS.md` or `AGENTS.override.md`. The thread config also sets
+  `project_doc_max_bytes: 0`, which stops Codex's parent/nested project-doc
+  walk, and carries the working copy's root `AGENTS.md` as
+  `developer_instructions`; a non-git working copy otherwise read a parent
+  `AGENTS.md`. This intentionally drops nested working-copy files and replaces
+  an operator `developer_instructions` for the thread. The characterization test
+  `codex-instruction-overlay.test.ts` runs the real Codex prompt input to prove
+  the operator's override and a parent file do not reach it.
 - The Claude bridge prints an `instruction_scope version=N ...` marker that the
   runner parses (`packages/agent-runner/src/bridge/instruction-scope-observer.ts`);
   change both together.

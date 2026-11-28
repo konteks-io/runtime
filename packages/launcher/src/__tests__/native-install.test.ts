@@ -933,7 +933,7 @@ describe("native install composition", () => {
     expect(loaded.record.codexHome).toBe(await realpath(join(f.root, "operator-codex")));
     vi.stubEnv("CODEX_HOME", join(f.root, "not-the-installed-profile"));
     const restarted = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
-    expect(restarted.runners[0]?.RUNNER_NATIVE_CODEX_HOME).toBe(loaded.record.codexHome);
+    expect(restarted.runners[0]?.RUNNER_NATIVE_CODEX_HOME).toBe(await realpath(join(f.root, "credentials", "codex", "codex-home")));
     const runner = loaded.runners[0]!, family = resolveBridgeFamily("codex");
     const bridge = resolveBridgeSpawnSpec(runner), login = resolveToolingCommand(runner, family, family.tooling.login);
     expect(bridge.command).toBe(join(runner.RUNNER_BRIDGE_PREFIX, "bin/node"));
