@@ -45,6 +45,19 @@ describe("bridge spawn spec", () => {
     expect(() => bridgeEnvironment(native, findAgentBridge("codex")!)).toThrow(/native personal Claude/);
     expect(() => bridgeEnvironment({ ...native, RUNNER_NATIVE_CLAUDE_EXECUTABLE: "claude" }, family)).toThrow(/native personal Claude/);
   });
+  it("keeps every RUNNER_* setting out of the personal Claude environment, so none can redirect instructions or memory", () => {
+    const config = RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "claude-code" });
+    const family = findAgentBridge("claude-code")!;
+    const native = { ...config, RUNNER_NATIVE_PACKAGE_PROFILE: offlineFixture().profile, RUNNER_NATIVE_CLAUDE_EXECUTABLE: "/operator/.local/bin/claude",
+      RUNNER_WORKSPACE_DIR: userInfo().homedir, RUNNER_CREDENTIAL_DIR: join(userInfo().homedir, ".claude", "private") };
+    const env = bridgeEnvironment(native, family);
+    // The bridge patch excludes the user CLAUDE.md, its rules, ancestors and
+    // auto memory; nothing in the environment can move those roots.
+    expect(Object.keys(env).filter(key => key.startsWith("RUNNER_"))).toEqual([]);
+    expect(env.HOME).toBe(userInfo().homedir);
+    expect(env.CLAUDE_CONFIG_DIR).toBeUndefined();
+    expect(env.CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD).toBeUndefined();
+  });
   it("points Claude Code on Windows at Git Bash with CLAUDE_CODE_GIT_BASH_PATH, from the connector's own environment", async () => {
     const dir = await mkdtemp(join(tmpdir(), "git-bash-"));
     try {

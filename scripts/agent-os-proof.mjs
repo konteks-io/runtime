@@ -207,6 +207,13 @@ const phase = name => {
 const host = S.hostAgentInstallAdapter(AGENT);
 let installed = null; // { settings, version, kind, executable }
 let codexSocketRoots = 0;
+/** The real home behind each phase's prepared Codex overlay, for config and login. */
+const codexRealHomes = new Map();
+function codexRealHome(name) {
+  const home = codexRealHomes.get(name);
+  if (home === undefined) throw new Error(`no Codex home was resolved for the ${name} phase`);
+  return home;
+}
 async function locate() {
   const started = Date.now();
   if (host) return locateHostAgent(started);
@@ -250,14 +257,17 @@ async function runnerConfig(name) {
   const { credentials, workspace } = phase(name);
   const settings = { ...installed.settings };
   if (AGENT === "codex") {
-    // Codex runs on the person's own CODEX_HOME in production; here a private
-    // one per phase (never the owner's), resolved by the connector's code.
-    const codexHome = join(WORK, "codex-home", name);
-    mkdirSync(codexHome, { recursive: true, mode: 0o700 });
-    settings.RUNNER_NATIVE_CODEX_HOME = await S.resolveNativeCodexHome({ CODEX_HOME: codexHome });
+    // Codex runs on the person's own CODEX_HOME in production; here a real
+    // private home per phase (never the owner's) sits behind the connector's
+    // prepared overlay, resolved and prepared by the connector's own code.
+    const realHome = join(WORK, "codex-home", `${name}-real`);
+    mkdirSync(realHome, { recursive: true, mode: 0o700 });
+    const realCodexHome = await S.resolveNativeCodexHome({ CODEX_HOME: realHome });
+    codexRealHomes.set(name, realCodexHome);
+    settings.RUNNER_NATIVE_CODEX_HOME = await S.prepareCodexHomeOverlay(realCodexHome, join(WORK, "codex-home", name));
     if (settings.RUNNER_NATIVE_PACKAGE_PROFILE?.codexLocalProxy && !WINDOWS) {
       codexSocketRoots += 1;
-      settings.RUNNER_NATIVE_CODEX_SOCKET = await S.resolveNativeCodexSocket(join(WORK, `root-${name}-${codexSocketRoots}`), settings.RUNNER_NATIVE_CODEX_HOME);
+      settings.RUNNER_NATIVE_CODEX_SOCKET = await S.resolveNativeCodexSocket(join(WORK, `root-${name}-${codexSocketRoots}`), realCodexHome);
     }
   }
   return A.RunnerConfigSchema.parse({ RUNNER_AGENT_ID: AGENT, RUNNER_AUTH_MODE: "agent_local_subscription", RUNNER_CREDENTIAL_DIR: credentials, RUNNER_WORKSPACE_DIR: workspace, ...settings });
@@ -533,10 +543,16 @@ try {
     return { ...spec, env };
   };
   if (AGENT === "dsh") await A.writeDshApiKey(A.dshRuntimePaths(governed.RUNNER_CREDENTIAL_DIR).credentialsFile, "konteks-scripted-model-key");
-  if (AGENT === "codex") writeFileSync(join(governed.RUNNER_NATIVE_CODEX_HOME, "config.toml"), [
-    `model = "${CODEX_SCRIPTED_MODEL}"`, "model_provider = \"konteksprobe\"", "",
-    "[model_providers.konteksprobe]", "name = \"Konteks probe\"", `base_url = "${scripted.origin}/v1"`, "wire_api = \"responses\"", "",
-  ].join("\n"));
+  if (AGENT === "codex") {
+    // The real home holds the config; the overlay gets the connector's
+    // sanitized copy, so it is prepared again after the write.
+    const realCodexHome = codexRealHome("governed");
+    writeFileSync(join(realCodexHome, "config.toml"), [
+      `model = "${CODEX_SCRIPTED_MODEL}"`, "model_provider = \"konteksprobe\"", "",
+      "[model_providers.konteksprobe]", "name = \"Konteks probe\"", `base_url = "${scripted.origin}/v1"`, "wire_api = \"responses\"", "",
+    ].join("\n"));
+    await S.prepareCodexHomeOverlay(realCodexHome, governed.RUNNER_NATIVE_CODEX_HOME);
+  }
   let codexOwner = null;
   if (governed.RUNNER_NATIVE_CODEX_SOCKET) {
     codexOwner = new S.NativeCodexAppServerOwner({ config: governed });
@@ -688,8 +704,12 @@ try {
   if (realKey && AGENT === "codex") {
     const family = A.resolveBridgeFamily("codex");
     const { command, args: argv } = A.resolveToolingCommand(real, family, ["codex", "login", "--with-api-key"]);
-    const login = spawnSync(command, argv, { input: `${realKey}\n`, env: A.bridgeEnvironment(real, family), encoding: "utf8", timeout: 60_000 });
-    credentialChannel = login.status === 0 ? "`codex login --with-api-key` in the private CODEX_HOME" : null;
+    // The login goes to the real home the connector's overlay sits behind;
+    // the overlay is refreshed after it so the new auth.json is linked.
+    const realCodexHome = codexRealHome("real");
+    const login = spawnSync(command, argv, { input: `${realKey}\n`, env: { ...A.bridgeEnvironment(real, family), CODEX_HOME: realCodexHome }, encoding: "utf8", timeout: 60_000 });
+    if (login.status === 0) await S.prepareCodexHomeOverlay(realCodexHome, real.RUNNER_NATIVE_CODEX_HOME);
+    credentialChannel = login.status === 0 ? "`codex login --with-api-key` in the real CODEX_HOME behind the private overlay" : null;
     if (login.status !== 0) note(`codex login --with-api-key failed: ${(login.stderr ?? "").split(realKey).join("<key>").slice(0, 300)}`);
   }
   if (realKey && AGENT === "claude-code") credentialChannel = "ANTHROPIC_API_KEY on the Claude Code process only (the connector signs Claude Code in through the person's own login; CI has none)";

@@ -2,23 +2,35 @@ import { createHash } from "node:crypto";
 import { gzipSync } from "node:zlib";
 const hash = (bytes: Buffer | string) => `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 
-export function offlineFixture(os = "macos", architecture = "arm64", agentId: "claude-code" | "codex" = "codex") {
+type FixtureFile = { path: string; bytes: Buffer; executable: boolean };
+
+/** A real macOS/Linux Codex package carries the Unix-only local proxy. */
+function codexProxyPart(os: string, agentId: "claude-code" | "codex", requested: boolean | undefined): { files: FixtureFile[]; profile: { codexLocalProxy?: { version: 1; entrypoint: string } } } {
+  if (requested !== true || agentId !== "codex" || os === "windows") return { files: [], profile: {} };
+  const file = { path: "konteks/codex-local-proxy.js", bytes: Buffer.from("// Codex local proxy for the offline package fixture"), executable: true };
+  return { files: [file], profile: { codexLocalProxy: { version: 1, entrypoint: file.path } } };
+}
+
+export function offlineFixture(os = "macos", architecture = "arm64", agentId: "claude-code" | "codex" = "codex", options: { codexLocalProxy?: boolean } = {}) {
   const suffix = os === "windows" ? ".exe" : "";
   const family = {
     "claude-code": { bridgePackage: "@agentclientprotocol/claude-agent-acp", bridgeVersion: "0.75.1", toolingPackage: "@anthropic-ai/claude-code", tooling: `bin/claude${suffix}` },
     codex: { bridgePackage: "@agentclientprotocol/codex-acp", bridgeVersion: "1.10.0", toolingPackage: "@openai/codex", tooling: `bin/codex${suffix}` },
   }[agentId];
+  const proxy = codexProxyPart(os, agentId, options.codexLocalProxy);
   const files = [
     { path: family.tooling, bytes: Buffer.from(`official-${agentId}-not-executed`), executable: true },
     { path: `bin/node${suffix}`, bytes: Buffer.from("node-runtime-not-executed"), executable: true },
     { path: "bridge/index.js", bytes: Buffer.from("// ACP bridge with offline dependencies"), executable: false },
     { path: "bridge/node_modules/example/package.json", bytes: Buffer.from('{"name":"example"}'), executable: false },
+    ...proxy.files,
   ];
   const profile = {
     schemaVersion: 1, agentId, os, architecture,
     bridge: { package: family.bridgePackage, version: family.bridgeVersion, entrypoint: "bridge/index.js", runtime: "node" },
     tooling: { package: family.toolingPackage, version: "0.153.3", entrypoint: family.tooling, runtime: "native" },
     node: { version: "22.23.2", entrypoint: `bin/node${suffix}` },
+    ...proxy.profile,
     files: files.map(file => ({ path: file.path, digest: hash(file.bytes), sizeBytes: file.bytes.length, executable: file.executable })),
   };
   const receipt = Buffer.from(JSON.stringify(profile));

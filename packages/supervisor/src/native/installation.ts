@@ -13,6 +13,7 @@ import { IdentitySchema, ManifestRecordSchema } from "../state/store.js";
 import { NativeBridgeVerification } from "./bridge-verification.js";
 import { NativeGitToolSchema, verifyNativeGitTool } from "./git-workspace.js";
 import { resolveNativeCodexHome } from "./codex-home.js";
+import { prepareCodexHomeOverlay } from "./codex-home-overlay.js";
 import { resolveNativeClaudeExecutable } from "./claude-executable.js";
 import { hostAgentInstallAdapter, nativeAgentOffered } from "./host-agents.js";
 import { antigravityUpdateNeeded, updateNativeAntigravity } from "./antigravity-update.js";
@@ -214,7 +215,7 @@ class InstallationLoader {
     for (const path of [prefix, credentials, workspace]) await this.directory(path);
     const artifact = artifacts.find(candidate => candidate.agentId === agent)!;
     const profile = await this.bridges.verifyPackage(prefix, artifact);
-    const { codexHome, claudeExecutable } = await agentExecutables(agent, record);
+    const { codexHome, realCodexHome, claudeExecutable } = await agentExecutables(agent, record, root);
     return RunnerConfigSchema.parse({
       RUNNER_AGENT_ID: agent, RUNNER_AUTH_MODE: "agent_local_subscription",
       RUNNER_CREDENTIAL_DIR: credentials, RUNNER_WORKSPACE_DIR: workspace,
@@ -222,7 +223,7 @@ class InstallationLoader {
       ...(claudeExecutable ? { RUNNER_NATIVE_CLAUDE_EXECUTABLE: claudeExecutable } : {}),
       // The supervisor owns this shared service lifecycle. Its default socket
       // is per connector; only the official CODEX_HOME remains shared.
-      ...await codexSocketSetting(root, codexHome, profile.codexLocalProxy, record.codexSocket),
+      ...await codexSocketSetting(root, realCodexHome, profile.codexLocalProxy, record.codexSocket),
       RUNNER_BRIDGE_PREFIX: prefix, RUNNER_BRIDGE_VERSION: profile.bridge.version,
       RUNNER_NATIVE_PACKAGE_PROFILE: profile, RUNNER_NATIVE_PACKAGE_ARTIFACT: artifact,
     });
@@ -278,15 +279,17 @@ function antigravityUnavailable(root: string, record: NativeRuntimeRecord, error
 }
 
 /** Codex's home and Claude Code's executable, located again from the record for the agent that needs one. */
-async function agentExecutables(agent: string, record: NativeRuntimeRecord): Promise<{ codexHome: string | undefined; claudeExecutable: string | undefined }> {
-  const codexHome = agent === "codex" ? await resolveNativeCodexHome(record.codexHome === undefined ? process.env : { CODEX_HOME: record.codexHome }) : undefined;
+async function agentExecutables(agent: string, record: NativeRuntimeRecord, root: string): Promise<{ codexHome: string | undefined; realCodexHome: string | undefined; claudeExecutable: string | undefined }> {
+  const realCodexHome = agent === "codex" ? await resolveNativeCodexHome(record.codexHome === undefined ? process.env : { CODEX_HOME: record.codexHome }) : undefined;
+  const codexHome = realCodexHome === undefined ? undefined
+    : await prepareCodexHomeOverlay(realCodexHome, join(root, "credentials", "codex", "codex-home"), record.codexHome !== undefined);
   const claudeExecutable = agent === "claude-code" ? await resolveNativeClaudeExecutable(process.env, undefined, undefined, record.claudeExecutable) : undefined;
-  return { codexHome, claudeExecutable };
+  return { codexHome, realCodexHome, claudeExecutable };
 }
 
-async function codexSocketSetting(root: string, codexHome: string | undefined, localProxy: unknown, requested: string | undefined): Promise<{ RUNNER_NATIVE_CODEX_SOCKET?: string }> {
-  if (!codexHome || !localProxy) return {};
-  return { RUNNER_NATIVE_CODEX_SOCKET: await resolveNativeCodexSocket(root, codexHome, requested) };
+async function codexSocketSetting(root: string, realCodexHome: string | undefined, localProxy: unknown, requested: string | undefined): Promise<{ RUNNER_NATIVE_CODEX_SOCKET?: string }> {
+  if (!realCodexHome || !localProxy) return {};
+  return { RUNNER_NATIVE_CODEX_SOCKET: await resolveNativeCodexSocket(root, realCodexHome, requested) };
 }
 
 function supervisorConfig(record: NativeRuntimeRecord, dataDir: string, releaseDir: string, options: NativeInstallationOptions) {

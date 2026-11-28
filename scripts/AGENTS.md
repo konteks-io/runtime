@@ -38,7 +38,7 @@ and the agent-on-every-OS proof. Most are called from `.github/workflows/`
   `id`, the bridge `version` and the sha256 of every upstream file it edits:
   - Claude: `id: "konteks-claude-project-settings-v5"`, version `0.75.1`,
     `hashes` for `acp-agent.js`, `settings.js`, `session-titles.js`.
-  - Codex: `id: "konteks-codex-acp-live-user-v12"`, version `1.10.0`,
+  - Codex: `id: "konteks-codex-acp-live-user-v13"`, version `1.10.0`,
     `upstreamSha256` for the bridge entry.
   A mismatch throws ("requires review of this upstream artifact") and every
   anchor must match exactly once. Bumping a bridge in
@@ -55,7 +55,28 @@ and the agent-on-every-OS proof. Most are called from `.github/workflows/`
   calls require a one-time human decision. The bridge names the tool in
   `toolCall._meta.claudeCode.toolName`; the Codex patch turns the person's and
   trusted projects' MCP servers off per thread and admits only
-  `admittedMcpServerNames` for an integration session.
+  `admittedMcpServerNames` for an integration session. A Konteks Codex session
+  never reads the operator's own instructions or memories: Codex reads
+  `$CODEX_HOME/AGENTS.md` and `AGENTS.override.md` into `Config.user_instructions`
+  independently of project docs (`project_doc_max_bytes: 0` does not suppress
+  them), so the supervisor gives Codex a private home overlay
+  (`packages/supervisor/src/native/codex-home-overlay.ts`) that links the
+  official login and thread store but omits `AGENTS.md`, `AGENTS.override.md`,
+  every `memories*` entry, and the personal `skills/`, `prompts/`, `plugins/`
+  and `instructions/` folders. It writes a sanitized `config.toml` copy without
+  `developer_instructions`, `model_instructions_file`,
+  `experimental_instructions_file`, `instructions`, `base_instructions` or
+  `compact_prompt`, in any TOML spelling (bare, quoted, dotted, table-scoped) instead of linking the operator's file. The overlay carries
+  a marker; the patch (`v13`) refuses any `CODEX_HOME` without it and any
+  marked overlay that still exposes `AGENTS.md` or `AGENTS.override.md`. The
+  thread config also sets `project_doc_max_bytes: 0` (no parent/nested
+  project-doc walk) and always sets `developer_instructions` — empty when the
+  working copy has none, otherwise its root `AGENTS.md` — so a config value
+  cannot survive. This intentionally drops nested working-copy files and
+  replaces an operator `developer_instructions` for the thread. The
+  characterization test `codex-instruction-overlay.test.ts` runs the real Codex
+  prompt input to prove the operator's override, config instructions, personal
+  skill and a parent file do not reach it.
 - The Claude bridge prints an `instruction_scope version=N ...` marker that the
   runner parses (`packages/agent-runner/src/bridge/instruction-scope-observer.ts`);
   change both together.

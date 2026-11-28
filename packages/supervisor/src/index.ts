@@ -50,6 +50,7 @@ export * from "./native/activation.js";
 export * from "./native/enrollment.js";
 export * from "./native/installation.js";
 export * from "./native/codex-home.js";
+export * from "./native/codex-home-overlay.js";
 export * from "./native/codex-app-server-owner.js";
 export * from "./native/claude-executable.js";
 export * from "./native/dsh-installation.js";

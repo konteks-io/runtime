@@ -2580,6 +2580,17 @@ describe("relayed session", () => {
     await ask("perm-beyond", [`${context}/memory/conversation.md`, "/private/native/other/notes.md"]);
     expect(registered).toHaveBeenCalledTimes(1);
     expect(vi.mocked(runner.answer).mock.calls.some(call => call[1] === "perm-beyond")).toBe(false);
+    // The session-context parent, a sibling session and the operator's own
+    // Claude memory are put to a person too, never auto-allowed.
+    for (const [requestId, path] of [
+      ["perm-parent", "/private/native/session-context"],
+      ["perm-sibling", "/private/native/session-context/session-2/source/memory/conversation.md"],
+      ["perm-home", "/home/operator/.claude/projects/-work/memory/MEMORY.md"],
+    ]) {
+      await ask(requestId, [path]);
+      expect(vi.mocked(runner.answer).mock.calls.some(call => call[1] === requestId)).toBe(false);
+    }
+    expect(registered).toHaveBeenCalledTimes(4);
   });
 
   it("shows a long, multi-line Codex command on the execute card as one redacted bounded line", async () => {

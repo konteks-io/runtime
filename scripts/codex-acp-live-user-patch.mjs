@@ -4,10 +4,13 @@ import { konteksPrefixedName } from "./konteks-session-prefix.mjs";
 // Build-time compatibility change only. Never mutate an installed signed artifact.
 // Reuse upstream's history conversion; do not reconstruct or read local files.
 // It admits an integration task's own server, switches every other configured
-// MCP server off, and shows a direct session's own title behind the
-// [konteks] prefix.
+// MCP server off, shows a direct session's own title behind the [konteks]
+// prefix, and refuses to start a thread whose CODEX_HOME still exposes the
+// operator's AGENTS.md, AGENTS.override.md or memories. The connector points
+// Codex at a private home overlay that omits those files; this guard fails
+// closed if that overlay is ever bypassed.
 export const codexAcpLiveUserPatch = {
-  id: "konteks-codex-acp-live-user-v12",
+  id: "konteks-codex-acp-live-user-v13",
   package: "@agentclientprotocol/codex-acp",
   version: "1.10.0",
   upstreamSha256: "4602784c5896fbf05a7d89b09655bacc768d0bf281e0d03a10333ff81da45268",
@@ -81,6 +84,70 @@ export function konteksRepositoryConfig(config, meta) {
   return { ...config, "shell_environment_policy.set.HUSKY": "0" };
 }
 
+// A Konteks thread must not load the operator's own instructions or memories.
+// Codex reads `$CODEX_HOME/AGENTS.md` and `AGENTS.override.md` into
+// `Config.user_instructions` independently of project-document discovery;
+// `project_doc_max_bytes: 0` skips project docs but still returns those user
+// instructions (measured against the installed Codex CLI). The connector
+// therefore gives Codex a private CODEX_HOME overlay that links the official
+// login and thread store but not those files or the operator's memories
+// (supervisor `native/codex-home-overlay.ts`). This guard fails the thread
+// closed unless the effective home is exactly that marked overlay, so a
+// regression cannot silently load the operator's personal instructions.
+export function konteksCodexHomeGuard(env = process.env) {
+  if (typeof env.CODEX_HOME !== "string" || env.CODEX_HOME.length === 0) return;
+  const fs = process.getBuiltinModule("node:fs");
+  const path = process.getBuiltinModule("node:path");
+  if (!fs.existsSync(path.join(env.CODEX_HOME, ".konteks-codex-overlay"))) {
+    throw new Error(
+      "Konteks refuses to start Codex from a CODEX_HOME that is not its private home overlay. Restart the connector so its private Codex home is used.",
+    );
+  }
+  const exposed = konteksCodexInstructionEntries(env.CODEX_HOME);
+  if (exposed.length === 0) return;
+  throw new Error(
+    `Konteks refuses to start Codex with personal instructions in its CODEX_HOME (${exposed.join(", ")}). Restart the connector so its private Codex home is used.`,
+  );
+}
+
+export function konteksCodexInstructionEntries(home) {
+  const fs = process.getBuiltinModule("node:fs");
+  const path = process.getBuiltinModule("node:path");
+  return ["AGENTS.md", "AGENTS.override.md"].filter(name => fs.existsSync(path.join(home, name)));
+}
+
+// Codex's project-document walk is not bounded by the working copy when it is
+// not a Git repository: it reads a parent or grandparent `AGENTS.md` too
+// (measured against the installed Codex CLI). Zero stops that walk, including
+// nested working-copy files; the working copy's own root file is then carried
+// explicitly. `developer_instructions` is always set, empty when the working
+// copy has none, so an operator value from config.toml cannot survive. That
+// replaces an operator's value for this thread, which is intentional.
+export function konteksCodexThreadScope(projectPath) {
+  return { project_doc_max_bytes: 0, developer_instructions: konteksWorkingCopyInstructions(projectPath) };
+}
+
+// The working copy's own AGENTS.md: a regular file whose real path stays
+// inside the working copy. A link out, a folder or a book is no instructions.
+export function konteksWorkingCopyInstructions(projectPath) {
+  const regularFileInside = (fs, path, root, file) => {
+    const inside = path.relative(root, file);
+    if (inside === "" || inside.startsWith("..") || path.isAbsolute(inside)) return false;
+    const stat = fs.lstatSync(file);
+    return stat.isFile() && stat.nlink === 1 && stat.size <= 32768;
+  };
+  if (typeof projectPath !== "string" || projectPath.length === 0) return "";
+  try {
+    const fs = process.getBuiltinModule("node:fs");
+    const path = process.getBuiltinModule("node:path");
+    const root = fs.realpathSync(projectPath);
+    const file = fs.realpathSync(path.join(root, "AGENTS.md"));
+    return regularFileInside(fs, path, root, file) ? fs.readFileSync(file, "utf8") : "";
+  } catch {
+    return "";
+  }
+}
+
 export function patchCodexAcpLiveUsers(source, version) {
   if (
     version !== codexAcpLiveUserPatch.version ||
@@ -115,7 +182,7 @@ function createReasoningEffortConfigOption`,
   );
   replaceOnce(
     "var CodexEventHandler = class _CodexEventHandler {",
-    `${konteksRepositoryConfig.toString()}\n${missingCodexToolTerminals.toString()}\n${reconcileCodexToolTerminals.toString()}\n${konteksCodexMcpServers.toString()}\n${konteksAdmittedMcpServerNames.toString()}\n${konteksPrefixedName.toString()}\nvar CodexEventHandler = class _CodexEventHandler {`,
+    `${konteksRepositoryConfig.toString()}\n${konteksCodexHomeGuard.toString()}\n${konteksCodexInstructionEntries.toString()}\n${konteksCodexThreadScope.toString()}\n${konteksWorkingCopyInstructions.toString()}\n${missingCodexToolTerminals.toString()}\n${reconcileCodexToolTerminals.toString()}\n${konteksCodexMcpServers.toString()}\n${konteksAdmittedMcpServerNames.toString()}\n${konteksPrefixedName.toString()}\nvar CodexEventHandler = class _CodexEventHandler {`,
   );
   replaceOnce(
     "      config: await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers),\n      modelProvider: this.getModelProvider(),",
@@ -123,7 +190,8 @@ function createReasoningEffortConfigOption`,
   );
   replaceOnce(
     `  async createSessionConfig(projectPath, additionalDirectories, mcpServers) {`,
-    `  async createSessionConfig(projectPath, additionalDirectories, mcpServers, admittedMcpServerNames = []) {`,
+    `  async createSessionConfig(projectPath, additionalDirectories, mcpServers, admittedMcpServerNames = []) {
+    konteksCodexHomeGuard();`,
   );
   replaceOnce(
     `    if (mcpServers.length === 0) {
@@ -152,10 +220,11 @@ function createReasoningEffortConfigOption`,
     const existingMcpServerNames = await this.getConfigMcpServerNames(projectPath);
     const disabledMcpServers = konteksCodexMcpServers(existingMcpServerNames, requestedServers.map((mcp) => mcp.name), admittedMcpServerNames.map(sanitizeMcpServerName));
     if (requestedServers.length === 0 && Object.keys(disabledMcpServers).length === 0) {
-      return configWithWorkspaceRoots;
+      return { ...configWithWorkspaceRoots, ...konteksCodexThreadScope(projectPath) };
     }
     return {
       ...configWithWorkspaceRoots,
+      ...konteksCodexThreadScope(projectPath),
       "mcp_servers": {
         ...disabledMcpServers,
         ...Object.fromEntries(requestedServers.map((mcp) => [mcp.name, this.createMcpSeverConfig(mcp.server)]))

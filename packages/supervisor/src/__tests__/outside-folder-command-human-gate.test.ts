@@ -100,6 +100,8 @@ const POLICY_CASES: readonly PolicyCase[] = [
   { name: "Claude Bash inside a skill folder", request: claudeRequest("Bash", [`${SKILL_ROOT}/scripts/run.sh`]), context: claudeContext, expectedOptionIds: ["allow-once", "reject"] },
   { name: "Claude Bash with mixed inside and outside locations", request: claudeRequest("Bash", ["/tmp/outside.txt", `${WORKSPACE}/src/a.ts`]), context: claudeContext, expectedOptionIds: ["allow-once", "reject"] },
   { name: "Claude Bash reading only the session context folder", request: claudeRequest("Bash", [`${CONTEXT_ROOT}/memory/conversation.md`]), context: claudeContext, expectedOptionIds: [], refusal: "session_context_shell" },
+  { name: "Claude Bash reaching the session-context parent", request: claudeRequest("Bash", ["/work/session-context"]), context: claudeContext, expectedOptionIds: ["allow-once", "reject"] },
+  { name: "Claude Bash reading a sibling session's context folder", request: claudeRequest("Bash", ["/work/session-context/session-2/source/memory/conversation.md"]), context: claudeContext, expectedOptionIds: ["allow-once", "reject"] },
   { name: "Codex execute with an outside cwd", request: codexRequest({ command: "ls", cwd: "/tmp" }), context: codexContext, expectedOptionIds: ["allow_once", "decline"] },
   { name: "Codex execute with outside locations", request: codexRequest({ command: "ls" }, codexOptions, "execute", ["/tmp/outside.txt"]), context: codexContext, expectedOptionIds: ["allow_once", "decline"] },
   { name: "Codex execute with additionalPermissions", request: codexRequest({ command: "ls", additionalPermissions: { network: {} } }), context: codexContext, expectedOptionIds: ["allow_once", "decline"] },

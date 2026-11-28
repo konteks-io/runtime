@@ -1,12 +1,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { konteksPrefixedName } from "./konteks-session-prefix.mjs";
 import {
   codexAcpLiveUserPatch,
+  konteksCodexHomeGuard,
+  konteksCodexInstructionEntries,
+  konteksCodexMcpServers,
+  konteksCodexThreadScope,
   konteksRepositoryConfig,
   konteksTitlePrefixCheck,
+  konteksWorkingCopyInstructions,
   missingCodexToolTerminals,
   reconcileCodexToolTerminals,
   patchCodexAcpLiveUsers,
@@ -152,7 +158,13 @@ test("the reviewed bridge disables configured MCP servers on every thread start,
   assert.match(source, /async createSessionConfig\(projectPath, additionalDirectories, mcpServers, admittedMcpServerNames = \[\]\) \{/);
   assert.match(source, /const disabledMcpServers = konteksCodexMcpServers\(existingMcpServerNames, requestedServers\.map\(\(mcp\) => mcp\.name\), admittedMcpServerNames\.map\(sanitizeMcpServerName\)\);/);
   assert.doesNotMatch(source, /shouldDeduplicateMcpConflicts\(\)\) \{\n      const existingNames/);
-  assert.equal(codexAcpLiveUserPatch.id, "konteks-codex-acp-live-user-v12");
+  assert.equal(codexAcpLiveUserPatch.id, "konteks-codex-acp-live-user-v13");
+  // Every thread start, resume and load goes through the home guard first.
+  assert.match(source, /async createSessionConfig\(projectPath, additionalDirectories, mcpServers, admittedMcpServerNames = \[\]\) \{\n    konteksCodexHomeGuard\(\);/);
+  assert.match(source, /function konteksCodexHomeGuard\(env = process\.env\)/);
+  // Every start, resume and load return carries the bounded working-copy scope.
+  assert.equal(source.match(/\.\.\.konteksCodexThreadScope\(projectPath\)/g)?.length, 2);
+  assert.match(source, /project_doc_max_bytes: 0/);
 },
 );
 
@@ -390,6 +402,142 @@ test("repository lifecycle policy is per thread and leaves direct configuration 
   assert.equal(konteksRepositoryConfig(base, { konteksRepository: { version: 2, managed: true } }), base);
   assert.equal(konteksRepositoryConfig(base, { konteksRepository: { version: 1, managed: false } }), base);
   assert.equal(Object.hasOwn(base, "shell_environment_policy.set.HUSKY"), false);
+});
+
+test("the Codex home guard refuses an unmarked home and a marked overlay that leaks instructions", () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-home-guard-"));
+  try {
+    const clean = join(root, "clean");
+    const dirty = join(root, "dirty");
+    const real = join(root, "operator-home");
+    mkdirSync(clean, { recursive: true });
+    mkdirSync(dirty, { recursive: true });
+    mkdirSync(real, { recursive: true });
+    writeFileSync(join(clean, "auth.json"), "{}\n");
+    writeFileSync(join(clean, ".konteks-codex-overlay"), "konteks-codex-home-overlay-v1\n");
+    writeFileSync(join(dirty, ".konteks-codex-overlay"), "konteks-codex-home-overlay-v1\n");
+    writeFileSync(join(real, "AGENTS.md"), "operator private\n");
+    assert.doesNotThrow(() => konteksCodexHomeGuard({ CODEX_HOME: clean }));
+    // A bundled Codex with no CODEX_HOME runs in its private HOME.
+    assert.doesNotThrow(() => konteksCodexHomeGuard({ HOME: join(root, "no-home") }));
+    // The operator's real home is not the connector's marked overlay.
+    assert.throws(() => konteksCodexHomeGuard({ CODEX_HOME: real }), /private home overlay/);
+    // A marked overlay that somehow exposes an instruction file is refused by name.
+    for (const entry of ["AGENTS.md", "AGENTS.override.md"]) {
+      writeFileSync(join(dirty, entry), "operator private\n");
+      assert.throws(() => konteksCodexHomeGuard({ CODEX_HOME: dirty }), new RegExp(entry.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      rmSync(join(dirty, entry));
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("the thread scope stops project discovery and carries only the working copy's own AGENTS.md", () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-thread-scope-"));
+  try {
+    const wc = join(root, "work");
+    mkdirSync(wc, { recursive: true });
+    assert.deepEqual(konteksCodexThreadScope(wc), { project_doc_max_bytes: 0, developer_instructions: "" });
+    writeFileSync(join(wc, "AGENTS.md"), "# working copy rules\n");
+    assert.deepEqual(konteksCodexThreadScope(wc), { project_doc_max_bytes: 0, developer_instructions: "# working copy rules\n" });
+    writeFileSync(join(root, "private.md"), "operator rules\n");
+    rmSync(join(wc, "AGENTS.md"));
+    symlinkSync(join(root, "private.md"), join(wc, "AGENTS.md"));
+    assert.deepEqual(konteksCodexThreadScope(wc), { project_doc_max_bytes: 0, developer_instructions: "" });
+    rmSync(join(wc, "AGENTS.md"));
+    mkdirSync(join(wc, "AGENTS.md"));
+    assert.equal(konteksWorkingCopyInstructions(wc), "");
+    rmSync(join(wc, "AGENTS.md"), { recursive: true, force: true });
+    writeFileSync(join(wc, "AGENTS.md"), "x".repeat(32_769));
+    assert.equal(konteksWorkingCopyInstructions(wc), "");
+    rmSync(join(wc, "AGENTS.md"));
+    writeFileSync(join(wc, "RULES.md"), "# rules\n");
+    symlinkSync(join(wc, "RULES.md"), join(wc, "AGENTS.md"));
+    assert.equal(konteksWorkingCopyInstructions(wc), "# rules\n");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("the pinned Codex source carries the memory stores the overlay hides", () => {
+  // scripts/fixtures/cpal-0.18.2-availability/Cargo.lock is exact public source
+  // from Codex commit 687a119: Codex has memories crates, so hiding those
+  // entries (not a config flag) is what keeps them out of a session.
+  const lock = readFileSync(new URL("./fixtures/cpal-0.18.2-availability/Cargo.lock", import.meta.url), "utf8");
+  for (const crate of ["codex-features", "codex-memories-read", "codex-memories-write", "codex-memories-extension"]) {
+    assert.match(lock, new RegExp(`name = "${crate}"`), crate);
+  }
+});
+
+// Build qualification supplies the pristine upstream dist directory.
+function methodSection(source, signature) {
+  const start = source.indexOf(signature);
+  assert.notEqual(start, -1, `the reviewed Codex section moved: ${signature}`);
+  const next = /\n {2}(?:async\s+)?[A-Za-z_$][\w$]*\s*[=(]/.exec(source.slice(start + 1));
+  return source.slice(start, next === null ? undefined : start + 1 + next.index).trim();
+}
+
+// Upstream's method reads this handler state and these module-level names.
+// A `new Function` body has no module scope, so the reviewed dist's names are
+// passed in explicitly (the real bridge supplies its own).
+const upstreamLogger = { log() {} };
+const upstreamMergeConfig = config => config;
+const upstreamHandler = {
+  gatewayConfig: null,
+  config: {},
+  getNativeProviderConfig: () => ({}),
+  getModelProvider: () => "openai",
+  getConfigMcpServerNames: async () => new Set(),
+  createMcpSeverConfig: () => ({}),
+};
+
+function sessionConfigFor(source) {
+  return new Function(
+    "konteksCodexMcpServers", "konteksCodexHomeGuard", "konteksCodexInstructionEntries", "konteksCodexThreadScope", "konteksWorkingCopyInstructions", "sanitizeMcpServerName",
+    "logger", "mergeGatewayConfig", "mergeSandboxWorkspaceWriteRoots", "gatewayApiTypeFromConfig",
+    `return { ${methodSection(source, "  async createSessionConfig(projectPath, additionalDirectories, mcpServers, admittedMcpServerNames = []) {")} };`,
+  )(konteksCodexMcpServers, konteksCodexHomeGuard, konteksCodexInstructionEntries, konteksCodexThreadScope, konteksWorkingCopyInstructions, name => name,
+    upstreamLogger, upstreamMergeConfig, upstreamMergeConfig, () => "openai");
+}
+
+test("the patched bridge refuses a personal CODEX_HOME and starts a thread from the clean overlay", { skip: !fixture }, async () => {
+  const original = readFileSync(join(fixture, "index.js"), "utf8");
+  const patched = patchCodexAcpLiveUsers(original, codexAcpLiveUserPatch.version).source;
+  const root = mkdtempSync(join(tmpdir(), "codex-thread-config-"));
+  const previous = process.env.CODEX_HOME;
+  try {
+    const wc = join(root, "work");
+    const sharedHome = join(root, "operator", ".codex");
+    const cleanHome = join(root, "overlay");
+    mkdirSync(wc, { recursive: true });
+    mkdirSync(sharedHome, { recursive: true });
+    mkdirSync(cleanHome, { recursive: true });
+    writeFileSync(join(wc, "AGENTS.md"), "# working copy rules\n");
+    writeFileSync(join(sharedHome, "AGENTS.md"), "# operator private rules\n");
+    writeFileSync(join(sharedHome, "AGENTS.override.md"), "# operator private override\n");
+    writeFileSync(join(sharedHome, ".konteks-codex-overlay"), "konteks-codex-home-overlay-v1\n");
+    writeFileSync(join(cleanHome, "auth.json"), "{}\n");
+    writeFileSync(join(cleanHome, ".konteks-codex-overlay"), "konteks-codex-home-overlay-v1\n");
+    const handler = { ...upstreamHandler };
+    const create = sessionConfigFor(patched).createSessionConfig;
+    // A thread whose CODEX_HOME is the operator's own home never starts.
+    process.env.CODEX_HOME = sharedHome;
+    await assert.rejects(create.call(handler, wc, [], [], []), /AGENTS\.override\.md/);
+    // The connector's overlay has the login and thread store but no personal
+    // instructions; the thread config carries no instruction keys of its own.
+    process.env.CODEX_HOME = cleanHome;
+    const config = await create.call(handler, wc, [], [], []);
+    assert.equal(config.project_doc_max_bytes, 0);
+    assert.equal(config.developer_instructions, "# working copy rules\n");
+    assert.equal(Object.hasOwn(config, "features"), false);
+    // The unpatched upstream method has no guard; the patched one is the change.
+    const plain = await new Function(
+      "sanitizeMcpServerName", "logger", "mergeGatewayConfig", "mergeSandboxWorkspaceWriteRoots", "gatewayApiTypeFromConfig",
+      `return { ${methodSection(original, "  async createSessionConfig(projectPath, additionalDirectories, mcpServers) {")} };`,
+    )(name => name, upstreamLogger, upstreamMergeConfig, upstreamMergeConfig, () => "openai").createSessionConfig.call(handler, wc, [], []);
+    assert.equal(Object.hasOwn(plain, "project_doc_max_bytes"), false);
+  } finally {
+    if (previous === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 
