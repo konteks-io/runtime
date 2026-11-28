@@ -4,10 +4,11 @@ import { konteksPrefixedName } from "./konteks-session-prefix.mjs";
 // Build-time compatibility change only. Never mutate an installed signed artifact.
 // Reuse upstream's history conversion; do not reconstruct or read local files.
 // It admits an integration task's own server, switches every other configured
-// MCP server off, and shows a direct session's own title behind the
-// [konteks] prefix.
+// MCP server off, shows a direct session's own title behind the [konteks]
+// prefix, and takes instructions only from the working copy (never from a
+// shared CODEX_HOME's AGENTS.md or Codex memories).
 export const codexAcpLiveUserPatch = {
-  id: "konteks-codex-acp-live-user-v12",
+  id: "konteks-codex-acp-live-user-v13",
   package: "@agentclientprotocol/codex-acp",
   version: "1.10.0",
   upstreamSha256: "4602784c5896fbf05a7d89b09655bacc768d0bf281e0d03a10333ff81da45268",
@@ -81,6 +82,38 @@ export function konteksRepositoryConfig(config, meta) {
   return { ...config, "shell_environment_policy.set.HUSKY": "0" };
 }
 
+// A Konteks thread takes its instructions only from the working copy. The
+// shared CODEX_HOME is reused for the official login and thread store, but its
+// AGENTS.md, AGENTS.override.md and Codex memories must never steer a session:
+// no instruction discovery at all, and only the working copy's own AGENTS.md
+// carried as developer instructions.
+export function konteksCodexInstructionScope(projectPath) {
+  const scope = { project_doc_max_bytes: 0, features: { memories: false } };
+  const instructions = konteksWorkingCopyInstructions(projectPath);
+  return instructions.length > 0 ? { ...scope, developer_instructions: instructions } : scope;
+}
+
+// The working copy's own AGENTS.md: a regular file whose real path stays
+// inside the working copy. A link out, a folder or a book is no instructions.
+export function konteksWorkingCopyInstructions(projectPath) {
+  const regularFileInside = (fs, path, root, file) => {
+    const inside = path.relative(root, file);
+    if (inside === "" || inside.startsWith("..") || path.isAbsolute(inside)) return false;
+    const stat = fs.lstatSync(file);
+    return stat.isFile() && stat.nlink === 1 && stat.size <= 32768;
+  };
+  if (typeof projectPath !== "string" || projectPath.length === 0) return "";
+  try {
+    const fs = process.getBuiltinModule("node:fs");
+    const path = process.getBuiltinModule("node:path");
+    const root = fs.realpathSync(projectPath);
+    const file = fs.realpathSync(path.join(root, "AGENTS.md"));
+    return regularFileInside(fs, path, root, file) ? fs.readFileSync(file, "utf8") : "";
+  } catch {
+    return "";
+  }
+}
+
 export function patchCodexAcpLiveUsers(source, version) {
   if (
     version !== codexAcpLiveUserPatch.version ||
@@ -115,7 +148,7 @@ function createReasoningEffortConfigOption`,
   );
   replaceOnce(
     "var CodexEventHandler = class _CodexEventHandler {",
-    `${konteksRepositoryConfig.toString()}\n${missingCodexToolTerminals.toString()}\n${reconcileCodexToolTerminals.toString()}\n${konteksCodexMcpServers.toString()}\n${konteksAdmittedMcpServerNames.toString()}\n${konteksPrefixedName.toString()}\nvar CodexEventHandler = class _CodexEventHandler {`,
+    `${konteksRepositoryConfig.toString()}\n${konteksCodexInstructionScope.toString()}\n${konteksWorkingCopyInstructions.toString()}\n${missingCodexToolTerminals.toString()}\n${reconcileCodexToolTerminals.toString()}\n${konteksCodexMcpServers.toString()}\n${konteksAdmittedMcpServerNames.toString()}\n${konteksPrefixedName.toString()}\nvar CodexEventHandler = class _CodexEventHandler {`,
   );
   replaceOnce(
     "      config: await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers),\n      modelProvider: this.getModelProvider(),",
@@ -152,10 +185,11 @@ function createReasoningEffortConfigOption`,
     const existingMcpServerNames = await this.getConfigMcpServerNames(projectPath);
     const disabledMcpServers = konteksCodexMcpServers(existingMcpServerNames, requestedServers.map((mcp) => mcp.name), admittedMcpServerNames.map(sanitizeMcpServerName));
     if (requestedServers.length === 0 && Object.keys(disabledMcpServers).length === 0) {
-      return configWithWorkspaceRoots;
+      return { ...configWithWorkspaceRoots, ...konteksCodexInstructionScope(projectPath) };
     }
     return {
       ...configWithWorkspaceRoots,
+      ...konteksCodexInstructionScope(projectPath),
       "mcp_servers": {
         ...disabledMcpServers,
         ...Object.fromEntries(requestedServers.map((mcp) => [mcp.name, this.createMcpSeverConfig(mcp.server)]))

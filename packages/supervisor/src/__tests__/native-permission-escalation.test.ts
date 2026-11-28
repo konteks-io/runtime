@@ -181,4 +181,18 @@ describe("a Claude shell command that reaches only into the session context fold
     expect(decide([`${contextRoot}/memory/conversation.md`], { ...context, sessionContextRoot: undefined }))
       .toMatchObject({ kind: "defer", title: "Wants to run a shell command: wc -l memory/conversation.md" });
   });
+
+  it("never reads a sibling session folder or the session-context parent as this session's context", () => {
+    const parent = "/work/session-context";
+    const sibling = `${parent}/session-2/source/memory/conversation.md`;
+    for (const path of [sibling, parent]) {
+      // Not context reads: no automatic allow, and never a Read-tool refusal.
+      expect(decide([path])).toMatchObject({ kind: "defer", allowOnceOnly: true, optionIds: ["allow-once", "reject"] });
+      // Even a broken caller that names the parent as the context root gets no allow.
+      expect(decide([path], { ...context, sessionContextRoot: parent, readOnlyRoots: [parent] }))
+        .toMatchObject({ kind: "defer", allowOnceOnly: true, optionIds: ["allow-once", "reject"] });
+    }
+    const home = "/home/operator/.claude/projects/-work/memory/MEMORY.md";
+    expect(decide([home])).toMatchObject({ kind: "defer", allowOnceOnly: true, optionIds: ["allow-once", "reject"] });
+  });
 });

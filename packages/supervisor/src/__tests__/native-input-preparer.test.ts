@@ -15,7 +15,7 @@ import {
   type RemoteWorkAssignment,
 } from "@konteks/remote-common";
 import { NativeInputClient } from "../native/input-client.js";
-import { createNativeInputPreparer } from "../native/input-preparer.js";
+import { createNativeInputPreparer, resolveSessionContextFolder } from "../native/input-preparer.js";
 import { dispatchFailureOutcome } from "../work/dispatch-failure-outcome.js";
 import { StateMutationGate } from "../state/mutation-gate.js";
 import { testGitCommand, testGitTool } from "./native-git-fixture.js";
@@ -259,6 +259,10 @@ describe("repository session continuity inputs", () => {
       const authority = { repoPath: prepared.cwd, workspaceRoot: prepared.cwd, readOnlyRoots: prepared.readOnlyRoots,
         sessionId: binding.sessionId, toolUseId: "context", agentId, input: { file_path: join(contextRoot!, "memory/conversation.md") } };
       expect((await policy.evaluateToolUse({ ...authority, toolName: "read" })).allowed).toBe(true);
+      // The Read tool still reaches both hidden context files.
+      for (const path of ["memory/conversation.md", ".assistant/session-context.json"]) {
+        expect((await policy.evaluateToolUse({ ...authority, toolName: "read", input: { file_path: join(contextRoot!, path) } })).allowed).toBe(true);
+      }
       expect((await policy.evaluateToolUse({ ...authority, toolName: "edit" })).allowed).toBe(false);
       expect((await policy.evaluateToolUse({ ...authority, toolName: "read", input: { file_path: join(f.root, "private.txt") } })).allowed).toBe(false);
       expect(await testGitCommand(f.git, prepared.cwd, ["status", "--porcelain"])).toBe("");
@@ -340,6 +344,30 @@ describe("repository session continuity inputs", () => {
     f.fetchFn.mockClear();
     await expect(prepared.beforePrompt()).rejects.toThrow();
     expect(f.fetchFn).not.toHaveBeenCalled();
+  });
+  it("anchors the prepared context root to this session's own resolved folder", async () => {
+    const f = await repositoryFixture(continuityFiles);
+    const prepared = await createNativeInputPreparer({ ...f.options, git: f.git,
+      repositoryCacheRoot: join(f.root, "cache") })(nativeRepositoryAssignment());
+    const contextRoot = prepared.readOnlyRoots!.find(path => path.endsWith("/source"))!;
+    const parent = dirname(dirname(contextRoot));
+    expect(parent.endsWith("/session-context")).toBe(true);
+    expect(await resolveSessionContextFolder(parent, f.selection)).toMatchObject({ cwd: contextRoot });
+    expect(prepared.sessionContextRoot).toBe(contextRoot);
+    expect(prepared.skillInstructions).toContain(JSON.stringify({ sessionContextDirectory: contextRoot }));
+    await prepared.beforePrompt();
+  });
+  it("refuses a context folder replaced by a link before another prompt", async () => {
+    const f = await repositoryFixture(continuityFiles);
+    const prepared = await createNativeInputPreparer({ ...f.options, git: f.git,
+      repositoryCacheRoot: join(f.root, "cache") })(nativeRepositoryAssignment());
+    const contextRoot = prepared.readOnlyRoots!.find(path => path.endsWith("/source"))!;
+    const folder = dirname(contextRoot);
+    const sibling = join(dirname(folder), `session-${"e".repeat(64)}`);
+    await mkdir(join(sibling, "source"), { recursive: true, mode: 0o700 });
+    await rename(folder, `${folder}.kept`);
+    await symlink(sibling, folder, "dir");
+    await expect(prepared.beforePrompt()).rejects.toThrow();
   });
   it("says which recheck step a prompt still waits on, and how long each took (D172)", async () => {
     const f = await repositoryFixture({});

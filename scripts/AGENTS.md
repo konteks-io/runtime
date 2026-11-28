@@ -38,7 +38,7 @@ and the agent-on-every-OS proof. Most are called from `.github/workflows/`
   `id`, the bridge `version` and the sha256 of every upstream file it edits:
   - Claude: `id: "konteks-claude-project-settings-v5"`, version `0.75.1`,
     `hashes` for `acp-agent.js`, `settings.js`, `session-titles.js`.
-  - Codex: `id: "konteks-codex-acp-live-user-v12"`, version `1.10.0`,
+  - Codex: `id: "konteks-codex-acp-live-user-v13"`, version `1.10.0`,
     `upstreamSha256` for the bridge entry.
   A mismatch throws ("requires review of this upstream artifact") and every
   anchor must match exactly once. Bumping a bridge in
@@ -55,7 +55,10 @@ and the agent-on-every-OS proof. Most are called from `.github/workflows/`
   calls require a one-time human decision. The bridge names the tool in
   `toolCall._meta.claudeCode.toolName`; the Codex patch turns the person's and
   trusted projects' MCP servers off per thread and admits only
-  `admittedMcpServerNames` for an integration session.
+  `admittedMcpServerNames` for an integration session. The Codex patch also
+  sets `project_doc_max_bytes: 0`, `features.memories: false` and carries only
+  the working copy's own `AGENTS.md` as `developer_instructions`, so a shared
+  `CODEX_HOME` never supplies instructions or memories.
 - The Claude bridge prints an `instruction_scope version=N ...` marker that the
   runner parses (`packages/agent-runner/src/bridge/instruction-scope-observer.ts`);
   change both together.

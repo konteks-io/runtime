@@ -1,12 +1,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { konteksPrefixedName } from "./konteks-session-prefix.mjs";
 import {
   codexAcpLiveUserPatch,
+  konteksCodexInstructionScope,
   konteksRepositoryConfig,
   konteksTitlePrefixCheck,
+  konteksWorkingCopyInstructions,
   missingCodexToolTerminals,
   reconcileCodexToolTerminals,
   patchCodexAcpLiveUsers,
@@ -152,7 +155,11 @@ test("the reviewed bridge disables configured MCP servers on every thread start,
   assert.match(source, /async createSessionConfig\(projectPath, additionalDirectories, mcpServers, admittedMcpServerNames = \[\]\) \{/);
   assert.match(source, /const disabledMcpServers = konteksCodexMcpServers\(existingMcpServerNames, requestedServers\.map\(\(mcp\) => mcp\.name\), admittedMcpServerNames\.map\(sanitizeMcpServerName\)\);/);
   assert.doesNotMatch(source, /shouldDeduplicateMcpConflicts\(\)\) \{\n      const existingNames/);
-  assert.equal(codexAcpLiveUserPatch.id, "konteks-codex-acp-live-user-v12");
+  assert.equal(codexAcpLiveUserPatch.id, "konteks-codex-acp-live-user-v13");
+  // Every start, resume and load return carries the working-copy-only scope.
+  assert.equal(source.match(/\.\.\.konteksCodexInstructionScope\(projectPath\)/g)?.length, 2);
+  assert.match(source, /project_doc_max_bytes: 0/);
+  assert.match(source, /features: \{ memories: false \}/);
 },
 );
 
@@ -390,6 +397,60 @@ test("repository lifecycle policy is per thread and leaves direct configuration 
   assert.equal(konteksRepositoryConfig(base, { konteksRepository: { version: 2, managed: true } }), base);
   assert.equal(konteksRepositoryConfig(base, { konteksRepository: { version: 1, managed: false } }), base);
   assert.equal(Object.hasOwn(base, "shell_environment_policy.set.HUSKY"), false);
+});
+
+test("a Konteks thread takes instructions only from its working copy and loads no Codex memories", () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-instruction-scope-"));
+  try {
+    const wc = join(root, "work");
+    mkdirSync(wc, { recursive: true });
+    writeFileSync(join(wc, "AGENTS.md"), "Run the project's tests.\n");
+    const scope = konteksCodexInstructionScope(wc);
+    assert.equal(scope.project_doc_max_bytes, 0);
+    assert.deepEqual(scope.features, { memories: false });
+    assert.equal(scope.developer_instructions, "Run the project's tests.\n");
+    // The shared CODEX_HOME is reused for the login and thread store, never
+    // for this session's instructions or memories.
+    const home = join(root, "operator", ".codex");
+    mkdirSync(home, { recursive: true });
+    writeFileSync(join(home, "AGENTS.md"), "Personal secret instructions.\n");
+    writeFileSync(join(home, "AGENTS.override.md"), "Personal override.\n");
+    const previous = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = home;
+    try {
+      assert.deepEqual(konteksCodexInstructionScope(wc), scope);
+      assert.doesNotMatch(JSON.stringify(scope), /Personal secret|Personal override/);
+    } finally {
+      if (previous === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previous;
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a working copy's instructions never come through a link out, a folder or a book", () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-working-copy-instructions-"));
+  try {
+    const wc = join(root, "work");
+    mkdirSync(wc, { recursive: true });
+    assert.equal(konteksWorkingCopyInstructions(undefined), "");
+    assert.equal(konteksWorkingCopyInstructions(""), "");
+    // No file: no instructions, and no private discovery outside the copy.
+    assert.equal(konteksWorkingCopyInstructions(wc), "");
+    writeFileSync(join(root, "private.md"), "Personal rules.\n");
+    symlinkSync(join(root, "private.md"), join(wc, "AGENTS.md"));
+    assert.equal(konteksWorkingCopyInstructions(wc), "");
+    rmSync(join(wc, "AGENTS.md"));
+    mkdirSync(join(wc, "AGENTS.md"));
+    assert.equal(konteksWorkingCopyInstructions(wc), "");
+    rmSync(join(wc, "AGENTS.md"), { recursive: true, force: true });
+    writeFileSync(join(wc, "AGENTS.md"), "x".repeat(32_769));
+    assert.equal(konteksWorkingCopyInstructions(wc), "");
+    // A link that stays inside the working copy is the working copy's own.
+    rmSync(join(wc, "AGENTS.md"));
+    writeFileSync(join(wc, "RULES.md"), "# rules\n");
+    symlinkSync(join(wc, "RULES.md"), join(wc, "AGENTS.md"));
+    assert.equal(konteksWorkingCopyInstructions(wc), "# rules\n");
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 

@@ -108,6 +108,48 @@ whole permission path.
   OpenCode's own tools are denied in its locked config instead.
 - Integration task sessions do not use this policy: see `../integration/AGENTS.md`.
 
+## Session context and instruction scope
+
+- **One resolved folder per session.** `sessionContextFolder` and
+  `resolveSessionContextFolder` (`../native/input-preparer.ts`) derive
+  `<RUNNER_WORKSPACE_DIR>/session-context/session-<hash>` (or
+  `assignment-<hash>` for assignment-isolated context) from the session's own
+  binding, resolve the result after `realpath`, and refuse a folder that is
+  the `session-context` parent, a sibling session, the operator's home or
+  anywhere outside it. Each refusal is a `LoggedRefusal` naming its rule
+  (`session_context_folder_is_parent`, `_is_sibling`, `_in_operator_home`,
+  `_outside_session`, `_missing`). Only the resolved `source` folder becomes
+  `readOnlyRoots` and `sessionContextRoot`; `verify()` re-resolves it before
+  every prompt.
+- **The parent is not a read root.** `isWithinReadRoots` refuses any path
+  under a `session-context` parent unless it is inside this session's single
+  own context root, even when a broken caller declares the parent as a read
+  root. The session's own folder is the only context path the policy and the
+  Claude escalation classify as data to read.
+- **Instruction scope.** Claude's bridge excludes the user `CLAUDE.md`, its
+  rules folder, every parent `CLAUDE.md` and auto memory, including under a
+  personal profile whose `HOME` is the operator's home
+  (`scripts/claude-instruction-scope.mjs`, marker
+  `instruction_scope version=4`). The Codex patch (`v13`) sets
+  `project_doc_max_bytes: 0`, `features.memories: false` and carries only the
+  working copy's own `AGENTS.md` as `developer_instructions`, so a shared
+  `CODEX_HOME` never supplies instructions or memories. Host agents
+  (dsh/OpenCode/Antigravity) take `AGENTS.md` only from the working copy
+  (`packages/agent-runner/src/host/working-copy-instructions.ts`).
+- **Out-of-folder locations that remain.** Two are genuinely required: the
+  session's own context folder, and the selected organization skill folders
+  staged by input preparation outside the working copy. The context folder is
+  data only: a Claude shell command reaching it is refused at once with the
+  Read tool named. A skill folder is data the agent reads with
+  Read/Grep/Glob; a shell command reaching it is never auto-allowed — it is
+  deferred as a one-time allow through the broker for an ordinary assignment
+  and refused for a planning estimate. No default, configuration or fallback
+  makes either auto-allowed. `src/__tests__/session-context-resolution-guard.test.ts`
+  drives the resolver and the policy with home, sibling, parent, symlink and
+  environment inputs; `src/__tests__/outside-folder-command-human-gate.test.ts`
+  extends its matrix with the context parent, a sibling session and a skill
+  folder.
+
 ## Finding: the four 2026-11-04 estimate cards
 
 The TKT-3 delivery description carries the full write-up; this is the code
@@ -133,12 +175,13 @@ cross-reference.
   to the operator's home (`packages/agent-runner/src/bridge/spec.ts`), and the
   Claude bridge patch excludes auto memory. `~/.claude` was reachable under a
   personal profile, but it is not what these four commands named.
-- **Sibling memory was reachable, outside the roots.** `readOnlyRoots` holds
+- **Sibling memory was reachable, outside the roots.** `readOnlyRoots` held
   only this session's context folder, so a sibling
-  `session-context/session-<other>/` and the `session-context/` parent are
-  outside it. These checks do not provide process/OS confinement: a shell
+  `session-context/session-<other>/` and the `session-context/` parent were
+  outside it; these checks do not provide process/OS confinement, so a shell
   naming a sibling would have run had a person allowed it. All four were
-  denied, so nothing was read.
+  denied, so nothing was read. `isWithinReadRoots` now refuses a sibling or
+  the parent outright (see above).
 - **Nothing consumed the result.** An estimate's output is `submit_result`;
   no code reads the shell result. That is why a planning shell call is now
   refused instead of deferred, including one that reaches a staged

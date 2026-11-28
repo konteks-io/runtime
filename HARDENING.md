@@ -96,6 +96,34 @@ from the repository root:
 - **Characterization:** `npm run test:characterization` needs installed agents
   or a Linux host and is opt-in.
 
+## Session context and instruction resolution
+
+A session's context, memory and instruction locations derive only from that
+session's own folder. The single resolver is
+`resolveSessionContextFolder` (`packages/supervisor/src/native/input-preparer.ts`):
+it resolves `<RUNNER_WORKSPACE_DIR>/session-context/session-<hash>` after
+`realpath` and refuses, by name, the `session-context` parent, a sibling
+session, the operator's home and any path outside the folder. Only that folder
+becomes `readOnlyRoots`/`sessionContextRoot`.
+`packages/supervisor/src/__tests__/session-context-resolution-guard.test.ts`
+fails, naming the broken rule, when any resolution path can leave the
+session's folder (home, sibling, parent, symlink, environment input); it runs
+under `npm test` and therefore `ci:check`. Instruction scope is pinned the same
+way: Claude excludes the user `CLAUDE.md`, rules, parent files and auto memory
+(`scripts/claude-instruction-scope.test.mjs`), and the Codex patch (`v13`)
+loads no instructions or memories from a shared `CODEX_HOME`
+(`scripts/codex-acp-live-user-patch.test.mjs`).
+
+Two out-of-folder locations are genuinely required and are named here rather
+than allowed: the session's own context folder, and the selected organization
+skill folders staged by input preparation. Neither is ever auto-allowed for a
+shell: Claude's shell read of the context folder is refused (use Read), and a
+shell call reaching a skill folder waits for a person's explicit one-time
+allow through the broker — or is refused for a planning estimate.
+`outside-folder-command-human-gate.test.ts` and
+`session-context-resolution-guard.test.ts` hold that matrix; a new allow
+branch must extend it.
+
 Release, bootstrap and install files (`scripts/release*`,
 `scripts/build-*.mjs`, `bootstrap/`, `vendor/*.tgz`, `.github/workflows/*`)
 are read by CI and by installers on Windows, macOS and Linux: keep their

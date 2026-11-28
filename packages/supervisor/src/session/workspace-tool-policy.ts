@@ -1,6 +1,6 @@
 import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { isFsErrorWithCode } from "@konteks/remote-common";
-import { dirname, isAbsolute, join, parse, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, parse, relative, resolve } from "node:path";
 import type { PolicyEvaluator, ToolPolicyContext, ToolPolicyEvaluation } from "@konteks/agent-core";
 
 /**
@@ -95,7 +95,48 @@ export function isWithinWorkspace(rawPath: string, workspaceRoot: string): boole
 /** Relative paths are always session-relative, including a read of a selected skill. */
 export function isWithinReadRoots(rawPath: string, cwd: string, readOnlyRoots: readonly string[] = []): boolean {
   const target = realPrefix(resolve(cwd, rawPath));
+  if (!readableInsideSessionContext(target, [cwd, ...readOnlyRoots])) return false;
   return [cwd, ...readOnlyRoots].some(root => withinResolvedRoot(target, realPrefix(resolve(root))));
+}
+
+const SESSION_CONTEXT_PARENT = "session-context";
+
+/** The `session-context` parent a declared root lives under (or is), or null. */
+function sessionContextParentOf(root: string): string | null {
+  let current = realPrefix(resolve(root));
+  while (current !== null) {
+    if (basename(current) === SESSION_CONTEXT_PARENT) return current;
+    const parent = dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+  return null;
+}
+
+/** The one root that is this session's own context folder; none when ambiguous. */
+function ownSessionContextRoot(roots: readonly string[]): string | null {
+  const candidates = roots.filter(root => {
+    const resolved = realPrefix(resolve(root));
+    const parent = resolved === null ? null : sessionContextParentOf(resolved);
+    return resolved !== null && parent !== null && resolved !== parent;
+  });
+  return candidates.length === 1 ? realPrefix(resolve(candidates[0]!)) : null;
+}
+
+/**
+ * A path under a `session-context` parent is readable only when it is inside
+ * this session's own folder. The parent, a sibling session and the operator's
+ * home are never read roots, even if a broken caller declares one.
+ */
+function readableInsideSessionContext(target: string | null, roots: readonly string[]): boolean {
+  const parents = new Set(roots.map(sessionContextParentOf).filter((parent): parent is string => parent !== null));
+  if (parents.size === 0 || target === null) return true;
+  const own = ownSessionContextRoot(roots);
+  for (const parent of parents) {
+    if (!withinResolvedRoot(target, realPrefix(parent))) continue;
+    return own !== null && withinResolvedRoot(target, own);
+  }
+  return true;
 }
 
 /**
