@@ -34,9 +34,9 @@ beforeEach(async () => {
 afterEach(async () => { vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }); });
 
 type FixturePlatform = { os: "macos" | "windows" | "debian"; architecture: "amd64" | "arm64" };
-async function fixture(platform: FixturePlatform = { os: "macos", architecture: "arm64" }, agentId: "codex" | "claude-code" = "codex") {
+async function fixture(platform: FixturePlatform = { os: "macos", architecture: "arm64" }, agentId: "codex" | "claude-code" = "codex", codexLocalProxy = false) {
   const keys = buildReleaseFixture();
-  const agent = offlineFixture(platform.os, platform.architecture, agentId);
+  const agent = offlineFixture(platform.os, platform.architecture, agentId, { codexLocalProxy });
   const bytes = "verified-test-bridge-not-executed";
   const artifact = { id: "connector", kind: "connector", format: "executable", ...platform, url: "https://release.example/connector", digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}`, sizeBytes: Buffer.byteLength(bytes) };
   const body = { bundleVersion: "1.0.0", protocol: { min: "1.0", max: "1.0" }, deploymentKind: "native_connector", components: ["agent_runner"], images: [], agentBridges: [], nativeArtifacts: [artifact, agent.artifact], expiresAt: "2027-01-01T00:00:00Z" };
@@ -257,6 +257,17 @@ describe("closed native runtime installation", () => {
     const custom = join(root, "socket", "s");
     expect(await resolveNativeCodexSocket(root, home, custom)).toBe(custom);
     await expect(resolveNativeCodexSocket(root, home, `${root}/../foreign/s`)).rejects.toThrow();
+  });
+  it("migrates a stored legacy Codex socket named under the real home", async () => {
+    // The record predates the overlay and still names the operator's socket.
+    const f = await fixture(undefined, "codex", true);
+    const realHome = join(root, "operator-codex");
+    const legacy = join(realHome, "app-server-control", "app-server-control.sock");
+    await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, codexHome: realHome, codexSocket: legacy }));
+    const loaded = await loadNativeInstallation(root, f.options);
+    expect(loaded.runners[0]?.RUNNER_NATIVE_CODEX_HOME).toBe(join(root, "credentials", "codex", "codex-home"));
+    expect(loaded.runners[0]?.RUNNER_NATIVE_CODEX_SOCKET).toBe(await resolveNativeCodexSocket(root, realHome));
+    expect(loaded.runners[0]?.RUNNER_NATIVE_CODEX_SOCKET).not.toBe(legacy);
   });
   it.runIf(process.platform !== "win32")("runs DeepSeek Harness from the person's own installation, with no bundled artifact", async () => {
     isolateDshDiscovery(root);

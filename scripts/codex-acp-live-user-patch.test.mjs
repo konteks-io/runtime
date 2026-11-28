@@ -474,11 +474,27 @@ function methodSection(source, signature) {
   return source.slice(start, next === null ? undefined : start + 1 + next.index).trim();
 }
 
+// Upstream's method reads this handler state and these module-level names.
+// A `new Function` body has no module scope, so the reviewed dist's names are
+// passed in explicitly (the real bridge supplies its own).
+const upstreamLogger = { log() {} };
+const upstreamMergeConfig = config => config;
+const upstreamHandler = {
+  gatewayConfig: null,
+  config: {},
+  getNativeProviderConfig: () => ({}),
+  getModelProvider: () => "openai",
+  getConfigMcpServerNames: async () => new Set(),
+  createMcpSeverConfig: () => ({}),
+};
+
 function sessionConfigFor(source) {
   return new Function(
     "konteksCodexMcpServers", "konteksCodexHomeGuard", "konteksCodexInstructionEntries", "konteksCodexThreadScope", "konteksWorkingCopyInstructions", "sanitizeMcpServerName",
+    "logger", "mergeGatewayConfig", "mergeSandboxWorkspaceWriteRoots", "gatewayApiTypeFromConfig",
     `return { ${methodSection(source, "  async createSessionConfig(projectPath, additionalDirectories, mcpServers, admittedMcpServerNames = []) {")} };`,
-  )(konteksCodexMcpServers, konteksCodexHomeGuard, konteksCodexInstructionEntries, konteksCodexThreadScope, konteksWorkingCopyInstructions, name => name);
+  )(konteksCodexMcpServers, konteksCodexHomeGuard, konteksCodexInstructionEntries, konteksCodexThreadScope, konteksWorkingCopyInstructions, name => name,
+    upstreamLogger, upstreamMergeConfig, upstreamMergeConfig, () => "openai");
 }
 
 test("the patched bridge refuses a personal CODEX_HOME and starts a thread from the clean overlay", { skip: !fixture }, async () => {
@@ -499,7 +515,7 @@ test("the patched bridge refuses a personal CODEX_HOME and starts a thread from 
     writeFileSync(join(sharedHome, ".konteks-codex-overlay"), "konteks-codex-home-overlay-v1\n");
     writeFileSync(join(cleanHome, "auth.json"), "{}\n");
     writeFileSync(join(cleanHome, ".konteks-codex-overlay"), "konteks-codex-home-overlay-v1\n");
-    const handler = { getConfigMcpServerNames: async () => new Set(), createMcpSeverConfig: () => ({}) };
+    const handler = { ...upstreamHandler };
     const create = sessionConfigFor(patched).createSessionConfig;
     // A thread whose CODEX_HOME is the operator's own home never starts.
     process.env.CODEX_HOME = sharedHome;
@@ -513,9 +529,9 @@ test("the patched bridge refuses a personal CODEX_HOME and starts a thread from 
     assert.equal(Object.hasOwn(config, "features"), false);
     // The unpatched upstream method has no guard; the patched one is the change.
     const plain = await new Function(
-      "sanitizeMcpServerName",
+      "sanitizeMcpServerName", "logger", "mergeGatewayConfig", "mergeSandboxWorkspaceWriteRoots", "gatewayApiTypeFromConfig",
       `return { ${methodSection(original, "  async createSessionConfig(projectPath, additionalDirectories, mcpServers) {")} };`,
-    )(name => name).createSessionConfig.call(handler, wc, [], []);
+    )(name => name, upstreamLogger, upstreamMergeConfig, upstreamMergeConfig, () => "openai").createSessionConfig.call(handler, wc, [], []);
     assert.equal(Object.hasOwn(plain, "project_doc_max_bytes"), false);
   } finally {
     if (previous === undefined) delete process.env.CODEX_HOME;

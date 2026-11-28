@@ -1,4 +1,4 @@
-import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -150,6 +150,21 @@ describe("the private Codex home overlay", () => {
     for (const blocked of ["AGENTS.md", "memories", "skills"]) {
       await expect(lstat(join(f.overlay, blocked))).rejects.toMatchObject({ code: "ENOENT" });
     }
+  });
+
+  it("picks up a replaced real auth.json after the operator signs out and in again", async () => {
+    const f = await homes();
+    await prepareCodexHomeOverlay(f.real, f.overlay);
+    const overlayAuth = join(f.overlay, "auth.json");
+    // Windows links the login as a hard link, so a sign-out and sign-in that
+    // replaces the real file leaves the overlay on the old token.
+    await rm(overlayAuth);
+    await link(join(f.real, "auth.json"), overlayAuth);
+    const replacement = join(f.root, "auth.json.new");
+    await writeFile(replacement, '{"token":"fresh-sign-in"}\n');
+    await rename(replacement, join(f.real, "auth.json"));
+    await prepareCodexHomeOverlay(f.real, f.overlay);
+    expect(await readFile(overlayAuth, "utf8")).toBe('{"token":"fresh-sign-in"}\n');
   });
 
   it("keeps the profile a legacy record's runner already used when the environment names another", async () => {

@@ -53,18 +53,31 @@ export async function prepareCodexHomeOverlay(realHome: string, overlay: string,
   const allowed = new Set(entries.map(entry => entry.name).filter(name => !blockedEntry(name) && name !== CODEX_CONFIG));
   await pruneOverlay(realHome, overlay, allowed);
   for (const entry of entries) {
-    if (!allowed.has(entry.name)) continue;
+    if (!allowed.has(entry.name) || entry.name === AUTH_ENTRY) continue;
     await linkEntry(join(realHome, entry.name), join(overlay, entry.name));
   }
-  // A profile that has not signed in yet still gets the operator's auth path:
-  // a dangling link is replaced by the real file when Codex writes it. A
-  // platform that cannot create a dangling link leaves sign-in to the overlay
-  // rather than failing the whole installation.
-  if (!entries.some(entry => entry.name === AUTH_ENTRY)) await linkEntry(join(realHome, AUTH_ENTRY), join(overlay, AUTH_ENTRY), true).catch(() => undefined);
+  await refreshAuthLink(realHome, overlay, entries.some(entry => entry.name === AUTH_ENTRY));
   await writeSanitizedConfig(realHome, overlay);
   await writeFile(join(overlay, CODEX_HOME_OVERLAY_MARKER), "konteks-codex-home-overlay-v1\n", { mode: 0o600 });
   await writeFile(join(overlay, CODEX_HOME_SOURCE), `${realHome}\n`, { mode: 0o600 });
   return overlay;
+}
+
+/**
+ * The login is the one shared entry that must not outlive a sign-in. On
+ * Windows it is a hard link, so a sign-out and sign-in that replaces the real
+ * file would otherwise leave the overlay on the old token. Re-link it on every
+ * prepare; with no real login keep what the overlay holds (a sign-in may have
+ * written it there when a dangling link could not be created).
+ */
+async function refreshAuthLink(realHome: string, overlay: string, realExists: boolean): Promise<void> {
+  const linkPath = join(overlay, AUTH_ENTRY);
+  if (!realExists) {
+    await linkEntry(join(realHome, AUTH_ENTRY), linkPath, true).catch(() => undefined);
+    return;
+  }
+  await rm(linkPath, { force: true, recursive: true });
+  await linkEntry(join(realHome, AUTH_ENTRY), linkPath);
 }
 
 /** The operator's instruction sources and personal skill/prompt folders. */
