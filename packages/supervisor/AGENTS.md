@@ -193,6 +193,11 @@ QA browser, structured results, updates and doctor/support.
   tags each step (`native/delivery-output-failure.ts`). A retained retry
   (attempt 1, then every 12th) is also reported as a `turn` runtime failure.
   A new bare refusal there is a blind spot again: give it a name.
+  Graft wiring's edits to tracked files (marked skip-worktree in the
+  worktree's own index) are never the agent's output: capture keeps such a
+  file at its baseline when it is gone or still holds the baseline bytes
+  (`wiringHiddenPaths`); only a real content edit is delivered (11-28: four
+  PRs deleted or un-executabled `.claude/helpers/graft-*.cjs`).
   The recovery-checkpoint path does the same (`NamedRefusal`, each Git call
   takes a `CheckpointGitStep`); `seal()` reports the cause in the stage, e.g.
   `workspace_capture_file_hardlinked` (`native/workspace-checkpoint-failure.ts`).

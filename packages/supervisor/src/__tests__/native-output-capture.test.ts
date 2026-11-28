@@ -168,6 +168,59 @@ describe("native delivery output capture", () => {
     expect(result.resultDigest).toBe(computeRemoteDeliveryOutputDigest(body));
   });
 
+  describe("tracked files Graft wiring hid with skip-worktree", () => {
+    async function wiredBase() {
+      await writeFixtureFiles([".claude/helpers/graft-hooks.cjs", ".claude/skills/graft/SKILL.md", "AGENTS.md"]);
+      await chmod(join(dir, ".claude/helpers/graft-hooks.cjs"), 0o755);
+      await run("git", ["-C", dir, "add", "."]);
+      await run("git", ["-C", dir, "-c", "user.name=Test", "-c", "user.email=test@invalid", "commit", "-qm", "wired base"]);
+      return outputOptions();
+    }
+
+    /** What `wireGraft` leaves: its edits to tracked files, hidden in the worktree's own index. */
+    const edit = {
+      removed: (path: string) => unlink(join(dir, path)),
+      demoded: (path: string) => chmod(join(dir, path), 0o644),
+      rewritten: (path: string) => writeFile(join(dir, path), "rewritten by the agent\n"),
+    };
+    async function wire(edits: Partial<Record<keyof typeof edit, string[]>>) {
+      const changes = Object.entries(edits).flatMap(([kind, paths]) => paths.map(path => ({ kind: kind as keyof typeof edit, path })));
+      for (const change of changes) await edit[change.kind](change.path);
+      await run("git", ["-C", dir, "update-index", "--skip-worktree", "--", ...changes.map(change => change.path)]);
+    }
+
+    it("never publishes the wiring's deletion or mode change as the agent's work", async () => {
+      const options = await wiredBase();
+      await wire({ removed: [".claude/skills/graft/SKILL.md"], demoded: [".claude/helpers/graft-hooks.cjs"] });
+      await writeFile(join(dir, "kept.txt"), "the agent's change\n");
+      const result = await captureNativeDeliveryOutput(options);
+      expect(result.files.entries.map(entry => entry.path)).toEqual(["kept.txt"]);
+      expect(result.deletions).toEqual([]);
+    });
+
+    it("still publishes a real edit to a file the wiring hid", async () => {
+      const options = await wiredBase();
+      await wire({ rewritten: ["AGENTS.md"] });
+      const result = await captureNativeDeliveryOutput(options);
+      expect(result.files.entries.map(entry => [entry.path, Buffer.from(entry.contentBase64, "base64").toString()]))
+        .toEqual([["AGENTS.md", "rewritten by the agent\n"]]);
+    });
+
+    it("restores the baseline when an earlier accepted output carried the wiring's change", async () => {
+      const options = await wiredBase();
+      await chmod(join(dir, ".claude/helpers/graft-hooks.cjs"), 0o644);
+      await unlink(join(dir, ".claude/skills/graft/SKILL.md"));
+      const leaked = await captureNativeDeliveryOutput(options);
+      expect(leaked.deletions).toEqual([".claude/skills/graft/SKILL.md"]);
+      await run("git", ["-C", dir, "update-index", "--skip-worktree", "--", ".claude/helpers/graft-hooks.cjs", ".claude/skills/graft/SKILL.md"]);
+      const corrected = await captureNativeDeliveryOutput({ ...options, invocationRef: "corrected", previousOutput: leaked });
+      expect(corrected.deletions).toEqual([]);
+      expect(corrected.files.entries.map(entry => [entry.path, entry.mode])).toEqual([
+        [".claude/helpers/graft-hooks.cjs", 0o700], [".claude/skills/graft/SKILL.md", 0o600],
+      ]);
+    });
+  });
+
   it("keeps tracked and pre-staged internal cache changes out without altering the real index or HEAD", async () => {
     await writeFixtureFiles(["graft/.cache/tracked.json", "graft/.graph/base.db"]);
     await run("git", ["-C", dir, "add", "--force", "graft"]);

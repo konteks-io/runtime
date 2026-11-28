@@ -14,7 +14,7 @@ export { diagnosticIdentifier };
 /** The Git call a capture refusal came from. */
 export type OutputGitStep =
   | "rev_parse" | "baseline_commit" | "read_tree" | "ls_files" | "ls_files_stage" | "add" | "add_accepted" | "accepted_mode"
-  | "write_tree" | "diff" | "ls_tree" | "cat_file";
+  | "write_tree" | "diff" | "ls_tree" | "cat_file" | "skip_worktree_list" | "hash_object" | "baseline_blob";
 
 /** The step of one delivery output hand-back that refused. */
 export type DeliveryOutputStage =

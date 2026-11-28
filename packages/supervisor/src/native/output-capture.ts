@@ -48,6 +48,36 @@ function isToolArtifactPath(relativePath: string): boolean {
   return TOOL_ARTIFACT_ROOTS.some(root => relativePath === root || relativePath.startsWith(`${root}/`));
 }
 
+/**
+ * Graft wiring (launcher `wireGraft`) edits tracked agent files in a delivery
+ * copy and hides each edit with skip-worktree in the worktree's own index.
+ * The capture's private index starts from the baseline, where that flag does
+ * not exist, so the wiring's deletions and executable-bit flips were published
+ * as the agent's change (11-28: core#714/#726 deleted
+ * `.claude/helpers/graft-*.cjs`, runtime#207/#208 dropped their executable
+ * bit, and review refused each delivery for it). Such a file stays at its
+ * baseline unless its bytes changed: a real edit is still the agent's work.
+ */
+async function wiringHiddenPaths(executable: string, cwd: string, baselineCommit: string): Promise<ReadonlySet<string>> {
+  const listing = decodeUtf8(await runGit(executable, cwd, "skip_worktree_list", ["ls-files", "-v", "-z"]));
+  const skipped = listing.split("\0").filter(entry => /^[Ss] /u.test(entry)).map(entry => entry.slice(2));
+  const hidden = new Set<string>();
+  for (const path of skipped) if (await goneOrBaselineBytes(executable, cwd, baselineCommit, path)) hidden.add(path);
+  return hidden;
+}
+
+/** The wiring's own change: the file is gone, or it still holds the baseline's bytes. */
+async function goneOrBaselineBytes(executable: string, cwd: string, baselineCommit: string, path: string): Promise<boolean> {
+  const entry = await lstat(join(cwd, path)).catch(() => null);
+  if (!entry) return true;
+  if (!entry.isFile()) return false;
+  const [disk, baseline] = await Promise.all([
+    runGit(executable, cwd, "hash_object", ["hash-object", "--", path]),
+    runGit(executable, cwd, "baseline_blob", ["rev-parse", "--verify", "--quiet", `${baselineCommit}:${path}`]).catch(() => Buffer.alloc(0)),
+  ]);
+  return disk.toString("ascii").trim() === baseline.toString("ascii").trim();
+}
+
 /** The captured tree against the transfer contract, before any bytes leave the runtime. */
 export function checkOutputTreeLimits(entries: ReadonlyArray<{ sizeBytes: number }>): void {
   const totalBytes = entries.reduce((sum, entry) => sum + entry.sizeBytes, 0);
@@ -114,20 +144,20 @@ function modeConfig(executableBits: boolean): string[] {
   return executableBits ? [] : ["-c", "core.fileMode=false"];
 }
 
-async function captureIndex(executable: string, cwd: string, baselineCommit: string, env: NodeJS.ProcessEnv, executableBits: boolean, previous?: PreviousOutput | null): Promise<string> {
+async function captureIndex(executable: string, cwd: string, baselineCommit: string, env: NodeJS.ProcessEnv, executableBits: boolean, hidden: ReadonlySet<string>, previous?: PreviousOutput | null): Promise<string> {
   await runGit(executable, cwd, "read_tree", ["read-tree", "--reset", baselineCommit], env);
   // Enumerate eligible names before reading their bytes. Naming an ignored
   // parent in an `add` exclusion makes Git refuse otherwise valid changes.
   const paths = decodePaths(await runGit(executable, cwd, "ls_files",
     ["ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", ".", ...OUTPUT_CACHE_EXCLUSIONS], env))
-    .filter(path => !isToolArtifactPath(path));
+    .filter(path => !isToolArtifactPath(path) && !hidden.has(path));
   // The list above already applied the ignore rules, so `-f` adds only these
   // names. Without it Git exits 1 on a tracked file inside an ignored folder
   // (Laravel's storage/.gitignore `*` beside tracked storage/*/.gitignore),
   // and every capture of that repository failed (E67, 11-01).
   if (paths.length) await runGit(executable, cwd, "add",
     [...modeConfig(executableBits), "--literal-pathspecs", "add", "--no-renormalize", "-A", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"], env, paths.join("\0") + "\0");
-  await captureAcceptedPaths(executable, cwd, env, executableBits, previous);
+  await captureAcceptedPaths(executable, cwd, env, executableBits, hidden, previous);
   const tree = (await runGit(executable, cwd, "write_tree", ["write-tree"], env)).toString("ascii").trim();
   if (!oidPattern.test(tree)) throw unavailable("tree_unparsable");
   return tree;
@@ -148,11 +178,11 @@ async function presentAcceptedEntries<T extends { path: string }>(cwd: string, e
 }
 
 /** Previously accepted paths remain project output even if a later ignore rule hides them. */
-async function captureAcceptedPaths(executable: string, cwd: string, env: NodeJS.ProcessEnv, executableBits: boolean, previous?: PreviousOutput | null): Promise<void> {
+async function captureAcceptedPaths(executable: string, cwd: string, env: NodeJS.ProcessEnv, executableBits: boolean, hidden: ReadonlySet<string>, previous?: PreviousOutput | null): Promise<void> {
   if (!previous) return;
   const parsed = RemoteFileTreeSchema.safeParse(previous.files);
   if (!parsed.success) throw unavailable("previous_output_invalid");
-  const present = await presentAcceptedEntries(cwd, parsed.data.entries);
+  const present = (await presentAcceptedEntries(cwd, parsed.data.entries)).filter(entry => !hidden.has(entry.path));
   const paths = present.map(entry => entry.path);
   if (paths.length) await runGit(executable, cwd, "add_accepted", [...modeConfig(executableBits), "--literal-pathspecs", "add", "--no-renormalize", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"], env, paths.join("\0") + "\0");
   if (!executableBits) await keepAcceptedModes(executable, cwd, env, present);
@@ -286,8 +316,9 @@ async function commonObjectDirectory(gitExecutable: string, root: string): Promi
 async function capturedChanges(gitExecutable: string, root: string, baselineCommit: string, env: NodeJS.ProcessEnv, executableBits: boolean, previous?: PreviousOutput | null): Promise<{ entries: CapturedEntry[]; deletions: string[] }> {
   const gitlinks = baselineGitlinks(await runGit(gitExecutable, root, "ls_tree", ["ls-tree", "-rz", baselineCommit]));
   await verifyEmptyGitlinks(root, gitlinks, await runGit(gitExecutable, root, "ls_files_stage", ["ls-files", "--stage", "-z"]));
-  const first = await captureIndex(gitExecutable, root, baselineCommit, env, executableBits, previous);
-  const second = await captureIndex(gitExecutable, root, baselineCommit, env, executableBits, previous);
+  const hidden = await wiringHiddenPaths(gitExecutable, root, baselineCommit);
+  const first = await captureIndex(gitExecutable, root, baselineCommit, env, executableBits, hidden, previous);
+  const second = await captureIndex(gitExecutable, root, baselineCommit, env, executableBits, hidden, previous);
   if (first !== second) throw unavailable("tree_unstable");
   let deletions = decodePaths(await runGit(gitExecutable, root, "diff", ["diff", "--cached", "--diff-filter=D", "--name-only", "-z", "--no-renames", baselineCommit, "--"], env));
   const writes = decodePaths(await runGit(gitExecutable, root, "diff", ["diff", "--cached", "--diff-filter=ACMRTUXB", "--name-only", "-z", "--no-renames", baselineCommit, "--"], env));
