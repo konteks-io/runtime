@@ -98,6 +98,32 @@ describe('native workspace recovery checkpoint', () => {
     expect(await git(restored.cwd, 'for-each-ref', '--format=%(refname)')).toBe('');
   });
 
+  it("keeps Graft's own wiring out of a linked worktree's checkpoint and restores the agent's work", async () => {
+    const cacheRoot = join(root, 'graft-cache'); await mkdir(cacheRoot, { mode: 0o700 });
+    const ownerRoot = join(root, 'graft-agent'); await mkdir(ownerRoot, { mode: 0o700 });
+    const cache = join(cacheRoot, 'repository.git');
+    await git(root, 'clone', '--bare', source, cache);
+    const linked = join(ownerRoot, 'linked');
+    await git(cache, 'worktree', 'add', '--detach', linked, 'HEAD');
+    // What launcher `wireGraft` leaves: its files, and its block in the shared exclude file.
+    await mkdir(join(linked, 'graft'), { recursive: true }); await writeFile(join(linked, 'graft', 'INDEX.md'), 'map');
+    await mkdir(join(linked, '.claude', 'helpers'), { recursive: true }); await writeFile(join(linked, '.claude', 'helpers', 'graft-hook.cjs'), 'hook');
+    await mkdir(join(linked, '.claude', 'notes'), { recursive: true }); await writeFile(join(linked, '.claude', 'notes', 'draft.md'), 'agent draft');
+    await writeFile(join(linked, '.ignore'), 'graft/');
+    await mkdir(join(cache, 'info'), { recursive: true });
+    await writeFile(join(cache, 'info', 'exclude'), "# git ls-files --others --exclude-from=.git/info/exclude\n" +
+      "# Konteks: Graft's local files (set up by konteks-remote onboard)\n/.claude/helpers/\n/.ignore\n/graft/\n");
+    await writeFile(join(linked, 'kept.txt'), 'agent edit');
+    await mkdir(join(linked, 'private-local')); await writeFile(join(linked, 'private-local', 'draft.txt'), 'ignored unfinished work');
+    const checkpoint = await captureWorkspaceCheckpoint({ cwd: linked, ownerRoot, repositoryCacheRoot: cacheRoot, tool, baselineCommit: baseline });
+    expect(checkpoint.entries.map(entry => entry.path).sort()).toEqual(
+      ['.claude', '.claude/notes', '.claude/notes/draft.md', '.gitignore', 'deleted.txt', 'kept.txt', 'private-local', 'private-local/draft.txt']);
+    const restored = await restoreWorkspaceCheckpoint({ destination: join(root, 'recovered-graft'), tool, checkpoint });
+    expect(await readFile(join(restored.cwd, 'kept.txt'), 'utf8')).toBe('agent edit');
+    expect(await readFile(join(restored.cwd, '.claude', 'notes', 'draft.md'), 'utf8')).toBe('agent draft');
+    await expect(lstat(join(restored.cwd, 'graft'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it.each([false, true])('retains stash stacks until their metadata can be preserved (linked=%s)', async linked => {
     let checkout = source; let ownerRoot = root; let cacheRoot: string | undefined;
     if (linked) {
