@@ -182,7 +182,10 @@ describe("the instruction scopes are driven by the session folder, never the ope
     expect((await isolateClaudeInstructions({}, cwd, user)).claudeMdExcludes).toEqual(result.claudeMdExcludes);
   });
 
-  it(`${RULE} — a shared CODEX_HOME supplies neither instructions nor memories`, async () => {
+  it(`${RULE} — the Codex thread scope carries only the working copy's instructions`, async () => {
+    // The fixture-backed test in scripts/codex-acp-live-user-patch.test.mjs
+    // drives the patched upstream createSessionConfig and checks the config
+    // that reaches thread/start. This guard checks the scope's contract.
     const { konteksCodexInstructionScope } = (await import("../../../../scripts/codex-acp-live-user-patch.mjs")) as unknown as CodexScope;
     const root = await realpath(await mkdtemp(join(tmpdir(), "instruction-scope-codex-")));
     roots.push(root);
@@ -193,15 +196,9 @@ describe("the instruction scopes are driven by the session folder, never the ope
     await writeFile(join(workingCopy, "AGENTS.md"), "# working copy rules\n");
     await writeFile(join(sharedHome, "AGENTS.md"), "# operator private rules\n");
     await writeFile(join(sharedHome, "AGENTS.override.md"), "# operator private override\n");
-    const previous = process.env.CODEX_HOME;
-    process.env.CODEX_HOME = sharedHome;
-    try {
-      const scope = konteksCodexInstructionScope(workingCopy);
-      expect(scope).toMatchObject({ project_doc_max_bytes: 0, features: { memories: false }, developer_instructions: "# working copy rules\n" });
-      expect(JSON.stringify(scope)).not.toMatch(/operator private/);
-    } finally {
-      if (previous === undefined) delete process.env.CODEX_HOME;
-      else process.env.CODEX_HOME = previous;
-    }
+    const scope = konteksCodexInstructionScope(workingCopy);
+    expect(scope).toMatchObject({ project_doc_max_bytes: 0, features: { memories: false }, developer_instructions: "# working copy rules\n" });
+    // Nothing in the thread scope names the shared profile or its files.
+    expect(JSON.stringify(scope)).not.toMatch(/operator private|\.codex|CODEX_HOME/);
   });
 });

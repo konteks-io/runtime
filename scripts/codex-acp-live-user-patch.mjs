@@ -84,9 +84,24 @@ export function konteksRepositoryConfig(config, meta) {
 
 // A Konteks thread takes its instructions only from the working copy. The
 // shared CODEX_HOME is reused for the official login and thread store, but its
-// AGENTS.md, AGENTS.override.md and Codex memories must never steer a session:
-// no instruction discovery at all, and only the working copy's own AGENTS.md
-// carried as developer instructions.
+// AGENTS.md, AGENTS.override.md and Codex memories must never steer a session.
+//
+// Upstream grounding (Codex, pinned tooling 0.159.0; the source-bound fixtures
+// at scripts/fixtures/cpal-0.18.2-availability come from Codex commit 687a119):
+// - `project_doc_max_bytes` is Codex's bounded AGENTS.md reader. Zero returns
+//   before it reads the user-level `$CODEX_HOME/AGENTS.md`, every
+//   `AGENTS.override.md` and every working-copy/parent `AGENTS.md`. That also
+//   means nested working-copy AGENTS.md files are not discovered; only the
+//   working copy's root file is carried below.
+// - `features` is Codex's TOML feature table (`codex-config` deserializes it
+//   through `codex-features`, and that source carries the `codex-memories-*`
+//   crates). `features.memories = false` turns the memories feature off.
+// - `developer_instructions` is the thread's own instruction text. Setting it
+//   replaces an operator's `developer_instructions` for this thread; that is
+//   intentional, because only this working copy may steer the session.
+//
+// The patched bridge test drives the real patched `createSessionConfig` from
+// the pristine dist, so these keys are proven to reach `thread/start`.
 export function konteksCodexInstructionScope(projectPath) {
   const scope = { project_doc_max_bytes: 0, features: { memories: false } };
   const instructions = konteksWorkingCopyInstructions(projectPath);

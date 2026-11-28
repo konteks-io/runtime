@@ -131,11 +131,14 @@ whole permission path.
   personal profile whose `HOME` is the operator's home
   (`scripts/claude-instruction-scope.mjs`, marker
   `instruction_scope version=4`). The Codex patch (`v13`) sets
-  `project_doc_max_bytes: 0`, `features.memories: false` and carries only the
-  working copy's own `AGENTS.md` as `developer_instructions`, so a shared
-  `CODEX_HOME` never supplies instructions or memories. Host agents
-  (dsh/OpenCode/Antigravity) take `AGENTS.md` only from the working copy
-  (`packages/agent-runner/src/host/working-copy-instructions.ts`).
+  `project_doc_max_bytes: 0` (no user-level `$CODEX_HOME/AGENTS.md`, override
+  file, parent or project docs), `features.memories: false`, and carries only
+  the working copy's root `AGENTS.md` as `developer_instructions`, so a shared
+  `CODEX_HOME` never supplies instructions or memories. Nested working-copy
+  `AGENTS.md` files are therefore not discovered, and the thread's
+  `developer_instructions` replaces any operator value; both are intentional.
+  Host agents (dsh/OpenCode/Antigravity) take `AGENTS.md` only from the working
+  copy (`packages/agent-runner/src/host/working-copy-instructions.ts`).
 - **Out-of-folder locations that remain.** Two are genuinely required: the
   session's own context folder, and the selected organization skill folders
   staged by input preparation outside the working copy. The context folder is

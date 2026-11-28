@@ -56,9 +56,15 @@ and the agent-on-every-OS proof. Most are called from `.github/workflows/`
   `toolCall._meta.claudeCode.toolName`; the Codex patch turns the person's and
   trusted projects' MCP servers off per thread and admits only
   `admittedMcpServerNames` for an integration session. The Codex patch also
-  sets `project_doc_max_bytes: 0`, `features.memories: false` and carries only
-  the working copy's own `AGENTS.md` as `developer_instructions`, so a shared
-  `CODEX_HOME` never supplies instructions or memories.
+  sets `project_doc_max_bytes: 0` (Codex returns before reading the user-level
+  `$CODEX_HOME/AGENTS.md`, any `AGENTS.override.md` and project docs),
+  `features.memories: false` (the `features` table `codex-config` deserializes
+  through `codex-features`; the source-bound Codex fixtures carry the
+  `codex-memories-*` crates), and carries only the working copy's root
+  `AGENTS.md` as `developer_instructions`, so a shared `CODEX_HOME` never
+  supplies instructions or memories. Two consequences are intentional and
+  documented here: nested working-copy `AGENTS.md` files are not discovered,
+  and a Konteks thread's `developer_instructions` replaces any operator value.
 - The Claude bridge prints an `instruction_scope version=N ...` marker that the
   runner parses (`packages/agent-runner/src/bridge/instruction-scope-observer.ts`);
   change both together.

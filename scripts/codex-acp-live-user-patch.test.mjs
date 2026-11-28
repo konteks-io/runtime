@@ -7,6 +7,7 @@ import { konteksPrefixedName } from "./konteks-session-prefix.mjs";
 import {
   codexAcpLiveUserPatch,
   konteksCodexInstructionScope,
+  konteksCodexMcpServers,
   konteksRepositoryConfig,
   konteksTitlePrefixCheck,
   konteksWorkingCopyInstructions,
@@ -399,7 +400,7 @@ test("repository lifecycle policy is per thread and leaves direct configuration 
   assert.equal(Object.hasOwn(base, "shell_environment_policy.set.HUSKY"), false);
 });
 
-test("a Konteks thread takes instructions only from its working copy and loads no Codex memories", () => {
+test("the instruction scope turns off Codex docs and memories and carries only the working copy's AGENTS.md", () => {
   const root = mkdtempSync(join(tmpdir(), "codex-instruction-scope-"));
   try {
     const wc = join(root, "work");
@@ -409,20 +410,82 @@ test("a Konteks thread takes instructions only from its working copy and loads n
     assert.equal(scope.project_doc_max_bytes, 0);
     assert.deepEqual(scope.features, { memories: false });
     assert.equal(scope.developer_instructions, "Run the project's tests.\n");
-    // The shared CODEX_HOME is reused for the login and thread store, never
-    // for this session's instructions or memories.
-    const home = join(root, "operator", ".codex");
-    mkdirSync(home, { recursive: true });
-    writeFileSync(join(home, "AGENTS.md"), "Personal secret instructions.\n");
-    writeFileSync(join(home, "AGENTS.override.md"), "Personal override.\n");
+    // Without a working-copy AGENTS.md there are no instructions at all; the
+    // scope never names a path outside the working copy.
+    assert.deepEqual(konteksCodexInstructionScope(join(root, "empty")), {
+      project_doc_max_bytes: 0,
+      features: { memories: false },
+    });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("the pinned Codex source carries the memories feature behind its features config", () => {
+  // scripts/fixtures/cpal-0.18.2-availability/Cargo.lock is exact public source
+  // from Codex commit 687a119. It grounds the feature name and that Codex's
+  // config crate deserializes the feature table through codex-features.
+  const lock = readFileSync(new URL("./fixtures/cpal-0.18.2-availability/Cargo.lock", import.meta.url), "utf8");
+  for (const crate of ["codex-features", "codex-memories-read", "codex-memories-write", "codex-memories-extension"]) {
+    assert.match(lock, new RegExp(`name = "${crate}"`), crate);
+  }
+  const start = lock.indexOf('name = "codex-config"');
+  const end = lock.indexOf("[[package]]", start);
+  assert.ok(start >= 0 && end > start, "codex-config moved in the pinned Codex source");
+  assert.match(lock.slice(start, end), /"codex-features"/);
+});
+
+// Build qualification supplies the pristine upstream dist directory.
+function methodSection(source, signature) {
+  const start = source.indexOf(signature);
+  assert.notEqual(start, -1, `the reviewed Codex section moved: ${signature}`);
+  const next = /\n {2}(?:async\s+)?[A-Za-z_$][\w$]*\s*[=(]/.exec(source.slice(start + 1));
+  return source.slice(start, next === null ? undefined : start + 1 + next.index).trim();
+}
+
+function sessionConfigFor(source) {
+  return new Function(
+    "konteksCodexMcpServers", "konteksCodexInstructionScope", "konteksWorkingCopyInstructions", "sanitizeMcpServerName",
+    `return { ${methodSection(source, "  async createSessionConfig(projectPath, additionalDirectories, mcpServers, admittedMcpServerNames = []) {")} };`,
+  )(konteksCodexMcpServers, konteksCodexInstructionScope, konteksWorkingCopyInstructions, name => name);
+}
+
+test("the patched bridge sends working-copy-only instruction scope to every thread config", { skip: !fixture }, async () => {
+  const original = readFileSync(join(fixture, "index.js"), "utf8");
+  const patched = patchCodexAcpLiveUsers(original, codexAcpLiveUserPatch.version).source;
+  const root = mkdtempSync(join(tmpdir(), "codex-thread-config-"));
+  try {
+    const wc = join(root, "work");
+    const sharedHome = join(root, "operator", ".codex");
+    mkdirSync(wc, { recursive: true });
+    mkdirSync(sharedHome, { recursive: true });
+    writeFileSync(join(wc, "AGENTS.md"), "# working copy rules\n");
+    writeFileSync(join(sharedHome, "AGENTS.md"), "# operator private rules\n");
+    writeFileSync(join(sharedHome, "AGENTS.override.md"), "# operator private override\n");
+    const handler = { getConfigMcpServerNames: async () => new Set(), createMcpSeverConfig: () => ({}) };
+    const create = sessionConfigFor(patched).createSessionConfig;
+    const config = await create.call(handler, wc, [], [], []);
+    assert.equal(config.project_doc_max_bytes, 0);
+    assert.deepEqual(config.features, { memories: false });
+    assert.equal(config.developer_instructions, "# working copy rules\n");
+    // The same thread config with the shared profile present, and with the
+    // environment naming it, still carries no CODEX_HOME instruction bytes.
     const previous = process.env.CODEX_HOME;
-    process.env.CODEX_HOME = home;
+    process.env.CODEX_HOME = sharedHome;
     try {
-      assert.deepEqual(konteksCodexInstructionScope(wc), scope);
-      assert.doesNotMatch(JSON.stringify(scope), /Personal secret|Personal override/);
+      const same = await create.call(handler, wc, [], [], []);
+      assert.deepEqual(same, config);
+      assert.doesNotMatch(JSON.stringify(same), /operator private|sharedHome/);
     } finally {
       if (previous === undefined) delete process.env.CODEX_HOME;
       else process.env.CODEX_HOME = previous;
+    }
+    // The unpatched upstream method returns none of these keys for the same
+    // working copy: the config the app-server receives is the patch's change.
+    const plain = await new Function(
+      "sanitizeMcpServerName",
+      `return { ${methodSection(original, "  async createSessionConfig(projectPath, additionalDirectories, mcpServers) {")} };`,
+    )(name => name).createSessionConfig.call(handler, wc, [], []);
+    for (const key of ["project_doc_max_bytes", "features", "developer_instructions"]) {
+      assert.equal(Object.hasOwn(plain, key), false, key);
     }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
