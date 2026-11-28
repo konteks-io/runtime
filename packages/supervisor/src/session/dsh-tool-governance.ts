@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { canonicalize, CoordinationAgentToolNames, plainRecord, type JsonValue } from "@konteks/remote-common";
 import { BROWSER_MCP_SERVER_NAME, DSH_READ_ONLY_TOOLS, isDeniedBrowserTool } from "@konteks/remote-agent-runner";
 import { resolveIn } from "./host-decisions.js";
+import { isWithinWorkspace } from "./workspace-tool-policy.js";
 import type { HostPermissionDecision } from "./host-tool-governance.js";
 
 /**
@@ -111,7 +112,7 @@ function toolDecision(request: RequestPermissionRequest, observed: ObservedCall,
   if (FILE_READ.has(title)) return readDecision(request, toolCallId, title, rawInput, cwd);
   const exempt = exemptDecision(title, browserTools);
   if (exempt !== null) return exempt;
-  if (EXECUTE.has(title)) return executeDecision(request, toolCallId, title, rawInput.command);
+  if (EXECUTE.has(title)) return executeDecision(request, toolCallId, title, rawInput, cwd);
   if (EDIT.has(title)) return editDecision(request, toolCallId, title, editPath(rawInput), cwd);
   return { kind: "deny", reason: `${title || "an unnamed tool"} is not a tool Konteks allows DeepSeek Harness to use` };
 }
@@ -129,9 +130,19 @@ function browserDecision(browserTool: string, browserTools: boolean): DshPermiss
   return browserTools && !isDeniedBrowserTool(browserTool) ? { kind: "allow" } : { kind: "deny", reason: `the browser tool ${browserTool} is not allowed in this session` };
 }
 
-function executeDecision(request: RequestPermissionRequest, toolCallId: string, title: string, command: unknown): DshPermissionDecision {
+function executeDecision(request: RequestPermissionRequest, toolCallId: string, title: string, rawInput: Record<string, unknown>, cwd: string): DshPermissionDecision {
+  const command = rawInput.command;
   if (typeof command !== "string" || command.trim().length === 0) return { kind: "deny", reason: `${title} call has no command to judge` };
+  if (shellFolderOutside(rawInput, cwd)) return { kind: "deny", reason: "a command run outside the working copy" };
   return { kind: "evaluate", request: { ...request, toolCall: { toolCallId, kind: "execute", title: command, rawInput: { command } } } };
+}
+
+/** A shell whose cwd or workdir leaves the working copy is refused, never judged as an ordinary command. */
+function shellFolderOutside(rawInput: Record<string, unknown>, cwd: string): boolean {
+  return ["cwd", "workdir"].some(key => {
+    const folder = rawInput[key];
+    return typeof folder === "string" && folder.trim().length > 0 && !isWithinWorkspace(resolveIn(cwd, folder), cwd);
+  });
 }
 
 function editPath(rawInput: Record<string, unknown>): string | undefined {
