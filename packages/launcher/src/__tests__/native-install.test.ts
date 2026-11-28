@@ -1064,6 +1064,14 @@ describe("native install composition", () => {
     expect(updated).toEqual(installed);
     expect(await readFile(join(f.root, "supervisor", "identity.json"), "utf8")).toBe(before);
     expect(f.activate).toHaveBeenCalledTimes(1);
+    // A later launcher run with a different CODEX_HOME must not rebind the
+    // profile the legacy runner already used.
+    await writeSecretFile(join(f.root, "native-runtime.json"), JSON.stringify(legacy));
+    const other = join(f.root, "other-codex");
+    await mkdir(other, { recursive: true });
+    vi.stubEnv("CODEX_HOME", other);
+    const rebound = await installNative(f.options as never);
+    expect(rebound.codexHome).toBe(installed.codexHome);
   });
   it("refuses untrusted native releases before activation", async () => {
     const f = await fixture();

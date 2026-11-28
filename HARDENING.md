@@ -112,16 +112,18 @@ under `npm test` and therefore `ci:check`. Instruction scope is pinned the same
 way: Claude excludes the user `CLAUDE.md`, rules, parent files and auto memory
 (`scripts/claude-instruction-scope.test.mjs`); Codex is pointed at a private
 `CODEX_HOME` overlay that keeps the login and thread store but not
-`AGENTS.md`, `AGENTS.override.md` or any `memories*` entry
-(`packages/supervisor/src/native/codex-home-overlay.ts`); the patch (`v13`)
+`AGENTS.md`, `AGENTS.override.md`, any `memories*` entry, or the personal
+`skills/`, `prompts/`, `plugins/` and `instructions/` folders; its `config.toml`
+is a sanitized copy without the instruction-source keys
+(`packages/supervisor/src/native/codex-home-overlay.ts`). The patch (`v13`)
 refuses any `CODEX_HOME` that is not that marked overlay, and any marked
 overlay that still exposes an instruction file. The thread config sets
-`project_doc_max_bytes: 0` (no parent or nested project-doc walk) and carries
-the working copy's root `AGENTS.md` as `developer_instructions`; this drops
-nested files and replaces an operator `developer_instructions` for the thread.
-The characterization test `codex-instruction-overlay.test.ts` runs the real
-Codex prompt input to prove the operator's and a parent file's instructions do
-not reach it.
+`project_doc_max_bytes: 0` (no parent or nested project-doc walk) and always
+sets `developer_instructions` (empty when the working copy has none); this
+drops nested files and replaces an operator value. The characterization test
+`codex-instruction-overlay.test.ts` runs the real Codex prompt input to prove
+the operator's override, config instructions, personal skill and a parent
+file's instructions do not reach it.
 
 Two out-of-folder locations are genuinely required and are named here rather
 than allowed: the session's own context folder, and the selected organization

@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { basename, delimiter, join, parse, resolve } from "node:path";
 import { CONTROL_SOCKET_DEFAULT_PORT, findGitForWindows, RemoteInstanceError, SystemClock, writeSecretFile, type RemoteSignedBundleManifest } from "@konteks/remote-common";
 import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, findAgentBridge, installOfflineAgentPackage, isHostAgentId, selectNativeArtifacts, stageNativeRelease, verifyNativeRelease, type EmbeddedReleaseRoot, type NativeDownloadProgress } from "@konteks/remote-release";
-import { acquireNativeRootLock, compareSemver, deleteNativeAntigravity, HOST_AGENT_INSTALL_ADAPTERS, hostAgentInstallAdapter, loadNativeInstallation, signOutNativeAntigravity, type HostAgentInstallAdapter, nativeAgentOffered, NativeRuntimeRecordSchema, parseNativeRuntimeRecord, resolveNativeClaudeExecutable, resolveNativeCodexHome, runNativeActivationExchange, SupervisorStore, verifyNativeGitTool, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
+import { acquireNativeRootLock, codexHomeBehindOverlay, compareSemver, deleteNativeAntigravity, HOST_AGENT_INSTALL_ADAPTERS, hostAgentInstallAdapter, loadNativeInstallation, signOutNativeAntigravity, type HostAgentInstallAdapter, nativeAgentOffered, NativeRuntimeRecordSchema, parseNativeRuntimeRecord, resolveNativeClaudeExecutable, resolveNativeCodexHome, runNativeActivationExchange, SupervisorStore, verifyNativeGitTool, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { isRetiredAgentId, retiredAgentMessage } from "@konteks/backstage-plugin-common";
 import { z } from "zod";
 import type { Output } from "../output.js";
@@ -156,9 +156,11 @@ function sameInstall(install: InstallContext, record: NativeRuntimeRecord, activ
   );
 }
 
-/** A record from before the Codex profile was recorded binds the operator's real profile, never the private overlay. */
+/** A record from before the Codex profile was recorded binds the real profile behind the overlay the runner used. */
 async function bindCodexProfile(install: InstallContext, installation: Awaited<ReturnType<typeof loadNativeInstallation>>): Promise<NativeRuntimeRecord> {
-  const codexHome = await resolveNativeCodexHome();
+  const overlay = installation.runners.find(runner => runner.RUNNER_AGENT_ID === "codex")?.RUNNER_NATIVE_CODEX_HOME;
+  const codexHome = overlay === undefined ? null : await codexHomeBehindOverlay(overlay);
+  if (codexHome === null) throw invalid();
   const bound = NativeRuntimeRecordSchema.parse({ ...installation.record, codexHome });
   install.lock.assertOwned();
   await writeSecretFile(join(install.root, "native-runtime.json"), JSON.stringify(bound));

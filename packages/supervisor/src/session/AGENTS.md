@@ -134,14 +134,17 @@ whole permission path.
   `AGENTS.override.md` into `Config.user_instructions` independently of project
   docs, so the supervisor gives it a private home overlay
   (`../native/codex-home-overlay.ts`) that links the official login and thread
-  store but omits those files and every `memories*` entry. The thread config
-  also sets `project_doc_max_bytes: 0` (no parent or nested project-doc walk)
-  and carries the working copy's root `AGENTS.md` as `developer_instructions`;
-  this intentionally drops nested files and replaces an operator
-  `developer_instructions` for the thread. The patch (`v13`) refuses any
-  `CODEX_HOME` that is not the marked overlay, and any marked overlay that
-  still exposes those files. Host agents (dsh/OpenCode/Antigravity) take
-  `AGENTS.md` only from the working copy
+  store but omits those files, every `memories*` entry, and personal `skills/`,
+  `prompts/`, `plugins/` and `instructions/` folders. Its `config.toml` is a
+  sanitized copy without `developer_instructions`, `model_instructions_file`,
+  `experimental_instructions_file`, `instructions`, `base_instructions` or
+  `compact_prompt`. The thread config also sets `project_doc_max_bytes: 0` (no
+  parent or nested project-doc walk) and always sets `developer_instructions`
+  (empty when the working copy has none, otherwise its root `AGENTS.md`); this
+  intentionally drops nested files and replaces an operator value. The patch
+  (`v13`) refuses any `CODEX_HOME` that is not the marked overlay, and any
+  marked overlay that still exposes those files. Host agents
+  (dsh/OpenCode/Antigravity) take `AGENTS.md` only from the working copy
   (`packages/agent-runner/src/host/working-copy-instructions.ts`).
 - **Out-of-folder locations that remain.** Two are genuinely required: the
   session's own context folder, and the selected organization skill folders

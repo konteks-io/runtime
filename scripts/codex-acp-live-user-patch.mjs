@@ -120,13 +120,11 @@ export function konteksCodexInstructionEntries(home) {
 // not a Git repository: it reads a parent or grandparent `AGENTS.md` too
 // (measured against the installed Codex CLI). Zero stops that walk, including
 // nested working-copy files; the working copy's own root file is then carried
-// explicitly. That replaces an operator's `developer_instructions` for this
-// thread, which is intentional: only this working copy may steer the session.
+// explicitly. `developer_instructions` is always set, empty when the working
+// copy has none, so an operator value from config.toml cannot survive. That
+// replaces an operator's value for this thread, which is intentional.
 export function konteksCodexThreadScope(projectPath) {
-  const instructions = konteksWorkingCopyInstructions(projectPath);
-  return instructions.length > 0
-    ? { project_doc_max_bytes: 0, developer_instructions: instructions }
-    : { project_doc_max_bytes: 0 };
+  return { project_doc_max_bytes: 0, developer_instructions: konteksWorkingCopyInstructions(projectPath) };
 }
 
 // The working copy's own AGENTS.md: a regular file whose real path stays

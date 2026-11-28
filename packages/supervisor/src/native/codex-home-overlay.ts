@@ -1,19 +1,34 @@
-import { chmod, link, lstat, mkdir, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
-import { RemoteInstanceError } from "@konteks/remote-common";
+import { chmod, link, lstat, mkdir, readFile, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { isFsErrorWithCode, RemoteInstanceError } from "@konteks/remote-common";
 
 /**
  * A Konteks Codex session must not see the operator's own instruction or
  * memory files. Codex reads `$CODEX_HOME/AGENTS.md` and `AGENTS.override.md`
  * into `Config.user_instructions` independently of project-document discovery
- * (setting `project_doc_max_bytes` does not suppress them), and its memories
- * live under the same home. The connector therefore points Codex at a private
- * overlay that exposes the login and thread store but none of those files.
+ * (setting `project_doc_max_bytes` does not suppress them), loads personal
+ * skills, prompts and plugin text, and its memories live under the same home.
+ * The connector therefore points Codex at a private overlay that exposes the
+ * login and thread store but none of those entries.
  */
-export const CODEX_HOME_INSTRUCTIONS: readonly string[] = Object.freeze(["AGENTS.md", "AGENTS.override.md"]);
+export const CODEX_HOME_BLOCKED_ENTRIES: readonly string[] = Object.freeze([
+  "AGENTS.md", "AGENTS.override.md", "skills", "prompts", "plugins", "instructions", ".tmp",
+]);
 
 /** Marks the exact home the connector prepared; the bridge refuses any other CODEX_HOME. */
 export const CODEX_HOME_OVERLAY_MARKER = ".konteks-codex-overlay";
+
+/** The real profile the overlay was made from, for a legacy record that has no codexHome yet. */
+const CODEX_HOME_SOURCE = ".konteks-codex-home";
+
+/** Codex's config carries instruction sources that would otherwise steer a session. */
+const CODEX_CONFIG = "config.toml";
+const CODEX_CONFIG_INSTRUCTION_KEYS: ReadonlySet<string> = new Set([
+  "developer_instructions", "model_instructions_file", "experimental_instructions_file",
+  "instructions", "base_instructions", "compact_prompt",
+]);
+/** Tables that can name skills, prompts or plugins by an absolute path outside the overlay. */
+const CODEX_CONFIG_BLOCKED_TABLES: ReadonlySet<string> = new Set(["plugins", "marketplaces", "skills", "prompts", "instructions"]);
 
 /** Memories are files or folders whose name starts with `memories`. */
 export function isCodexMemoryEntry(name: string): boolean {
@@ -28,14 +43,18 @@ const overlayRefusal = (diagnostic: string, message: string): RemoteInstanceErro
 
 /**
  * Create or refresh the private Codex home overlay. Every entry the operator's
- * profile holds is linked into the overlay except the instruction and memory
- * entries; the overlay is the only CODEX_HOME a Konteks session gets. No real
- * file is copied and no real content is deleted.
+ * profile holds is linked into the overlay except instruction, memory, skill,
+ * prompt and plugin entries; `config.toml` is copied without its instruction
+ * keys instead of linked. No real content is deleted.
  */
-export async function prepareCodexHomeOverlay(realHome: string, overlay: string): Promise<string> {
+export async function prepareCodexHomeOverlay(realHome: string, overlay: string, rebind = true): Promise<string> {
   await ensurePrivateDirectory(overlay);
+  const bound = await codexHomeBehindOverlay(overlay);
+  // A legacy record has no codexHome: keep the profile its runner already
+  // used, even when this process's CODEX_HOME now names another one.
+  if (!rebind && bound !== null && resolve(bound) !== resolve(realHome)) return overlay;
   const entries = await readdir(realHome, { withFileTypes: true });
-  const allowed = new Set(entries.map(entry => entry.name).filter(name => !blockedEntry(name)));
+  const allowed = new Set(entries.map(entry => entry.name).filter(name => !blockedEntry(name) && name !== CODEX_CONFIG));
   await pruneOverlay(realHome, overlay, allowed);
   for (const entry of entries) {
     if (!allowed.has(entry.name)) continue;
@@ -46,12 +65,81 @@ export async function prepareCodexHomeOverlay(realHome: string, overlay: string)
   // platform that cannot create a dangling link leaves sign-in to the overlay
   // rather than failing the whole installation.
   if (!entries.some(entry => entry.name === AUTH_ENTRY)) await linkEntry(join(realHome, AUTH_ENTRY), join(overlay, AUTH_ENTRY), true).catch(() => undefined);
+  await writeSanitizedConfig(realHome, overlay);
   await writeFile(join(overlay, CODEX_HOME_OVERLAY_MARKER), "konteks-codex-home-overlay-v1\n", { mode: 0o600 });
+  await writeFile(join(overlay, CODEX_HOME_SOURCE), `${realHome}\n`, { mode: 0o600 });
   return overlay;
 }
 
+/** The operator's instruction sources and personal skill/prompt folders. */
 function blockedEntry(name: string): boolean {
-  return CODEX_HOME_INSTRUCTIONS.includes(name) || isCodexMemoryEntry(name);
+  return CODEX_HOME_BLOCKED_ENTRIES.includes(name) || isCodexMemoryEntry(name);
+}
+
+/** The real home behind an overlay, recorded when it was prepared. */
+export async function codexHomeBehindOverlay(overlay: string): Promise<string | null> {
+  const stored = await readFile(join(overlay, CODEX_HOME_SOURCE), "utf8").catch(() => null);
+  const value = stored?.trim() ?? "";
+  if (value.length > 0 && isAbsolute(value) && !/[\p{Cc}\p{Cf}]/u.test(value)) return value;
+  for (const entry of [AUTH_ENTRY, "sessions"]) {
+    const target = await readlink(join(overlay, entry)).catch(() => null);
+    if (target !== null) return dirname(resolve(overlay, target));
+  }
+  return null;
+}
+
+/** Drop top-level instruction keys and skill/prompt/plugin tables. */
+export function sanitizeCodexConfig(text: string): string {
+  const lines = text.split(/\r?\n/);
+  const kept: string[] = [];
+  let table: "none" | "keep" | "denied" = "none";
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index]!;
+    if (isTableHeader(line)) table = deniedTable(line) ? "denied" : "keep";
+    if (table === "denied") continue;
+    if (table === "none" && instructionKey(line)) {
+      index = skipValue(lines, index);
+      continue;
+    }
+    kept.push(line);
+  }
+  return kept.join("\n");
+}
+
+function isTableHeader(line: string): boolean {
+  return /^\s*\[/.test(line);
+}
+
+function deniedTable(line: string): boolean {
+  const name = /^\s*\[\s*([A-Za-z0-9_-]+)/.exec(line)?.[1]?.toLowerCase();
+  return name !== undefined && CODEX_CONFIG_BLOCKED_TABLES.has(name);
+}
+
+function instructionKey(line: string): boolean {
+  const match = /^\s*([A-Za-z0-9_-]+)\s*=/.exec(line);
+  return match !== null && CODEX_CONFIG_INSTRUCTION_KEYS.has(match[1]!);
+}
+
+/** The last line of the denied key's value: a multi-line string or array, else its own line. */
+function skipValue(lines: readonly string[], index: number): number {
+  return multilineEnd(lines, index, '"""') ?? multilineEnd(lines, index, "'''") ?? arrayEnd(lines, index);
+}
+
+function multilineEnd(lines: readonly string[], index: number, delimiter: string): number | null {
+  const line = lines[index]!;
+  const first = line.indexOf(delimiter);
+  if (first === -1) return null;
+  if (line.indexOf(delimiter, first + 3) !== -1) return index;
+  for (let next = index + 1; next < lines.length; next++) if (lines[next]!.includes(delimiter)) return next;
+  return null;
+}
+
+function arrayEnd(lines: readonly string[], index: number): number {
+  const line = lines[index]!;
+  const value = line.slice(line.indexOf("=") + 1).trim();
+  if (!value.startsWith("[") || value.includes("]")) return index;
+  for (let next = index + 1; next < lines.length; next++) if (lines[next]!.includes("]")) return next;
+  return index;
 }
 
 async function ensurePrivateDirectory(path: string): Promise<void> {
@@ -67,22 +155,58 @@ async function ensurePrivateDirectory(path: string): Promise<void> {
 
 /** Remove instruction/memory entries and links whose real target disappeared; keep connector-created stores. */
 async function pruneOverlay(realHome: string, overlay: string, allowed: ReadonlySet<string>): Promise<void> {
-  for (const name of await readdir(overlay)) {
-    const path = join(overlay, name);
-    if (blockedEntry(name)) {
-      const stat = await lstat(path).catch(() => null);
-      // A link to the operator's file must go; a connector-created memory store
-      // may still be open, so its removal is best effort.
-      await rm(path, { recursive: true, force: true }).catch(error => {
-        if (stat?.isSymbolicLink()) throw error;
-      });
-      continue;
-    }
-    const stat = await lstat(path).catch(() => null);
-    if (!stat?.isSymbolicLink()) continue;
-    const target = await lstat(join(realHome, name)).catch(() => null);
-    if (!allowed.has(name) || target === null) await rm(path, { force: true });
+  for (const name of await readdir(overlay)) await pruneEntry(realHome, overlay, allowed, name);
+}
+
+async function pruneEntry(realHome: string, overlay: string, allowed: ReadonlySet<string>, name: string): Promise<void> {
+  const path = join(overlay, name);
+  if (name === CODEX_CONFIG) {
+    await removeConfigLink(path);
+    return;
   }
+  if (blockedEntry(name)) {
+    await removeBlocked(path);
+    return;
+  }
+  await removeStaleLink(realHome, allowed, path, name);
+}
+
+async function removeConfigLink(path: string): Promise<void> {
+  if ((await lstat(path).catch(() => null))?.isSymbolicLink()) await rm(path, { force: true });
+}
+
+async function removeStaleLink(realHome: string, allowed: ReadonlySet<string>, path: string, name: string): Promise<void> {
+  const stat = await lstat(path).catch(() => null);
+  if (!stat?.isSymbolicLink()) return;
+  const target = await lstat(join(realHome, name)).catch(() => null);
+  if (!allowed.has(name) || target === null) await rm(path, { force: true });
+}
+
+/** A link to the operator's file must go; a connector-created memory store may still be open. */
+async function removeBlocked(path: string): Promise<void> {
+  const stat = await lstat(path).catch(() => null);
+  await rm(path, { recursive: true, force: true }).catch(error => {
+    if (stat?.isSymbolicLink()) throw error;
+  });
+}
+
+/** Copy the operator's config without its instruction keys; never link the real file. */
+async function writeSanitizedConfig(realHome: string, overlay: string): Promise<void> {
+  const target = join(overlay, CODEX_CONFIG);
+  const source = await readFile(join(realHome, CODEX_CONFIG), "utf8").catch(error => {
+    if (isFsErrorWithCode(error, "ENOENT")) return null;
+    throw error;
+  });
+  const current = await readFile(target, "utf8").catch(() => null);
+  if (source === null) {
+    if (current !== null) await rm(target, { force: true });
+    return;
+  }
+  const sanitized = sanitizeCodexConfig(source);
+  if (current === sanitized) return;
+  await rm(target, { force: true });
+  await writeFile(target, sanitized, { mode: 0o600 });
+  if (process.platform !== "win32") await chmod(target, 0o600);
 }
 
 /** Link one real entry; an existing connector-created real entry is left alone. */

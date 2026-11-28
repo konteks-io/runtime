@@ -43,29 +43,41 @@ it.skipIf(!CODEX)("the real Codex prompt input loads the working copy but no ope
   await writeFile(join(real, "AGENTS.override.md"), "OPERATOR_OVERRIDE_MARKER\n");
   await mkdir(join(real, "memories"), { recursive: true });
   await writeFile(join(real, "memories", "note.md"), "OPERATOR_MEMORY_MARKER\n");
+  await mkdir(join(real, "skills", "personal"), { recursive: true });
+  await writeFile(join(real, "skills", "personal", "SKILL.md"), "PERSONAL_SKILL_MARKER\n");
+  await mkdir(join(real, "prompts"), { recursive: true });
+  await writeFile(join(real, "prompts", "personal.md"), "PERSONAL_PROMPT_MARKER\n");
+  await writeFile(join(real, "config.toml"), 'developer_instructions = "OPERATOR_CONFIG_MARKER"\n');
   await writeFile(join(root, "AGENTS.md"), "PARENT_DIRECTORY_MARKER\n");
   await writeFile(join(work, "AGENTS.md"), "WORKING_COPY_MARKER\n");
   await prepareCodexHomeOverlay(real, overlay);
 
   const direct = promptInput(real, work, home);
   expect(direct).toContain("OPERATOR_OVERRIDE_MARKER");
+  expect(direct).toContain("OPERATOR_CONFIG_MARKER");
   expect(direct).toContain("WORKING_COPY_MARKER");
   // A working copy with no AGENTS.md has no working-copy instructions; the
   // overlay still excludes the operator's own.
   const bareDirect = promptInput(real, bare, home);
   expect(bareDirect).toContain("OPERATOR_OVERRIDE_MARKER");
+  expect(bareDirect).toContain("OPERATOR_CONFIG_MARKER");
 
   const overlayed = promptInput(overlay, work, home);
   expect(overlayed).toContain("WORKING_COPY_MARKER");
-  for (const marker of ["OPERATOR_AGENTS_MARKER", "OPERATOR_OVERRIDE_MARKER", "OPERATOR_MEMORY_MARKER"]) {
+  for (const marker of ["OPERATOR_AGENTS_MARKER", "OPERATOR_OVERRIDE_MARKER", "OPERATOR_MEMORY_MARKER", "OPERATOR_CONFIG_MARKER",
+    "PERSONAL_SKILL_MARKER", "PERSONAL_PROMPT_MARKER"]) {
     expect(overlayed).not.toContain(marker);
   }
 
-  // The thread config bounds the parent walk and carries the working copy's
-  // root file explicitly; no operator or parent instructions reach the model.
-  const scoped = promptInput(overlay, bare, home, ["-c", "project_doc_max_bytes=0", "-c", 'developer_instructions="WORKING_COPY_MARKER"']);
-  expect(scoped).toContain("WORKING_COPY_MARKER");
-  for (const marker of ["OPERATOR_AGENTS_MARKER", "OPERATOR_OVERRIDE_MARKER", "OPERATOR_MEMORY_MARKER", "PARENT_DIRECTORY_MARKER"]) {
-    expect(scoped).not.toContain(marker);
+  // The thread config bounds the parent walk and always sets
+  // developer_instructions, including empty when the working copy has none.
+  const scopedBare = promptInput(overlay, bare, home, ["-c", "project_doc_max_bytes=0", "-c", 'developer_instructions=""']);
+  for (const marker of ["OPERATOR_AGENTS_MARKER", "OPERATOR_OVERRIDE_MARKER", "OPERATOR_MEMORY_MARKER", "OPERATOR_CONFIG_MARKER", "PARENT_DIRECTORY_MARKER"]) {
+    expect(scopedBare).not.toContain(marker);
+  }
+  const scopedWork = promptInput(overlay, bare, home, ["-c", "project_doc_max_bytes=0", "-c", 'developer_instructions="WORKING_COPY_MARKER"']);
+  expect(scopedWork).toContain("WORKING_COPY_MARKER");
+  for (const marker of ["OPERATOR_AGENTS_MARKER", "OPERATOR_OVERRIDE_MARKER", "OPERATOR_MEMORY_MARKER", "OPERATOR_CONFIG_MARKER", "PARENT_DIRECTORY_MARKER"]) {
+    expect(scopedWork).not.toContain(marker);
   }
 });

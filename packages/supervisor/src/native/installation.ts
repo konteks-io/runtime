@@ -282,7 +282,7 @@ function antigravityUnavailable(root: string, record: NativeRuntimeRecord, error
 async function agentExecutables(agent: string, record: NativeRuntimeRecord, root: string): Promise<{ codexHome: string | undefined; claudeExecutable: string | undefined }> {
   const realCodexHome = agent === "codex" ? await resolveNativeCodexHome(record.codexHome === undefined ? process.env : { CODEX_HOME: record.codexHome }) : undefined;
   const codexHome = realCodexHome === undefined ? undefined
-    : await prepareCodexHomeOverlay(realCodexHome, join(root, "credentials", "codex", "codex-home"));
+    : await prepareCodexHomeOverlay(realCodexHome, join(root, "credentials", "codex", "codex-home"), record.codexHome !== undefined);
   const claudeExecutable = agent === "claude-code" ? await resolveNativeClaudeExecutable(process.env, undefined, undefined, record.claudeExecutable) : undefined;
   return { codexHome, claudeExecutable };
 }

@@ -436,13 +436,13 @@ test("the thread scope stops project discovery and carries only the working copy
   try {
     const wc = join(root, "work");
     mkdirSync(wc, { recursive: true });
-    assert.deepEqual(konteksCodexThreadScope(wc), { project_doc_max_bytes: 0 });
+    assert.deepEqual(konteksCodexThreadScope(wc), { project_doc_max_bytes: 0, developer_instructions: "" });
     writeFileSync(join(wc, "AGENTS.md"), "# working copy rules\n");
     assert.deepEqual(konteksCodexThreadScope(wc), { project_doc_max_bytes: 0, developer_instructions: "# working copy rules\n" });
     writeFileSync(join(root, "private.md"), "operator rules\n");
     rmSync(join(wc, "AGENTS.md"));
     symlinkSync(join(root, "private.md"), join(wc, "AGENTS.md"));
-    assert.deepEqual(konteksCodexThreadScope(wc), { project_doc_max_bytes: 0 });
+    assert.deepEqual(konteksCodexThreadScope(wc), { project_doc_max_bytes: 0, developer_instructions: "" });
     rmSync(join(wc, "AGENTS.md"));
     mkdirSync(join(wc, "AGENTS.md"));
     assert.equal(konteksWorkingCopyInstructions(wc), "");
