@@ -68,6 +68,16 @@ describe("named recovery checkpoint refusals", () => {
     expect(error.message).toBe("The unfinished workspace could not be preserved or verified. The original workspace was kept.");
   });
 
+  it.each([
+    ["a line before Graft's block", "private-notes/\n# Konteks: Graft's local files (set up by konteks-remote onboard)\n/graft/\n"],
+    ["a pattern inside Graft's block", "# Konteks: Graft's local files (set up by konteks-remote onboard)\n/graft/\n*.log\n"],
+    ["a re-included path inside Graft's block", "# Konteks: Graft's local files (set up by konteks-remote onboard)\n!/graft/\n"],
+    ["an indented comment, which Git reads as a pattern", "  # private\n"],
+  ])("still names %s as custom", async (_case, block) => {
+    await appendFile(join(cwd, ".git", "info", "exclude"), block);
+    expect(await refusal(captured())).toMatchObject({ diagnostic: "git_info_exclude_custom" });
+  });
+
   it("names a submodule the index carries", async () => {
     await testGitCommand(tool, cwd, ["update-index", "--add", "--cacheinfo", `160000,${baseline},sub`]);
     expect(await refusal(captured())).toMatchObject({ diagnostic: "index_unparsable_gitlink" });

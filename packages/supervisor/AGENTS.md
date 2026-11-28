@@ -76,6 +76,11 @@ QA browser, structured results, updates and doctor/support.
   accepted-output authority. Restore into a fresh private folder, verify before
   acknowledging, and retain every superseded checkout. An active recovered
   folder keeps later uncommitted edits across preparation and supervisor restarts.
+  The repository's `info/exclude` must hold only comments, or Graft's own
+  block (launcher `wireGraft`: its mark, then anchored literal paths); any
+  other rule is `git_info_exclude_custom`. Graft's ignored, untracked files
+  are left out of the checkpoint like rebuildable folders (`skippedPaths`),
+  so a restored folder never carries them as visible untracked output.
 - **A delivery session coming back** (D105): a harness turn that finds its own
   old checkout started at another commit (`staleCheckout`) replaces it only when
   `staleCheckoutVerdict` says nothing is unsaved (no edits, exactly its last

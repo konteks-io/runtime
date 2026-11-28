@@ -33,6 +33,14 @@ const LONG_GIT_STEPS: ReadonlySet<CheckpointGitStep> = new Set(["ls_files_ignore
 const REBUILDABLE_FOLDERS: ReadonlySet<string> = new Set(["node_modules", "bower_components", "vendor", ".venv", "venv", "__pycache__",
   "target", "dist", "build", ".next", ".nuxt", ".svelte-kit", ".turbo", ".parcel-cache", ".cache", ".gradle", "Pods", ".terraform"]);
 const NOTHING_SKIPPED: ReadonlySet<string> = new Set();
+/**
+ * The block launcher `wireGraft` appends to the shared exclude file: this
+ * mark, then one anchored literal path per file or folder Graft owns. Graft's
+ * files are local wiring, never the agent's work, so a checkpoint leaves out
+ * those Git reports ignored and untracked; a restored folder works without them.
+ */
+const GRAFT_EXCLUDE_MARK = "# Konteks: Graft's local files (set up by konteks-remote onboard)";
+const GRAFT_EXCLUDE_PATH = /^\/(?:[^\s*?[\]!\\#/]+\/)*[^\s*?[\]!\\#/]+\/?$/u;
 
 /** Which way a Git call failed, and which call. */
 function gitRefusal(error: ExecFileException, gitStep: CheckpointGitStep): NamedRefusal {
@@ -123,11 +131,22 @@ async function addWorkingEntry(root: string, absolute: string, path: string, ent
   entries.push({ path, kind: "file", mode, ...data }); budget.bytes += data.sizeBytes;
 }
 
-/** The ignored folders that hold nothing tracked and that tools rebuild. Git lists such a folder whole, with a trailing slash. */
-async function rebuildableFolders(git: Git, root: string): Promise<ReadonlySet<string>> {
+/**
+ * What a checkpoint leaves out, all ignored and untracked: folders tools
+ * rebuild, and Graft's own files. Git lists a wholly ignored folder once, with
+ * a trailing slash.
+ */
+async function skippedPaths(git: Git, root: string, graft: readonly string[]): Promise<ReadonlySet<string>> {
   const rows = (await git(root, "ls_files_ignored", ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"])).toString("utf8").split("\0");
   const folders = rows.filter(row => row.endsWith("/")).map(row => row.slice(0, -1));
-  return new Set(folders.filter(folder => REBUILDABLE_FOLDERS.has(folder.split("/").at(-1)!)));
+  const ignored = rows.filter(Boolean).map(row => row.replace(/\/$/u, ""));
+  return new Set([...folders.filter(folder => REBUILDABLE_FOLDERS.has(folder.split("/").at(-1)!)), ...graftOwned(ignored, graft)]);
+}
+
+/** Ignored paths inside one of Graft's, and Graft's paths inside an ignored folder. */
+function graftOwned(ignored: readonly string[], graft: readonly string[]): string[] {
+  const within = (path: string, folder: string) => path === folder || path.startsWith(`${folder}/`);
+  return [...ignored.filter(path => graft.some(owned => within(path, owned))), ...graft.filter(owned => ignored.some(path => within(owned, path)))];
 }
 
 function ascii(value: Buffer): string { return value.toString("utf8").trim(); }
@@ -201,17 +220,17 @@ export async function captureWorkspaceCheckpoint(options: CaptureOptions & { chu
   const run = gitRunner(tool);
   const git: Git = (cwd, step, args, input) => run(cwd, step, cwd === root ? ["--git-dir", control.gitDir, "--work-tree", root, ...args] : args, input);
   const linked = control.gitDir !== control.commonDir;
-  await assertSupportedGitMetadata(control);
+  const graft = await assertSupportedGitMetadata(control);
   await git(root, "cat_file", ["cat-file", "-e", `${options.baselineCommit}^{commit}`]);
   const state = await gitState(git, root, linked, options.chunks);
-  const skipped = await rebuildableFolders(git, root);
+  const skipped = await skippedPaths(git, root, graft);
   const entries = await workingFiles(root, root, [], options.chunks, skipped);
   const temporary = await mkdtemp(join(dirname(root), ".workspace-checkpoint-"));
   await chmod(temporary, 0o700);
   try {
     const packed = await bundle(git, root, temporary, state, options.baselineCommit, options.chunks);
     assertGitControl(await inspectWorkspaceGitControl(options), control);
-    await assertSupportedGitMetadata(control);
+    if ((await assertSupportedGitMetadata(control)).join("\n") !== graft.join("\n")) throw unavailable("git_info_changed");
     await assertUnchangedDuringCapture(git, root, { state, entries, before, linked, chunks: options.chunks, skipped });
     const { indexEntries: _entries, ...metadata } = state;
     const body = { format: options.chunks ? "konteks-workspace-checkpoint-v2" as const : "konteks-workspace-checkpoint-v1" as const, baselineCommit: options.baselineCommit, ...metadata, bundle: packed, entries };
@@ -340,31 +359,45 @@ function sameOwnedDirectory(owner: Stats, current: Stats): boolean {
 }
 
 /** Checkpoints retain ordinary refs/index/worktree state. Operation journals
- * and split indexes need a different format; never silently omit their work. */
-async function assertSupportedGitMetadata(control: WorkspaceGitControl): Promise<void> {
+ * and split indexes need a different format; never silently omit their work.
+ * Returns Graft's paths from the exclude file Git reads (the common one). */
+async function assertSupportedGitMetadata(control: WorkspaceGitControl): Promise<string[]> {
+  let graft: string[] = [];
   for (const folder of new Set([control.gitDir, control.commonDir])) {
     await directory(folder);
     const names = await readdir(folder);
     if (names.some(name => /^(?:MERGE_|AUTO_MERGE$|CHERRY_PICK_HEAD$|REVERT_HEAD$|REBASE_HEAD$|SQUASH_MSG$|rebase-|sequencer$|sharedindex\.|shallow$)/u.test(name))) throw unavailable("git_operation_in_progress");
-    await assertDefaultGitInfo(folder);
+    const owned = await assertDefaultGitInfo(folder);
+    if (folder === control.commonDir) graft = owned;
   }
+  return graft;
 }
 
 function assertGitControl(actual: WorkspaceGitControl, expected?: WorkspaceGitControl): void {
   if (expected && canonicalize(actual as never) !== canonicalize(expected as never)) throw unavailable("git_control_changed");
 }
 
-async function assertDefaultGitInfo(folder: string): Promise<void> {
+/** Git's default `info` folder, plus at most Graft's block; returns Graft's paths. */
+async function assertDefaultGitInfo(folder: string): Promise<string[]> {
   const info = join(folder, "info");
   let names: string[];
   try { names = await readdir(info); } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
     throw error;
   }
   if (names.some(name => name !== "exclude")) throw unavailable("git_info_unsupported");
-  if (!names.includes("exclude")) return;
-  const lines = (await readStable(join(info, "exclude"))).toString("utf8").split("\n");
-  if (lines.some(line => line.trim() !== "" && !line.trim().startsWith("#"))) throw unavailable("git_info_exclude_custom");
+  if (!names.includes("exclude")) return [];
+  return graftExcludePaths((await readStable(join(info, "exclude"))).toString("utf8").split("\n"));
+}
+
+/** Every rule must come after Graft's mark and name one literal anchored path; Git reads only a line starting `#` as a comment. */
+function graftExcludePaths(lines: string[]): string[] {
+  const isRule = (line: string) => line.trim() !== "" && !line.startsWith("#");
+  const rules = lines.filter(isRule);
+  if (rules.length === 0) return [];
+  const mark = lines.indexOf(GRAFT_EXCLUDE_MARK);
+  if (mark < 0 || lines.slice(0, mark).some(isRule) || !rules.every(rule => GRAFT_EXCLUDE_PATH.test(rule))) throw unavailable("git_info_exclude_custom");
+  return rules.map(rule => rule.slice(1).replace(/\/$/u, ""));
 }
 
 async function syncRestoredTree(folder: string): Promise<void> {
